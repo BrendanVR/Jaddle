@@ -11,7 +11,7 @@ setup(
         "scipy",
         "highspy",
     ],
-    author="Brendan",
+    author="Brendan van Rooyen",
     description="A JAX-based saddle solver for linear and convex programs",
     license="MIT",
 )
