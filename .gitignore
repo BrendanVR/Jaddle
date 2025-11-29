@@ -1,0 +1,11 @@
+jaddle_logo_full.png
+jaddle_logo_no_text_square.png
+/data
+/jaddle.egg-info
+/jadde/__pycache__
+jaddle/__pycache__/__init__.cpython-312.pyc
+jaddle/__pycache__/highs_helpers.cpython-312.pyc
+jaddle/__pycache__/jaddle_convex.cpython-312.pyc
+jaddle/__pycache__/jaddle_linear.cpython-312.pyc
+jaddle/__pycache__/jaddle_optimisers.cpython-312.pyc
+/build
