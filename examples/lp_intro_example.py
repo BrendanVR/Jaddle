@@ -3,8 +3,11 @@
 # This example demonstrates how to define and solve a simple linear programming problem using the Jaddle library.
 
 # %%
+import jax
 import numpy as np
 import jaddle.jaddle_linear as jl
+
+jax.config.update("jax_platform_name", "cpu")  # Using CPU for toy problem
 
 # %% [markdown]
 # ## Defining the Linear Programming Problem

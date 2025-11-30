@@ -172,7 +172,7 @@ def highs_linear_solver(
 
     highs.run()
     highs_solution = highs.getSolution()
-    highs_primal = jnp.array(highs_solution.col_value)
+    highs_primal = np.array(highs_solution.col_value)
 
     return highs_primal
 

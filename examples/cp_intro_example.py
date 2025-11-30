@@ -4,8 +4,11 @@
 # We will formulate a convex problem with inequality and equality constraints and solve it.
 
 # %%
+import jax
 import jax.numpy as jnp
 import jaddle.jaddle_convex as jc
+
+jax.config.update("jax_platform_name", "cpu")  # Usiing CPU for toy problem
 
 
 # %% [markdown]
