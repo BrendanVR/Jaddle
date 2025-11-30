@@ -1,7 +1,7 @@
+<img width="1536" height="1024" alt="jaddle_logo_full" src="https://github.com/user-attachments/assets/d4e61518-3557-4273-b4d0-0d89510e0f3f" />
+
 # Jaddle: The JAX Saddle Solver
 *Saddle up with JAX to solve large scale linear and convex programs*
-
-![Jaddle Logo](jaddle_logo_full.png)
 
 ## 🚀 Introduction
 
