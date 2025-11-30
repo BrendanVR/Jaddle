@@ -251,28 +251,33 @@ def __sps(
 
 
 def solve(
-    iterations_per_epoch,
     lp: LP,
-    initial_solution,
+    initial_solution=None,
     optimiser=None,
-    constraint_tolerance=1e-5,
+    iterations_per_epoch=int(1e4),
+    constraint_tolerance=1e-4,
     progress_tolerance=1e-4,
     complementarity_tolerance=1e-4,
     exponential_weighting=0.01,
-    scale_rc=False,
-    scale_objective=False,
+    scale_A=False,
+    scale_b=False,
+    scale_c=False,
+    max_epochs=1000,
 ):
+
+    if initial_solution is None:
+        initial_solution = lp.initial_solution()
 
     if optimiser is None:
         optimiser = jo.adamdelta_saddle()
 
-    if scale_rc and not sp.issparse(lp.A_eq):
+    if scale_A and not sp.issparse(lp.A_eq):
         lp, rs_ruiz, cs_ruiz = __ruiz_scaling(lp)
         lp, rs_pc, cs_pc = __pc_scaling(lp)
         lp_summary_statistics(lp)
         lp = __to_jaddle(lp)
 
-    elif scale_rc and sp.issparse(lp.A_eq):
+    elif scale_A and sp.issparse(lp.A_eq):
         lp, rs_ruiz, cs_ruiz = __ruiz_scaling_sparse(lp)
         lp, rs_pc, cs_pc = __pc_scaling_sparse(lp)
         lp_summary_statistics(lp)
@@ -286,12 +291,27 @@ def solve(
         lp_summary_statistics(lp)
         lp = __to_jaddle_sparse(lp)
 
-    if scale_objective:
+    if scale_c:
         print("--------------------------------")
-        obj_scale = jnp.max(jnp.abs(lp.c))
-        lp.c = lp.c / obj_scale
-        print(f"Objective scaled by factor: {obj_scale:.6f}")
+        c_scale = jnp.max(jnp.abs(lp.c))
+        lp.c = lp.c / c_scale
+        print(f"Objective scaled by factor: {c_scale:.6f}")
         print(f"New [Min, Max] of c: [{jnp.min(lp.c):.6f}, {jnp.max(lp.c):.6f}]")
+        print("--------------------------------")
+
+    if scale_b:
+        print("--------------------------------")
+        b_scale_eq = jnp.max(jnp.abs(lp.b_eq))
+        if b_scale_eq > 0:
+            lp.b_eq = lp.b_eq / b_scale_eq
+            lp.A_eq = lp.A_eq / b_scale_eq
+
+        b_scale_ineq = jnp.max(jnp.abs(lp.b_ineq))
+        if b_scale_ineq > 0:
+            lp.b_ineq = lp.b_ineq / b_scale_ineq
+            lp.A_ineq = lp.A_ineq / b_scale_ineq
+
+        print(f"b scaled by factor: eq {b_scale_eq:.6f}, ineq {b_scale_ineq:.6f}")
         print("--------------------------------")
 
     i = 1
@@ -301,6 +321,7 @@ def solve(
     progress = jnp.inf
     max_complementarity_slack = jnp.inf
     constraints_satisfied = False
+    count = 0
 
     start_time_total = time.time()
 
@@ -321,11 +342,17 @@ def solve(
         )
         end_time = time.time()
 
-        objective_value = lp.c @ new_average_state["primal"]
+        objective_value = lp.objective(new_average_state["primal"])
 
-        progress = jnp.abs(lp.c @ average_state["primal"] - objective_value) / (
-            1.0 + jnp.abs(objective_value)
-        )
+        if scale_c:
+            objective_value = c_scale * objective_value
+            progress = jnp.abs(
+                c_scale * lp.objective(average_state["primal"]) - objective_value
+            ) / (1.0 + jnp.abs(objective_value))
+        else:
+            progress = jnp.abs(
+                lp.objective(average_state["primal"]) - objective_value
+            ) / (1.0 + jnp.abs(objective_value))
 
         ineq_violations = jnp.maximum(
             lp.A_ineq @ new_average_state["primal"] - lp.b_ineq, 0.0
@@ -356,11 +383,17 @@ def solve(
             and max_eq_violation < constraint_tolerance
         )
         average_state = new_average_state
+        count += 1
+
+        if count >= max_epochs:
+            print("Maximum epochs reached, terminating solver.")
+            break
 
     end_time_total = time.time()
-    print("Total solve time:", end_time_total - start_time_total)
+    print(f"Total solve time: {end_time_total - start_time_total:.2f} seconds")
+    print(f"Total epochs: {count}")
 
-    if scale_rc:
+    if scale_A:
         average_state["primal"] = average_state["primal"] * cs_pc * cs_ruiz
         average_state["dual_eq"] = (
             average_state["dual_eq"]

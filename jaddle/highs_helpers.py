@@ -158,7 +158,7 @@ def highs_linear_solver(
     highs.setOptionValue("solver", method)
     highs.setOptionValue("presolve", "off")
     highs.setOptionValue("primal_feasibility_tolerance", feasibility_tolerance)
-    # highs.setOptionValue("dual_feasibility_tolerance", feasibility_tolerance)
+    highs.setOptionValue("dual_feasibility_tolerance", feasibility_tolerance)
     highs.setOptionValue("optimality_tolerance", 1e-4)
 
     if warm_start is not None:

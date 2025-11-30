@@ -4,6 +4,7 @@ import jax.numpy as jnp
 from optax.projections import projection_non_negative, projection_box
 import optax
 import jaddle.jaddle_optimisers as jo
+import time
 
 
 # %%
@@ -139,15 +140,18 @@ def __sps(
 
 
 def solve(
-    iterations_per_epoch,
     cp: CP,
-    initial_solution,
+    iterations_per_epoch=int(1e4),
+    initial_solution=None,
     optimiser=None,
-    constraint_tolerance=1e-5,
+    constraint_tolerance=1e-4,
     progress_tolerance=1e-4,
     complementarity_tolerance=1e-4,
     exponential_weighting=0.01,
+    max_epochs=1000,
 ):
+    if initial_solution is None:
+        initial_solution = cp.initial_solution()
 
     if optimiser is None:
         optimiser = jo.adamdelta_saddle()
@@ -159,11 +163,15 @@ def solve(
     progress = jnp.inf
     max_complementarity_slack = jnp.inf
     constraints_satisfied = False
+    count = 0
+
+    start_time_total = time.time()
 
     while (
         progress > progress_tolerance
         or max_complementarity_slack > complementarity_tolerance
     ) or not constraints_satisfied:
+        start_time = time.time()
         i, state, new_average_state, opt_state = __sps(
             iterations_per_epoch,
             i,
@@ -174,6 +182,7 @@ def solve(
             opt_state,
             exponential_weighting,
         )
+        end_time = time.time()
 
         objective_value = cp.objective(new_average_state["primal"])
 
@@ -192,14 +201,27 @@ def solve(
         ) / (1.0 + jnp.abs(objective_value))
         max_complementarity_slack = jnp.abs(jnp.sum(complentariy_slack))
 
+        print("--------------------------------")
+        print(f"Epoch time: {end_time - start_time:.2f} seconds")
         print(
             f"|obj: {objective_value:.6f} |prog: {progress:.6f}|ineq_viol: {max_ineq_violation:.6f}|eq_viol: {max_eq_violation:.6f}|comp_slack: {max_complementarity_slack:.6f}|"
         )
+        print("--------------------------------")
+
         constraints_satisfied = (
             max_ineq_violation < constraint_tolerance
             and max_eq_violation < constraint_tolerance
         )
         average_state = new_average_state
+        count += 1
+
+        if count >= max_epochs:
+            print("Maximum epochs reached, terminating solver.")
+            break
+
+    end_time_total = time.time()
+    print(f"Total solve time: {end_time_total - start_time_total:.2f} seconds")
+    print(f"Total epochs: {count}")
 
     return average_state
 

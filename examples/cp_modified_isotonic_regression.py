@@ -1,6 +1,6 @@
 # %% [markdown]
-# # Isotonic Regression with SPS Optimizer
-# This example demonstrates how to perform modified isotonic regression using the SPS optimizer from the Jaddle Convex library.
+# # Isotonic Regression with Jaddle
+# This example demonstrates how to perform modified isotonic regression using Jaddle.
 # Isotonic regression is a type of regression that fits a non-decreasing function to the data. Here we impose an extra mean constraint
 # on the solution.
 
@@ -49,14 +49,7 @@ cp = jc.CP(
 
 # %% [markdown]
 # ## Solve the problem using Jaddle Convex SPS optimizer
-solution = jc.solve(
-    iterations_per_epoch=int(1e4),
-    cp=cp,
-    initial_solution=cp.initial_solution(),
-    constraint_tolerance=1e-5,
-    progress_tolerance=1e-4,
-    complementarity_tolerance=1e-3,
-)
+solution = jc.solve(cp)
 
 # %%
 plt.figure(figsize=(10, 6))
@@ -79,8 +72,8 @@ plt.show()
 y_pred = solution["primal"]
 ineq_violations = constraints_ineq(y_pred)
 eq_violations = constraints_eq(y_pred)
-print("Max Inequality Constraint Violation (should be <= 0):", ineq_violations.max())
-print("Equality Constraint Violation (should be == 0):", eq_violations)
+print("Max Inequality Constraint Violation (should be <= 0):", cp.ineq_slack(y_pred))
+print("Max Equality Constraint Violation (should be == 0):", cp.eq_slack(y_pred))
 print("Optimal Objective Value:", objective(y_pred))
 
 # %%

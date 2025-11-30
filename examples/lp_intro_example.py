@@ -5,7 +5,6 @@
 # %%
 import numpy as np
 import jaddle.jaddle_linear as jl
-import jaddle.jaddle_optimisers as jo
 
 # %% [markdown]
 # ## Defining the Linear Programming Problem
@@ -39,15 +38,9 @@ lp = jl.LP(
 
 # %% [markdown]
 # ## Solving the LP Problem
-solution = jl.solve(
-    iterations_per_epoch=int(1e4),
-    lp=lp,
-    initial_solution=lp.initial_solution(),
-    constraint_tolerance=1e-5,
-    progress_tolerance=1e-5,
-)
+solution = jl.solve(lp)
 # %%
-print(f"x1 = {solution["primal"][0]:.4f}, x2 = {solution["primal"][1]:.4f}")
-print(f"Optimal objective value: {c @ solution["primal"]:.4f}")
+print(f"x1 = {solution['primal'][0]:.4f}, x2 = {solution['primal'][1]:.4f}")
+print(f"Optimal objective value: {lp.objective(solution['primal']):.4f}")
 
 # %%

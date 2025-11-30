@@ -5,7 +5,7 @@
 
 ## 🚀 Introduction
 
-Jaddle isn’t here to replace your industrial solver. It’s here to show that primal–dual optimization can be elegant, lightweight, and fun — built in ~1000 lines of JAX.
+Jaddle isn’t here to replace your industrial solver. It’s here to show that primal–dual optimization can be elegant, lightweight, and fun. Built in ~1000 lines of JAX.
 
 Jaddle performs admirably on many hard linear and convex benchmarks, while remaining simple enough for rapid experimentation. Utilizing the basic building blocks that Optax provides, one can specify many complicated variants of primal–dual optimizers all with only 10–15 lines of code.
 
@@ -56,26 +56,31 @@ def adamdelta_saddle(
 
 ```
 
-This modular code produces a family of optimizers for each primal, dual learning rate and each input extra gradient parameter alpha. JAX allows you to succinctly specify what the optimizer is doing.
+This modular code produces a family of optimizers for each primal, dual learning rate and each input extra gradient parameter alpha. JAX allows you to succinctly specify what the optimiser is doing.
 
 ---
 
 ## 📊 Benchmarks
 
-Jaddle has been tested on challenging MIPLIB relaxations.  While not a production solver, it performs competitively with PDLP‑style methods. Here we compare **Jaddle** against **cuPDLP-C** with the appropriate scaling. We also make use of HiGHs' pre-solve functionality. We quote the size of the presolved system and not of the original problem. We also only quote solve time, and not time taken to scale the system (which is done in the same fashion by Jaddle and cuPDLP-C). Running with the above adamdelta_saddle optimizer on a GPU we have the following benchmark results:
+Jaddle has been tested on challenging MIPLIB relaxations.  While not a production solver, it performs competitively with PDLP‑style methods. Here we compare **Jaddle** against **cuPDLP-C** with the appropriate scaling. We also make use of HiGHs' pre-solve functionality. We quote the size of the presolved system and not of the original problem. We also only quote solve time, and not time taken to scale the system (which is done in the same fashion by Jaddle and cuPDLP-C). Running with the above adamdelta_saddle optimiser on a GPU we have the following benchmark results:
 
 | Instance    | Variables | Constraints| cuPDLP-C Runtime (s) | Jaddle Runtime (s) | 
 |-------------|------| ------|-----------|--------|
-| `nug`         | 20446   |   18268  |     1      |   4 |
+| `nug`         | 20446   |   18268  |     1      |   3 |
 | `stp3d`       | 136924  |  97457    |    35      | 9 |        
 | `ns1758913`   |  17684  |  26760 |    39       | 11 |
+| `buildingenergy`   |  154978   |  277594  |    142       | 92 |
 
 The point is not to beat cuPDLP‑C outright, but to show that ~1000 lines of JAX can hang in the same ballpark. The hope is that by utilizing increased algorithmic smarts, Jaddle can reduce the oscillatory nature of PDLP.
 
 ## 📦 Installation
+
 Clone the repo and install locally:
 ```bash
 pip install -e .
 ```
+Jaddle has been tested to work the the WSL 2.
 
+## 📖 Examples
 
+Along with source code, we provide four examples to start your Jaddle journey, showcasing both the linear and convex capabilities of the library.
