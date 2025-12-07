@@ -255,9 +255,9 @@ def solve(
     initial_solution=None,
     optimiser=None,
     iterations_per_epoch=int(1e4),
-    constraint_tolerance=1e-4,
-    progress_tolerance=1e-4,
-    complementarity_tolerance=1e-4,
+    constraint_tolerance=1e-5,
+    progress_tolerance=1e-5,
+    complementarity_tolerance=1e-5,
     exponential_weighting=0.01,
     scale_A=False,
     scale_b=False,
@@ -356,12 +356,10 @@ def solve(
 
         ineq_violations = jnp.maximum(
             lp.A_ineq @ new_average_state["primal"] - lp.b_ineq, 0.0
-        ) / (1.0 + jnp.abs(lp.b_ineq))
+        )
         max_ineq_violation = jnp.max(ineq_violations)
 
-        eq_violations = jnp.abs(lp.A_eq @ new_average_state["primal"] - lp.b_eq) / (
-            1.0 + jnp.abs(lp.b_eq)
-        )
+        eq_violations = jnp.abs(lp.A_eq @ new_average_state["primal"] - lp.b_eq)
         max_eq_violation = jnp.max(eq_violations)
 
         complentariy_slack = (

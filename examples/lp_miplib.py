@@ -5,6 +5,11 @@
 # The LP will then be presolved to simplify the problem before applying saddle point optimisation.
 
 # %%
+import os
+
+# Suppress INFO and WARNING logs from XLA/JAX
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
 import time
 import jaddle.jaddle_linear as jl
 import jaddle.jaddle_optimisers as jo
@@ -18,7 +23,7 @@ import optax
 # The LP is then presolved to reduce its size and complexity.
 # Finally, we convert the presolved LP into a format compatible with Jaddle.
 highs = hspy.Highs()
-highs.readModel("../data/stp3d.mps")  # path to MPS file
+highs.readModel("<PATH_TO_MPS_FILE>")  # path to MPS file
 highs.presolve()
 highs_lp = highs.getPresolvedLp()
 jaddle_lp = hh.highs_to_standard_form_sparse(highs_lp)
@@ -27,21 +32,24 @@ jaddle_lp = hh.highs_to_standard_form_sparse(highs_lp)
 # We solve the presolved LP using HiGHs PDLP solver for comparison.
 start_time = time.time()
 highs_solution = hh.highs_linear_solver(
-    highs_lp, method="pdlp", feasibility_tolerance=1e-3
+    highs_lp, method="pdlp", feasibility_tolerance=1e-5
 )
+# %%
 print("--------------------------------")
 print("HiGHs PDLP solver objective:", jaddle_lp.objective(highs_solution))
+print("Inequality violation:", jaddle_lp.ineq_slack(highs_solution))
+print("Equality violation:", jaddle_lp.eq_slack(highs_solution))
 print("--------------------------------")
 
 # %%
 lr = optax.cosine_decay_schedule(
-    init_value=1.0,
-    decay_steps=int(3e4),
+    init_value=1e-2,
+    decay_steps=int(1e5),
     alpha=1e-4,
-    exponent=2.0,
+    exponent=1.5,
 )
 
-optimiser = jo.adamdelta_saddle(lr_primal=lr)
+optimiser = jo.adamdelta_saddle(lr_primal=lr, lr_dual=1.0)
 
 # %% [markdown]
 # ## Solve the scaled, presolved LP using Jaddle's saddle point solver
@@ -60,4 +68,6 @@ print("Equality violation:", jaddle_lp.eq_slack(solution["primal"]))
 print("Time to solution:", time.time() - start_time)
 print("--------------------------------")
 
+# %%
+jl.lp_summary_statistics(jaddle_lp)
 # %%

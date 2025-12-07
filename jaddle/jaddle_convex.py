@@ -144,9 +144,9 @@ def solve(
     iterations_per_epoch=int(1e4),
     initial_solution=None,
     optimiser=None,
-    constraint_tolerance=1e-4,
-    progress_tolerance=1e-4,
-    complementarity_tolerance=1e-4,
+    constraint_tolerance=1e-5,
+    progress_tolerance=1e-5,
+    complementarity_tolerance=1e-5,
     exponential_weighting=0.01,
     max_epochs=1000,
 ):
