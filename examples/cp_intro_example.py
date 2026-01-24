@@ -62,14 +62,14 @@ solution = jc.solve(cp)
 
 # %% [markdown
 # ## Displaying the Solution
-print("Optimal Objective Value:", objective(solution["primal"]))
-print("Optimal Solution:", solution["primal"])
+print("Optimal Objective Value:", objective(solution.primal))
+print("Optimal Solution:", solution.primal)
 print(
     "Inequality Constraints (should be <= 0):",
-    cp.ineq_slack(solution["primal"]),
+    cp.ineq_slack(solution.primal),
 )
 print(
     "Max Equality Constraint Violation (should be == 0):",
-    cp.eq_slack(solution["primal"]),
+    cp.eq_slack(solution.primal),
 )
 # %%

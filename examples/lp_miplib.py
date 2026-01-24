@@ -6,6 +6,10 @@
 
 # %%
 import os
+import jax
+
+print(jax.devices())
+
 
 # Suppress INFO and WARNING logs from XLA/JAX
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
@@ -23,7 +27,7 @@ import optax
 # The LP is then presolved to reduce its size and complexity.
 # Finally, we convert the presolved LP into a format compatible with Jaddle.
 highs = hspy.Highs()
-highs.readModel("<PATH_TO_MPS_FILE>")  # path to MPS file
+highs.readModel("../data/nug.mps")  # path to MPS file
 highs.presolve()
 highs_lp = highs.getPresolvedLp()
 jaddle_lp = hh.highs_to_standard_form_sparse(highs_lp)
@@ -43,31 +47,36 @@ print("--------------------------------")
 
 # %%
 lr = optax.cosine_decay_schedule(
-    init_value=1e-2,
+    init_value=1e0,
     decay_steps=int(1e5),
+    exponent=3,
     alpha=1e-4,
-    exponent=1.5,
 )
 
-optimiser = jo.adamdelta_saddle(lr_primal=lr, lr_dual=1.0)
+optimiser = jo.adamdelta_saddle(
+    lr_primal=lr,
+    lr_dual=1e0,
+    nesterov=True,
+)
 
 # %% [markdown]
 # ## Solve the scaled, presolved LP using Jaddle's saddle point solver
 start_time = time.time()
-solution = jl.solve(
+solution, iterations = jl.solve(
     optimiser=optimiser,
+    iterations_per_epoch=100,
     lp=jaddle_lp,
     scale_A=True,
     scale_b=True,
     scale_c=True,
+    max_epochs=5000,
 )
 print("--------------------------------")
-print("Saddle point solver objective:", jaddle_lp.objective(solution["primal"]))
-print("Inequality violation:", jaddle_lp.ineq_slack(solution["primal"]))
-print("Equality violation:", jaddle_lp.eq_slack(solution["primal"]))
+print("Iterations:", iterations)
+print("Saddle point solver objective:", jaddle_lp.objective(solution.primal))
+print("Inequality violation:", jaddle_lp.ineq_slack(solution.primal))
+print("Equality violation:", jaddle_lp.eq_slack(solution.primal))
 print("Time to solution:", time.time() - start_time)
 print("--------------------------------")
 
-# %%
-jl.lp_summary_statistics(jaddle_lp)
 # %%

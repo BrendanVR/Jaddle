@@ -56,7 +56,7 @@ plt.figure(figsize=(10, 6))
 plt.plot(x, y, label="Noisy data", marker="o", linestyle="", alpha=0.2)
 plt.plot(
     x,
-    solution["primal"],
+    solution.primal,
     label="Modified isotonic regression solution",
     color="red",
     linewidth=2,
@@ -69,7 +69,7 @@ plt.show()
 
 # %% [markdown]
 # Verify that the solution satisfies the constraints
-y_pred = solution["primal"]
+y_pred = solution.primal
 ineq_violations = constraints_ineq(y_pred)
 eq_violations = constraints_eq(y_pred)
 print("Max Inequality Constraint Violation (should be <= 0):", cp.ineq_slack(y_pred))

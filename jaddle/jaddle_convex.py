@@ -5,6 +5,13 @@ from optax.projections import projection_non_negative, projection_box
 import optax
 import jaddle.jaddle_optimisers as jo
 import time
+from typing import NamedTuple
+
+
+class SaddleState(NamedTuple):
+    primal: jnp.ndarray
+    dual_ineq: jnp.ndarray
+    dual_eq: jnp.ndarray
 
 
 # %%
@@ -48,11 +55,11 @@ class CP:
         return (dual_ineq * (self.constraints_ineq(x))).sum()
 
     def initial_solution(self):
-        return {
-            "primal": jnp.zeros(self.num_variables),
-            "dual_ineq": jnp.zeros(self.num_ineq_constraints()),
-            "dual_eq": jnp.zeros(self.num_eq_constraints()),
-        }
+        return SaddleState(
+            primal=jnp.zeros(self.num_variables),
+            dual_ineq=jnp.zeros(self.num_ineq_constraints()),
+            dual_eq=jnp.zeros(self.num_eq_constraints()),
+        )
 
 
 # %%
@@ -72,9 +79,9 @@ def __sps(
 
     def lagrangian(state):
         return (
-            cp.objective(state["primal"])
-            + state["dual_eq"] @ (cp.constraints_eq(state["primal"]))
-            + state["dual_ineq"] @ (cp.constraints_ineq(state["primal"]))
+            cp.objective(state.primal)
+            + state.dual_eq @ (cp.constraints_eq(state.primal))
+            + state.dual_ineq @ (cp.constraints_ineq(state.primal))
         )
 
     def grad(state):
@@ -94,12 +101,18 @@ def __sps(
         ) = loop_vars
 
         gradient = grad(state)
-        gradient["dual_eq"] = -gradient["dual_eq"]  # ascent for dual eq
-        gradient["dual_ineq"] = -gradient["dual_ineq"]  # ascent for dual ineq
+        gradient = SaddleState(
+            primal=gradient.primal,
+            dual_eq=-gradient.dual_eq,
+            dual_ineq=-gradient.dual_ineq,
+        )
         updates, opt_state = opt_update(gradient, opt_state, state)
         state = optax.apply_updates(state, updates)
-        state["primal"] = primal_projection(state["primal"])
-        state["dual_ineq"] = projection_non_negative(state["dual_ineq"])
+        state = SaddleState(
+            primal=primal_projection(state.primal),
+            dual_ineq=projection_non_negative(state.dual_ineq),
+            dual_eq=state.dual_eq,
+        )
 
         average_state = optax.incremental_update(
             state, average_state, exponential_weighting
@@ -184,20 +197,20 @@ def solve(
         )
         end_time = time.time()
 
-        objective_value = cp.objective(new_average_state["primal"])
+        objective_value = cp.objective(new_average_state.primal)
 
-        progress = (cp.objective(average_state["primal"]) - objective_value) / (
+        progress = (cp.objective(average_state.primal) - objective_value) / (
             1.0 + jnp.abs(objective_value)
         )
 
-        ineq_violations = jnp.maximum(cp.ineq_slack(new_average_state["primal"]), 0.0)
+        ineq_violations = jnp.maximum(cp.ineq_slack(new_average_state.primal), 0.0)
         max_ineq_violation = jnp.max(ineq_violations)
 
-        eq_violations = jnp.abs(cp.eq_slack(new_average_state["primal"]))
+        eq_violations = jnp.abs(cp.eq_slack(new_average_state.primal))
         max_eq_violation = jnp.max(eq_violations)
 
         complentariy_slack = cp.complementarity_slack(
-            new_average_state["primal"], new_average_state["dual_ineq"]
+            new_average_state.primal, new_average_state.dual_ineq
         ) / (1.0 + jnp.abs(objective_value))
         max_complementarity_slack = jnp.abs(jnp.sum(complentariy_slack))
 

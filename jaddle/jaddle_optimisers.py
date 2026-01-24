@@ -1,6 +1,20 @@
 import optax
 
 
+def _saddle_param_labels(params):
+    if hasattr(params, "_fields"):
+        return type(params)(
+            primal="primal_opt",
+            dual_ineq="dual_opt",
+            dual_eq="dual_opt",
+        )
+    return {
+        "primal": "primal_opt",
+        "dual_ineq": "dual_opt",
+        "dual_eq": "dual_opt",
+    }
+
+
 def adamdelta_saddle(
     lr_primal=1e-3,
     lr_dual=1.0,
@@ -18,11 +32,7 @@ def adamdelta_saddle(
                 learning_rate=lr_dual,
             ),
         },
-        param_labels={
-            "primal": "primal_opt",
-            "dual_ineq": "dual_opt",
-            "dual_eq": "dual_opt",
-        },
+        param_labels=_saddle_param_labels,
     )
 
     return optimiser
@@ -45,11 +55,7 @@ def adam2max_saddle(
                 learning_rate=lr_dual,
             ),
         },
-        param_labels={
-            "primal": "primal_opt",
-            "dual_ineq": "dual_opt",
-            "dual_eq": "dual_opt",
-        },
+        param_labels=_saddle_param_labels,
     )
 
     return optimiser
@@ -72,11 +78,7 @@ def adamgrad_saddle(
                 learning_rate=lr_dual,
             ),
         },
-        param_labels={
-            "primal": "primal_opt",
-            "dual_ineq": "dual_opt",
-            "dual_eq": "dual_opt",
-        },
+        param_labels=_saddle_param_labels,
     )
 
     return optimiser
@@ -102,11 +104,7 @@ def sgd_saddle(
                 nesterov=nesterov,
             ),
         },
-        param_labels={
-            "primal": "primal_opt",
-            "dual_ineq": "dual_opt",
-            "dual_eq": "dual_opt",
-        },
+        param_labels=_saddle_param_labels,
     )
 
     return optimiser
@@ -121,11 +119,7 @@ def optimistic_sgd_saddle(
             "primal_opt": optax.optimistic_gradient_descent(learning_rate=lr_primal),
             "dual_opt": optax.optimistic_gradient_descent(learning_rate=lr_dual),
         },
-        param_labels={
-            "primal": "primal_opt",
-            "dual_ineq": "dual_opt",
-            "dual_eq": "dual_opt",
-        },
+        param_labels=_saddle_param_labels,
     )
 
     return optimiser

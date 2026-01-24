@@ -163,11 +163,19 @@ def highs_linear_solver(
 
     if warm_start is not None:
         solution = hspy.HighsSolution()
-        solution.col_value = np.array(warm_start["primal"])
+        if hasattr(warm_start, "primal"):
+            solution.col_value = np.array(warm_start.primal)
+        else:
+            solution.col_value = np.array(warm_start["primal"])
         if dual_warmstart:
-            solution.row_dual = np.array(
-                warm_start["dual_eq"].tolist() + warm_start["dual_ineq"].tolist()
-            )
+            if hasattr(warm_start, "dual_eq"):
+                solution.row_dual = np.array(
+                    warm_start.dual_eq.tolist() + warm_start.dual_ineq.tolist()
+                )
+            else:
+                solution.row_dual = np.array(
+                    warm_start["dual_eq"].tolist() + warm_start["dual_ineq"].tolist()
+                )
         highs.setSolution(solution)
 
     highs.run()

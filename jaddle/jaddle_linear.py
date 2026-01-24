@@ -8,6 +8,14 @@ import optax
 import numpy as np
 import scipy.sparse as sp
 import time
+import functools
+from typing import NamedTuple
+
+
+class SaddleState(NamedTuple):
+    primal: jnp.ndarray
+    dual_ineq: jnp.ndarray
+    dual_eq: jnp.ndarray
 
 
 # %%
@@ -56,62 +64,11 @@ class LP:
         return (dual_ineq * (self.A_ineq @ x - self.b_ineq)).sum()
 
     def initial_solution(self):
-        return {
-            "primal": jnp.zeros(self.num_variables()),
-            "dual_ineq": jnp.zeros(self.num_ineq_constraints()),
-            "dual_eq": jnp.zeros(self.num_eq_constraints()),
-        }
-
-
-class JaddleLP:
-    def __init__(
-        self,
-        c,
-        A_eq,
-        b_eq,
-        A_ineq,
-        b_ineq,
-        lower_bounds,
-        upper_bounds,
-    ):
-        self.c = c
-        self.A_eq = A_eq
-        self.b_eq = b_eq
-        self.A_ineq = A_ineq
-        self.b_ineq = b_ineq
-        self.lower_bounds = lower_bounds
-        self.upper_bounds = upper_bounds
-
-    def objective(self, x):
-        return self.c @ x
-
-    def num_variables(self):
-        return len(self.c)
-
-    def num_eq_constraints(self):
-        return self.A_eq.shape[0]
-
-    def num_ineq_constraints(self):
-        return self.A_ineq.shape[0]
-
-    def num_constraints(self):
-        return self.A_eq.shape[0] + self.A_ineq.shape[0]
-
-    def ineq_slack(self, x):
-        return jnp.max(jnp.maximum(self.A_ineq @ x - self.b_ineq, 0.0))
-
-    def eq_slack(self, x):
-        return jnp.max(jnp.abs(self.A_eq @ x - self.b_eq))
-
-    def complementarity_slack(self, x, dual_ineq):
-        return (dual_ineq * (self.A_ineq @ x - self.b_ineq)).sum()
-
-    def initial_solution(self):
-        return {
-            "primal": jnp.zeros(self.num_variables()),
-            "dual_ineq": jnp.zeros(self.num_ineq_constraints()),
-            "dual_eq": jnp.zeros(self.num_eq_constraints()),
-        }
+        return SaddleState(
+            primal=jnp.zeros(self.num_variables()),
+            dual_ineq=jnp.zeros(self.num_ineq_constraints()),
+            dual_eq=jnp.zeros(self.num_eq_constraints()),
+        )
 
 
 class LP:
@@ -158,11 +115,11 @@ class LP:
         return (dual_ineq * (self.A_ineq @ x - self.b_ineq)).sum()
 
     def initial_solution(self):
-        return {
-            "primal": jnp.zeros(self.num_variables()),
-            "dual_ineq": jnp.zeros(self.num_ineq_constraints()),
-            "dual_eq": jnp.zeros(self.num_eq_constraints()),
-        }
+        return SaddleState(
+            primal=jnp.zeros(self.num_variables()),
+            dual_ineq=jnp.zeros(self.num_ineq_constraints()),
+            dual_eq=jnp.zeros(self.num_eq_constraints()),
+        )
 
 
 # %%
@@ -178,83 +135,85 @@ def __sps(
     exponential_weighting=0.01,
 ):
 
-    primal_projection = lambda x: projection_box(x, lp.lower_bounds, lp.upper_bounds)
+    # Cache transposes to avoid recomputing each gradient step
+    A_eq_T = lp.A_eq.T
+    A_ineq_T = lp.A_ineq.T
+
+    @jax.jit
+    def primal_projection(x):
+        return projection_box(x, lp.lower_bounds, lp.upper_bounds)
 
     @jax.jit
     def grad(state):
-        grad_primal = (
-            lp.c + lp.A_ineq.T @ state["dual_ineq"] + lp.A_eq.T @ state["dual_eq"]
+        grad_primal = lp.c + A_ineq_T @ state.dual_ineq + A_eq_T @ state.dual_eq
+        grad_dual_ineq = lp.b_ineq - lp.A_ineq @ state.primal
+        grad_dual_eq = lp.b_eq - lp.A_eq @ state.primal
+        return SaddleState(
+            primal=grad_primal,
+            dual_ineq=grad_dual_ineq,
+            dual_eq=grad_dual_eq,
         )
-        grad_dual_ineq = lp.b_ineq - lp.A_ineq @ state["primal"]
-        grad_dual_eq = lp.b_eq - lp.A_eq @ state["primal"]
-        return {
-            "primal": grad_primal,
-            "dual_ineq": grad_dual_ineq,
-            "dual_eq": grad_dual_eq,
-        }
 
     @jax.jit
     def opt_update(gradient, opt_state, state):
         return optimiser.update(gradient, opt_state, state)
 
-    @jax.jit
-    def body_fun(_, loop_vars):
-        (
-            i,
-            state,
-            average_state,
-            opt_state,
-        ) = loop_vars
+    @functools.partial(jax.jit, static_argnames=("max_iter", "exponential_weighting"))
+    def run_epoch(
+        max_iter, exponential_weighting, start_iter, state, average_state, opt_state
+    ):
+        def step(carry, _):
+            i, state, average_state, opt_state = carry
 
-        gradient = grad(state)
-        updates, opt_state = opt_update(gradient, opt_state, state)
-        state = optax.apply_updates(state, updates)
-        state["primal"] = primal_projection(state["primal"])
-        state["dual_ineq"] = projection_non_negative(state["dual_ineq"])
+            gradient = grad(state)
+            updates, opt_state = opt_update(gradient, opt_state, state)
+            state = optax.apply_updates(state, updates)
+            state = SaddleState(
+                primal=primal_projection(state.primal),
+                dual_ineq=projection_non_negative(state.dual_ineq),
+                dual_eq=state.dual_eq,
+            )
 
-        average_state = optax.incremental_update(
-            state, average_state, exponential_weighting
+            average_state = optax.incremental_update(
+                state, average_state, exponential_weighting
+            )
+
+            return (i + 1, state, average_state, opt_state), None
+
+        (i, state, average_state, opt_state), _ = jax.lax.scan(
+            step,
+            (start_iter, state, average_state, opt_state),
+            None,
+            length=max_iter,
         )
-
-        return (
-            i + 1,
-            state,
-            average_state,
-            opt_state,
-        )
-
-    @jax.jit
-    def the_final_show():
-        state = initial_solution
-        if initial_avg_state is not None:
-            average_state = initial_avg_state
-        else:
-            average_state = initial_solution
-        if initial_opt_state is not None:
-            opt_state = initial_opt_state
-        else:
-            opt_state = optimiser.init(initial_solution)
-
-        loop_vars = (
-            start_iter,
-            state,
-            average_state,
-            opt_state,
-        )
-
-        loop_vars = jax.lax.fori_loop(0, max_iter, body_fun, loop_vars)
-        i, state, average_state, opt_state = loop_vars
 
         return i, state, average_state, opt_state
 
-    return the_final_show()
+    state = initial_solution
+    if initial_avg_state is not None:
+        average_state = initial_avg_state
+    else:
+        average_state = initial_solution
+    if initial_opt_state is not None:
+        opt_state = initial_opt_state
+    else:
+        opt_state = optimiser.init(initial_solution)
+
+    return run_epoch(
+        max_iter,
+        exponential_weighting,
+        start_iter,
+        state,
+        average_state,
+        opt_state,
+    )
 
 
 def solve(
     lp: LP,
     initial_solution=None,
     optimiser=None,
-    iterations_per_epoch=int(1e4),
+    iterations_per_epoch=int(1e3),
     constraint_tolerance=1e-5,
     progress_tolerance=1e-5,
     complementarity_tolerance=1e-5,
@@ -292,44 +251,73 @@ def solve(
         lp = __to_jaddle_sparse(lp)
 
     if scale_c:
-        print("--------------------------------")
         c_scale = jnp.max(jnp.abs(lp.c))
         lp.c = lp.c / c_scale
-        print(f"Objective scaled by factor: {c_scale:.6f}")
-        print(f"New [Min, Max] of c: [{jnp.min(lp.c):.6f}, {jnp.max(lp.c):.6f}]")
-        print("--------------------------------")
 
     if scale_b:
-        print("--------------------------------")
         b_scale_eq = jnp.max(jnp.abs(lp.b_eq))
-        if b_scale_eq > 0:
-            lp.b_eq = lp.b_eq / b_scale_eq
-            lp.A_eq = lp.A_eq / b_scale_eq
+
+        def _scale_eq(_):
+            return (lp.b_eq / b_scale_eq, lp.A_eq / b_scale_eq)
+
+        def _no_scale(_):
+            return (lp.b_eq, lp.A_eq)
+
+        lp.b_eq, lp.A_eq = jax.lax.cond(
+            b_scale_eq > 0, _scale_eq, _no_scale, operand=None
+        )
 
         b_scale_ineq = jnp.max(jnp.abs(lp.b_ineq))
-        if b_scale_ineq > 0:
-            lp.b_ineq = lp.b_ineq / b_scale_ineq
-            lp.A_ineq = lp.A_ineq / b_scale_ineq
 
-        print(f"b scaled by factor: eq {b_scale_eq:.6f}, ineq {b_scale_ineq:.6f}")
-        print("--------------------------------")
+        def _scale_ineq(_):
+            return (lp.b_ineq / b_scale_ineq, lp.A_ineq / b_scale_ineq)
+
+        def _no_scale_ineq(_):
+            return (lp.b_ineq, lp.A_ineq)
+
+        lp.b_ineq, lp.A_ineq = jax.lax.cond(
+            b_scale_ineq > 0, _scale_ineq, _no_scale_ineq, operand=None
+        )
 
     i = 1
     state = initial_solution
     average_state = initial_solution
-    opt_state = None
+    opt_state = optimiser.init(initial_solution)
     progress = jnp.inf
     max_complementarity_slack = jnp.inf
     constraints_satisfied = False
     count = 0
 
-    start_time_total = time.time()
+    def cond_fun(loop_vars):
+        (
+            i,
+            state,
+            average_state,
+            opt_state,
+            progress,
+            max_complementarity_slack,
+            constraints_satisfied,
+            count,
+        ) = loop_vars
 
-    while (
-        progress > progress_tolerance
-        or max_complementarity_slack > complementarity_tolerance
-    ) or not constraints_satisfied:
-        start_time = time.time()
+        return (
+            (progress > progress_tolerance)
+            | (max_complementarity_slack > complementarity_tolerance)
+            | (~constraints_satisfied)
+        ) & (count < max_epochs)
+
+    def body_fun(loop_vars):
+        (
+            i,
+            state,
+            average_state,
+            opt_state,
+            progress,
+            max_complementarity_slack,
+            constraints_satisfied,
+            count,
+        ) = loop_vars
+
         i, state, new_average_state, opt_state = __sps(
             iterations_per_epoch,
             i,
@@ -340,71 +328,89 @@ def solve(
             opt_state,
             exponential_weighting,
         )
-        end_time = time.time()
 
-        objective_value = lp.objective(new_average_state["primal"])
+        objective_value = lp.objective(new_average_state.primal)
 
         if scale_c:
             objective_value = c_scale * objective_value
             progress = jnp.abs(
-                c_scale * lp.objective(average_state["primal"]) - objective_value
+                c_scale * lp.objective(average_state.primal) - objective_value
             ) / (1.0 + jnp.abs(objective_value))
         else:
-            progress = jnp.abs(
-                lp.objective(average_state["primal"]) - objective_value
-            ) / (1.0 + jnp.abs(objective_value))
+            progress = jnp.abs(lp.objective(average_state.primal) - objective_value) / (
+                1.0 + jnp.abs(objective_value)
+            )
 
         ineq_violations = jnp.maximum(
-            lp.A_ineq @ new_average_state["primal"] - lp.b_ineq, 0.0
+            lp.A_ineq @ new_average_state.primal - lp.b_ineq, 0.0
         )
         max_ineq_violation = jnp.max(ineq_violations)
 
-        eq_violations = jnp.abs(lp.A_eq @ new_average_state["primal"] - lp.b_eq)
+        eq_violations = jnp.abs(lp.A_eq @ new_average_state.primal - lp.b_eq)
         max_eq_violation = jnp.max(eq_violations)
 
         complentariy_slack = (
-            new_average_state["dual_ineq"]
-            * (lp.A_ineq @ new_average_state["primal"] - lp.b_ineq)
+            new_average_state.dual_ineq
+            * (lp.A_ineq @ new_average_state.primal - lp.b_ineq)
             / (1.0 + jnp.abs(objective_value))
         )
         max_complementarity_slack = jnp.abs(jnp.sum(complentariy_slack))
 
-        print("--------------------------------")
-        print(f"Epoch time: {end_time - start_time:.2f} seconds")
-        print(
-            f"|obj: {objective_value:.6f} |prog: {progress:.6f}|ineq_viol: {max_ineq_violation:.6f}|eq_viol: {max_eq_violation:.6f}|comp_slack: {max_complementarity_slack:.6f}|"
-        )
-        print("--------------------------------")
-
-        constraints_satisfied = (
-            max_ineq_violation < constraint_tolerance
-            and max_eq_violation < constraint_tolerance
+        constraints_satisfied = (max_ineq_violation < constraint_tolerance) & (
+            max_eq_violation < constraint_tolerance
         )
         average_state = new_average_state
         count += 1
 
-        if count >= max_epochs:
-            print("Maximum epochs reached, terminating solver.")
-            break
+        return (
+            i,
+            state,
+            average_state,
+            opt_state,
+            progress,
+            max_complementarity_slack,
+            constraints_satisfied,
+            count,
+        )
 
-    end_time_total = time.time()
-    print(f"Total solve time: {end_time_total - start_time_total:.2f} seconds")
-    print(f"Total epochs: {count}")
+    # Initialize loop variables
+    loop_vars = (
+        i,
+        state,
+        average_state,
+        opt_state,
+        progress,
+        max_complementarity_slack,
+        constraints_satisfied,
+        count,
+    )
+
+    # Run the while loop
+    loop_vars = jax.lax.while_loop(cond_fun, body_fun, loop_vars)
+
+    (
+        i,
+        state,
+        average_state,
+        opt_state,
+        progress,
+        max_complementarity_slack,
+        constraints_satisfied,
+        count,
+    ) = loop_vars
 
     if scale_A:
-        average_state["primal"] = average_state["primal"] * cs_pc * cs_ruiz
-        average_state["dual_eq"] = (
-            average_state["dual_eq"]
+        average_state = SaddleState(
+            primal=average_state.primal * cs_pc * cs_ruiz,
+            dual_eq=average_state.dual_eq
             * rs_pc[: lp.A_eq.shape[0]]
-            * rs_ruiz[: lp.A_eq.shape[0]]
-        )
-        average_state["dual_ineq"] = (
-            average_state["dual_ineq"]
+            * rs_ruiz[: lp.A_eq.shape[0]],
+            dual_ineq=average_state.dual_ineq
             * rs_pc[lp.A_eq.shape[0] :]
-            * rs_ruiz[lp.A_eq.shape[0] :]
+            * rs_ruiz[lp.A_eq.shape[0] :],
         )
 
-    return average_state
+    return average_state, count * iterations_per_epoch
 
 
 # %%
