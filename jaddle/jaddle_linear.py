@@ -71,57 +71,6 @@ class LP:
         )
 
 
-class LP:
-    def __init__(
-        self,
-        c,
-        A_eq,
-        b_eq,
-        A_ineq,
-        b_ineq,
-        lower_bounds,
-        upper_bounds,
-    ):
-        self.c = c
-        self.A_eq = A_eq
-        self.b_eq = b_eq
-        self.A_ineq = A_ineq
-        self.b_ineq = b_ineq
-        self.lower_bounds = lower_bounds
-        self.upper_bounds = upper_bounds
-
-    def objective(self, x):
-        return self.c @ x
-
-    def num_variables(self):
-        return len(self.c)
-
-    def num_eq_constraints(self):
-        return self.A_eq.shape[0]
-
-    def num_ineq_constraints(self):
-        return self.A_ineq.shape[0]
-
-    def num_constraints(self):
-        return self.A_eq.shape[0] + self.A_ineq.shape[0]
-
-    def ineq_slack(self, x):
-        return jnp.max(jnp.maximum(self.A_ineq @ x - self.b_ineq, 0.0))
-
-    def eq_slack(self, x):
-        return jnp.max(jnp.abs(self.A_eq @ x - self.b_eq))
-
-    def complementarity_slack(self, x, dual_ineq):
-        return (dual_ineq * (self.A_ineq @ x - self.b_ineq)).sum()
-
-    def initial_solution(self):
-        return SaddleState(
-            primal=jnp.zeros(self.num_variables()),
-            dual_ineq=jnp.zeros(self.num_ineq_constraints()),
-            dual_eq=jnp.zeros(self.num_eq_constraints()),
-        )
-
-
 # %%
 # Solvers for constrained linear optimisation via saddle point formulation
 def __sps(
