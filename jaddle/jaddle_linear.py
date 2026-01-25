@@ -274,16 +274,28 @@ def solve(
         dual_initial_solution = lp.dual_initial_solution()
 
     if primal_optimiser is None:
+        lr = optax.cosine_decay_schedule(
+            init_value=1e0,
+            decay_steps=int(1e4),
+            exponent=1.5,
+            alpha=1e-4,
+        )
         primal_optimiser = optax.optimistic_adam_v2(
-            learning_rate=1e-3,
-            alpha=5e-2,
+            learning_rate=lr,
+            alpha=0.1,
             nesterov=True,
         )
 
     if dual_optimiser is None:
+        lr = optax.cosine_decay_schedule(
+            init_value=1e0,
+            decay_steps=int(1e4),
+            exponent=1.5,
+            alpha=1e-4,
+        )
         dual_optimiser = optax.optimistic_adam_v2(
-            learning_rate=1e-3,
-            alpha=5e-2,
+            learning_rate=lr,
+            alpha=0.1,
             nesterov=True,
         )
 

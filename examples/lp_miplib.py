@@ -14,7 +14,6 @@ import time
 import jaddle.jaddle_linear as jl
 import jaddle.highs_helpers as hh
 import highspy as hspy
-import optax
 
 # %% [markdown]
 # ## Load and presolve the LP
@@ -22,29 +21,16 @@ import optax
 # The LP is then presolved to reduce its size and complexity.
 # Finally, we convert the presolved LP into a format compatible with Jaddle.
 highs = hspy.Highs()
-highs.readModel("../data/nug.mps")  # path to MPS file
+highs.readModel("../data/bab1.mps")  # path to MPS file
 highs.presolve()
 highs_lp = highs.getPresolvedLp()
 jaddle_lp = hh.highs_to_standard_form_sparse(highs_lp)
-
-# %%
-lr = optax.cosine_decay_schedule(
-    init_value=1e0,
-    decay_steps=int(1e4),
-    exponent=1,
-    alpha=1e-4,
-)
-
-primal_optimiser = optax.optimistic_adam_v2(learning_rate=lr, alpha=0.1)
-dual_optimiser = optax.adadelta(learning_rate=1e0)
 
 # %% [markdown]
 # ## Solve the scaled, presolved LP using Jaddle's saddle point solver
 start_time = time.time()
 solution_primal, solution_dual = jl.solve(
     iterations_per_epoch=1000,
-    primal_optimiser=primal_optimiser,
-    dual_optimiser=dual_optimiser,
     lp=jaddle_lp,
     scale_A=True,
     scale_b=True,

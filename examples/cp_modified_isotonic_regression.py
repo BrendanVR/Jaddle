@@ -9,11 +9,12 @@ import numpy as np
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import jaddle.jaddle_convex as jc
+import optax
 
 # %% [markdown]
 # ## Generate Synthetic Data
 # We will create synthetic data that follows a cubic relationship with some added noise.
-n = 500
+n = 100
 x = np.linspace(-1, 1, n)
 y = x**3
 y += 0.1 * np.random.randn(n)  # add noise
@@ -50,6 +51,7 @@ cp = jc.CP(
 # %% [markdown]
 # ## Solve the problem using Jaddle Convex SPS optimizer
 solution, _ = jc.solve(cp)
+
 
 # %%
 plt.figure(figsize=(10, 6))

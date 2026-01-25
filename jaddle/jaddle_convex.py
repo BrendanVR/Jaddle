@@ -3,8 +3,6 @@ import jax
 import jax.numpy as jnp
 from optax.projections import projection_non_negative, projection_box
 import optax
-import jaddle.jaddle_optimisers as jo
-import time
 import functools
 from typing import NamedTuple
 
@@ -56,7 +54,7 @@ class CP:
         return jnp.max(jnp.abs(self.constraints_eq(x)))
 
     def complementarity_slack(self, x, dual_ineq):
-        return (dual_ineq * (self.constraints_ineq(x))).sum()
+        return dual_ineq * (self.constraints_ineq(x))
 
     def primal_initial_solution(self):
         return PrimalState(
@@ -255,9 +253,6 @@ def solve(
     progress_tolerance=1e-5,
     complementarity_tolerance=1e-5,
     exponential_weighting=0.01,
-    scale_A=False,
-    scale_b=False,
-    scale_c=False,
     max_epochs=1000,
 ):
 
@@ -268,16 +263,28 @@ def solve(
         dual_initial_solution = cp.dual_initial_solution()
 
     if primal_optimiser is None:
+        lr = optax.cosine_decay_schedule(
+            init_value=1e0,
+            decay_steps=int(1e4),
+            exponent=1.5,
+            alpha=1e-4,
+        )
         primal_optimiser = optax.optimistic_adam_v2(
-            learning_rate=1e-3,
-            alpha=5e-2,
+            learning_rate=lr,
+            alpha=0.1,
             nesterov=True,
         )
 
     if dual_optimiser is None:
+        lr = optax.cosine_decay_schedule(
+            init_value=1e0,
+            decay_steps=int(1e4),
+            exponent=1.5,
+            alpha=1e-4,
+        )
         dual_optimiser = optax.optimistic_adam_v2(
-            learning_rate=1e-3,
-            alpha=5e-2,
+            learning_rate=lr,
+            alpha=0.1,
             nesterov=True,
         )
 

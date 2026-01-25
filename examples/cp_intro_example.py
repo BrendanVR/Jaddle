@@ -58,7 +58,7 @@ cp = jc.CP(
 
 # %% [markdown]
 # ## Solving the Convex Problem
-solution = jc.solve(cp)
+solution, _ = jc.solve(cp)
 
 # %% [markdown
 # ## Displaying the Solution
