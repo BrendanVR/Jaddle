@@ -49,7 +49,7 @@ cp = jc.CP(
 
 # %% [markdown]
 # ## Solve the problem using Jaddle Convex SPS optimizer
-solution = jc.solve(cp)
+solution, _ = jc.solve(cp)
 
 # %%
 plt.figure(figsize=(10, 6))

@@ -150,8 +150,8 @@ def highs_linear_solver(
     lp,
     feasibility_tolerance=1e-7,
     method="simplex",
-    warm_start=None,
-    dual_warmstart=False,
+    primal_warm_start=None,
+    dual_warm_start=None,
 ):
     highs = hspy.Highs()
     highs.passModel(lp)
@@ -161,21 +161,13 @@ def highs_linear_solver(
     highs.setOptionValue("dual_feasibility_tolerance", feasibility_tolerance)
     highs.setOptionValue("optimality_tolerance", 1e-4)
 
-    if warm_start is not None:
+    if primal_warm_start is not None:
         solution = hspy.HighsSolution()
-        if hasattr(warm_start, "primal"):
-            solution.col_value = np.array(warm_start.primal)
-        else:
-            solution.col_value = np.array(warm_start["primal"])
-        if dual_warmstart:
-            if hasattr(warm_start, "dual_eq"):
-                solution.row_dual = np.array(
-                    warm_start.dual_eq.tolist() + warm_start.dual_ineq.tolist()
-                )
-            else:
-                solution.row_dual = np.array(
-                    warm_start["dual_eq"].tolist() + warm_start["dual_ineq"].tolist()
-                )
+        solution.col_value = np.array(primal_warm_start.primal)
+        if dual_warm_start is not None:
+            solution.row_dual = np.array(
+                dual_warm_start.dual_eq.tolist() + dual_warm_start.dual_ineq.tolist()
+            )
         highs.setSolution(solution)
 
     highs.run()

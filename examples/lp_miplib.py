@@ -12,7 +12,6 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 import time
 import jaddle.jaddle_linear as jl
-import jaddle.jaddle_optimisers as jo
 import jaddle.highs_helpers as hh
 import highspy as hspy
 import optax
@@ -23,44 +22,29 @@ import optax
 # The LP is then presolved to reduce its size and complexity.
 # Finally, we convert the presolved LP into a format compatible with Jaddle.
 highs = hspy.Highs()
-highs.readModel("../data/boeing.mps")  # path to MPS file
+highs.readModel("../data/nug.mps")  # path to MPS file
 highs.presolve()
 highs_lp = highs.getPresolvedLp()
 jaddle_lp = hh.highs_to_standard_form_sparse(highs_lp)
 
-# %% [markdown]
-# We solve the presolved LP using HiGHs PDLP solver for comparison.
-start_time = time.time()
-highs_solution = hh.highs_linear_solver(
-    highs_lp, method="pdlp", feasibility_tolerance=1e-5
-)
-# %%
-print("--------------------------------")
-print("HiGHs PDLP solver objective:", jaddle_lp.objective(highs_solution))
-print("Inequality violation:", jaddle_lp.ineq_slack(highs_solution))
-print("Equality violation:", jaddle_lp.eq_slack(highs_solution))
-print("--------------------------------")
-
 # %%
 lr = optax.cosine_decay_schedule(
     init_value=1e0,
-    decay_steps=int(1e5),
-    exponent=3,
+    decay_steps=int(1e4),
+    exponent=1,
     alpha=1e-4,
 )
 
-optimiser = jo.adamdelta_saddle(
-    lr_primal=lr,
-    lr_dual=1e0,
-    nesterov=True,
-)
+primal_optimiser = optax.optimistic_adam_v2(learning_rate=lr, alpha=0.1)
+dual_optimiser = optax.adadelta(learning_rate=1e0)
 
 # %% [markdown]
 # ## Solve the scaled, presolved LP using Jaddle's saddle point solver
 start_time = time.time()
-solution, iterations = jl.solve(
-    optimiser=optimiser,
+solution_primal, solution_dual = jl.solve(
     iterations_per_epoch=1000,
+    primal_optimiser=primal_optimiser,
+    dual_optimiser=dual_optimiser,
     lp=jaddle_lp,
     scale_A=True,
     scale_b=True,
@@ -68,10 +52,9 @@ solution, iterations = jl.solve(
     max_epochs=5000,
 )
 print("--------------------------------")
-print("Iterations:", iterations)
-print("Saddle point solver objective:", jaddle_lp.objective(solution.primal))
-print("Inequality violation:", jaddle_lp.ineq_slack(solution.primal))
-print("Equality violation:", jaddle_lp.eq_slack(solution.primal))
+print("Saddle point solver objective:", jaddle_lp.objective(solution_primal.primal))
+print("Inequality violation:", jaddle_lp.ineq_slack(solution_primal.primal))
+print("Equality violation:", jaddle_lp.eq_slack(solution_primal.primal))
 print("Time to solution:", time.time() - start_time)
 print("--------------------------------")
 
