@@ -6,10 +6,6 @@
 
 # %%
 import os
-import jax
-
-print(jax.devices())
-
 
 # Suppress INFO and WARNING logs from XLA/JAX
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
@@ -27,7 +23,7 @@ import optax
 # The LP is then presolved to reduce its size and complexity.
 # Finally, we convert the presolved LP into a format compatible with Jaddle.
 highs = hspy.Highs()
-highs.readModel("../data/nug.mps")  # path to MPS file
+highs.readModel("../data/boeing.mps")  # path to MPS file
 highs.presolve()
 highs_lp = highs.getPresolvedLp()
 jaddle_lp = hh.highs_to_standard_form_sparse(highs_lp)
@@ -64,7 +60,7 @@ optimiser = jo.adamdelta_saddle(
 start_time = time.time()
 solution, iterations = jl.solve(
     optimiser=optimiser,
-    iterations_per_epoch=100,
+    iterations_per_epoch=1000,
     lp=jaddle_lp,
     scale_A=True,
     scale_b=True,

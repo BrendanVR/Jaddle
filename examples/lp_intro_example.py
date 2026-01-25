@@ -41,7 +41,7 @@ lp = jl.LP(
 
 # %% [markdown]
 # ## Solving the LP Problem
-solution = jl.solve(lp)
+solution, _ = jl.solve(lp)
 # %%
 print(f"x1 = {solution.primal[0]:.4f}, x2 = {solution.primal[1]:.4f}")
 print(f"Optimal objective value: {lp.objective(solution.primal):.4f}")
