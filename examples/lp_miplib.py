@@ -14,6 +14,10 @@ import time
 import jaddle.jaddle_linear as jl
 import jaddle.highs_helpers as hh
 import highspy as hspy
+import optax
+import numpy as np
+import matplotlib.pyplot as plt
+
 
 # %% [markdown]
 # ## Load and presolve the LP
@@ -21,7 +25,7 @@ import highspy as hspy
 # The LP is then presolved to reduce its size and complexity.
 # Finally, we convert the presolved LP into a format compatible with Jaddle.
 highs = hspy.Highs()
-highs.readModel("../data/bab1.mps")  # path to MPS file
+highs.readModel("../data/nug.mps")  # path to MPS file
 highs.presolve()
 highs_lp = highs.getPresolvedLp()
 jaddle_lp = hh.highs_to_standard_form_sparse(highs_lp)
@@ -31,11 +35,15 @@ jaddle_lp = hh.highs_to_standard_form_sparse(highs_lp)
 start_time = time.time()
 solution_primal, solution_dual = jl.solve(
     iterations_per_epoch=1000,
+    dual_lr_scale_k=0.0,
+    dual_lr_scale_min=0.0001,
+    dual_lr_scale_max=100.0,
     lp=jaddle_lp,
     scale_A=True,
     scale_b=True,
     scale_c=True,
     max_epochs=5000,
+    verbose=False,
 )
 print("--------------------------------")
 print("Saddle point solver objective:", jaddle_lp.objective(solution_primal.primal))
