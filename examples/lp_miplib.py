@@ -41,7 +41,7 @@ solution_highs = hh.highs_linear_solver(
 # %% [markdown]
 # ## Solve the scaled, presolved LP using Jaddle's saddle point solver
 start_time = time.time()
-solution_primal, solution_dual = jl.solve(
+solution = jl.solve(
     iterations_per_epoch=500,
     lp=jaddle_lp,
     scale=True,
@@ -52,12 +52,9 @@ solution_primal, solution_dual = jl.solve(
 
 print("--------------------------------")
 print("Time to solution:", time.time() - start_time)
-print("Saddle point solver objective:", jaddle_lp.objective(solution_primal.primal))
-print("Inequality violation:", jaddle_lp.ineq_slack(solution_primal.primal))
-print("Equality violation:", jaddle_lp.eq_slack(solution_primal.primal))
+print("Saddle point solver objective:", jaddle_lp.objective(solution.primal))
+print("Inequality violation:", jaddle_lp.ineq_slack(solution.primal))
+print("Equality violation:", jaddle_lp.eq_slack(solution.primal))
 print("--------------------------------")
-
-# %%
-jaddle_lp.objective(solution_primal.primal)
 
 # %%
