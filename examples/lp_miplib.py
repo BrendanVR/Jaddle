@@ -10,14 +10,16 @@ import os
 # Suppress INFO and WARNING logs from XLA/JAX
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
+import jax
+
+# Ensure JAX is properly initialized
+_ = jax.random.normal(jax.random.PRNGKey(0), (1,)).block_until_ready()
+
 import time
 import jaddle.jaddle_linear as jl
 import jaddle.highs_helpers as hh
 import highspy as hspy
 import optax
-import numpy as np
-import matplotlib.pyplot as plt
-
 
 # %% [markdown]
 # ## Load and presolve the LP
@@ -25,19 +27,33 @@ import matplotlib.pyplot as plt
 # The LP is then presolved to reduce its size and complexity.
 # Finally, we convert the presolved LP into a format compatible with Jaddle.
 highs = hspy.Highs()
-highs.readModel("../data/nug.mps")  # path to MPS file
+highs.readModel("/home/brendanvr/python/Jaddle/data/bab1.mps")  # path to MPS file
 highs.presolve()
 highs_lp = highs.getPresolvedLp()
 jaddle_lp = hh.highs_to_standard_form_sparse(highs_lp)
+
+# %%
+primal_optimiser = optax.chain(
+    optax.optimistic_adam_v2(learning_rate=1e0, alpha=5e-2),
+    optax.contrib.reduce_on_plateau(
+        factor=0.9,
+        patience=500,
+        min_scale=1e-4,
+        cooldown=100,
+    ),
+)
+
+dual_optimiser = optax.adadelta(1.0)
+
 
 # %% [markdown]
 # ## Solve the scaled, presolved LP using Jaddle's saddle point solver
 start_time = time.time()
 solution_primal, solution_dual = jl.solve(
-    iterations_per_epoch=1000,
-    dual_lr_scale_k=0.0,
-    dual_lr_scale_min=0.0001,
-    dual_lr_scale_max=100.0,
+    primal_optimiser=primal_optimiser,
+    dual_optimiser=dual_optimiser,
+    iterations_per_epoch=500,
+    # constraint_tolerance=1e-6,
     lp=jaddle_lp,
     scale_A=True,
     scale_b=True,
@@ -45,11 +61,12 @@ solution_primal, solution_dual = jl.solve(
     max_epochs=5000,
     verbose=False,
 )
+
 print("--------------------------------")
+print("Time to solution:", time.time() - start_time)
 print("Saddle point solver objective:", jaddle_lp.objective(solution_primal.primal))
 print("Inequality violation:", jaddle_lp.ineq_slack(solution_primal.primal))
 print("Equality violation:", jaddle_lp.eq_slack(solution_primal.primal))
-print("Time to solution:", time.time() - start_time)
 print("--------------------------------")
 
 # %%

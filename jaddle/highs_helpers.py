@@ -54,8 +54,8 @@ def highs_to_standard_form(lp):
              x <= upper_bounds
     Returns: c, A_eq, b_eq, A_ineq, b_ineq, lower_bounds, upper_bounds
     """
-    c = np.array(lp.col_cost_)
-    lower_bounds = np.array(lp.col_lower_)
+    c = np.array(lp.col_cost_, dtype=np.float32)
+    lower_bounds = np.array(lp.col_lower_, dtype=np.float32)
     upper_bounds = np.array(lp.col_upper_)
     row_lower = np.array(lp.row_lower_)
     row_upper = np.array(lp.row_upper_)
@@ -66,6 +66,7 @@ def highs_to_standard_form(lp):
     A = sp.csc_matrix(
         (lp.a_matrix_.value_, lp.a_matrix_.index_, lp.a_matrix_.start_),
         shape=(num_row, num_col),
+        dtype=np.float32,
     ).toarray()
 
     # Equality constraints: row_lower == row_upper
@@ -105,18 +106,18 @@ def highs_to_standard_form_sparse(lp):
              x <= upper_bounds
     Returns: c, A_eq, b_eq, A_ineq, b_ineq, lower_bounds, upper_bounds
     """
-    c = np.array(lp.col_cost_)
-    lower_bounds = np.array(lp.col_lower_)
-    upper_bounds = np.array(lp.col_upper_)
-    row_lower = np.array(lp.row_lower_)
-    row_upper = np.array(lp.row_upper_)
-
+    c = np.array(lp.col_cost_, dtype=np.float32)
+    lower_bounds = np.array(lp.col_lower_, dtype=np.float32)
+    upper_bounds = np.array(lp.col_upper_, dtype=np.float32)
+    row_lower = np.array(lp.row_lower_, dtype=np.float32)
+    row_upper = np.array(lp.row_upper_, dtype=np.float32)
     # Build A matrix from sparse representation
     num_row = lp.a_matrix_.num_row_
     num_col = lp.a_matrix_.num_col_
     A = sp.csc_matrix(
         (lp.a_matrix_.value_, lp.a_matrix_.index_, lp.a_matrix_.start_),
         shape=(num_row, num_col),
+        dtype=np.float32,
     )
 
     # Equality constraints: row_lower == row_upper

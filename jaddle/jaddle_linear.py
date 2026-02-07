@@ -34,10 +34,10 @@ class LP:
     ):
         self.c = c
         self.A_eq = A_eq
-        self.A_eq_T = A_eq.T
+        self.A_eq_T = self.A_eq.T
         self.b_eq = b_eq
         self.A_ineq = A_ineq
-        self.A_ineq_T = A_ineq.T
+        self.A_ineq_T = self.A_ineq.T
         self.b_ineq = b_ineq
         self.lower_bounds = lower_bounds
         self.upper_bounds = upper_bounds
@@ -91,17 +91,20 @@ def __sps(
     primal_initial_opt_state=None,
     dual_initial_opt_state=None,
     exponential_weighting=0.01,
-    # Dual LR scaling parameters (if k == 0.0 scaling is disabled)
-    dual_lr_scale_k: float = 0.0,
-    dual_lr_scale_min: float = 0.1,
-    dual_lr_scale_max: float = 10.0,
 ):
-
-    # Cache transposes to avoid recomputing each gradient step
 
     @jax.jit
     def primal_projection(x):
         return projection_box(x, lp.lower_bounds, lp.upper_bounds)
+
+    @jax.jit
+    def langragean(primal_state, dual_state):
+        lagrangian = lp.objective(primal_state.primal)
+        lagrangian -= dual_state.dual_eq @ (lp.b_eq - lp.A_eq @ primal_state.primal)
+        lagrangian -= dual_state.dual_ineq @ (
+            lp.b_ineq - lp.A_ineq @ primal_state.primal
+        )
+        return lagrangian
 
     @jax.jit
     def grad_primal(primal_state, dual_state):
@@ -120,26 +123,32 @@ def __sps(
         )
 
     @jax.jit
-    def primal_opt_update(gradient, opt_state, state):
-        return optimiser_primal.update(gradient, opt_state, state)
+    def primal_opt_update(value, gradient, opt_state, primal_state, dual_state):
+        return optimiser_primal.update(
+            gradient,
+            opt_state,
+            primal_state,
+            value=value,
+            grad=gradient,
+            value_fn=lambda ps: langragean(ps, dual_state),
+        )
 
     @jax.jit
-    def dual_opt_update(gradient, opt_state, state):
-        return optimiser_dual.update(gradient, opt_state, state)
+    def dual_opt_update(value, gradient, opt_state, primal_state, dual_state):
+        return optimiser_dual.update(
+            gradient,
+            opt_state,
+            dual_state,
+            value=value,
+            grad=gradient,
+            value_fn=lambda ds: -langragean(primal_state, ds),
+        )
 
     @functools.partial(
         jax.jit,
         static_argnames=(
             "max_iter",
             "exponential_weighting",
-        ),
-        donate_argnames=(
-            "primal_state",
-            "dual_state",
-            "primal_average_state",
-            "dual_average_state",
-            "primal_opt_state",
-            "dual_opt_state",
         ),
     )
     def run_epoch(
@@ -152,10 +161,8 @@ def __sps(
         dual_average_state,
         primal_opt_state,
         dual_opt_state,
-        dual_lr_scale_k,
-        dual_lr_scale_min,
-        dual_lr_scale_max,
     ):
+        @jax.jit
         def step(carry, _):
             (
                 i,
@@ -165,14 +172,17 @@ def __sps(
                 dual_average_state,
                 primal_opt_state,
                 dual_opt_state,
-                dual_lr_scale_k,
-                dual_lr_scale_min,
-                dual_lr_scale_max,
             ) = carry
 
+            value_primal = langragean(primal_state, dual_state)
             gradient_primal = grad_primal(primal_state, dual_state)
+
             updates, primal_opt_state = primal_opt_update(
-                gradient_primal, primal_opt_state, primal_state
+                value_primal,
+                gradient_primal,
+                primal_opt_state,
+                primal_state,
+                dual_state,
             )
             primal_state = optax.apply_updates(primal_state, updates)
             primal_state = PrimalState(primal=primal_projection(primal_state.primal))
@@ -181,22 +191,15 @@ def __sps(
                 primal_state, primal_average_state, exponential_weighting
             )
 
+            value_dual = -langragean(primal_state, dual_state)
             gradient_dual = grad_dual(primal_state, dual_state)
 
-            # Compute a scaling factor for the dual `ineq` gradient based on violation
-            # Note: gradient_dual.dual_ineq = b_ineq - A_ineq @ x, so violation = max(A@x - b, 0) = max(-grad, 0)
-            scale = jnp.clip(
-                1.0 + dual_lr_scale_k * jnp.maximum(-gradient_dual.dual_ineq, 0.0),
-                dual_lr_scale_min,
-                dual_lr_scale_max,
-            )
-            gradient_dual = DualState(
-                dual_ineq=gradient_dual.dual_ineq * scale,
-                dual_eq=gradient_dual.dual_eq,
-            )
-
             updates, dual_opt_state = dual_opt_update(
-                gradient_dual, dual_opt_state, dual_state
+                value_dual,
+                gradient_dual,
+                dual_opt_state,
+                primal_state,
+                dual_state,
             )
             dual_state = optax.apply_updates(dual_state, updates)
             dual_state = DualState(
@@ -216,9 +219,6 @@ def __sps(
                 dual_average_state,
                 primal_opt_state,
                 dual_opt_state,
-                dual_lr_scale_k,
-                dual_lr_scale_min,
-                dual_lr_scale_max,
             ), None
 
         (
@@ -229,9 +229,6 @@ def __sps(
             dual_average_state,
             primal_opt_state,
             dual_opt_state,
-            dual_lr_scale_k,
-            dual_lr_scale_min,
-            dual_lr_scale_max,
         ), _ = jax.lax.scan(
             step,
             (
@@ -242,9 +239,6 @@ def __sps(
                 dual_average_state,
                 primal_opt_state,
                 dual_opt_state,
-                dual_lr_scale_k,
-                dual_lr_scale_min,
-                dual_lr_scale_max,
             ),
             None,
             length=max_iter,
@@ -260,34 +254,34 @@ def __sps(
             dual_opt_state,
         )
 
-    primal_state = jax.tree_util.tree_map(lambda x: x.copy(), primal_initial_solution)
-    dual_state = jax.tree_util.tree_map(lambda x: x.copy(), dual_initial_solution)
+    # primal_state = jax.tree_util.tree_map(lambda x: x.copy(), primal_initial_solution)
+    # dual_state = jax.tree_util.tree_map(lambda x: x.copy(), dual_initial_solution)
+    primal_state = primal_initial_solution
+    dual_state = dual_initial_solution
 
     if primal_initial_avg_state is not None:
         primal_average_state = primal_initial_avg_state
     else:
-        primal_average_state = jax.tree_util.tree_map(
-            lambda x: x.copy(), primal_initial_solution
-        )
+        # primal_average_state = jax.tree_util.tree_map(
+        #     lambda x: x.copy(), primal_initial_solution
+        # )
+        primal_average_state = primal_initial_solution
 
     if dual_initial_avg_state is not None:
         dual_average_state = dual_initial_avg_state
     else:
-        dual_average_state = jax.tree_util.tree_map(
-            lambda x: x.copy(), dual_initial_solution
-        )
+        # dual_average_state = jax.tree_util.tree_map(
+        #     lambda x: x.copy(), dual_initial_solution
+        # )
+        dual_average_state = dual_initial_solution
 
     if primal_initial_opt_state is not None:
-        primal_opt_state = jax.tree_util.tree_map(
-            lambda x: x.copy() if hasattr(x, "copy") else x, primal_initial_opt_state
-        )
+        primal_opt_state = primal_initial_opt_state
     else:
         primal_opt_state = optimiser_primal.init(primal_initial_solution)
 
     if dual_initial_opt_state is not None:
-        dual_opt_state = jax.tree_util.tree_map(
-            lambda x: x.copy() if hasattr(x, "copy") else x, dual_initial_opt_state
-        )
+        dual_opt_state = dual_initial_opt_state
     else:
         dual_opt_state = optimiser_dual.init(dual_initial_solution)
 
@@ -301,9 +295,6 @@ def __sps(
         dual_average_state,
         primal_opt_state,
         dual_opt_state,
-        dual_lr_scale_k,
-        dual_lr_scale_min,
-        dual_lr_scale_max,
     )
 
 
@@ -315,7 +306,7 @@ def solve(
     dual_optimiser=None,
     iterations_per_epoch=int(1e3),
     constraint_tolerance=1e-5,
-    progress_tolerance=1e-5,
+    progress_tolerance=1e-3,
     complementarity_tolerance=1e-5,
     exponential_weighting=0.01,
     scale_A=False,
@@ -323,9 +314,6 @@ def solve(
     scale_c=False,
     max_epochs=1000,
     # Dual LR scaling: k=0 disables; otherwise lr_scale = clip(1 + k * max_violation, min, max)
-    dual_lr_scale_k: float = 0.0,
-    dual_lr_scale_min: float = 0.1,
-    dual_lr_scale_max: float = 10.0,
     verbose=False,
 ):
 
@@ -338,7 +326,7 @@ def solve(
     if primal_optimiser is None:
         lr = optax.cosine_decay_schedule(
             init_value=1e0,
-            decay_steps=int(1e4),
+            decay_steps=int(1e5),
             exponent=1.5,
             alpha=1e-4,
         )
@@ -351,7 +339,7 @@ def solve(
     if dual_optimiser is None:
         lr = optax.cosine_decay_schedule(
             init_value=1e0,
-            decay_steps=int(1e4),
+            decay_steps=int(1e5),
             exponent=1.5,
             alpha=1e-4,
         )
@@ -364,21 +352,21 @@ def solve(
     if scale_A and not sp.issparse(lp.A_eq):
         lp, rs_ruiz, cs_ruiz = __ruiz_scaling(lp)
         lp, rs_pc, cs_pc = __pc_scaling(lp)
-        lp_summary_statistics(lp)
+        lp_summary_statistics(lp) if verbose else None
         lp = __to_jaddle(lp)
 
     elif scale_A and sp.issparse(lp.A_eq):
         lp, rs_ruiz, cs_ruiz = __ruiz_scaling_sparse(lp)
         lp, rs_pc, cs_pc = __pc_scaling_sparse(lp)
-        lp_summary_statistics(lp)
+        lp_summary_statistics(lp) if verbose else None
         lp = __to_jaddle_sparse(lp)
 
     elif not sp.issparse(lp.A_eq):
-        lp_summary_statistics(lp)
+        lp_summary_statistics(lp) if verbose else None
         lp = __to_jaddle(lp)
 
     else:
-        lp_summary_statistics(lp)
+        lp_summary_statistics(lp) if verbose else None
         lp = __to_jaddle_sparse(lp)
 
     if scale_c:
@@ -411,7 +399,7 @@ def solve(
         )
 
     i = 1
-    primal_state = state = primal_initial_solution
+    primal_state = primal_initial_solution
     dual_state = dual_initial_solution
     primal_average_state = primal_initial_solution
     dual_average_state = dual_initial_solution
@@ -432,9 +420,6 @@ def solve(
             dual_average_state,
             primal_opt_state,
             dual_opt_state,
-            dual_lr_scale_k,
-            dual_lr_scale_min,
-            dual_lr_scale_max,
             previous_objective,
             progress,
             max_complementarity_slack,
@@ -457,9 +442,6 @@ def solve(
             dual_average_state,
             primal_opt_state,
             dual_opt_state,
-            dual_lr_scale_k,
-            dual_lr_scale_min,
-            dual_lr_scale_max,
             previous_objective,
             progress,
             max_complementarity_slack,
@@ -488,9 +470,6 @@ def solve(
             primal_opt_state,
             dual_opt_state,
             exponential_weighting,
-            dual_lr_scale_k,
-            dual_lr_scale_min,
-            dual_lr_scale_max,
         )
 
         objective_value = lp.objective(primal_average_state.primal)
@@ -528,9 +507,6 @@ def solve(
             dual_average_state,
             primal_opt_state,
             dual_opt_state,
-            dual_lr_scale_k,
-            dual_lr_scale_min,
-            dual_lr_scale_max,
             objective_value,
             progress,
             max_complementarity_slack,
@@ -547,9 +523,6 @@ def solve(
         dual_average_state,
         primal_opt_state,
         dual_opt_state,
-        dual_lr_scale_k,
-        dual_lr_scale_min,
-        dual_lr_scale_max,
         previous_objective,
         progress,
         max_complementarity_slack,
@@ -570,9 +543,6 @@ def solve(
             dual_average_state,
             primal_opt_state,
             dual_opt_state,
-            dual_lr_scale_k,
-            dual_lr_scale_min,
-            dual_lr_scale_max,
             previous_objective,
             progress,
             max_complementarity_slack,
@@ -606,9 +576,6 @@ def solve(
                 dual_average_state,
                 primal_opt_state,
                 dual_opt_state,
-                dual_lr_scale_k,
-                dual_lr_scale_min,
-                dual_lr_scale_max,
                 objective_value,
                 progress,
                 max_complementarity_slack,
@@ -906,9 +873,7 @@ def __to_jaddle(lp: LP):
         jnp.array(lp.lower_bounds, dtype=jnp.float32),
         jnp.array(lp.upper_bounds, dtype=jnp.float32),
     )
-    # Cache transposes for gradient computation
-    lp_jax.A_eq_T = A_eq.T
-    lp_jax.A_ineq_T = A_ineq.T
+
     return lp_jax
 
 
@@ -928,9 +893,6 @@ def __to_jaddle_sparse(lp: LP):
         jnp.array(lp.lower_bounds, dtype=jnp.float32),
         jnp.array(lp.upper_bounds, dtype=jnp.float32),
     )
-    # Cache transposes for gradient computation
-    lp_jax.A_eq_T = A_eq.T
-    lp_jax.A_ineq_T = A_ineq.T
     return lp_jax
 
 
