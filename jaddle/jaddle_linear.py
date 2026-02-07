@@ -309,9 +309,7 @@ def solve(
     progress_tolerance=1e-3,
     complementarity_tolerance=1e-5,
     exponential_weighting=0.01,
-    scale_A=False,
-    scale_b=False,
-    scale_c=False,
+    scale=False,
     max_epochs=1000,
     verbose=False,
 ):
@@ -323,38 +321,21 @@ def solve(
         dual_initial_solution = lp.dual_initial_solution()
 
     if primal_optimiser is None:
-        lr = optax.cosine_decay_schedule(
-            init_value=1e0,
-            decay_steps=int(1e5),
-            exponent=1.5,
-            alpha=1e-4,
-        )
-        primal_optimiser = optax.optimistic_adam_v2(
-            learning_rate=lr,
-            alpha=0.1,
-            nesterov=True,
+        primal_optimiser = optax.chain(
+            optax.optimistic_adam_v2(learning_rate=1e0, alpha=0.1),
+            optax.contrib.reduce_on_plateau(0.9, 1000, min_scale=1e-4),
         )
 
     if dual_optimiser is None:
-        lr = optax.cosine_decay_schedule(
-            init_value=1e0,
-            decay_steps=int(1e5),
-            exponent=1.5,
-            alpha=1e-4,
-        )
-        dual_optimiser = optax.optimistic_adam_v2(
-            learning_rate=lr,
-            alpha=0.1,
-            nesterov=True,
-        )
+        dual_optimiser = optax.optimistic_adam_v2(learning_rate=1.0, alpha=0.1)
 
-    if scale_A and not sp.issparse(lp.A_eq):
-        lp, rs_ruiz, cs_ruiz = __ruiz_scaling(lp)
+    if scale and not sp.issparse(lp.A_eq):
+        lp, rs_ruiz, cs_ruiz = __ruiz_scaling(lp, 40)
         lp, rs_pc, cs_pc = __pc_scaling(lp)
         lp = __to_jaddle(lp)
 
-    elif scale_A and sp.issparse(lp.A_eq):
-        lp, rs_ruiz, cs_ruiz = __ruiz_scaling_sparse(lp)
+    elif scale and sp.issparse(lp.A_eq):
+        lp, rs_ruiz, cs_ruiz = __ruiz_scaling_sparse(lp, 40)
         lp, rs_pc, cs_pc = __pc_scaling_sparse(lp)
         lp = __to_jaddle_sparse(lp)
 
@@ -364,37 +345,7 @@ def solve(
     else:
         lp = __to_jaddle_sparse(lp)
 
-    if scale_c:
-        c_scale = jnp.max(jnp.abs(lp.c))
-        lp.c = lp.c / c_scale
-
-    if scale_b:
-        b_scale_eq = jnp.max(jnp.abs(lp.b_eq))
-
-        def _scale_eq(_):
-            return (lp.b_eq / b_scale_eq, lp.A_eq / b_scale_eq)
-
-        def _no_scale(_):
-            return (lp.b_eq, lp.A_eq)
-
-        lp.b_eq, lp.A_eq = jax.lax.cond(
-            b_scale_eq > 0, _scale_eq, _no_scale, operand=None
-        )
-
-        b_scale_ineq = jnp.max(jnp.abs(lp.b_ineq))
-
-        def _scale_ineq(_):
-            return (lp.b_ineq / b_scale_ineq, lp.A_ineq / b_scale_ineq)
-
-        def _no_scale_ineq(_):
-            return (lp.b_ineq, lp.A_ineq)
-
-        lp.b_ineq, lp.A_ineq = jax.lax.cond(
-            b_scale_ineq > 0, _scale_ineq, _no_scale_ineq, operand=None
-        )
-
-    if verbose:
-        lp_summary_statistics(lp)
+    lp_summary_statistics(lp)
 
     i = 1
     primal_state = primal_initial_solution
@@ -471,8 +422,6 @@ def solve(
         )
 
         objective_value = lp.objective(primal_average_state.primal)
-        if scale_c:
-            objective_value = c_scale * objective_value
         progress = jnp.abs(objective_value - previous_objective) / (
             1.0 + jnp.abs(objective_value)
         )
@@ -546,7 +495,7 @@ def solve(
             count,
         ) = loop_vars
 
-        if scale_A:
+        if scale:
             primal_average_state = PrimalState(
                 primal=primal_average_state.primal * cs_pc * cs_ruiz,
             )
@@ -583,7 +532,7 @@ def solve(
                 f"Epoch {count}: Progress={progress:.2e}, Max Compl. Slack={max_complementarity_slack:.2e}, Constraint Bound={constraint_bound:.2e}"
             )
 
-        if scale_A:
+        if scale:
             primal_average_state = PrimalState(
                 primal=primal_average_state.primal * cs_pc * cs_ruiz,
             )
@@ -622,6 +571,7 @@ def __ruiz_scaling(lp: LP, max_iter=10, threshold=1e-8, clip_bounds=(1e-6, 1e6))
 
     for _ in range(max_iter):
         row_norms = np.linalg.norm(A, axis=1, ord=np.inf)
+        row_norms = np.maximum(row_norms, np.abs(b_scaled * row_scale))
         row_norms = np.where(row_norms <= threshold, 1.0, row_norms)
 
         col_norms = np.linalg.norm(A, axis=0, ord=np.inf)
@@ -688,6 +638,7 @@ def __ruiz_scaling_sparse(lp: LP, max_iter=10, threshold=1e-8, clip_bounds=(1e-6
     for _ in range(max_iter):
         # Row norms (infinity norm)
         row_norms = np.abs(A_scaled).max(axis=1).todense().A.flatten()
+        row_norms = np.maximum(row_norms, np.abs(b_scaled * row_scale))
         row_norms = np.where(row_norms <= threshold, 1.0, row_norms)
         row_s = 1.0 / np.sqrt(row_norms)
         row_s = np.clip(row_s, clip_bounds[0], clip_bounds[1])
@@ -750,6 +701,7 @@ def __pc_scaling(lp: LP, max_iter=1, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
 
     for _ in range(max_iter):
         row_norms = np.linalg.norm(A, axis=1, ord=1)
+        row_norms = np.maximum(row_norms, np.abs(b_scaled * row_scale))
         row_norms = np.where(row_norms <= threshold, 1.0, row_norms)
 
         col_norms = np.linalg.norm(A, axis=0, ord=1)
@@ -816,6 +768,7 @@ def __pc_scaling_sparse(lp: LP, max_iter=1, threshold=1e-8, clip_bounds=(1e-6, 1
     for _ in range(max_iter):
         # Row norms (1-norm)
         row_norms = np.abs(A_scaled).sum(axis=1).A.flatten()
+        row_norms = np.maximum(row_norms, np.abs(b_scaled * row_scale))
         row_norms = np.where(row_norms <= threshold, 1.0, row_norms)
         row_s = 1.0 / np.sqrt(row_norms)
         row_s = np.clip(row_s, clip_bounds[0], clip_bounds[1])

@@ -11,6 +11,7 @@ import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 import jax
+import jax.numpy as jnp
 
 # Ensure JAX is properly initialized
 _ = jax.random.normal(jax.random.PRNGKey(0), (1,)).block_until_ready()
@@ -32,33 +33,21 @@ highs.presolve()
 highs_lp = highs.getPresolvedLp()
 jaddle_lp = hh.highs_to_standard_form_sparse(highs_lp)
 
-# %%
-primal_optimiser = optax.chain(
-    optax.optimistic_adam_v2(learning_rate=1e0, alpha=5e-2),
-    optax.contrib.reduce_on_plateau(
-        factor=0.9,
-        patience=500,
-        min_scale=1e-4,
-        cooldown=100,
-    ),
-)
-
-dual_optimiser = optax.adadelta(1.0)
+solution_highs = hh.highs_linear_solver(
+    highs_lp, method="pdlp"
+)  # Solve the presolved LP using Highs to get a reference solution
 
 
 # %% [markdown]
 # ## Solve the scaled, presolved LP using Jaddle's saddle point solver
 start_time = time.time()
 solution_primal, solution_dual = jl.solve(
-    primal_optimiser=primal_optimiser,
-    dual_optimiser=dual_optimiser,
     iterations_per_epoch=500,
     lp=jaddle_lp,
-    # scale_A=True,
-    # scale_b=True,
-    # scale_c=True,
+    scale=True,
     max_epochs=5000,
-    verbose=True,
+    verbose=False,
+    exponential_weighting=0.01,
 )
 
 print("--------------------------------")
@@ -67,5 +56,8 @@ print("Saddle point solver objective:", jaddle_lp.objective(solution_primal.prim
 print("Inequality violation:", jaddle_lp.ineq_slack(solution_primal.primal))
 print("Equality violation:", jaddle_lp.eq_slack(solution_primal.primal))
 print("--------------------------------")
+
+# %%
+jaddle_lp.objective(solution_primal.primal)
 
 # %%
