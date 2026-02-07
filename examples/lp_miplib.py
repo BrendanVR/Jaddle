@@ -27,7 +27,7 @@ import optax
 # The LP is then presolved to reduce its size and complexity.
 # Finally, we convert the presolved LP into a format compatible with Jaddle.
 highs = hspy.Highs()
-highs.readModel("/home/brendanvr/python/Jaddle/data/bab1.mps")  # path to MPS file
+highs.readModel("/home/brendanvr/python/Jaddle/data/boeing.mps")  # path to MPS file
 highs.presolve()
 highs_lp = highs.getPresolvedLp()
 jaddle_lp = hh.highs_to_standard_form_sparse(highs_lp)
@@ -53,13 +53,12 @@ solution_primal, solution_dual = jl.solve(
     primal_optimiser=primal_optimiser,
     dual_optimiser=dual_optimiser,
     iterations_per_epoch=500,
-    # constraint_tolerance=1e-6,
     lp=jaddle_lp,
     scale_A=True,
     scale_b=True,
     scale_c=True,
     max_epochs=5000,
-    verbose=False,
+    verbose=True,
 )
 
 print("--------------------------------")

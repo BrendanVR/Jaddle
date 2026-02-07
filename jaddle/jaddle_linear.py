@@ -352,20 +352,16 @@ def solve(
     if scale_A and not sp.issparse(lp.A_eq):
         lp, rs_ruiz, cs_ruiz = __ruiz_scaling(lp)
         lp, rs_pc, cs_pc = __pc_scaling(lp)
-        lp_summary_statistics(lp) if verbose else None
         lp = __to_jaddle(lp)
 
     elif scale_A and sp.issparse(lp.A_eq):
         lp, rs_ruiz, cs_ruiz = __ruiz_scaling_sparse(lp)
         lp, rs_pc, cs_pc = __pc_scaling_sparse(lp)
-        lp_summary_statistics(lp) if verbose else None
         lp = __to_jaddle_sparse(lp)
 
     elif not sp.issparse(lp.A_eq):
-        lp_summary_statistics(lp) if verbose else None
         lp = __to_jaddle(lp)
 
-    else:
         lp_summary_statistics(lp) if verbose else None
         lp = __to_jaddle_sparse(lp)
 
@@ -398,6 +394,8 @@ def solve(
             b_scale_ineq > 0, _scale_ineq, _no_scale_ineq, operand=None
         )
 
+    lp_summary_statistics(lp) if verbose else None
+
     i = 1
     primal_state = primal_initial_solution
     dual_state = dual_initial_solution
@@ -408,7 +406,7 @@ def solve(
     previous_objective = jnp.inf
     progress = jnp.inf
     max_complementarity_slack = jnp.inf
-    constraints_satisfied = False
+    constraint_bound = jnp.inf
     count = 0
 
     def cond_fun(loop_vars):
@@ -423,14 +421,14 @@ def solve(
             previous_objective,
             progress,
             max_complementarity_slack,
-            constraints_satisfied,
+            constraint_bound,
             count,
         ) = loop_vars
 
         return (
             (progress > progress_tolerance)
             | (max_complementarity_slack > complementarity_tolerance)
-            | (~constraints_satisfied)
+            | (constraint_bound > constraint_tolerance)
         ) & (count < max_epochs)
 
     def body_fun(loop_vars):
@@ -445,7 +443,7 @@ def solve(
             previous_objective,
             progress,
             max_complementarity_slack,
-            constraints_satisfied,
+            constraint_bound,
             count,
         ) = loop_vars
 
@@ -494,9 +492,7 @@ def solve(
         )
         max_complementarity_slack = jnp.abs(jnp.sum(complentariy_slack))
 
-        constraints_satisfied = (max_ineq_violation < constraint_tolerance) & (
-            max_eq_violation < constraint_tolerance
-        )
+        constraint_bound = jnp.maximum(max_ineq_violation, max_eq_violation)
         count += 1
 
         return (
@@ -510,7 +506,7 @@ def solve(
             objective_value,
             progress,
             max_complementarity_slack,
-            constraints_satisfied,
+            constraint_bound,
             count,
         )
 
@@ -526,7 +522,7 @@ def solve(
         previous_objective,
         progress,
         max_complementarity_slack,
-        constraints_satisfied,
+        constraint_bound,
         count,
     )
 
@@ -546,7 +542,7 @@ def solve(
             previous_objective,
             progress,
             max_complementarity_slack,
-            constraints_satisfied,
+            constraint_bound,
             count,
         ) = loop_vars
 
@@ -579,12 +575,12 @@ def solve(
                 objective_value,
                 progress,
                 max_complementarity_slack,
-                constraints_satisfied,
+                constraint_bound,
                 count,
             ) = loop_vars
 
             print(
-                f"Epoch {count}: Progress={progress:.2e}, Max Compl. Slack={max_complementarity_slack:.2e}, Constraints Satisfied={constraints_satisfied}"
+                f"Epoch {count}: Progress={progress:.2e}, Max Compl. Slack={max_complementarity_slack:.2e}, Constraint Bound={constraint_bound:.2e}"
             )
 
         if scale_A:
@@ -900,12 +896,12 @@ def lp_summary_statistics(lp: LP):
     num_vars = lp.num_variables()
     num_eq = lp.num_eq_constraints()
     num_ineq = lp.num_ineq_constraints()
-    min_A_eq = np.min(lp.A_eq) if num_eq > 0 else None
-    max_A_eq = np.max(lp.A_eq) if num_eq > 0 else None
+    min_A_eq = np.minimum(np.min(lp.A_eq.data), 0.0) if num_eq > 0 else None
+    max_A_eq = np.maximum(np.max(lp.A_eq.data), 0.0) if num_eq > 0 else None
     min_b_eq = np.min(lp.b_eq) if num_eq > 0 else None
     max_b_eq = np.max(lp.b_eq) if num_eq > 0 else None
-    min_A_ineq = np.min(lp.A_ineq) if num_ineq > 0 else None
-    max_A_ineq = np.max(lp.A_ineq) if num_ineq > 0 else None
+    min_A_ineq = np.minimum(np.min(lp.A_ineq.data), 0.0) if num_ineq > 0 else None
+    max_A_ineq = np.maximum(np.max(lp.A_ineq.data), 0.0) if num_ineq > 0 else None
     min_b_ineq = np.min(lp.b_ineq) if num_ineq > 0 else None
     max_b_ineq = np.max(lp.b_ineq) if num_ineq > 0 else None
     min_c = np.min(lp.c)
