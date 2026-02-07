@@ -54,9 +54,9 @@ solution_primal, solution_dual = jl.solve(
     dual_optimiser=dual_optimiser,
     iterations_per_epoch=500,
     lp=jaddle_lp,
-    scale_A=True,
-    scale_b=True,
-    scale_c=True,
+    # scale_A=True,
+    # scale_b=True,
+    # scale_c=True,
     max_epochs=5000,
     verbose=True,
 )

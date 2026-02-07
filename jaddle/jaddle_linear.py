@@ -313,7 +313,6 @@ def solve(
     scale_b=False,
     scale_c=False,
     max_epochs=1000,
-    # Dual LR scaling: k=0 disables; otherwise lr_scale = clip(1 + k * max_violation, min, max)
     verbose=False,
 ):
 
@@ -362,7 +361,7 @@ def solve(
     elif not sp.issparse(lp.A_eq):
         lp = __to_jaddle(lp)
 
-        lp_summary_statistics(lp) if verbose else None
+    else:
         lp = __to_jaddle_sparse(lp)
 
     if scale_c:
@@ -394,7 +393,8 @@ def solve(
             b_scale_ineq > 0, _scale_ineq, _no_scale_ineq, operand=None
         )
 
-    lp_summary_statistics(lp) if verbose else None
+    if verbose:
+        lp_summary_statistics(lp)
 
     i = 1
     primal_state = primal_initial_solution
