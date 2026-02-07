@@ -37,13 +37,34 @@ solution_highs = hh.highs_linear_solver(
     highs_lp, method="pdlp"
 )  # Solve the presolved LP using Highs to get a reference solution
 
+# %%
+optimiser = optax.partition(
+    {
+        "primal_opt": optax.optimistic_adam_v2(
+            learning_rate=1.0,
+            alpha=0.1,
+        ),
+        "dual_opt": optax.adadelta(
+            learning_rate=1.0,
+        ),
+    },
+    param_labels={
+        "primal": "primal_opt",
+        "dual_ineq": "dual_opt",
+        "dual_eq": "dual_opt",
+    },
+)
+
+optimiser.init(jaddle_lp.initial_solution())
+
 
 # %% [markdown]
 # ## Solve the scaled, presolved LP using Jaddle's saddle point solver
 start_time = time.time()
 solution = jl.solve(
-    iterations_per_epoch=500,
     lp=jaddle_lp,
+    optimiser=optimiser,
+    iterations_per_epoch=500,
     scale=True,
     max_epochs=5000,
     verbose=False,

@@ -200,7 +200,7 @@ def solve(
 ):
 
     if initial_solution is None:
-        initial_solution = lp.primal_initial_solution()
+        initial_solution = lp.initial_solution()
 
     if scale and not sp.issparse(lp.A_eq):
         lp, rs_ruiz, cs_ruiz = __ruiz_scaling(lp, 40)
