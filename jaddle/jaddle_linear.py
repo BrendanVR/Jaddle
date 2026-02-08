@@ -8,6 +8,8 @@ import numpy as np
 import scipy.sparse as sp
 import functools
 from typing import NamedTuple
+import time
+from jax.scipy.sparse.linalg import cg, bicgstab, gmres
 
 
 class SaddleState(NamedTuple):
@@ -60,12 +62,17 @@ class LP:
     def eq_slack(self, x):
         return jnp.max(jnp.abs(self.A_eq @ x - self.b_eq))
 
+    def diff_eq_slack(self, x):
+        return self.A_eq @ x - self.b_eq
+
     def complementarity_slack(self, x, dual_ineq):
         return (dual_ineq * (self.A_ineq @ x - self.b_ineq)).sum()
 
     def initial_solution(self):
         return SaddleState(
-            primal=jnp.zeros(self.num_variables()),
+            primal=projection_box(
+                jnp.zeros(self.num_variables()), self.lower_bounds, self.upper_bounds
+            ),
             dual_ineq=jnp.zeros(self.num_ineq_constraints()),
             dual_eq=jnp.zeros(self.num_eq_constraints()),
         )
@@ -87,15 +94,6 @@ def __sps(
     @jax.jit
     def primal_projection(x):
         return projection_box(x, lp.lower_bounds, lp.upper_bounds)
-
-    @jax.jit
-    def langragean(primal_state, dual_state):
-        lagrangian = lp.objective(primal_state.primal)
-        lagrangian -= dual_state.dual_eq @ (lp.b_eq - lp.A_eq @ primal_state.primal)
-        lagrangian -= dual_state.dual_ineq @ (
-            lp.b_ineq - lp.A_ineq @ primal_state.primal
-        )
-        return lagrangian
 
     @jax.jit
     def grad(state):
@@ -123,12 +121,9 @@ def __sps(
         max_iter,
         exponential_weighting,
         start_iter,
-        primal_state,
-        dual_state,
-        primal_average_state,
-        dual_average_state,
-        primal_opt_state,
-        dual_opt_state,
+        state,
+        average_state,
+        opt_state,
     ):
         @jax.jit
         def step(carry, _):
@@ -158,8 +153,6 @@ def __sps(
 
         return i, state, average_state, opt_state
 
-    # primal_state = jax.tree_util.tree_map(lambda x: x.copy(), primal_initial_solution)
-    # dual_state = jax.tree_util.tree_map(lambda x: x.copy(), dual_initial_solution)
     state = initial_solution
 
     if initial_avg_state is not None:
@@ -264,12 +257,9 @@ def solve(
 
         (
             i,
-            primal_state,
-            dual_state,
-            primal_average_state,
-            dual_average_state,
-            primal_opt_state,
-            dual_opt_state,
+            state,
+            average_state,
+            opt_state,
         ) = __sps(
             iterations_per_epoch,
             i,
@@ -281,22 +271,20 @@ def solve(
             exponential_weighting,
         )
 
-        objective_value = lp.objective(primal_average_state.primal)
+        objective_value = lp.objective(average_state.primal)
         progress = jnp.abs(objective_value - previous_objective) / (
             1.0 + jnp.abs(objective_value)
         )
 
-        ineq_violations = jnp.maximum(
-            lp.A_ineq @ primal_average_state.primal - lp.b_ineq, 0.0
-        )
+        ineq_violations = jnp.maximum(lp.A_ineq @ average_state.primal - lp.b_ineq, 0.0)
         max_ineq_violation = jnp.max(ineq_violations)
 
-        eq_violations = jnp.abs(lp.A_eq @ primal_average_state.primal - lp.b_eq)
+        eq_violations = jnp.abs(lp.A_eq @ average_state.primal - lp.b_eq)
         max_eq_violation = jnp.max(eq_violations)
 
         complentariy_slack = (
-            dual_average_state.dual_ineq
-            * (lp.A_ineq @ primal_average_state.primal - lp.b_ineq)
+            average_state.dual_ineq
+            * (lp.A_ineq @ average_state.primal - lp.b_ineq)
             / (1.0 + jnp.abs(objective_value))
         )
         max_complementarity_slack = jnp.abs(jnp.sum(complentariy_slack))
@@ -329,6 +317,7 @@ def solve(
         count,
     )
 
+    start_time = time.time()
     # Run the while loop
     if verbose == False:
 
@@ -346,9 +335,24 @@ def solve(
             count,
         ) = loop_vars
 
+        residual = lp.diff_eq_slack(average_state.primal)
+
+        def matvec(v):
+            return lp.A_eq @ (lp.A_eq.T @ v)
+
+        nu, _ = gmres(matvec, residual)
+        primal_projected = average_state.primal - lp.A_eq.T @ nu
+
+        # Update state with projected primal
+        average_state = SaddleState(
+            primal=primal_projected,
+            dual_ineq=average_state.dual_ineq,
+            dual_eq=average_state.dual_eq,
+        )
+
         if scale:
-            primal_average_state = SaddleState(
-                primal=primal_average_state.primal * cs_pc * cs_ruiz,
+            average_state = SaddleState(
+                primal=average_state.primal * cs_pc * cs_ruiz,
                 dual_eq=average_state.dual_eq
                 * rs_pc[: lp.A_eq.shape[0]]
                 * rs_ruiz[: lp.A_eq.shape[0]],
@@ -357,7 +361,9 @@ def solve(
                 * rs_ruiz[lp.A_eq.shape[0] :],
             )
 
-        return primal_average_state, dual_average_state
+        end_time = time.time()
+        print(f"Time to solution: {end_time - start_time:.2f} seconds")
+        return average_state
 
     else:
         while cond_fun(loop_vars):
@@ -378,8 +384,8 @@ def solve(
                 f"Epoch {count}: Progress={progress:.2e}, Max Compl. Slack={max_complementarity_slack:.2e}, Constraint Bound={constraint_bound:.2e}"
             )
         if scale:
-            primal_average_state = SaddleState(
-                primal=primal_average_state.primal * cs_pc * cs_ruiz,
+            average_state = SaddleState(
+                primal=average_state.primal * cs_pc * cs_ruiz,
                 dual_eq=average_state.dual_eq
                 * rs_pc[: lp.A_eq.shape[0]]
                 * rs_ruiz[: lp.A_eq.shape[0]],
@@ -388,6 +394,8 @@ def solve(
                 * rs_ruiz[lp.A_eq.shape[0] :],
             )
 
+        end_time = time.time()
+        print(f"Time to solution: {end_time - start_time:.2f} seconds")
         return average_state
 
 

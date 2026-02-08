@@ -13,11 +13,15 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 import jax
 import jax.numpy as jnp
 
+# jax.config.update("jax_platform_name", "cpu")
+# jax.config.update("jax_default_dtype_bits", "64")
+
 # Ensure JAX is properly initialized
 _ = jax.random.normal(jax.random.PRNGKey(0), (1,)).block_until_ready()
 
 import time
 import jaddle.jaddle_linear as jl
+import jaddle.jaddle_optimisers as jo
 import jaddle.highs_helpers as hh
 import highspy as hspy
 import optax
@@ -28,54 +32,43 @@ import optax
 # The LP is then presolved to reduce its size and complexity.
 # Finally, we convert the presolved LP into a format compatible with Jaddle.
 highs = hspy.Highs()
-highs.readModel("/home/brendanvr/python/Jaddle/data/boeing.mps")  # path to MPS file
-highs.presolve()
-highs_lp = highs.getPresolvedLp()
+highs.readModel("/home/brendanvr/python/Jaddle/data/stp3d.mps")  # path to MPS file
+# highs.presolve()
+highs_lp = highs.getLp()
 jaddle_lp = hh.highs_to_standard_form_sparse(highs_lp)
-
-solution_highs = hh.highs_linear_solver(
-    highs_lp, method="pdlp"
-)  # Solve the presolved LP using Highs to get a reference solution
-
-# %%
-optimiser = optax.partition(
-    {
-        "primal_opt": optax.optimistic_adam_v2(
-            learning_rate=1.0,
-            alpha=0.1,
-        ),
-        "dual_opt": optax.adadelta(
-            learning_rate=1.0,
-        ),
-    },
-    param_labels={
-        "primal": "primal_opt",
-        "dual_ineq": "dual_opt",
-        "dual_eq": "dual_opt",
-    },
-)
-
-optimiser.init(jaddle_lp.initial_solution())
-
+highs_lp = hh.highs_from_standard_form_sparse(jaddle_lp)
 
 # %% [markdown]
 # ## Solve the scaled, presolved LP using Jaddle's saddle point solver
-start_time = time.time()
+lr_primal = optax.exponential_decay(
+    init_value=1e0,
+    transition_steps=1000,
+    decay_rate=0.9,
+    end_value=1e-4,
+)
+
+
+def lr_dual(step):
+    return 1 / lr_primal(step)
+
+
 solution = jl.solve(
     lp=jaddle_lp,
-    optimiser=optimiser,
-    iterations_per_epoch=500,
-    scale=True,
+    optimiser=jo.adamdelta_saddle(
+        lr_primal=lr_primal,
+        lr_dual=1e0,
+    ),
+    iterations_per_epoch=1000,
     max_epochs=5000,
     verbose=False,
     exponential_weighting=0.01,
 )
 
 print("--------------------------------")
-print("Time to solution:", time.time() - start_time)
 print("Saddle point solver objective:", jaddle_lp.objective(solution.primal))
 print("Inequality violation:", jaddle_lp.ineq_slack(solution.primal))
 print("Equality violation:", jaddle_lp.eq_slack(solution.primal))
 print("--------------------------------")
+
 
 # %%
