@@ -32,36 +32,42 @@ import optax
 # The LP is then presolved to reduce its size and complexity.
 # Finally, we convert the presolved LP into a format compatible with Jaddle.
 highs = hspy.Highs()
-highs.readModel("/home/brendanvr/python/Jaddle/data/stp3d.mps")  # path to MPS file
+highs.readModel("/home/brendanvr/python/Jaddle/data/boeing.mps")  # path to MPS file
 # highs.presolve()
 highs_lp = highs.getLp()
 jaddle_lp = hh.highs_to_standard_form_sparse(highs_lp)
 highs_lp = hh.highs_from_standard_form_sparse(jaddle_lp)
 
+highs_solution = hh.highs_linear_solver(highs_lp, method="pdlp")
+
+# %%
+print("--------------------------------")
+print("Saddle point solver objective:", jaddle_lp.objective(highs_solution.primal))
+print("Inequality violation:", jaddle_lp.ineq_slack(highs_solution.primal))
+print("Equality violation:", jaddle_lp.eq_slack(highs_solution.primal))
+print("--------------------------------")
+
+# %%
+
+jaddle_lp.complementarity_slack(highs_solution.primal, highs_solution.dual_ineq)
+
 # %% [markdown]
 # ## Solve the scaled, presolved LP using Jaddle's saddle point solver
 lr_primal = optax.exponential_decay(
-    init_value=1e0,
+    init_value=1e-2,
     transition_steps=1000,
     decay_rate=0.9,
-    end_value=1e-4,
+    end_value=1e-6,
 )
-
-
-def lr_dual(step):
-    return 1 / lr_primal(step)
-
 
 solution = jl.solve(
     lp=jaddle_lp,
-    optimiser=jo.adamdelta_saddle(
-        lr_primal=lr_primal,
-        lr_dual=1e0,
-    ),
+    optimiser=jo.adamdelta_saddle(lr_primal),
+    initial_solution=highs_solution,
     iterations_per_epoch=1000,
     max_epochs=5000,
-    verbose=False,
-    exponential_weighting=0.01,
+    verbose=True,
+    scale=False,
 )
 
 print("--------------------------------")

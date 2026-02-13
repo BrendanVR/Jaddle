@@ -70,7 +70,7 @@ def highs_to_standard_form(lp):
     ).toarray()
 
     # Equality constraints: row_lower == row_upper
-    eq_mask = np.isclose(row_lower, row_upper)
+    eq_mask = np.equal(row_lower, row_upper)
     A_eq = A[eq_mask, :]
     b_eq = row_lower[eq_mask]
 
@@ -121,7 +121,7 @@ def highs_to_standard_form_sparse(lp):
     )
 
     # Equality constraints: row_lower == row_upper
-    eq_mask = np.isclose(row_lower, row_upper)
+    eq_mask = np.equal(row_lower, row_upper)
     A_eq = A[eq_mask, :]
     b_eq = row_lower[eq_mask]
 
@@ -173,9 +173,18 @@ def highs_linear_solver(
 
     highs.run()
     highs_solution = highs.getSolution()
-    highs_primal = np.array(highs_solution.col_value)
 
-    return highs_primal
+    row_lower = np.array(lp.row_lower_, dtype=np.float32)
+    row_upper = np.array(lp.row_upper_, dtype=np.float32)
+    n_eq = np.sum(np.isclose(row_lower, row_upper))
+
+    highs_primal = np.array(highs_solution.col_value)
+    highs_dual_eq = np.array(highs_solution.row_dual[:n_eq])
+    highs_dual_ineq = np.array(highs_solution.row_dual[n_eq:])
+
+    return jl.SaddleState(
+        primal=highs_primal, dual_ineq=highs_dual_ineq, dual_eq=highs_dual_eq
+    )
 
 
 def create_highs_solution(primal):

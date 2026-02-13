@@ -69,10 +69,14 @@ class LP:
         return (dual_ineq * (self.A_ineq @ x - self.b_ineq)).sum()
 
     def initial_solution(self):
+
+        # Project onto box constraints first
+        primal = projection_box(
+            jnp.zeros(self.num_variables()), self.lower_bounds, self.upper_bounds
+        )
+
         return SaddleState(
-            primal=projection_box(
-                jnp.zeros(self.num_variables()), self.lower_bounds, self.upper_bounds
-            ),
+            primal=primal,
             dual_ineq=jnp.zeros(self.num_ineq_constraints()),
             dual_eq=jnp.zeros(self.num_eq_constraints()),
         )
@@ -276,10 +280,14 @@ def solve(
             1.0 + jnp.abs(objective_value)
         )
 
-        ineq_violations = jnp.maximum(lp.A_ineq @ average_state.primal - lp.b_ineq, 0.0)
+        ineq_violations = jnp.maximum(
+            lp.A_ineq @ average_state.primal - lp.b_ineq, 0.0
+        ) / (1.0 + jnp.abs(lp.b_ineq))
         max_ineq_violation = jnp.max(ineq_violations)
 
-        eq_violations = jnp.abs(lp.A_eq @ average_state.primal - lp.b_eq)
+        eq_violations = jnp.abs(lp.A_eq @ average_state.primal - lp.b_eq) / (
+            1.0 + jnp.abs(lp.b_eq)
+        )
         max_eq_violation = jnp.max(eq_violations)
 
         complentariy_slack = (

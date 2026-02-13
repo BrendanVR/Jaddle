@@ -164,7 +164,7 @@ def optimistic_adam_saddle(
     return optimiser
 
 
-def create_saddle_optimizer(
+def create_saddle_optimiser(
     primal_optimizer: optax.GradientTransformation,
     dual_optimizer: optax.GradientTransformation,
 ):
