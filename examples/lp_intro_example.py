@@ -5,7 +5,10 @@
 # %%
 import jax
 import numpy as np
+import optax
+import scipy.sparse as sp
 import jaddle.jaddle_linear as jl
+import jaddle.jaddle_optimisers as jo
 
 jax.config.update("jax_platform_name", "cpu")  # Using CPU for toy problem
 
@@ -18,13 +21,13 @@ jax.config.update("jax_platform_name", "cpu")  # Using CPU for toy problem
 
 c = np.array([3, 2])  # Objective coefficients
 
-A_eq = np.array([[0, 0]])  # No equality constraints
+A_eq = sp.csc_matrix([[0, 0]])  # No equality constraints
 b_eq = np.array([0])
 
-A_ineq = np.array([[-1, -1]])  # Inequality constraints
+A_ineq = sp.csc_matrix([[-1, -1]])  # Inequality constraints
 b_ineq = np.array([-4])  # x1 + x2 >= 4 in standard form
 
-lower_bounds = np.array([0, 0])  # Non-negativity constraints
+lower_bounds = np.array([0, 0])  # x >= 0
 upper_bounds = np.array([np.inf, np.inf])  # No upper bounds
 
 # %% [markdown]
@@ -41,7 +44,20 @@ lp = jl.LP(
 
 # %% [markdown]
 # ## Solving the LP Problem
-solution, _ = jl.solve(lp, dual_lr_scale_k=100.0, dual_lr_scale_min=0.01)
+lr_primal = optax.exponential_decay(
+    init_value=1e0,
+    transition_steps=1000,
+    decay_rate=0.9,
+    end_value=1e-5,
+)
+
+solution = jl.solve(
+    lp,
+    optimiser=jo.adamdelta_saddle(lr_primal),
+    iterations_per_epoch=10000,
+    max_epochs=5000,
+    verbose=True,
+)
 # %%
 print(f"x1 = {solution.primal[0]:.4f}, x2 = {solution.primal[1]:.4f}")
 print(f"Optimal objective value: {lp.objective(solution.primal):.4f}")
