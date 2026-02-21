@@ -2,6 +2,7 @@
 import jax
 import jax.numpy as jnp
 import jax.experimental.sparse as jsp
+import jax.scipy.linalg as jsla
 from optax.projections import projection_non_negative, projection_box
 import optax
 import numpy as np
@@ -78,18 +79,6 @@ class LP:
 
 
 # %%
-def project_to_equality_constraints(primal, lp: LP):
-    residual = lp.A_eq @ primal - lp.b_eq
-
-    def matvec(v):
-        return lp.A_eq @ (lp.A_eq.T @ v)
-
-    nu, _ = gmres(matvec, residual)
-    primal_projected = primal - lp.A_eq.T @ nu
-    return primal_projected
-
-
-# %%
 # Solvers for constrained linear optimisation via saddle point formulation
 def __sps(
     max_iter,
@@ -101,6 +90,7 @@ def __sps(
     initial_opt_state=None,
     weight_function=lambda _: 1.0,
     total_weight=0.0,
+    reg=1e-7,
 ):
 
     @jax.jit
@@ -113,7 +103,7 @@ def __sps(
             lp.c
             + lp.A_ineq_T @ state.dual_ineq
             + lp.A_eq_T @ state.dual_eq
-            # + 1e-8 * state.primal
+            + reg * state.primal
         )
         grad_dual_ineq = lp.b_ineq - lp.A_ineq @ state.primal
         grad_dual_eq = lp.b_eq - lp.A_eq @ state.primal
@@ -174,7 +164,7 @@ def __sps(
 
         (i, state, average_state, opt_state, total_weight), _ = jax.lax.scan(
             step,
-            (start_iter, state, average_state, opt_state, 0.0),
+            (start_iter, state, average_state, opt_state, total_weight),
             None,
             length=max_iter,
         )
@@ -207,46 +197,20 @@ def solve(
     lp: LP,
     optimiser,
     initial_solution=None,
-    iterations_per_epoch=int(1e3),
+    iterations_per_epoch=int(1e4),
     constraint_tolerance=1e-4,
     progress_tolerance=1e-4,
     complementarity_tolerance=1e-4,
-    max_epochs=1000,
+    max_epochs=100,
     verbose=False,
-    project_to_feasible=False,
-    use_double_precision=False,
-    initialize_to_feasible=False,
     weight_function=lambda _: 1.0,
+    reg=1e-7,
 ):
-
-    if use_double_precision:
-        jax.config.update("jax_enable_x64", True)
-        lp = __to_jaddle_sparse64(lp)
-    else:
-        jax.config.update("jax_enable_x64", False)
-        lp = __to_jaddle_sparse(lp)
-
     if initial_solution is not None:
         initial_solution = initial_solution
 
     if initial_solution is None:
         initial_solution = lp.initial_solution()
-
-    if initialize_to_feasible:
-        residual = lp.diff_eq_slack(initial_solution.primal)
-
-        def matvec(v):
-            return lp.A_eq @ (lp.A_eq.T @ v)
-
-        nu, _ = gmres(matvec, residual)
-        primal_projected = initial_solution.primal - lp.A_eq.T @ nu
-
-        # Update state with projected primal
-        initial_solution = SaddleState(
-            primal=primal_projected,
-            dual_ineq=initial_solution.dual_ineq,
-            dual_eq=initial_solution.dual_eq,
-        )
 
     lp_summary_statistics(lp)
 
@@ -302,6 +266,7 @@ def solve(
             opt_state,
             weight_function,
             total_weight,
+            reg,
         )
 
         objective_value = lp.objective(average_state.primal)
@@ -314,21 +279,13 @@ def solve(
         grad_dual_ineq = lp.A_ineq @ average_state.primal - lp.b_ineq
         grad_dual_eq = lp.A_eq @ average_state.primal - lp.b_eq
 
-        finite_lower = jnp.isfinite(lp.lower_bounds)
-        finite_upper = jnp.isfinite(lp.upper_bounds)
-
-        lower_active = finite_lower & (
-            average_state.primal <= (lp.lower_bounds + constraint_tolerance)
+        projected_primal = projection_box(
+            average_state.primal - grad_primal,
+            lp.lower_bounds,
+            lp.upper_bounds,
         )
-        upper_active = finite_upper & (
-            average_state.primal >= (lp.upper_bounds - constraint_tolerance)
-        )
-
-        dual_lower = jnp.where(lower_active, jnp.maximum(grad_primal, 0.0), 0.0)
-        dual_upper = jnp.where(upper_active, jnp.maximum(-grad_primal, 0.0), 0.0)
-
-        stationarity_residual = grad_primal - dual_lower + dual_upper
-        primal_grad_norm = jnp.max(jnp.abs(stationarity_residual))
+        projected_gradient_residual = average_state.primal - projected_primal
+        primal_grad_norm = jnp.max(jnp.abs(projected_gradient_residual))
 
         ineq_violations = jnp.maximum(grad_dual_ineq, 0.0)
         max_ineq_violation = jnp.max(ineq_violations)
@@ -336,41 +293,11 @@ def solve(
         eq_violations = jnp.abs(grad_dual_eq)
         max_eq_violation = jnp.max(eq_violations)
 
-        lower_violation = jnp.where(
-            finite_lower,
-            jnp.maximum(lp.lower_bounds - average_state.primal, 0.0),
-            0.0,
-        )
-        upper_violation = jnp.where(
-            finite_upper,
-            jnp.maximum(average_state.primal - lp.upper_bounds, 0.0),
-            0.0,
-        )
-        max_bound_violation = jnp.maximum(
-            jnp.max(lower_violation), jnp.max(upper_violation)
-        )
-
-        lower_slack = jnp.where(
-            finite_lower, average_state.primal - lp.lower_bounds, 0.0
-        )
-        upper_slack = jnp.where(
-            finite_upper, lp.upper_bounds - average_state.primal, 0.0
-        )
-        bound_complementarity_slack = jnp.maximum(
-            jnp.max(jnp.abs(dual_lower * lower_slack)),
-            jnp.max(jnp.abs(dual_upper * upper_slack)),
-        )
-
-        inequality_complementarity_slack = jnp.max(
+        complementarity_slack = jnp.max(
             jnp.abs(average_state.dual_ineq * grad_dual_ineq)
         )
-        complementarity_slack = jnp.maximum(
-            inequality_complementarity_slack, bound_complementarity_slack
-        )
 
-        constraint_bound = jnp.maximum(
-            jnp.maximum(max_ineq_violation, max_eq_violation), max_bound_violation
-        )
+        constraint_bound = jnp.maximum(max_ineq_violation, max_eq_violation)
         count += 1
 
         return (
@@ -434,13 +361,6 @@ def solve(
             total_weight,
         ) = loop_vars
 
-        if project_to_feasible:
-            average_state = SaddleState(
-                primal=project_to_equality_constraints(average_state.primal, lp),
-                dual_ineq=average_state.dual_ineq,
-                dual_eq=average_state.dual_eq,
-            )
-
         end_time = time.time()
         print(f"Time to solution: {end_time - start_time:.2f} seconds")
         return average_state
@@ -466,20 +386,13 @@ def solve(
                 f"Objective {objective_value:.2e}: Primal Grad Norm={primal_grad_norm:.2e}, Compl. Slack={complementarity_slack:.2e}, Constraint Bound={constraint_bound:.2e}"
             )
 
-        if project_to_feasible:
-            average_state = SaddleState(
-                primal=project_to_equality_constraints(average_state.primal, lp),
-                dual_ineq=average_state.dual_ineq,
-                dual_eq=average_state.dual_eq,
-            )
-
         end_time = time.time()
         print(f"Time to solution: {end_time - start_time:.2f} seconds")
         return average_state
 
 
 # %%
-def __to_jaddle_sparse(lp: LP):
+def to_jaddle_sparse(lp: LP):
     A_eq_sp = lp.A_eq.astype(np.float32)
     A_ineq_sp = lp.A_ineq.astype(np.float32)
 
@@ -498,7 +411,7 @@ def __to_jaddle_sparse(lp: LP):
     return lp_jax
 
 
-def __to_jaddle_sparse64(lp: LP):
+def to_jaddle_sparse64(lp: LP):
     A_eq_sp = lp.A_eq.astype(np.float64)
     A_ineq_sp = lp.A_ineq.astype(np.float64)
 
