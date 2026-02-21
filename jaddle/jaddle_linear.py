@@ -182,12 +182,13 @@ def solve(
     optimiser,
     initial_solution=None,
     iterations_per_epoch=int(1e3),
-    constraint_tolerance=1e-5,
-    progress_tolerance=1e-5,
-    complementarity_tolerance=1e-5,
+    constraint_tolerance=1e-4,
+    progress_tolerance=1e-4,
+    complementarity_tolerance=1e-4,
     exponential_weighting=0.01,
     max_epochs=1000,
     verbose=False,
+    project_to_feasible=False,
 ):
 
     lp = __to_jaddle_sparse(lp)
@@ -368,20 +369,21 @@ def solve(
             count,
         ) = loop_vars
 
-        residual = lp.diff_eq_slack(average_state.primal)
+        if project_to_feasible:
+            residual = lp.diff_eq_slack(average_state.primal)
 
-        def matvec(v):
-            return lp.A_eq @ (lp.A_eq.T @ v)
+            def matvec(v):
+                return lp.A_eq @ (lp.A_eq.T @ v)
 
-        nu, _ = gmres(matvec, residual)
-        primal_projected = average_state.primal - lp.A_eq.T @ nu
+            nu, _ = gmres(matvec, residual)
+            primal_projected = average_state.primal - lp.A_eq.T @ nu
 
-        # Update state with projected primal
-        average_state = SaddleState(
-            primal=primal_projected,
-            dual_ineq=average_state.dual_ineq,
-            dual_eq=average_state.dual_eq,
-        )
+            # Update state with projected primal
+            average_state = SaddleState(
+                primal=primal_projected,
+                dual_ineq=average_state.dual_ineq,
+                dual_eq=average_state.dual_eq,
+            )
 
         end_time = time.time()
         print(f"Time to solution: {end_time - start_time:.2f} seconds")
@@ -406,20 +408,21 @@ def solve(
                 f"Epoch {count}: Progress={progress:.2e}, Compl. Slack={complementarity_slack:.2e}, Constraint Bound={constraint_bound:.2e}"
             )
 
-        residual = lp.diff_eq_slack(average_state.primal)
+        if project_to_feasible:
+            residual = lp.diff_eq_slack(average_state.primal)
 
-        def matvec(v):
-            return lp.A_eq @ (lp.A_eq.T @ v)
+            def matvec(v):
+                return lp.A_eq @ (lp.A_eq.T @ v)
 
-        nu, _ = gmres(matvec, residual)
-        primal_projected = average_state.primal - lp.A_eq.T @ nu
+            nu, _ = gmres(matvec, residual)
+            primal_projected = average_state.primal - lp.A_eq.T @ nu
 
-        # Update state with projected primal
-        average_state = SaddleState(
-            primal=primal_projected,
-            dual_ineq=average_state.dual_ineq,
-            dual_eq=average_state.dual_eq,
-        )
+            # Update state with projected primal
+            average_state = SaddleState(
+                primal=primal_projected,
+                dual_ineq=average_state.dual_ineq,
+                dual_eq=average_state.dual_eq,
+            )
 
         end_time = time.time()
         print(f"Time to solution: {end_time - start_time:.2f} seconds")

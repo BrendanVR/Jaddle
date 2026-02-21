@@ -60,9 +60,10 @@ solution = jl.solve(
     optimiser=optimiser,
     iterations_per_epoch=10000,
     max_epochs=5000,
-    progress_tolerance=1e-3,
+    progress_tolerance=1e-4,
     complementarity_tolerance=1e-4,
     constraint_tolerance=1e-4,
+    project_to_feasible=True,
 )
 
 print("--------------------------------")
