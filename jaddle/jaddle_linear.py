@@ -189,15 +189,38 @@ def solve(
     max_epochs=1000,
     verbose=False,
     project_to_feasible=False,
+    use_double_precision=False,
+    initialize_to_feasible=False,
 ):
 
-    lp = __to_jaddle_sparse(lp)
+    if use_double_precision:
+        jax.config.update("jax_enable_x64", True)
+        lp = __to_jaddle_sparse64(lp)
+    else:
+        jax.config.update("jax_enable_x64", False)
+        lp = __to_jaddle_sparse(lp)
 
     if initial_solution is not None:
         initial_solution = initial_solution
 
     if initial_solution is None:
         initial_solution = lp.initial_solution()
+
+    if initialize_to_feasible:
+        residual = lp.diff_eq_slack(initial_solution.primal)
+
+        def matvec(v):
+            return lp.A_eq @ (lp.A_eq.T @ v)
+
+        nu, _ = gmres(matvec, residual)
+        primal_projected = initial_solution.primal - lp.A_eq.T @ nu
+
+        # Update state with projected primal
+        initial_solution = SaddleState(
+            primal=primal_projected,
+            dual_ineq=initial_solution.dual_ineq,
+            dual_eq=initial_solution.dual_eq,
+        )
 
     lp_summary_statistics(lp)
 
@@ -206,7 +229,7 @@ def solve(
     average_state = initial_solution
     opt_state = optimiser.init(initial_solution)
     previous_objective = jnp.inf
-    progress = jnp.inf
+    primal_grad_norm = jnp.inf
     complementarity_slack = jnp.inf
     constraint_bound = jnp.inf
     count = 0
@@ -218,14 +241,14 @@ def solve(
             average_state,
             opt_state,
             previous_objective,
-            progress,
+            primal_grad_norm,
             complementarity_slack,
             constraint_bound,
             count,
         ) = loop_vars
 
         return (
-            (progress > progress_tolerance)
+            (primal_grad_norm > progress_tolerance)
             | (complementarity_slack > complementarity_tolerance)
             | (constraint_bound > constraint_tolerance)
         ) & (count < max_epochs)
@@ -237,7 +260,7 @@ def solve(
             average_state,
             opt_state,
             previous_objective,
-            progress,
+            primal_grad_norm,
             complementarity_slack,
             constraint_bound,
             count,
@@ -281,7 +304,7 @@ def solve(
         dual_upper = jnp.where(upper_active, jnp.maximum(-grad_primal, 0.0), 0.0)
 
         stationarity_residual = grad_primal - dual_lower + dual_upper
-        progress = jnp.max(jnp.abs(stationarity_residual))
+        primal_grad_norm = jnp.max(jnp.abs(stationarity_residual))
 
         ineq_violations = jnp.maximum(grad_dual_ineq, 0.0)
         max_ineq_violation = jnp.max(ineq_violations)
@@ -332,7 +355,7 @@ def solve(
             average_state,
             opt_state,
             previous_objective,
-            progress,
+            primal_grad_norm,
             complementarity_slack,
             constraint_bound,
             count,
@@ -345,7 +368,7 @@ def solve(
         average_state,
         opt_state,
         previous_objective,
-        progress,
+        primal_grad_norm,
         complementarity_slack,
         constraint_bound,
         count,
@@ -363,7 +386,7 @@ def solve(
             average_state,
             opt_state,
             previous_objective,
-            progress,
+            primal_grad_norm,
             complementarity_slack,
             constraint_bound,
             count,
@@ -398,14 +421,14 @@ def solve(
                 average_state,
                 opt_state,
                 previous_objective,
-                progress,
+                primal_grad_norm,
                 complementarity_slack,
                 constraint_bound,
                 count,
             ) = loop_vars
 
             print(
-                f"Epoch {count}: Progress={progress:.2e}, Compl. Slack={complementarity_slack:.2e}, Constraint Bound={constraint_bound:.2e}"
+                f"Epoch {count}: Primal Grad Norm={primal_grad_norm:.2e}, Compl. Slack={complementarity_slack:.2e}, Constraint Bound={constraint_bound:.2e}"
             )
 
         if project_to_feasible:
@@ -443,8 +466,27 @@ def __to_jaddle_sparse(lp: LP):
         jnp.array(lp.b_eq, dtype=jnp.float32),
         A_ineq,
         jnp.array(lp.b_ineq, dtype=jnp.float32),
-        lp.lower_bounds,
-        lp.upper_bounds,
+        jnp.array(lp.lower_bounds, dtype=jnp.float32),
+        jnp.array(lp.upper_bounds, dtype=jnp.float32),
+    )
+    return lp_jax
+
+
+def __to_jaddle_sparse64(lp: LP):
+    A_eq_sp = lp.A_eq.astype(np.float64)
+    A_ineq_sp = lp.A_ineq.astype(np.float64)
+
+    A_eq = jsp.BCOO.from_scipy_sparse(A_eq_sp)
+    A_ineq = jsp.BCOO.from_scipy_sparse(A_ineq_sp)
+
+    lp_jax = LP(
+        jnp.array(lp.c, dtype=jnp.float64),
+        A_eq,
+        jnp.array(lp.b_eq, dtype=jnp.float64),
+        A_ineq,
+        jnp.array(lp.b_ineq, dtype=jnp.float64),
+        jnp.array(lp.lower_bounds, dtype=jnp.float64),
+        jnp.array(lp.upper_bounds, dtype=jnp.float64),
     )
     return lp_jax
 
