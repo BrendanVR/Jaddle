@@ -78,6 +78,18 @@ class LP:
 
 
 # %%
+def project_to_equality_constraints(primal, lp: LP):
+    residual = lp.A_eq @ primal - lp.b_eq
+
+    def matvec(v):
+        return lp.A_eq @ (lp.A_eq.T @ v)
+
+    nu, _ = gmres(matvec, residual)
+    primal_projected = primal - lp.A_eq.T @ nu
+    return primal_projected
+
+
+# %%
 # Solvers for constrained linear optimisation via saddle point formulation
 def __sps(
     max_iter,
@@ -87,7 +99,8 @@ def __sps(
     initial_solution,
     initial_avg_state=None,
     initial_opt_state=None,
-    exponential_weighting=0.01,
+    weight_function=lambda _: 1.0,
+    total_weight=0.0,
 ):
 
     @jax.jit
@@ -96,7 +109,12 @@ def __sps(
 
     @jax.jit
     def grad(state):
-        grad_primal = lp.c + lp.A_ineq_T @ state.dual_ineq + lp.A_eq_T @ state.dual_eq
+        grad_primal = (
+            lp.c
+            + lp.A_ineq_T @ state.dual_ineq
+            + lp.A_eq_T @ state.dual_eq
+            # + 1e-8 * state.primal
+        )
         grad_dual_ineq = lp.b_ineq - lp.A_ineq @ state.primal
         grad_dual_eq = lp.b_eq - lp.A_eq @ state.primal
         return SaddleState(
@@ -111,22 +129,25 @@ def __sps(
 
     @functools.partial(
         jax.jit,
-        static_argnames=(
-            "max_iter",
-            "exponential_weighting",
-        ),
+        static_argnames=("max_iter",),
     )
     def run_epoch(
         max_iter,
-        exponential_weighting,
         start_iter,
         state,
         average_state,
         opt_state,
+        total_weight=0.0,
     ):
         @jax.jit
         def step(carry, _):
-            i, state, average_state, opt_state = carry
+            (
+                i,
+                state,
+                average_state,
+                opt_state,
+                total_weight,
+            ) = carry
 
             gradient = grad(state)
             updates, opt_state = opt_update(gradient, opt_state, state)
@@ -137,29 +158,34 @@ def __sps(
                 dual_eq=state.dual_eq,
             )
 
+            total_weight += weight_function(i)
+
             average_state = optax.incremental_update(
-                state, average_state, exponential_weighting
+                state, average_state, weight_function(i) / total_weight
             )
 
-            return (i + 1, state, average_state, opt_state), None
+            return (
+                i + 1,
+                state,
+                average_state,
+                opt_state,
+                total_weight,
+            ), None
 
-        (i, state, average_state, opt_state), _ = jax.lax.scan(
+        (i, state, average_state, opt_state, total_weight), _ = jax.lax.scan(
             step,
-            (start_iter, state, average_state, opt_state),
+            (start_iter, state, average_state, opt_state, 0.0),
             None,
             length=max_iter,
         )
 
-        return i, state, average_state, opt_state
+        return i, state, average_state, opt_state, total_weight
 
     state = initial_solution
 
     if initial_avg_state is not None:
         average_state = initial_avg_state
     else:
-        # primal_average_state = jax.tree_util.tree_map(
-        #     lambda x: x.copy(), primal_initial_solution
-        # )
         average_state = initial_solution
 
     if initial_opt_state is not None:
@@ -169,11 +195,11 @@ def __sps(
 
     return run_epoch(
         max_iter,
-        exponential_weighting,
         start_iter,
         state,
         average_state,
         opt_state,
+        total_weight,
     )
 
 
@@ -185,12 +211,12 @@ def solve(
     constraint_tolerance=1e-4,
     progress_tolerance=1e-4,
     complementarity_tolerance=1e-4,
-    exponential_weighting=0.01,
     max_epochs=1000,
     verbose=False,
     project_to_feasible=False,
     use_double_precision=False,
     initialize_to_feasible=False,
+    weight_function=lambda _: 1.0,
 ):
 
     if use_double_precision:
@@ -224,16 +250,6 @@ def solve(
 
     lp_summary_statistics(lp)
 
-    i = 1
-    state = initial_solution
-    average_state = initial_solution
-    opt_state = optimiser.init(initial_solution)
-    previous_objective = jnp.inf
-    primal_grad_norm = jnp.inf
-    complementarity_slack = jnp.inf
-    constraint_bound = jnp.inf
-    count = 0
-
     def cond_fun(loop_vars):
         (
             i,
@@ -245,6 +261,8 @@ def solve(
             complementarity_slack,
             constraint_bound,
             count,
+            objective_value,
+            total_weight,
         ) = loop_vars
 
         return (
@@ -264,6 +282,8 @@ def solve(
             complementarity_slack,
             constraint_bound,
             count,
+            objective_value,
+            total_weight,
         ) = loop_vars
 
         (
@@ -271,6 +291,7 @@ def solve(
             state,
             average_state,
             opt_state,
+            total_weight,
         ) = __sps(
             iterations_per_epoch,
             i,
@@ -279,8 +300,11 @@ def solve(
             state,
             average_state,
             opt_state,
-            exponential_weighting,
+            weight_function,
+            total_weight,
         )
+
+        objective_value = lp.objective(average_state.primal)
 
         grad_primal = (
             lp.c
@@ -359,7 +383,21 @@ def solve(
             complementarity_slack,
             constraint_bound,
             count,
+            objective_value,
+            total_weight,
         )
+
+    i = 1
+    state = initial_solution
+    average_state = initial_solution
+    opt_state = optimiser.init(initial_solution)
+    previous_objective = jnp.inf
+    primal_grad_norm = jnp.inf
+    complementarity_slack = jnp.inf
+    constraint_bound = jnp.inf
+    objective_value = jnp.inf
+    count = 0
+    total_weight = 0.0
 
     # Initialize loop variables
     loop_vars = (
@@ -372,6 +410,8 @@ def solve(
         complementarity_slack,
         constraint_bound,
         count,
+        objective_value,
+        total_weight,
     )
 
     start_time = time.time()
@@ -390,20 +430,13 @@ def solve(
             complementarity_slack,
             constraint_bound,
             count,
+            objective_value,
+            total_weight,
         ) = loop_vars
 
         if project_to_feasible:
-            residual = lp.diff_eq_slack(average_state.primal)
-
-            def matvec(v):
-                return lp.A_eq @ (lp.A_eq.T @ v)
-
-            nu, _ = gmres(matvec, residual)
-            primal_projected = average_state.primal - lp.A_eq.T @ nu
-
-            # Update state with projected primal
             average_state = SaddleState(
-                primal=primal_projected,
+                primal=project_to_equality_constraints(average_state.primal, lp),
                 dual_ineq=average_state.dual_ineq,
                 dual_eq=average_state.dual_eq,
             )
@@ -425,24 +458,17 @@ def solve(
                 complementarity_slack,
                 constraint_bound,
                 count,
+                objective_value,
+                total_weight,
             ) = loop_vars
 
             print(
-                f"Epoch {count}: Primal Grad Norm={primal_grad_norm:.2e}, Compl. Slack={complementarity_slack:.2e}, Constraint Bound={constraint_bound:.2e}"
+                f"Objective {objective_value:.2e}: Primal Grad Norm={primal_grad_norm:.2e}, Compl. Slack={complementarity_slack:.2e}, Constraint Bound={constraint_bound:.2e}"
             )
 
         if project_to_feasible:
-            residual = lp.diff_eq_slack(average_state.primal)
-
-            def matvec(v):
-                return lp.A_eq @ (lp.A_eq.T @ v)
-
-            nu, _ = gmres(matvec, residual)
-            primal_projected = average_state.primal - lp.A_eq.T @ nu
-
-            # Update state with projected primal
             average_state = SaddleState(
-                primal=primal_projected,
+                primal=project_to_equality_constraints(average_state.primal, lp),
                 dual_ineq=average_state.dual_ineq,
                 dual_eq=average_state.dual_eq,
             )
