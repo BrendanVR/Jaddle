@@ -10,6 +10,7 @@ import os
 # Suppress INFO and WARNING logs from XLA/JAX
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
+import jax
 import jax.numpy as jnp
 import jaddle.jaddle_linear as jl
 import jaddle.jaddle_optimisers as jo
@@ -40,38 +41,29 @@ highs.readModel("/home/brendanvr/python/Jaddle/data/nug.mps")  # path to MPS fil
 highs_lp = highs.getLp()
 jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 
+
 # %% [markdown]
 # ## Solve the presolved LP using Jaddle's saddle point solver
-lr_primal = optax.exponential_decay(
+primal_lr = optax.exponential_decay(
     init_value=1e0,
-    transition_steps=5000,
+    transition_steps=1000,
     decay_rate=0.9,
     end_value=1e-4,
     staircase=True,
 )
 
 optimiser = jo.create_saddle_optimiser(
-    optax.optimistic_adam_v2(
-        lr_primal,
-        alpha=0.05,
-        beta=0.99,
-    ),
-    optax.optimistic_adam_v2(
-        1e0,
-        alpha=0.1,
-        beta=0.99,
-    ),
+    optax.optimistic_adam_v2(primal_lr, alpha=0.05),
+    dual_optimizer=optax.adadelta(learning_rate=1.0),
 )
 
-tol = 1e-3
+
 solution = jl.solve(
     lp=jaddle_lp,
     optimiser=optimiser,
-    progress_tolerance=tol,
-    constraint_tolerance=tol,
-    complementarity_tolerance=tol,
     verbose=True,
-    weight_function=lambda i: i,
+    weight_function=lambda i: jax.lax.select(i < int(5e4), 1e-16, 1.0),
+    max_epochs=int(1e6),
 )
 
 # %%
