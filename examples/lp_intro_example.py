@@ -41,6 +41,8 @@ lp = jl.LP(
     lower_bounds=lower_bounds,
     upper_bounds=upper_bounds,
 )
+lp = jl.to_jaddle_sparse(lp)  # Convert to Jaddle sparse format
+
 
 # %% [markdown]
 # ## Solving the LP Problem
@@ -55,7 +57,6 @@ solution = jl.solve(
     lp,
     optimiser=jo.adamdelta_saddle(lr_primal),
     iterations_per_epoch=10000,
-    max_epochs=5000,
     verbose=True,
 )
 # %%

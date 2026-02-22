@@ -7,6 +7,7 @@
 import jax
 import jax.numpy as jnp
 import jaddle.jaddle_convex as jc
+import jaddle.jaddle_optimisers as jo
 
 jax.config.update("jax_platform_name", "cpu")  # Using CPU for toy problem
 
@@ -58,12 +59,13 @@ cp = jc.CP(
 
 # %% [markdown]
 # ## Solving the Convex Problem
-solution, _ = jc.solve(cp)
+optimiser = jo.adamdelta_saddle(lr_primal=1e-3, lr_dual=1.0, alpha=5e-2, nesterov=True)
+
+solution = jc.solve(cp, optimiser=optimiser)
 
 # %% [markdown
 # ## Displaying the Solution
 print("Optimal Objective Value:", objective(solution.primal))
-print("Optimal Solution:", solution.primal)
 print(
     "Inequality Constraints (should be <= 0):",
     cp.ineq_slack(solution.primal),

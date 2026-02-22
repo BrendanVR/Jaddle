@@ -9,12 +9,13 @@ import numpy as np
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import jaddle.jaddle_convex as jc
+import jaddle.jaddle_optimisers as jo
 import optax
 
 # %% [markdown]
 # ## Generate Synthetic Data
 # We will create synthetic data that follows a cubic relationship with some added noise.
-n = 100
+n = 1000
 x = np.linspace(-1, 1, n)
 y = x**3
 y += 0.1 * np.random.randn(n)  # add noise
@@ -50,7 +51,11 @@ cp = jc.CP(
 
 # %% [markdown]
 # ## Solve the problem using Jaddle Convex SPS optimizer
-solution, _ = jc.solve(cp)
+optimiser = jo.create_saddle_optimiser(
+    primal_optimizer=optax.adadelta(learning_rate=1.0),
+    dual_optimizer=optax.adadelta(learning_rate=1.0),
+)
+solution = jc.solve(cp, optimiser=optimiser, primal_damping=1e-2)
 
 
 # %%

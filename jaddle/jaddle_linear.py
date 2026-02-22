@@ -2,15 +2,12 @@
 import jax
 import jax.numpy as jnp
 import jax.experimental.sparse as jsp
-import jax.scipy.linalg as jsla
 from optax.projections import projection_non_negative, projection_box
 import optax
 import numpy as np
-import scipy.sparse as sp
 import functools
 from typing import NamedTuple
 import time
-from jax.scipy.sparse.linalg import gmres
 
 
 class SaddleState(NamedTuple):
@@ -203,12 +200,6 @@ def solve(
     lp: LP,
     optimiser=None,
     max_epochs=100,
-    optimiser_builder=None,
-    lr_controller=None,
-    iterations_per_epoch_controller=None,
-    lr_state=None,
-    reset_opt_state_on_lr_change=False,
-    return_diagnostics=False,
     initial_solution=None,
     iterations_per_epoch=int(1e4),
     dual_damping_ineq=0.0,
@@ -220,27 +211,6 @@ def solve(
     weight_function=lambda _: 1.0,
     verbose=False,
 ):
-
-    if optimiser is not None and optimiser_builder is not None:
-        raise ValueError("Cannot specify both optimiser and optimiser_builder")
-
-    if optimiser is None and optimiser_builder is None:
-        raise ValueError("Must specify either optimiser or optimiser_builder")
-
-    if initial_solution is not None:
-        initial_solution = initial_solution
-
-    if initial_solution is None:
-        initial_solution = lp.initial_solution()
-
-    if lr_controller is not None and optimiser_builder is None:
-        raise ValueError("optimiser_builder must be provided when lr_controller is set")
-
-    if lr_controller is not None:
-        if lr_state is None:
-            lr_state = {}
-        optimiser = optimiser_builder(lr_state)
-
     lp_summary_statistics(lp)
 
     @jax.jit
@@ -361,6 +331,9 @@ def solve(
             total_weight,
         )
 
+    if initial_solution is None:
+        initial_solution = lp.initial_solution()
+
     i = 1
     state = initial_solution
     average_state = initial_solution
@@ -372,19 +345,6 @@ def solve(
     objective_value = jnp.inf
     count = 0
     total_weight = 0.0
-    dual_ineq_norm = jnp.inf
-    dual_eq_norm = jnp.inf
-    diagnostics = {
-        "objective_value": objective_value,
-        "primal_grad_norm": primal_grad_norm,
-        "complementarity_slack": complementarity_slack,
-        "constraint_bound": constraint_bound,
-        "dual_ineq_norm": dual_ineq_norm,
-        "dual_eq_norm": dual_eq_norm,
-        "count": count,
-        "iterations_per_epoch": iterations_per_epoch,
-    }
-    current_iterations_per_epoch = iterations_per_epoch
 
     # Initialize loop variables
     loop_vars = (
@@ -403,11 +363,7 @@ def solve(
 
     start_time = time.time()
     # Run the while loop
-    if (
-        lr_controller is None
-        and iterations_per_epoch_controller is None
-        and verbose == False
-    ):
+    if verbose == False:
 
         loop_vars = jax.lax.while_loop(cond_fun, body_fun, loop_vars)
 
@@ -430,18 +386,6 @@ def solve(
 
         end_time = time.time()
         print(f"Time to solution: {end_time - start_time:.2f} seconds")
-        if return_diagnostics:
-            diagnostics = {
-                "objective_value": objective_value,
-                "primal_grad_norm": primal_grad_norm,
-                "complementarity_slack": complementarity_slack,
-                "constraint_bound": constraint_bound,
-                "dual_ineq_norm": dual_ineq_norm,
-                "dual_eq_norm": dual_eq_norm,
-                "count": count,
-                "iterations_per_epoch": current_iterations_per_epoch,
-            }
-            return average_state, diagnostics
         return average_state
 
     else:
@@ -457,7 +401,7 @@ def solve(
                 opt_state,
                 total_weight,
             ) = __sps(
-                current_iterations_per_epoch,
+                iterations_per_epoch,
                 i,
                 lp,
                 optimiser,
@@ -479,63 +423,12 @@ def solve(
             ) = compute_epoch_metrics(average_state)
             count += 1
 
-            dual_ineq_norm = jnp.linalg.norm(average_state.dual_ineq)
-            dual_eq_norm = jnp.linalg.norm(average_state.dual_eq)
-
-            diagnostics = {
-                "objective_value": objective_value,
-                "primal_grad_norm": primal_grad_norm,
-                "complementarity_slack": complementarity_slack,
-                "constraint_bound": constraint_bound,
-                "dual_ineq_norm": dual_ineq_norm,
-                "dual_eq_norm": dual_eq_norm,
-                "count": count,
-                "iterations_per_epoch": current_iterations_per_epoch,
-            }
-
-            if lr_controller is not None:
-                controller_output = lr_controller(diagnostics, count, lr_state)
-                controller_reset_opt_state = reset_opt_state_on_lr_change
-                if controller_output is not None:
-                    if (
-                        isinstance(controller_output, tuple)
-                        and len(controller_output) == 2
-                    ):
-                        lr_state, controller_reset_opt_state = controller_output
-                    elif isinstance(controller_output, dict):
-                        lr_state = controller_output.get("lr_state", lr_state)
-                        controller_reset_opt_state = controller_output.get(
-                            "reset_opt_state", controller_reset_opt_state
-                        )
-                    else:
-                        lr_state = controller_output
-
-                optimiser = optimiser_builder(lr_state)
-                if controller_reset_opt_state:
-                    opt_state = optimiser.init(state)
-
-            if iterations_per_epoch_controller is not None:
-                next_iterations_per_epoch = iterations_per_epoch_controller(
-                    diagnostics,
-                    count,
-                    current_iterations_per_epoch,
-                )
-                if next_iterations_per_epoch is not None:
-                    current_iterations_per_epoch = max(
-                        int(next_iterations_per_epoch), 1
-                    )
-
-            if verbose:
-                print(
-                    f"Objective {objective_value:.2e}: Primal Grad Norm={primal_grad_norm:.2e}, Compl. Slack={complementarity_slack:.2e}, Constraint Bound={constraint_bound:.2e}"
-                )
+            print(
+                f"Objective {objective_value:.2e}: Primal Grad Norm={primal_grad_norm:.2e}, Compl. Slack={complementarity_slack:.2e}, Constraint Bound={constraint_bound:.2e}"
+            )
 
         end_time = time.time()
         print(f"Time to solution: {end_time - start_time:.2f} seconds")
-        if return_diagnostics:
-            if lr_controller is not None:
-                return average_state, diagnostics, lr_state
-            return average_state, diagnostics
         return average_state
 
 
@@ -555,25 +448,6 @@ def to_jaddle_sparse(lp: LP):
         jnp.array(lp.b_ineq, dtype=jnp.float32),
         jnp.array(lp.lower_bounds, dtype=jnp.float32),
         jnp.array(lp.upper_bounds, dtype=jnp.float32),
-    )
-    return lp_jax
-
-
-def to_jaddle_sparse64(lp: LP):
-    A_eq_sp = lp.A_eq.astype(np.float64)
-    A_ineq_sp = lp.A_ineq.astype(np.float64)
-
-    A_eq = jsp.BCOO.from_scipy_sparse(A_eq_sp)
-    A_ineq = jsp.BCOO.from_scipy_sparse(A_ineq_sp)
-
-    lp_jax = LP(
-        jnp.array(lp.c, dtype=jnp.float64),
-        A_eq,
-        jnp.array(lp.b_eq, dtype=jnp.float64),
-        A_ineq,
-        jnp.array(lp.b_ineq, dtype=jnp.float64),
-        jnp.array(lp.lower_bounds, dtype=jnp.float64),
-        jnp.array(lp.upper_bounds, dtype=jnp.float64),
     )
     return lp_jax
 
@@ -622,3 +496,31 @@ def lp_summary_statistics(lp: LP):
 
 
 # %%
+
+
+def project_onto_equality_constraints(
+    lp: LP, x: jnp.ndarray, num_iterations: int = 100, step_size: float = 0.1
+) -> jnp.ndarray:
+    """
+    Project a point onto the equality constraints of an LP using iterative projection.
+
+    Args:
+        lp: Linear program with equality constraints
+        x: Point to project
+        num_iterations: Number of projection iterations
+        step_size: Step size for each projection step
+
+    Returns:
+        Projected point satisfying A_eq @ x ≈ b_eq
+    """
+
+    def project_step(x_curr):
+        residual = lp.A_eq @ x_curr - lp.b_eq
+        gradient = lp.A_eq_T @ residual
+        return x_curr - step_size * gradient
+
+    x_proj = x
+    for _ in range(num_iterations):
+        x_proj = project_step(x_proj)
+
+    return x_proj
