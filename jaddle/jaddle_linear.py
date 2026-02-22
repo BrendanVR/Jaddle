@@ -252,6 +252,15 @@ def solve(
             constraint_bound,
         )
 
+    def check_convergence(
+        primal_grad_norm, complementarity_slack, constraint_bound, count
+    ):
+        return (
+            (primal_grad_norm > progress_tolerance)
+            | (complementarity_slack > complementarity_tolerance)
+            | (constraint_bound > constraint_tolerance)
+        ) & (count < max_epochs)
+
     def cond_fun(loop_vars):
         (
             i,
@@ -267,10 +276,8 @@ def solve(
             total_weight,
         ) = loop_vars
 
-        return (
-            (primal_grad_norm > progress_tolerance)
-            | (complementarity_slack > complementarity_tolerance)
-            | (constraint_bound > constraint_tolerance)
+        return check_convergence(
+            primal_grad_norm, complementarity_slack, constraint_bound, count
         ) & (count < max_epochs)
 
     def body_fun(loop_vars):
