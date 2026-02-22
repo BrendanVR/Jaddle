@@ -15,7 +15,7 @@ import optax
 # %% [markdown]
 # ## Generate Synthetic Data
 # We will create synthetic data that follows a cubic relationship with some added noise.
-n = 1000
+n = 500
 x = np.linspace(-1, 1, n)
 y = x**3
 y += 0.1 * np.random.randn(n)  # add noise
@@ -51,11 +51,20 @@ cp = jc.CP(
 
 # %% [markdown]
 # ## Solve the problem using Jaddle Convex SPS optimizer
-optimiser = jo.create_saddle_optimiser(
-    primal_optimizer=optax.adadelta(learning_rate=1.0),
-    dual_optimizer=optax.adadelta(learning_rate=1.0),
+primal_lr = optax.exponential_decay(
+    init_value=1e0,
+    transition_steps=1000,
+    decay_rate=0.9,
+    end_value=1e-5,
+    staircase=True,
 )
-solution = jc.solve(cp, optimiser=optimiser, primal_damping=1e-2)
+
+optimiser = jo.create_saddle_optimiser(
+    optax.optimistic_adam_v2(primal_lr, alpha=0.05),
+    optax.optimistic_adam_v2(primal_lr, alpha=0.05),
+)
+
+solution = jc.solve(cp, optimiser=optimiser, average=False)
 
 
 # %%

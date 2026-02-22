@@ -90,6 +90,7 @@ def __sps(
     primal_damping=0.0,
     dual_damping_ineq=0.0,
     dual_damping_eq=0.0,
+    average=True,
 ):
 
     @jax.jit
@@ -151,10 +152,18 @@ def __sps(
                 dual_eq=state.dual_eq,
             )
 
-            total_weight += weight_function(i)
+            total_weight = jax.lax.cond(
+                average,
+                lambda: total_weight + weight_function(i),
+                lambda: total_weight,
+            )
 
-            average_state = optax.incremental_update(
-                state, average_state, weight_function(i) / total_weight
+            average_state = jax.lax.cond(
+                average,
+                lambda: optax.incremental_update(
+                    state, average_state, weight_function(i) / total_weight
+                ),
+                lambda: average_state,
             )
 
             return (
@@ -210,6 +219,7 @@ def solve(
     complementarity_tolerance=1e-4,
     weight_function=lambda _: 1.0,
     verbose=False,
+    average=True,
 ):
     lp_summary_statistics(lp)
 
@@ -321,7 +331,12 @@ def solve(
             primal_grad_norm,
             complementarity_slack,
             constraint_bound,
-        ) = compute_epoch_metrics(average_state)
+        ) = jax.lax.cond(
+            average,
+            lambda: compute_epoch_metrics(average_state),
+            lambda: compute_epoch_metrics(state),
+        )
+
         count += 1
 
         return (
@@ -388,12 +403,13 @@ def solve(
             total_weight,
         ) = loop_vars
 
-        dual_ineq_norm = jnp.linalg.norm(average_state.dual_ineq)
-        dual_eq_norm = jnp.linalg.norm(average_state.dual_eq)
-
         end_time = time.time()
         print(f"Time to solution: {end_time - start_time:.2f} seconds")
-        return average_state
+
+        if average:
+            return average_state
+        else:
+            return state
 
     else:
         while (
@@ -427,7 +443,11 @@ def solve(
                 primal_grad_norm,
                 complementarity_slack,
                 constraint_bound,
-            ) = compute_epoch_metrics(average_state)
+            ) = jax.lax.cond(
+                average,
+                lambda: compute_epoch_metrics(average_state),
+                lambda: compute_epoch_metrics(state),
+            )
             count += 1
 
             print(
@@ -436,7 +456,10 @@ def solve(
 
         end_time = time.time()
         print(f"Time to solution: {end_time - start_time:.2f} seconds")
-        return average_state
+        if average:
+            return average_state
+        else:
+            return state
 
 
 # %%

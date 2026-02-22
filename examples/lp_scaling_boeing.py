@@ -19,17 +19,15 @@ jax.config.update(
     "jax_enable_x64", True
 )  # Use 64-bit precision for better numerical stability
 
-
 import jaddle.jaddle_linear as jl
 import jaddle.jaddle_optimisers as jo
 import jaddle.jaddle_linear_scalers as jls
 import jaddle.highs_helpers as hh
 import highspy as hspy
 import optax
-import numpy as np
 
 # %% [markdown]
-# ## Load and presolve the LP
+# ## Load the LP
 # We load a MIPLIB LP from an MPS file using the `highspy` library.
 highs = hspy.Highs()
 highs.readModel("/home/brendanvr/python/Jaddle/data/boeing.mps")  # path to MPS file
@@ -47,27 +45,26 @@ primal_lr = optax.exponential_decay(
     init_value=1e0,
     transition_steps=5000,
     decay_rate=0.9,
-    end_value=1e-3,
+    end_value=1e-5,
     staircase=True,
 )
 
 optimiser = jo.create_saddle_optimiser(
     optax.optimistic_adam_v2(primal_lr, alpha=0.05),
-    dual_optimizer=optax.adadelta(learning_rate=1.0),
+    optax.optimistic_adam_v2(primal_lr, alpha=0.05),
 )
 
-solution = jls.solve_scaled_lp(
-    lp=scaled_jaddle_lp,
+solution = jl.solve(
+    lp=scaled_jaddle_lp.lp,
     optimiser=optimiser,
-    verbose=True,
-    weight_function=lambda i: jax.lax.select(
-        i < int(1e5), 1e-16, 1.0
-    ),  # Tail averaging after the first 100k iterations to help with convergence
-    progress_tolerance=1e-2,
-    constraint_tolerance=1e-4,
-    complementarity_tolerance=1e-4,
-    max_epochs=1000,
+    average=False,
 )
+
+solution = jls.Scaled_Solution(
+    solution, scaled_jaddle_lp.row_scale, scaled_jaddle_lp.col_scale
+)
+
+solution = jls.unscale_solution(solution)
 
 # %%
 print("----------------------------------------------")
@@ -77,4 +74,3 @@ print(f"Primal Inequality Residual: {jaddle_lp.ineq_slack(solution.primal)}")
 print("----------------------------------------------")
 
 # %%
-``

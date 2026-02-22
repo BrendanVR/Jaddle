@@ -58,6 +58,7 @@ solution = jl.solve(
     optimiser=jo.adamdelta_saddle(lr_primal),
     iterations_per_epoch=10000,
     verbose=True,
+    average=False,
 )
 # %%
 print(f"x1 = {solution.primal[0]:.4f}, x2 = {solution.primal[1]:.4f}")

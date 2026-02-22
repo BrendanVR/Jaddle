@@ -62,8 +62,6 @@ class CP:
         )
 
 
-# %%
-# Solvers for constrained linear optimisation via saddle point formulation
 def __sps(
     max_iter,
     start_iter,
@@ -77,6 +75,7 @@ def __sps(
     primal_damping=0.0,
     dual_damping_ineq=0.0,
     dual_damping_eq=0.0,
+    average=True,
 ):
 
     @jax.jit
@@ -135,10 +134,18 @@ def __sps(
                 dual_eq=state.dual_eq,
             )
 
-            total_weight += weight_function(i)
+            total_weight = jax.lax.cond(
+                average,
+                lambda: total_weight + weight_function(i),
+                lambda: total_weight,
+            )
 
-            average_state = optax.incremental_update(
-                state, average_state, weight_function(i) / total_weight
+            average_state = jax.lax.cond(
+                average,
+                lambda: optax.incremental_update(
+                    state, average_state, weight_function(i) / total_weight
+                ),
+                lambda: average_state,
             )
 
             return (
@@ -184,12 +191,6 @@ def solve(
     cp: CP,
     optimiser=None,
     max_epochs=100,
-    optimiser_builder=None,
-    lr_controller=None,
-    iterations_per_epoch_controller=None,
-    lr_state=None,
-    reset_opt_state_on_lr_change=False,
-    return_diagnostics=False,
     initial_solution=None,
     iterations_per_epoch=int(1e4),
     dual_damping_ineq=0.0,
@@ -200,7 +201,9 @@ def solve(
     complementarity_tolerance=1e-4,
     weight_function=lambda _: 1.0,
     verbose=False,
+    average=True,
 ):
+
     @jax.jit
     def projection_primal(primal_state):
         return projection_box(primal_state, cp.lower_bounds, cp.upper_bounds)
@@ -222,32 +225,11 @@ def solve(
             dual_eq=gradient.dual_eq + dual_damping_eq * state.dual_eq,
         )
 
-    if optimiser is not None and optimiser_builder is not None:
-        raise ValueError("Cannot specify both optimiser and optimiser_builder")
-
-    if optimiser is None and optimiser_builder is None:
-        raise ValueError("Must specify either optimiser or optimiser_builder")
-
-    if initial_solution is not None:
-        initial_solution = initial_solution
-
-    if initial_solution is None:
-        initial_solution = cp.initial_solution()
-
-    if lr_controller is not None and optimiser_builder is None:
-        raise ValueError("optimiser_builder must be provided when lr_controller is set")
-
-    if lr_controller is not None:
-        if lr_state is None:
-            lr_state = {}
-        optimiser = optimiser_builder(lr_state)
-
     @jax.jit
     def compute_epoch_metrics(average_state):
         objective_value = cp.objective(average_state.primal)
 
         gradient = grad(average_state)
-
         grad_primal = gradient.primal
         grad_dual_ineq = gradient.dual_ineq
         grad_dual_eq = gradient.dual_eq
@@ -275,6 +257,15 @@ def solve(
             constraint_bound,
         )
 
+    def check_convergence(
+        primal_grad_norm, complementarity_slack, constraint_bound, count
+    ):
+        return (
+            (primal_grad_norm > progress_tolerance)
+            | (complementarity_slack > complementarity_tolerance)
+            | (constraint_bound > constraint_tolerance)
+        ) & (count < max_epochs)
+
     def cond_fun(loop_vars):
         (
             i,
@@ -290,10 +281,8 @@ def solve(
             total_weight,
         ) = loop_vars
 
-        return (
-            (primal_grad_norm > progress_tolerance)
-            | (complementarity_slack > complementarity_tolerance)
-            | (constraint_bound > constraint_tolerance)
+        return check_convergence(
+            primal_grad_norm, complementarity_slack, constraint_bound, count
         ) & (count < max_epochs)
 
     def body_fun(loop_vars):
@@ -337,7 +326,12 @@ def solve(
             primal_grad_norm,
             complementarity_slack,
             constraint_bound,
-        ) = compute_epoch_metrics(average_state)
+        ) = jax.lax.cond(
+            average,
+            lambda: compute_epoch_metrics(average_state),
+            lambda: compute_epoch_metrics(state),
+        )
+
         count += 1
 
         return (
@@ -354,6 +348,9 @@ def solve(
             total_weight,
         )
 
+    if initial_solution is None:
+        initial_solution = cp.initial_solution()
+
     i = 1
     state = initial_solution
     average_state = initial_solution
@@ -365,19 +362,6 @@ def solve(
     objective_value = jnp.inf
     count = 0
     total_weight = 0.0
-    dual_ineq_norm = jnp.inf
-    dual_eq_norm = jnp.inf
-    diagnostics = {
-        "objective_value": objective_value,
-        "primal_grad_norm": primal_grad_norm,
-        "complementarity_slack": complementarity_slack,
-        "constraint_bound": constraint_bound,
-        "dual_ineq_norm": dual_ineq_norm,
-        "dual_eq_norm": dual_eq_norm,
-        "count": count,
-        "iterations_per_epoch": iterations_per_epoch,
-    }
-    current_iterations_per_epoch = iterations_per_epoch
 
     # Initialize loop variables
     loop_vars = (
@@ -396,11 +380,7 @@ def solve(
 
     start_time = time.time()
     # Run the while loop
-    if (
-        lr_controller is None
-        and iterations_per_epoch_controller is None
-        and verbose == False
-    ):
+    if verbose == False:
 
         loop_vars = jax.lax.while_loop(cond_fun, body_fun, loop_vars)
 
@@ -418,24 +398,13 @@ def solve(
             total_weight,
         ) = loop_vars
 
-        dual_ineq_norm = jnp.linalg.norm(average_state.dual_ineq)
-        dual_eq_norm = jnp.linalg.norm(average_state.dual_eq)
-
         end_time = time.time()
         print(f"Time to solution: {end_time - start_time:.2f} seconds")
-        if return_diagnostics:
-            diagnostics = {
-                "objective_value": objective_value,
-                "primal_grad_norm": primal_grad_norm,
-                "complementarity_slack": complementarity_slack,
-                "constraint_bound": constraint_bound,
-                "dual_ineq_norm": dual_ineq_norm,
-                "dual_eq_norm": dual_eq_norm,
-                "count": count,
-                "iterations_per_epoch": current_iterations_per_epoch,
-            }
-            return average_state, diagnostics
-        return average_state
+
+        if average:
+            return average_state
+        else:
+            return state
 
     else:
         while (
@@ -450,7 +419,7 @@ def solve(
                 opt_state,
                 total_weight,
             ) = __sps(
-                current_iterations_per_epoch,
+                iterations_per_epoch,
                 i,
                 cp,
                 optimiser,
@@ -469,67 +438,23 @@ def solve(
                 primal_grad_norm,
                 complementarity_slack,
                 constraint_bound,
-            ) = compute_epoch_metrics(average_state)
+            ) = jax.lax.cond(
+                average,
+                lambda: compute_epoch_metrics(average_state),
+                lambda: compute_epoch_metrics(state),
+            )
             count += 1
 
-            dual_ineq_norm = jnp.linalg.norm(average_state.dual_ineq)
-            dual_eq_norm = jnp.linalg.norm(average_state.dual_eq)
-
-            diagnostics = {
-                "objective_value": objective_value,
-                "primal_grad_norm": primal_grad_norm,
-                "complementarity_slack": complementarity_slack,
-                "constraint_bound": constraint_bound,
-                "dual_ineq_norm": dual_ineq_norm,
-                "dual_eq_norm": dual_eq_norm,
-                "count": count,
-                "iterations_per_epoch": current_iterations_per_epoch,
-            }
-
-            if lr_controller is not None:
-                controller_output = lr_controller(diagnostics, count, lr_state)
-                controller_reset_opt_state = reset_opt_state_on_lr_change
-                if controller_output is not None:
-                    if (
-                        isinstance(controller_output, tuple)
-                        and len(controller_output) == 2
-                    ):
-                        lr_state, controller_reset_opt_state = controller_output
-                    elif isinstance(controller_output, dict):
-                        lr_state = controller_output.get("lr_state", lr_state)
-                        controller_reset_opt_state = controller_output.get(
-                            "reset_opt_state", controller_reset_opt_state
-                        )
-                    else:
-                        lr_state = controller_output
-
-                optimiser = optimiser_builder(lr_state)
-                if controller_reset_opt_state:
-                    opt_state = optimiser.init(state)
-
-            if iterations_per_epoch_controller is not None:
-                next_iterations_per_epoch = iterations_per_epoch_controller(
-                    diagnostics,
-                    count,
-                    current_iterations_per_epoch,
-                )
-                if next_iterations_per_epoch is not None:
-                    current_iterations_per_epoch = max(
-                        int(next_iterations_per_epoch), 1
-                    )
-
-            if verbose:
-                print(
-                    f"Objective {objective_value:.2e}: Primal Grad Norm={primal_grad_norm:.2e}, Compl. Slack={complementarity_slack:.2e}, Constraint Bound={constraint_bound:.2e}"
-                )
+            print(
+                f"Objective {objective_value:.2e}: Primal Grad Norm={primal_grad_norm:.2e}, Compl. Slack={complementarity_slack:.2e}, Constraint Bound={constraint_bound:.2e}"
+            )
 
         end_time = time.time()
         print(f"Time to solution: {end_time - start_time:.2f} seconds")
-        if return_diagnostics:
-            if lr_controller is not None:
-                return average_state, diagnostics, lr_state
-            return average_state, diagnostics
-        return average_state
+        if average:
+            return average_state
+        else:
+            return state
 
 
 # %%

@@ -25,41 +25,30 @@ highs.readModel("/home/brendanvr/python/Jaddle/data/nug.mps")  # path to MPS fil
 
 # %% [markdown]
 # We convert the LP to Jaddle's sparse format.
-highs.presolve()
-highs_lp = highs.getPresolvedLp()
+highs_lp = highs.getLp()
 jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
-scaled_jaddle_lp = jls.ruiz_scaling(
-    jaddle_lp
-).lp  # Apply Ruiz scaling to improve conditioning
-
+jaddle_lp = jls.pc_scaling(jaddle_lp).lp
 
 # %% [markdown]
 # ## Solve the presolved LP using Jaddle's saddle point solver
 primal_lr = optax.exponential_decay(
     init_value=1e0,
-    transition_steps=5000,
+    transition_steps=1000,
     decay_rate=0.9,
-    end_value=1e-3,
+    end_value=1e-5,
     staircase=True,
 )
 
 optimiser = jo.create_saddle_optimiser(
-    optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.scale_by_adadelta(),
-        optax.optimistic_adam_v2(primal_lr, alpha=0.05),
-    ),
-    dual_optimizer=optax.adadelta(learning_rate=1.0),
+    optax.optimistic_adam_v2(primal_lr, alpha=0.05),
+    optax.optimistic_adam_v2(primal_lr, alpha=0.05),
 )
 
 solution = jl.solve(
     max_epochs=1000,
-    verbose=True,
-    lp=scaled_jaddle_lp,
+    lp=jaddle_lp,
     optimiser=optimiser,
-    weight_function=lambda i: jax.lax.select(
-        i < int(1e5), 1e-16, 1.0
-    ),  # Tail averaging after the first 100k iterations to help with convergence
+    average=False,
 )
 
 # %%
