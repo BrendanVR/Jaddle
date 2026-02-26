@@ -6,60 +6,7 @@ import optax
 import functools
 from typing import NamedTuple
 import time
-
-
-class SaddleState(NamedTuple):
-    primal: jnp.ndarray
-    dual_ineq: jnp.ndarray
-    dual_eq: jnp.ndarray
-
-
-# %%
-# Basic Types
-class CP:
-    def __init__(
-        self,
-        num_variables,
-        objective,
-        constraints_eq,
-        constraints_ineq,
-        lower_bounds,
-        upper_bounds,
-    ):
-        self.num_variables = num_variables
-        self.objective = objective
-        self.constraints_eq = constraints_eq
-        self.constraints_ineq = constraints_ineq
-        self.lower_bounds = lower_bounds
-        self.upper_bounds = upper_bounds
-
-    def initial_primal_solution(self):
-        return jnp.zeros(self.num_variables)
-
-    def num_eq_constraints(self):
-        return len(self.constraints_eq(self.initial_primal_solution()))
-
-    def num_ineq_constraints(self):
-        return len(self.constraints_ineq(self.initial_primal_solution()))
-
-    def num_constraints(self):
-        return self.num_eq_constraints() + self.num_ineq_constraints()
-
-    def ineq_slack(self, x):
-        return jnp.max(jnp.maximum(self.constraints_ineq(x), 0.0))
-
-    def eq_slack(self, x):
-        return jnp.max(jnp.abs(self.constraints_eq(x)))
-
-    def complementarity_slack(self, x, dual_ineq):
-        return dual_ineq * (self.constraints_ineq(x))
-
-    def initial_solution(self):
-        return SaddleState(
-            primal=jnp.zeros(self.num_variables),
-            dual_ineq=jnp.zeros(self.num_ineq_constraints()),
-            dual_eq=jnp.zeros(self.num_eq_constraints()),
-        )
+from jaddle.jaddle_basic_types import CP, SaddleState
 
 
 def __sps(

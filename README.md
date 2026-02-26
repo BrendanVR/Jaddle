@@ -31,6 +31,25 @@ optimiser = jo.create_saddle_optimiser(
 
 ```
 
+You can also add static optimizer-side metric preconditioning without changing the LP matrices:
+
+```python
+import jax.numpy as jnp
+
+num_vars = jaddle_lp.num_variables()
+num_eq = jaddle_lp.num_eq_constraints()
+num_ineq = jaddle_lp.num_ineq_constraints()
+
+optimiser = jo.optimistic_adam_metric_saddle(
+    lr_primal=1e-2,
+    lr_dual_ineq=1e-2,
+    lr_dual_eq=1e-2,
+    primal_metric=jnp.ones(num_vars),
+    dual_ineq_metric=jnp.ones(num_ineq),
+    dual_eq_metric=jnp.ones(num_eq),
+)
+```
+
 ---
 
 ## 📊 Benchmarks

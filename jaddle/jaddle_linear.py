@@ -9,71 +9,8 @@ import functools
 from typing import NamedTuple
 import time
 from scipy import sparse as sp
-
-
-class SaddleState(NamedTuple):
-    primal: jnp.ndarray
-    dual_ineq: jnp.ndarray
-    dual_eq: jnp.ndarray
-
-
-# %%
-# Basic Types
-class LP:
-    def __init__(
-        self,
-        c,
-        A_eq,
-        b_eq,
-        A_ineq,
-        b_ineq,
-        lower_bounds,
-        upper_bounds,
-    ):
-        self.c = c
-        self.A_eq = A_eq
-        self.A_eq_T = self.A_eq.T
-        self.b_eq = b_eq
-        self.A_ineq = A_ineq
-        self.A_ineq_T = self.A_ineq.T
-        self.b_ineq = b_ineq
-        self.lower_bounds = lower_bounds
-        self.upper_bounds = upper_bounds
-
-    def objective(self, x):
-        return self.c @ x
-
-    def num_variables(self):
-        return len(self.c)
-
-    def num_eq_constraints(self):
-        return self.A_eq.shape[0]
-
-    def num_ineq_constraints(self):
-        return self.A_ineq.shape[0]
-
-    def num_constraints(self):
-        return self.A_eq.shape[0] + self.A_ineq.shape[0]
-
-    def ineq_slack(self, x):
-        return jnp.max(jnp.maximum(self.A_ineq @ x - self.b_ineq, 0.0))
-
-    def eq_slack(self, x):
-        return jnp.max(jnp.abs(self.A_eq @ x - self.b_eq))
-
-    def diff_eq_slack(self, x):
-        return self.A_eq @ x - self.b_eq
-
-    def complementarity_slack(self, x, dual_ineq):
-        return (dual_ineq * (self.A_ineq @ x - self.b_ineq)).sum()
-
-    def initial_solution(self):
-
-        return SaddleState(
-            primal=jnp.zeros(self.num_variables()),
-            dual_ineq=jnp.zeros(self.num_ineq_constraints()),
-            dual_eq=jnp.zeros(self.num_eq_constraints()),
-        )
+import jaddle.jaddle_optimisers as jo
+from jaddle.jaddle_basic_types import LP, SaddleState
 
 
 # %%
@@ -86,7 +23,7 @@ def __sps(
     initial_solution,
     initial_avg_state=None,
     initial_opt_state=None,
-    weight_function=lambda _: 1.0,
+    weight_function=lambda i: jax.lax.select(i <= int(5e4), 1e-16, 1.0),
     total_weight=0.0,
     primal_damping=0.0,
     dual_damping_ineq=0.0,
@@ -209,7 +146,7 @@ def __sps(
 def solve(
     lp: LP,
     optimiser=None,
-    max_epochs=100,
+    max_epochs=None,
     initial_solution=None,
     iterations_per_epoch=int(1e4),
     dual_damping_ineq=0.0,
@@ -218,7 +155,7 @@ def solve(
     progress_tolerance=1e-2,
     constraint_tolerance=1e-4,
     complementarity_tolerance=1e-4,
-    weight_function=lambda _: 1.0,
+    weight_function=lambda i: jax.lax.select(i <= int(5e4), 1e-16, 1.0),
     verbose=False,
     average=True,
     scale=None,
@@ -233,6 +170,33 @@ def solve(
 
     elif scale == "pc":
         lp, row_scale, col_scale = pc_scaling(lp)
+
+    elif scale == "ruiz+pc":
+        lp, row_scale_ruiz, col_scale_ruiz = ruiz_scaling(lp)
+        lp, row_scale_pc, col_scale_pc = pc_scaling(lp)
+
+        row_scale, col_scale = (
+            row_scale_ruiz * row_scale_pc,
+            col_scale_ruiz * col_scale_pc,
+        )
+
+    if optimiser is None:
+        lr = optax.exponential_decay(
+            init_value=1e0,
+            transition_steps=int(1e4),
+            decay_rate=0.99,
+            end_value=1e-4,
+        )
+        metrics = jo.compute_static_metrics(lp)
+        optimiser = jo.optimistic_adam_metric_saddle(
+            lr,
+            lr,
+            lr,
+            alpha=0.05,
+            primal_metric=metrics[0],
+            dual_ineq_metric=metrics[1],
+            dual_eq_metric=metrics[2],
+        )
 
     @jax.jit
     def compute_epoch_metrics(average_state):
@@ -262,7 +226,7 @@ def solve(
 
         complementarity_slack = jnp.max(
             jnp.abs(average_state.dual_ineq * grad_dual_ineq)
-        )
+        ) / (1.0 + jnp.abs(objective_value))
 
         constraint_bound = jnp.maximum(max_ineq_violation, max_eq_violation)
 
@@ -273,15 +237,31 @@ def solve(
             constraint_bound,
         )
 
-    def check_convergence(
-        primal_grad_norm, complementarity_slack, constraint_bound, count
-    ):
-        return (
-            (primal_grad_norm > progress_tolerance)
-            | (complementarity_slack > complementarity_tolerance)
-            | (constraint_bound > constraint_tolerance)
-        ) & (count < max_epochs)
+    if max_epochs:
 
+        @jax.jit
+        def check_convergence(
+            primal_grad_norm, complementarity_slack, constraint_bound, count
+        ):
+            return (
+                (primal_grad_norm > progress_tolerance)
+                | (complementarity_slack > complementarity_tolerance)
+                | (constraint_bound > constraint_tolerance)
+            ) & (count < max_epochs)
+
+    else:
+
+        @jax.jit
+        def check_convergence(
+            primal_grad_norm, complementarity_slack, constraint_bound, count
+        ):
+            return (
+                (primal_grad_norm > progress_tolerance)
+                | (complementarity_slack > complementarity_tolerance)
+                | (constraint_bound > constraint_tolerance)
+            )
+
+    @jax.jit
     def cond_fun(loop_vars):
         (
             i,
@@ -299,8 +279,9 @@ def solve(
 
         return check_convergence(
             primal_grad_norm, complementarity_slack, constraint_bound, count
-        ) & (count < max_epochs)
+        )
 
+    @jax.jit
     def body_fun(loop_vars):
         (
             i,
@@ -411,36 +392,15 @@ def solve(
             total_weight,
         ) = loop_vars
 
-        end_time = time.time()
-        print(f"Time to solution: {end_time - start_time:.2f} seconds")
-
         if average:
-            if scale in ["ruiz", "pc"]:
-                return SaddleState(
-                    primal=average_state.primal * col_scale,
-                    dual_ineq=average_state.dual_ineq
-                    * row_scale[len(average_state.dual_eq) :],
-                    dual_eq=average_state.dual_eq
-                    * row_scale[: len(average_state.dual_eq)],
-                )
-            else:
-                return average_state
+            output = average_state
         else:
-            if scale in ["ruiz", "pc"]:
-                return SaddleState(
-                    primal=state.primal * col_scale,
-                    dual_ineq=state.dual_ineq * row_scale[len(state.dual_eq) :],
-                    dual_eq=state.dual_eq * row_scale[: len(state.dual_eq)],
-                )
-            else:
-                return state
+            output = state
 
     else:
-        while (
-            (primal_grad_norm > progress_tolerance)
-            | (complementarity_slack > complementarity_tolerance)
-            | (constraint_bound > constraint_tolerance)
-        ) & (count < max_epochs):
+        while check_convergence(
+            primal_grad_norm, complementarity_slack, constraint_bound, count
+        ):
             (
                 i,
                 state,
@@ -478,28 +438,37 @@ def solve(
                 f"Objective {objective_value:.2e}: Primal Grad Norm={primal_grad_norm:.2e}, Compl. Slack={complementarity_slack:.2e}, Constraint Bound={constraint_bound:.2e}"
             )
 
-        end_time = time.time()
-        print(f"Time to solution: {end_time - start_time:.2f} seconds")
         if average:
-            if scale in ["ruiz", "pc"]:
-                return SaddleState(
-                    primal=average_state.primal * col_scale,
-                    dual_ineq=average_state.dual_ineq
-                    * row_scale[len(average_state.dual_eq) :],
-                    dual_eq=average_state.dual_eq
-                    * row_scale[: len(average_state.dual_eq)],
-                )
-            else:
-                return average_state
+            output = average_state
         else:
-            if scale in ["ruiz", "pc"]:
-                return SaddleState(
-                    primal=state.primal * col_scale,
-                    dual_ineq=state.dual_ineq * row_scale[len(state.dual_eq) :],
-                    dual_eq=state.dual_eq * row_scale[: len(state.dual_eq)],
-                )
-            else:
-                return state
+            output = state
+
+    output = jax.block_until_ready(output)
+    end_time = time.time()
+    print(f"Time to solution: {end_time - start_time:.2f} seconds")
+    print("----------------------------------------------")
+    print(f"Objective: {lp.objective(output.primal):.2e}")
+    print("----------------------------------------------")
+
+    if scale in ["ruiz", "pc", "ruiz+pc"]:
+        output = SaddleState(
+            primal=state.primal * col_scale,
+            dual_ineq=state.dual_ineq * row_scale[len(state.dual_eq) :],
+            dual_eq=state.dual_eq * row_scale[: len(state.dual_eq)],
+        )
+
+        return output
+
+    output = jax.block_until_ready(output)
+    end_time = time.time()
+    print(f"Time to solution: {end_time - start_time:.2f} seconds")
+    print("----------------------------------------------")
+    print(f"Primal objective value: {lp.objective(output.primal)}")
+    print(f"Primal Equality Residual: {lp.eq_slack(output.primal)}")
+    print(f"Primal Inequality Residual: {lp.ineq_slack(output.primal)}")
+    print("----------------------------------------------")
+
+    return output
 
 
 # %%
@@ -553,7 +522,8 @@ def lp_summary_statistics(lp: LP):
     max_c = np.max(lp.c)
 
     print("--------------------------------")
-    print("LP Summary Statistics:")
+    print("LP Summary Statistics")
+    print("--------------------------------")
     print(f"Number of variables: {num_vars}")
     print(f"Number of equality constraints: {num_eq}")
     print(f"Number of inequality constraints: {num_ineq}")
@@ -742,3 +712,6 @@ def pc_scaling(lp: LP, max_iter=1, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
     lp_scaled = to_jaddle_sparse(lp_scaled)
 
     return lp_scaled, row_scale, col_scale
+
+
+# %%

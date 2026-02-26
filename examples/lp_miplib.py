@@ -2,7 +2,6 @@
 # # Solve a MIPLIB LP using Jaddle Saddle Point Optimisation
 # This example demonstrates how to load and solve a MIPLIB linear program (LP) using saddle point optimisation methods implemented in Jaddle.
 # We will use the `highspy` library to load a MIPLIB LP from an MPS file.
-
 # %%
 import os
 
@@ -29,25 +28,10 @@ jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 
 # %% [markdown]
 # ## Solve the presolved LP using Jaddle's saddle point solver
-primal_lr = optax.exponential_decay(
-    init_value=1e0,
-    transition_steps=1000,
-    decay_rate=0.9,
-    end_value=1e-5,
-    staircase=True,
-)
-
-optimiser = jo.create_saddle_optimiser(
-    optax.optimistic_adam_v2(primal_lr, alpha=0.05),
-    optax.optimistic_adam_v2(primal_lr, alpha=0.05),
-)
-
 solution = jl.solve(
-    max_epochs=1000,
     lp=jaddle_lp,
-    optimiser=optimiser,
-    average=False,
-    scale="ruiz",
+    average=True,
+    verbose=True,
 )
 
 # %%
