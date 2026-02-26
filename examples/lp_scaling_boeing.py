@@ -58,15 +58,8 @@ solution = jl.solve(
     optimiser=optimiser,
     average=False,
     scale="pc",
-    # verbose=True,
+    verbose=True,
 )
-
-start = time.time()
-jax.block_until_ready(solution.primal)
-end = time.time()
-
-print(f"Execution time: {end - start:.4f} seconds")
-
 
 # %%
 print("----------------------------------------------")
