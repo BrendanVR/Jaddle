@@ -8,6 +8,7 @@ import numpy as np
 import functools
 from typing import NamedTuple
 import time
+from scipy import sparse as sp
 
 
 class SaddleState(NamedTuple):
@@ -220,8 +221,18 @@ def solve(
     weight_function=lambda _: 1.0,
     verbose=False,
     average=True,
+    scale=None,
 ):
     lp_summary_statistics(lp)
+
+    if initial_solution is None:
+        initial_solution = lp.initial_solution()
+
+    if scale == "ruiz":
+        lp, row_scale, col_scale = ruiz_scaling(lp)
+
+    elif scale == "pc":
+        lp, row_scale, col_scale = pc_scaling(lp)
 
     @jax.jit
     def compute_epoch_metrics(average_state):
@@ -353,9 +364,6 @@ def solve(
             total_weight,
         )
 
-    if initial_solution is None:
-        initial_solution = lp.initial_solution()
-
     i = 1
     state = initial_solution
     average_state = initial_solution
@@ -407,9 +415,25 @@ def solve(
         print(f"Time to solution: {end_time - start_time:.2f} seconds")
 
         if average:
-            return average_state
+            if scale in ["ruiz", "pc"]:
+                return SaddleState(
+                    primal=average_state.primal * col_scale,
+                    dual_ineq=average_state.dual_ineq
+                    * row_scale[len(average_state.dual_eq) :],
+                    dual_eq=average_state.dual_eq
+                    * row_scale[: len(average_state.dual_eq)],
+                )
+            else:
+                return average_state
         else:
-            return state
+            if scale in ["ruiz", "pc"]:
+                return SaddleState(
+                    primal=state.primal * col_scale,
+                    dual_ineq=state.dual_ineq * row_scale[len(state.dual_eq) :],
+                    dual_eq=state.dual_eq * row_scale[: len(state.dual_eq)],
+                )
+            else:
+                return state
 
     else:
         while (
@@ -457,9 +481,25 @@ def solve(
         end_time = time.time()
         print(f"Time to solution: {end_time - start_time:.2f} seconds")
         if average:
-            return average_state
+            if scale in ["ruiz", "pc"]:
+                return SaddleState(
+                    primal=average_state.primal * col_scale,
+                    dual_ineq=average_state.dual_ineq
+                    * row_scale[len(average_state.dual_eq) :],
+                    dual_eq=average_state.dual_eq
+                    * row_scale[: len(average_state.dual_eq)],
+                )
+            else:
+                return average_state
         else:
-            return state
+            if scale in ["ruiz", "pc"]:
+                return SaddleState(
+                    primal=state.primal * col_scale,
+                    dual_ineq=state.dual_ineq * row_scale[len(state.dual_eq) :],
+                    dual_eq=state.dual_eq * row_scale[: len(state.dual_eq)],
+                )
+            else:
+                return state
 
 
 # %%
@@ -554,3 +594,151 @@ def project_onto_equality_constraints(
         x_proj = project_step(x_proj)
 
     return x_proj
+
+
+def __convert_to_scipy(jsp_mat: jsp.BCOO) -> sp.csc_matrix:
+    data = np.array(jsp_mat.data)
+    indices = np.array(jsp_mat.indices)
+    row, col = indices[:, 0], indices[:, 1]
+
+    return sp.csc_matrix((data, (row, col)), shape=jsp_mat.shape)
+
+
+def ruiz_scaling(lp: LP, max_iter=10, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
+    """
+    Applies Ruiz scaling to an LP in standard form with sparse matrices:
+        min c^T x
+        s.t. A_eq x = b_eq
+             A_ineq x <= b_ineq
+             lower_bounds <= x <= upper_bounds
+    Returns scaled LP, row_scaling, col_scaling
+    """
+
+    # Stack all constraint matrices for scaling
+    A_eq = __convert_to_scipy(lp.A_eq)
+    A_ineq = __convert_to_scipy(lp.A_ineq)
+    A = sp.vstack([A_eq, A_ineq]).tocsc()
+    m, n = A.shape
+    row_scale = np.ones(m)
+    col_scale = np.ones(n)
+    c_scaled = lp.c.copy()
+    b_scaled = np.concatenate([lp.b_eq, lp.b_ineq])
+    lower_bounds = lp.lower_bounds.copy()
+    upper_bounds = lp.upper_bounds.copy()
+
+    A_scaled = A.copy()
+
+    for _ in range(max_iter):
+        # Row norms (infinity norm)
+        row_norms = np.abs(A_scaled).max(axis=1).todense().A.flatten()
+        row_norms = np.maximum(row_norms, np.abs(b_scaled * row_scale))
+        row_norms = np.where(row_norms <= threshold, 1.0, row_norms)
+        row_s = 1.0 / np.sqrt(row_norms)
+        row_s = np.clip(row_s, clip_bounds[0], clip_bounds[1])
+        # Scale rows
+        A_scaled = sp.diags(row_s) @ A_scaled
+        row_scale *= row_s
+
+        # Column norms (infinity norm)
+        col_norms = np.abs(A_scaled).max(axis=0).todense().A.flatten()
+        col_norms = np.where(col_norms <= 1e-8, 1.0, col_norms)
+        col_s = 1.0 / np.sqrt(col_norms)
+        col_s = np.clip(col_s, 1e-6, 1e6)
+        # Scale columns
+        A_scaled = A_scaled @ sp.diags(col_s)
+        col_scale *= col_s
+
+    # Split back A_eq and A_ineq, b_eq and b_ineq
+    A_eq_scaled = A_scaled[: lp.A_eq.shape[0], :]
+    A_ineq_scaled = A_scaled[lp.A_eq.shape[0] :, :]
+    c_scaled = c_scaled * col_scale
+    b_scaled = b_scaled * row_scale
+
+    b_eq_scaled = b_scaled[: lp.A_eq.shape[0]]
+    b_ineq_scaled = b_scaled[lp.A_eq.shape[0] :]
+    lower_bounds_scaled = lower_bounds / col_scale
+    upper_bounds_scaled = upper_bounds / col_scale
+
+    lp_scaled = LP(
+        c_scaled,
+        A_eq_scaled,
+        b_eq_scaled,
+        A_ineq_scaled,
+        b_ineq_scaled,
+        lower_bounds_scaled,
+        upper_bounds_scaled,
+    )
+
+    lp_scaled = to_jaddle_sparse(lp_scaled)
+
+    return lp_scaled, row_scale, col_scale
+
+
+def pc_scaling(lp: LP, max_iter=1, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
+    """
+    Applies PC scaling to an LP in standard form with sparse matrices:
+        min c^T x
+        s.t. A_eq x = b_eq
+                A_ineq x <= b_ineq
+                lower_bounds <= x <= upper_bounds
+    Returns scaled LP, row_scaling, col_scaling
+    """
+
+    # Stack all constraint matrices for scaling
+    A_eq = __convert_to_scipy(lp.A_eq)
+    A_ineq = __convert_to_scipy(lp.A_ineq)
+    A = sp.vstack([A_eq, A_ineq]).tocsc()
+    m, n = A.shape
+    row_scale = np.ones(m)
+    col_scale = np.ones(n)
+    c_scaled = lp.c.copy()
+    b_scaled = np.concatenate([lp.b_eq, lp.b_ineq])
+    lower_bounds = lp.lower_bounds.copy()
+    upper_bounds = lp.upper_bounds.copy()
+
+    A_scaled = A.copy()
+
+    for _ in range(max_iter):
+        # Row norms (1-norm)
+        row_norms = np.abs(A_scaled).sum(axis=1).A.flatten()
+        row_norms = np.maximum(row_norms, np.abs(b_scaled * row_scale))
+        row_norms = np.where(row_norms <= threshold, 1.0, row_norms)
+        row_s = 1.0 / np.sqrt(row_norms)
+        row_s = np.clip(row_s, clip_bounds[0], clip_bounds[1])
+        # Scale rows
+        A_scaled = sp.diags(row_s) @ A_scaled
+        row_scale *= row_s
+
+        # Column norms (1-norm)
+        col_norms = np.abs(A_scaled).sum(axis=0).A.flatten()
+        col_norms = np.where(col_norms <= threshold, 1.0, col_norms)
+        col_s = 1.0 / np.sqrt(col_norms)
+        col_s = np.clip(col_s, clip_bounds[0], clip_bounds[1])
+        # Scale columns
+        A_scaled = A_scaled @ sp.diags(col_s)
+        col_scale *= col_s
+
+    # Split back A_eq and A_ineq, b_eq and b_ineq
+    A_eq_scaled = A_scaled[: lp.A_eq.shape[0], :]
+    A_ineq_scaled = A_scaled[lp.A_eq.shape[0] :, :]
+    c_scaled = c_scaled * col_scale
+    b_scaled = b_scaled * row_scale
+
+    b_eq_scaled = b_scaled[: lp.A_eq.shape[0]]
+    b_ineq_scaled = b_scaled[lp.A_eq.shape[0] :]
+    lower_bounds_scaled = lower_bounds / col_scale
+    upper_bounds_scaled = upper_bounds / col_scale
+
+    lp_scaled = LP(
+        c_scaled,
+        A_eq_scaled,
+        b_eq_scaled,
+        A_ineq_scaled,
+        b_ineq_scaled,
+        lower_bounds_scaled,
+        upper_bounds_scaled,
+    )
+
+    lp_scaled = to_jaddle_sparse(lp_scaled)
+
+    return lp_scaled, row_scale, col_scale

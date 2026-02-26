@@ -18,13 +18,14 @@ jax.config.update(
 jax.config.update(
     "jax_enable_x64", True
 )  # Use 64-bit precision for better numerical stability
+# jax.config.update("jax_disable_jit", True)
 
 import jaddle.jaddle_linear as jl
 import jaddle.jaddle_optimisers as jo
-import jaddle.jaddle_linear_scalers as jls
 import jaddle.highs_helpers as hh
 import highspy as hspy
 import optax
+import time
 
 # %% [markdown]
 # ## Load the LP
@@ -36,8 +37,6 @@ highs.readModel("/home/brendanvr/python/Jaddle/data/boeing.mps")  # path to MPS 
 # We convert the LP to Jaddle's sparse format, before applying ruiz scaling.
 highs_lp = highs.getLp()
 jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
-scaled_jaddle_lp = jls.ruiz_scaling(jaddle_lp)
-
 
 # %% [markdown]
 # ## Solve the presolved LP using Jaddle's saddle point solver
@@ -55,16 +54,19 @@ optimiser = jo.create_saddle_optimiser(
 )
 
 solution = jl.solve(
-    lp=scaled_jaddle_lp.lp,
+    lp=jaddle_lp,
     optimiser=optimiser,
     average=False,
+    scale="pc",
+    # verbose=True,
 )
 
-solution = jls.Scaled_Solution(
-    solution, scaled_jaddle_lp.row_scale, scaled_jaddle_lp.col_scale
-)
+start = time.time()
+jax.block_until_ready(solution.primal)
+end = time.time()
 
-solution = jls.unscale_solution(solution)
+print(f"Execution time: {end - start:.4f} seconds")
+
 
 # %%
 print("----------------------------------------------")

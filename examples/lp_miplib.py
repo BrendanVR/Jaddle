@@ -11,7 +11,6 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 import jax
 import jaddle.jaddle_linear as jl
-import jaddle.jaddle_linear_scalers as jls
 import jaddle.jaddle_optimisers as jo
 import jaddle.highs_helpers as hh
 import highspy as hspy
@@ -27,7 +26,6 @@ highs.readModel("/home/brendanvr/python/Jaddle/data/nug.mps")  # path to MPS fil
 # We convert the LP to Jaddle's sparse format.
 highs_lp = highs.getLp()
 jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
-jaddle_lp = jls.pc_scaling(jaddle_lp).lp
 
 # %% [markdown]
 # ## Solve the presolved LP using Jaddle's saddle point solver
@@ -49,6 +47,7 @@ solution = jl.solve(
     lp=jaddle_lp,
     optimiser=optimiser,
     average=False,
+    scale="ruiz",
 )
 
 # %%
