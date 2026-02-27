@@ -393,9 +393,11 @@ def hedge_ensemble_saddle(
         primal_updates_stacked = jnp.stack(primal_step_updates, axis=0)
         primal_losses = jnp.stack(primal_losses, axis=0)
         primal_weights = jax.nn.softmax(state.primal.log_weights)
-        primal_key = jax.random.fold_in(jax.random.PRNGKey(0), state.step)
-        expert_index = jax.random.choice(primal_key, primal_count, p=primal_weights)
-        mixed_primal_update = primal_step_updates[expert_index]
+        mixed_primal_update = jnp.tensordot(
+            primal_weights,
+            primal_updates_stacked,
+            axes=(0, 0),
+        )
 
         dual_step_updates_ineq = []
         dual_step_updates_eq = []
