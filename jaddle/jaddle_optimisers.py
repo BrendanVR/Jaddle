@@ -2,6 +2,21 @@ import optax
 import jax
 import jax.numpy as jnp
 import jaddle.jaddle_basic_types as jt
+from typing import Any, Callable, NamedTuple, Sequence, Union
+
+
+ScheduleLike = Union[float, Callable[[jnp.ndarray], jnp.ndarray]]
+
+
+class HedgePoolState(NamedTuple):
+    expert_states: tuple
+    log_weights: jnp.ndarray
+
+
+class HedgeSaddleState(NamedTuple):
+    primal: HedgePoolState
+    dual: HedgePoolState
+    step: jnp.ndarray
 
 
 def _saddle_param_labels(params):
@@ -307,3 +322,147 @@ def optimistic_adam_metric_saddle(
     )
 
     return create_saddle_optimiser(primal_optimiser, dual_optimiser)
+
+
+def _resolve_schedule(schedule: ScheduleLike, step: jnp.ndarray) -> jnp.ndarray:
+    if callable(schedule):
+        return jnp.asarray(schedule(step), dtype=jnp.float32)
+    return jnp.asarray(schedule, dtype=jnp.float32)
+
+
+def _normalise_log_weights(log_weights: jnp.ndarray) -> jnp.ndarray:
+    return log_weights - jax.nn.logsumexp(log_weights)
+
+
+def hedge_ensemble_saddle(
+    primal_experts: Sequence[optax.GradientTransformation],
+    dual_experts: Sequence[optax.GradientTransformation],
+    primal_eta: ScheduleLike = 5e-2,
+    dual_eta: ScheduleLike = 5e-2,
+    loss_clip: float = 1e2,
+):
+    if len(primal_experts) == 0:
+        raise ValueError("primal_experts must contain at least one optimiser")
+    if len(dual_experts) == 0:
+        raise ValueError("dual_experts must contain at least one optimiser")
+
+    primal_count = len(primal_experts)
+    dual_count = len(dual_experts)
+
+    init_primal_log_weights = _normalise_log_weights(
+        jnp.zeros((primal_count,), dtype=jnp.float32)
+    )
+    init_dual_log_weights = _normalise_log_weights(
+        jnp.zeros((dual_count,), dtype=jnp.float32)
+    )
+
+    def init_fn(params: jt.SaddleState) -> HedgeSaddleState:
+        primal_states = tuple(opt.init(params.primal) for opt in primal_experts)
+        dual_params = (params.dual_ineq, params.dual_eq)
+        dual_states = tuple(opt.init(dual_params) for opt in dual_experts)
+
+        return HedgeSaddleState(
+            primal=HedgePoolState(primal_states, init_primal_log_weights),
+            dual=HedgePoolState(dual_states, init_dual_log_weights),
+            step=jnp.array(0, dtype=jnp.int32),
+        )
+
+    def update_fn(
+        updates: jt.SaddleState,
+        state: HedgeSaddleState,
+        params: jt.SaddleState,
+    ):
+        grad_primal = updates.primal
+        grad_dual_ineq = updates.dual_ineq
+        grad_dual_eq = updates.dual_eq
+
+        primal_step_updates = []
+        primal_next_states = []
+        primal_losses = []
+
+        for expert_index, expert in enumerate(primal_experts):
+            expert_update, expert_state = expert.update(
+                grad_primal,
+                state.primal.expert_states[expert_index],
+                params.primal,
+            )
+            primal_step_updates.append(expert_update)
+            primal_next_states.append(expert_state)
+            primal_losses.append(jnp.vdot(grad_primal, expert_update).real)
+
+        primal_updates_stacked = jnp.stack(primal_step_updates, axis=0)
+        primal_losses = jnp.stack(primal_losses, axis=0)
+        primal_weights = jax.nn.softmax(state.primal.log_weights)
+        primal_key = jax.random.fold_in(jax.random.PRNGKey(0), state.step)
+        expert_index = jax.random.choice(primal_key, primal_count, p=primal_weights)
+        mixed_primal_update = primal_step_updates[expert_index]
+
+        dual_step_updates_ineq = []
+        dual_step_updates_eq = []
+        dual_next_states = []
+        dual_losses = []
+
+        grad_dual = (grad_dual_ineq, grad_dual_eq)
+        params_dual = (params.dual_ineq, params.dual_eq)
+
+        for expert_index, expert in enumerate(dual_experts):
+            expert_update, expert_state = expert.update(
+                grad_dual,
+                state.dual.expert_states[expert_index],
+                params_dual,
+            )
+            update_dual_ineq, update_dual_eq = expert_update
+            dual_step_updates_ineq.append(update_dual_ineq)
+            dual_step_updates_eq.append(update_dual_eq)
+            dual_next_states.append(expert_state)
+            dual_losses.append(
+                -(
+                    jnp.vdot(grad_dual_ineq, update_dual_ineq).real
+                    + jnp.vdot(grad_dual_eq, update_dual_eq).real
+                )
+            )
+
+        dual_updates_ineq_stacked = jnp.stack(dual_step_updates_ineq, axis=0)
+        dual_updates_eq_stacked = jnp.stack(dual_step_updates_eq, axis=0)
+        dual_losses = jnp.stack(dual_losses, axis=0)
+        dual_weights = jax.nn.softmax(state.dual.log_weights)
+
+        mixed_dual_ineq_update = jnp.tensordot(
+            dual_weights,
+            dual_updates_ineq_stacked,
+            axes=(0, 0),
+        )
+        mixed_dual_eq_update = jnp.tensordot(
+            dual_weights,
+            dual_updates_eq_stacked,
+            axes=(0, 0),
+        )
+
+        primal_eta_value = _resolve_schedule(primal_eta, state.step)
+        dual_eta_value = _resolve_schedule(dual_eta, state.step)
+
+        primal_losses = jnp.clip(primal_losses, -loss_clip, loss_clip)
+        dual_losses = jnp.clip(dual_losses, -loss_clip, loss_clip)
+
+        next_primal_log_weights = _normalise_log_weights(
+            state.primal.log_weights - primal_eta_value * primal_losses
+        )
+        next_dual_log_weights = _normalise_log_weights(
+            state.dual.log_weights - dual_eta_value * dual_losses
+        )
+
+        next_state = HedgeSaddleState(
+            primal=HedgePoolState(tuple(primal_next_states), next_primal_log_weights),
+            dual=HedgePoolState(tuple(dual_next_states), next_dual_log_weights),
+            step=state.step + jnp.array(1, dtype=jnp.int32),
+        )
+
+        mixed_update = jt.SaddleState(
+            primal=mixed_primal_update,
+            dual_ineq=mixed_dual_ineq_update,
+            dual_eq=mixed_dual_eq_update,
+        )
+
+        return mixed_update, next_state
+
+    return optax.GradientTransformation(init_fn, update_fn)

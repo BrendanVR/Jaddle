@@ -362,6 +362,7 @@ def solve(
             primal_damping,
             dual_damping_ineq,
             dual_damping_eq,
+            average,
         )
 
         (
@@ -447,6 +448,7 @@ def solve(
                     primal_damping,
                     dual_damping_ineq,
                     dual_damping_eq,
+                    average,
                 )
 
                 (
@@ -546,6 +548,7 @@ def solve(
                 primal_damping,
                 dual_damping_ineq,
                 dual_damping_eq,
+                average,
             )
 
             (
@@ -584,13 +587,10 @@ def solve(
 
     if scale in ["ruiz", "pc", "ruiz+pc"]:
         output = SaddleState(
-            primal=state.primal * col_scale,
-            dual_ineq=state.dual_ineq * row_scale[len(state.dual_eq) :],
-            dual_eq=state.dual_eq * row_scale[: len(state.dual_eq)],
+            primal=output.primal * col_scale,
+            dual_ineq=output.dual_ineq * row_scale[len(output.dual_eq) :],
+            dual_eq=output.dual_eq * row_scale[: len(output.dual_eq)],
         )
-
-    output = jax.block_until_ready(output)
-    end_time = time.time()
 
     return output
 
