@@ -1,5 +1,6 @@
 import jax.numpy as jnp
 from typing import NamedTuple
+import optax
 
 
 # %%
@@ -105,9 +106,12 @@ class LP:
         return (dual_ineq * (self.A_ineq @ x - self.b_ineq)).sum()
 
     def initial_solution(self):
-
         return SaddleState(
-            primal=jnp.zeros(self.num_variables()),
+            primal=optax.projections.projection_box(
+                jnp.zeros(self.num_variables()),
+                self.lower_bounds,
+                self.upper_bounds,
+            ),
             dual_ineq=jnp.zeros(self.num_ineq_constraints()),
             dual_eq=jnp.zeros(self.num_eq_constraints()),
         )

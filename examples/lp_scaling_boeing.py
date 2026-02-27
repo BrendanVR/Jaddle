@@ -25,6 +25,7 @@ import jaddle.jaddle_linear as jl
 import jaddle.highs_helpers as hh
 import jaddle.jaddle_optimisers as jo
 import highspy as hspy
+import optax
 
 # %% [markdown]
 # ## Load the LP
@@ -37,13 +38,35 @@ highs.readModel("/home/brendanvr/python/Jaddle/data/boeing.mps")  # path to MPS 
 highs_lp = highs.getLp()
 jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 
+
+# %%
+learning_rate = optax.exponential_decay(
+    1e1,
+    transition_steps=1000,
+    decay_rate=0.9,
+    end_value=1e-4,
+    verbose=True,
+)
+
+optimiser = jo.create_saddle_optimiser(
+    optax.optimistic_adam_v2(learning_rate, alpha=0.05),
+    optax.optimistic_adam_v2(learning_rate, alpha=0.05),
+)
+
+
 # %% [markdown]
 # ## Solve the presolved LP using Jaddle's saddle point solver
+# Using warm restarts: 5 restart cycles, starting with 10 epochs per cycle,
+# doubling the cycle length each time (geometric growth).
 solution = jl.solve(
     lp=jaddle_lp,
-    verbose=True,
+    # optimiser=optimiser,
     scale="ruiz+pc",
-)  # %%
+    # verbose=True,
+    average=False,
+    constraint_tolerance=1e-3,
+)
+# %%
 print("----------------------------------------------")
 print(f"Primal objective value: {jaddle_lp.objective(solution.primal)}")
 print(f"Primal Equality Residual: {jaddle_lp.eq_slack(solution.primal)}")

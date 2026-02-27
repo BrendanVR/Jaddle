@@ -159,7 +159,27 @@ def solve(
     verbose=False,
     average=True,
     scale=None,
+    restarts=0,
+    epochs_per_restart=10,
+    restart_multiplier=1.0,
+    decay_kind="constant",
+    decay_constant=1.0,
+    aggression=1.0,
 ):
+    """
+    Solve a linear program via saddle-point optimisation.
+
+    Args:
+        restarts: Number of warm restarts. 0 = no restarts (default).
+            Each restart resets the optimizer state (momentum) and averaging
+            while keeping the current iterate as a warm start. The LR schedule
+            also restarts from its initial value.
+        epochs_per_restart: Number of epochs in the first restart cycle
+            (default 10). Subsequent cycles grow by restart_multiplier.
+        restart_multiplier: Geometric growth factor for cycle lengths
+            (default 1.0 = fixed length, 2.0 = doubling).
+        primal_dual_lr_ratio: Ratio of primal to dual learning rates (default 1.0).
+    """
     lp_summary_statistics(lp)
 
     if initial_solution is None:
@@ -180,22 +200,36 @@ def solve(
             col_scale_ruiz * col_scale_pc,
         )
 
+    else:
+        row_scale = np.ones(lp.A_eq.shape[0] + lp.A_ineq.shape[0])
+        col_scale = np.ones(lp.c.shape[0])
+
+    row_scale_ineq = row_scale[len(lp.b_eq) :]
+    row_scale_eq = row_scale[: len(lp.b_eq)]
+
+    # Convert to jax arrays for use inside jitted functions
+    jnp_row_scale_ineq = jnp.array(row_scale_ineq)
+    jnp_row_scale_eq = jnp.array(row_scale_eq)
+
     if optimiser is None:
-        lr = optax.exponential_decay(
-            init_value=1e0,
-            transition_steps=int(1e4),
-            decay_rate=0.99,
-            end_value=1e-4,
+        lr, sigma_max, sigma_min, kappa, init_value, decay_rate = (
+            jo.default_learning_rate_schedule(
+                lp,
+                scale=aggression,
+                kind=decay_kind,
+                decay_constant=decay_constant,
+            )
         )
-        metrics = jo.compute_static_metrics(lp)
+        if verbose:
+            print(f"Estimated sigma_max: {sigma_max:.4e}")
+            print(f"Estimated sigma_min: {sigma_min:.4e}")
+            print(f"Estimated condition number (kappa): {kappa:.4e}")
+            print(f"Initial learning rate: {init_value:.4e}")
+            print(f"Decay rate: {decay_rate:.6f}")
+            print("-----------------------------------------------")
         optimiser = jo.optimistic_adam_metric_saddle(
             lr,
             lr,
-            lr,
-            alpha=0.05,
-            primal_metric=metrics[0],
-            dual_ineq_metric=metrics[1],
-            dual_eq_metric=metrics[2],
         )
 
     @jax.jit
@@ -210,6 +244,10 @@ def solve(
         grad_dual_ineq = lp.A_ineq @ average_state.primal - lp.b_ineq
         grad_dual_eq = lp.A_eq @ average_state.primal - lp.b_eq
 
+        # Unscale constraint violations to original space
+        grad_dual_ineq_unscaled = grad_dual_ineq / jnp_row_scale_ineq
+        grad_dual_eq_unscaled = grad_dual_eq / jnp_row_scale_eq
+
         projected_primal = projection_box(
             average_state.primal - grad_primal,
             lp.lower_bounds,
@@ -218,10 +256,10 @@ def solve(
         projected_gradient_residual = average_state.primal - projected_primal
         primal_grad_norm = jnp.max(jnp.abs(projected_gradient_residual))
 
-        ineq_violations = jnp.maximum(grad_dual_ineq, 0.0)
+        ineq_violations = jnp.maximum(grad_dual_ineq_unscaled, 0.0)
         max_ineq_violation = jnp.max(ineq_violations)
 
-        eq_violations = jnp.abs(grad_dual_eq)
+        eq_violations = jnp.abs(grad_dual_eq_unscaled)
         max_eq_violation = jnp.max(eq_violations)
 
         complementarity_slack = jnp.max(
@@ -260,6 +298,14 @@ def solve(
                 | (complementarity_slack > complementarity_tolerance)
                 | (constraint_bound > constraint_tolerance)
             )
+
+    def is_converged(primal_grad_norm, complementarity_slack, constraint_bound):
+        """Check if all tolerances are met (ignoring epoch count)."""
+        return (
+            (primal_grad_norm <= progress_tolerance)
+            & (complementarity_slack <= complementarity_tolerance)
+            & (constraint_bound <= constraint_tolerance)
+        )
 
     @jax.jit
     def cond_fun(loop_vars):
@@ -357,24 +403,104 @@ def solve(
     count = 0
     total_weight = 0.0
 
-    # Initialize loop variables
-    loop_vars = (
-        i,
-        state,
-        average_state,
-        opt_state,
-        previous_objective,
-        primal_grad_norm,
-        complementarity_slack,
-        constraint_bound,
-        count,
-        objective_value,
-        total_weight,
-    )
-
     start_time = time.time()
-    # Run the while loop
-    if verbose == False:
+
+    # ---- Warm restart loop ----
+    if restarts > 0:
+        cycle_length = epochs_per_restart
+
+        for restart in range(restarts + 1):
+            if restart > 0:
+                # Warm restart: keep iterate, reset everything else
+                opt_state = optimiser.init(state)
+                total_weight = 0.0
+                average_state = state
+
+                if verbose:
+                    print(
+                        f"--- Restart {restart}/{restarts} "
+                        f"(cycle: {cycle_length} epochs) ---"
+                    )
+
+            for epoch in range(cycle_length):
+                if is_converged(
+                    primal_grad_norm, complementarity_slack, constraint_bound
+                ):
+                    break
+
+                (
+                    i,
+                    state,
+                    average_state,
+                    opt_state,
+                    total_weight,
+                ) = __sps(
+                    iterations_per_epoch,
+                    i,
+                    lp,
+                    optimiser,
+                    state,
+                    average_state,
+                    opt_state,
+                    weight_function,
+                    total_weight,
+                    primal_damping,
+                    dual_damping_ineq,
+                    dual_damping_eq,
+                )
+
+                (
+                    objective_value,
+                    primal_grad_norm,
+                    complementarity_slack,
+                    constraint_bound,
+                ) = jax.lax.cond(
+                    average,
+                    lambda: compute_epoch_metrics(average_state),
+                    lambda: compute_epoch_metrics(state),
+                )
+                count += 1
+
+                if verbose:
+                    print(
+                        f"Objective {objective_value:.2e}: "
+                        f"Primal Grad Norm={primal_grad_norm:.2e}, "
+                        f"Compl. Slack={complementarity_slack:.2e}, "
+                        f"Constraint Bound={constraint_bound:.2e}"
+                    )
+                    print("----------------------------------------------")
+
+            if is_converged(primal_grad_norm, complementarity_slack, constraint_bound):
+                if verbose:
+                    print(
+                        f"Converged after {restart} restart(s), {count} total epochs."
+                    )
+                break
+
+            # Grow cycle length geometrically for next restart
+            cycle_length = max(1, int(cycle_length * restart_multiplier))
+
+        if average:
+            output = average_state
+        else:
+            output = state
+
+    # ---- Standard loop (no restarts) ----
+    elif verbose == False:
+        # Initialize loop variables
+        loop_vars = (
+            i,
+            state,
+            average_state,
+            opt_state,
+            previous_objective,
+            primal_grad_norm,
+            complementarity_slack,
+            constraint_bound,
+            count,
+            objective_value,
+            total_weight,
+        )
 
         loop_vars = jax.lax.while_loop(cond_fun, body_fun, loop_vars)
 
@@ -435,8 +561,12 @@ def solve(
             count += 1
 
             print(
-                f"Objective {objective_value:.2e}: Primal Grad Norm={primal_grad_norm:.2e}, Compl. Slack={complementarity_slack:.2e}, Constraint Bound={constraint_bound:.2e}"
+                f"Objective {objective_value:.2e}: "
+                f"Primal Grad Norm={primal_grad_norm:.2e}, "
+                f"Compl. Slack={complementarity_slack:.2e}, "
+                f"Constraint Bound={constraint_bound:.2e}"
             )
+            print("----------------------------------------------")
 
         if average:
             output = average_state
@@ -446,6 +576,8 @@ def solve(
     output = jax.block_until_ready(output)
     end_time = time.time()
     print(f"Time to solution: {end_time - start_time:.2f} seconds")
+    print("----------------------------------------------")
+    print(f"Epochs to solution: {count}")
     print("----------------------------------------------")
     print(f"Objective: {lp.objective(output.primal):.2e}")
     print("----------------------------------------------")
@@ -457,16 +589,8 @@ def solve(
             dual_eq=state.dual_eq * row_scale[: len(state.dual_eq)],
         )
 
-        return output
-
     output = jax.block_until_ready(output)
     end_time = time.time()
-    print(f"Time to solution: {end_time - start_time:.2f} seconds")
-    print("----------------------------------------------")
-    print(f"Primal objective value: {lp.objective(output.primal)}")
-    print(f"Primal Equality Residual: {lp.eq_slack(output.primal)}")
-    print(f"Primal Inequality Residual: {lp.ineq_slack(output.primal)}")
-    print("----------------------------------------------")
 
     return output
 
@@ -532,7 +656,7 @@ def lp_summary_statistics(lp: LP):
     print(f"[Min, Max] of b_eq: [{min_b_eq}, {max_b_eq}]")
     print(f"[Min, Max] of A_ineq: [{min_A_ineq}, {max_A_ineq}]")
     print(f"[Min, Max] of b_ineq: [{min_b_ineq}, {max_b_ineq}]")
-    print("--------------------------------")
+    print("-----------------------------------------------")
 
 
 # %%
