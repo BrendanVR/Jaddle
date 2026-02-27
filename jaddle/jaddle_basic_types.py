@@ -1,6 +1,20 @@
 import jax.numpy as jnp
 from typing import NamedTuple
 import optax
+from typing import Any, Callable, NamedTuple, Sequence, Union
+
+ScheduleLike = Union[float, Callable[[jnp.ndarray], jnp.ndarray]]
+
+
+class HedgePoolState(NamedTuple):
+    expert_states: tuple
+    log_weights: jnp.ndarray
+
+
+class HedgeSaddleState(NamedTuple):
+    primal: HedgePoolState
+    dual: HedgePoolState
+    step: jnp.ndarray
 
 
 # %%

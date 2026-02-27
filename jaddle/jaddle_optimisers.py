@@ -1,22 +1,14 @@
 import optax
 import jax
 import jax.numpy as jnp
-import jaddle.jaddle_basic_types as jt
-from typing import Any, Callable, NamedTuple, Sequence, Union
-
-
-ScheduleLike = Union[float, Callable[[jnp.ndarray], jnp.ndarray]]
-
-
-class HedgePoolState(NamedTuple):
-    expert_states: tuple
-    log_weights: jnp.ndarray
-
-
-class HedgeSaddleState(NamedTuple):
-    primal: HedgePoolState
-    dual: HedgePoolState
-    step: jnp.ndarray
+from typing import Any, Sequence
+from jaddle.jaddle_basic_types import (
+    HedgePoolState,
+    HedgeSaddleState,
+    ScheduleLike,
+    LP,
+    SaddleState,
+)
 
 
 def _saddle_param_labels(params):
@@ -33,73 +25,7 @@ def _saddle_param_labels(params):
     }
 
 
-def _saddle_param_labels_granular(params):
-    if hasattr(params, "_fields"):
-        return type(params)(
-            primal="primal_opt",
-            dual_ineq="dual_ineq_opt",
-            dual_eq="dual_eq_opt",
-        )
-    return {
-        "primal": "primal_opt",
-        "dual_ineq": "dual_ineq_opt",
-        "dual_eq": "dual_eq_opt",
-    }
-
-
-def scale_by_inverse_metric(metric, epsilon: float = 1e-8):
-    if metric is None:
-        metric_array = None
-        metric_tree = None
-    else:
-        try:
-            metric_array = jnp.asarray(metric)
-            metric_tree = None
-        except TypeError:
-            metric_array = None
-            metric_tree = jax.tree_util.tree_map(lambda m: jnp.asarray(m), metric)
-
-    def _is_array_leaf(value):
-        return (
-            hasattr(value, "dtype")
-            and hasattr(value, "shape")
-            and not isinstance(value, optax.MaskedNode)
-        )
-
-    def _scale_with_array(grad_leaf, metric_leaf):
-        if not _is_array_leaf(grad_leaf):
-            return grad_leaf
-        return grad_leaf / (jnp.abs(metric_leaf) + epsilon)
-
-    def _scale_with_tree(grad_leaf, metric_leaf):
-        if not _is_array_leaf(grad_leaf):
-            return grad_leaf
-        if isinstance(metric_leaf, optax.MaskedNode):
-            return grad_leaf
-        return grad_leaf / (jnp.abs(metric_leaf) + epsilon)
-
-    def init_fn(_):
-        return ()
-
-    def update_fn(updates, state, params=None):
-        del params
-        if metric_array is None and metric_tree is None:
-            return updates, state
-
-        if metric_array is not None:
-            scaled_updates = jax.tree_util.tree_map(
-                lambda g: _scale_with_array(g, metric_array), updates
-            )
-            return scaled_updates, state
-
-        scaled_updates = jax.tree_util.tree_map(_scale_with_tree, updates, metric_tree)
-
-        return scaled_updates, state
-
-    return optax.GradientTransformation(init_fn, update_fn)
-
-
-def estimate_operator_norm(lp: jt.LP, num_iters: int = 20, seed: int = 0):
+def estimate_operator_norm(lp: LP, num_iters: int = 20, seed: int = 0):
     """
     Estimate the largest singular value of the stacked constraint matrix
     [A_eq; A_ineq] via power iteration on A^T A.
@@ -144,7 +70,7 @@ def estimate_operator_norm(lp: jt.LP, num_iters: int = 20, seed: int = 0):
 
 
 def estimate_condition_number(
-    lp: jt.LP, num_iters: int = 20, seed: int = 0, regularisation: float = 1e-6
+    lp: LP, num_iters: int = 20, seed: int = 0, regularisation: float = 1e-6
 ):
     """
     Estimate the condition number kappa = sigma_max / sigma_min of the stacked
@@ -224,7 +150,7 @@ def estimate_condition_number(
 
 
 def default_learning_rate_schedule(
-    lp: jt.LP,
+    lp: LP,
     scale: float = 1.0,
     transition_steps: int = int(1e3),
     decay_rate: float = None,
@@ -356,7 +282,7 @@ def hedge_ensemble_saddle(
         jnp.zeros((dual_count,), dtype=jnp.float32)
     )
 
-    def init_fn(params: jt.SaddleState) -> HedgeSaddleState:
+    def init_fn(params: SaddleState) -> HedgeSaddleState:
         primal_states = tuple(opt.init(params.primal) for opt in primal_experts)
         dual_params = (params.dual_ineq, params.dual_eq)
         dual_states = tuple(opt.init(dual_params) for opt in dual_experts)
@@ -368,9 +294,9 @@ def hedge_ensemble_saddle(
         )
 
     def update_fn(
-        updates: jt.SaddleState,
+        updates: SaddleState,
         state: HedgeSaddleState,
-        params: jt.SaddleState,
+        params: SaddleState,
     ):
         grad_primal = updates.primal
         grad_dual_ineq = updates.dual_ineq
@@ -459,7 +385,7 @@ def hedge_ensemble_saddle(
             step=state.step + jnp.array(1, dtype=jnp.int32),
         )
 
-        mixed_update = jt.SaddleState(
+        mixed_update = SaddleState(
             primal=mixed_primal_update,
             dual_ineq=mixed_dual_ineq_update,
             dual_eq=mixed_dual_eq_update,
@@ -468,3 +394,19 @@ def hedge_ensemble_saddle(
         return mixed_update, next_state
 
     return optax.GradientTransformation(init_fn, update_fn)
+
+
+def hedge_weights_from_state(opt_state: Any):
+    """
+    Extract (primal_weights, dual_weights) from a hedge ensemble optimiser state.
+
+    Returns:
+        Tuple of jnp arrays (primal_weights, dual_weights) if available, else None.
+    """
+    try:
+        primal_log_weights = opt_state.primal.log_weights
+        dual_log_weights = opt_state.dual.log_weights
+    except AttributeError:
+        return None
+
+    return jax.nn.softmax(primal_log_weights), jax.nn.softmax(dual_log_weights)

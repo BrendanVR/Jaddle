@@ -75,6 +75,7 @@ solution = jl.solve(
     optimiser=ensemble_optimiser,
     iterations_per_epoch=5000,
     verbose=True,
+    expert_diagnostics=True,
 )
 
 # %%

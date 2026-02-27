@@ -165,6 +165,7 @@ def solve(
     decay_kind="constant",
     decay_constant=1.0,
     aggression=1.0,
+    expert_diagnostics=False,
 ):
     """
     Solve a linear program via saddle-point optimisation.
@@ -405,6 +406,30 @@ def solve(
     total_weight = 0.0
 
     start_time = time.time()
+    missing_expert_state_warning_printed = False
+
+    def print_expert_weights(epoch_count, state_for_weights):
+        nonlocal missing_expert_state_warning_printed
+        if not expert_diagnostics:
+            return
+
+        extracted = jo.hedge_weights_from_state(state_for_weights)
+        if extracted is None:
+            if (not missing_expert_state_warning_printed) and verbose:
+                print(
+                    "Expert diagnostics requested, but optimiser state has no hedge weights."
+                )
+                print("----------------------------------------------")
+                missing_expert_state_warning_printed = True
+            return
+
+        primal_weights, dual_weights = extracted
+        if verbose:
+            print(
+                f"Expert Weights (epoch {epoch_count}): "
+                f"primal={np.asarray(primal_weights)}, dual={np.asarray(dual_weights)}"
+            )
+            print("----------------------------------------------")
 
     # ---- Warm restart loop ----
     if restarts > 0:
@@ -472,6 +497,8 @@ def solve(
                     )
                     print("----------------------------------------------")
 
+                print_expert_weights(count, opt_state)
+
             if is_converged(primal_grad_norm, complementarity_slack, constraint_bound):
                 if verbose:
                     print(
@@ -525,6 +552,13 @@ def solve(
         else:
             output = state
 
+        if expert_diagnostics:
+            print(
+                "Expert diagnostics in non-verbose mode prints only final expert weights."
+            )
+            print("----------------------------------------------")
+            print_expert_weights(count, opt_state)
+
     else:
         while check_convergence(
             primal_grad_norm, complementarity_slack, constraint_bound, count
@@ -571,6 +605,8 @@ def solve(
             )
             print("----------------------------------------------")
 
+            print_expert_weights(count, opt_state)
+
         if average:
             output = average_state
         else:
@@ -588,8 +624,8 @@ def solve(
     if scale in ["ruiz", "pc", "ruiz+pc"]:
         output = SaddleState(
             primal=output.primal * col_scale,
-            dual_ineq=output.dual_ineq * row_scale[len(output.dual_eq) :],
-            dual_eq=output.dual_eq * row_scale[: len(output.dual_eq)],
+            dual_ineq=output.dual_ineq * jnp_row_scale_ineq,
+            dual_eq=output.dual_eq * jnp_row_scale_eq,
         )
 
     return output
