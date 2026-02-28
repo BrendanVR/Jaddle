@@ -189,9 +189,13 @@ def solve(
 
     if scale == "ruiz":
         lp, row_scale, col_scale = ruiz_scaling(lp)
+        print("Applied Ruiz scaling to the LP.")
+        print("----------------------------------------------")
 
     elif scale == "pc":
         lp, row_scale, col_scale = pc_scaling(lp)
+        print("Applied PC scaling to the LP.")
+        print("----------------------------------------------")
 
     elif scale == "ruiz+pc":
         lp, row_scale_ruiz, col_scale_ruiz = ruiz_scaling(lp)
@@ -201,6 +205,9 @@ def solve(
             row_scale_ruiz * row_scale_pc,
             col_scale_ruiz * col_scale_pc,
         )
+
+        print("Applied combined Ruiz + PC scaling to the LP.")
+        print("----------------------------------------------")
 
     else:
         row_scale = np.ones(lp.A_eq.shape[0] + lp.A_ineq.shape[0])
@@ -212,6 +219,12 @@ def solve(
     # Convert to jax arrays for use inside jitted functions
     jnp_row_scale_ineq = jnp.array(row_scale_ineq)
     jnp_row_scale_eq = jnp.array(row_scale_eq)
+
+    initial_solution = SaddleState(
+        primal=initial_solution.primal / col_scale,
+        dual_ineq=initial_solution.dual_ineq / jnp_row_scale_ineq,
+        dual_eq=initial_solution.dual_eq / jnp_row_scale_eq,
+    )
 
     @jax.jit
     def compute_epoch_metrics(average_state):

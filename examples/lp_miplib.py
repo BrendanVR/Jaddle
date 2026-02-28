@@ -20,7 +20,9 @@ import optax
 # ## Load and presolve the LP
 # We load a MIPLIB LP from an MPS file using the `highspy` library.
 highs = hspy.Highs()
-highs.readModel("/home/brendanvr/python/Jaddle/data/stp3d.mps")  # path to MPS file
+highs.readModel(
+    "/home/brendanvr/python/Jaddle/data/buildingenergy.mps"
+)  # path to MPS file
 
 # %% [markdown]
 # We convert the LP to Jaddle's sparse format.
@@ -32,21 +34,22 @@ jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 def lr(decay_rate):
     return optax.exponential_decay(
         init_value=1e0,
-        transition_steps=1000,
+        transition_steps=int(1e4),
         decay_rate=decay_rate,
-        end_value=1e-4,
+        end_value=1e-5,
     )
 
 
-learning_rates = [lr(decay_rate) for decay_rate in [0.6, 0.7, 0.8, 0.9, 0.99]]
+learning_rates = [lr(decay_rate) for decay_rate in [0.5, 0.6, 0.7, 0.8, 0.9, 0.99]]
 primal_experts = [
-    optax.optimistic_adam_v2(learning_rate=lr, alpha=0.05) for lr in learning_rates
+    optax.optimistic_adam_v2(learning_rate=lr, alpha=0.1) for lr in learning_rates
 ]
-dual_optimiser = optax.adadelta(learning_rate=1.0)
+dual_optimiser = optax.optimistic_adam_v2(learning_rate=lr(0.9), alpha=0.1)
 ensemble_optimiser = jo.hedge_ensemble_saddle(
     primal_experts=primal_experts,
     dual_experts=[dual_optimiser],
     lp=jaddle_lp,
+    primal_eta=1.0,
 )
 
 # %%
@@ -55,26 +58,27 @@ solution, opt_state = jl.solve(
     optimiser=ensemble_optimiser,
     output_opt_state=True,
     max_epochs=1,
-    iterations_per_epoch=5000,
 )
 
 # Evaluate all experts and find the best
 print("Evaluating experts...")
 print(f"Primal Weights = {jax.nn.softmax(opt_state.primal.log_weights)}")
-print(f"Dual Weights = {jax.nn.softmax(opt_state.dual.log_weights)}")
 best_expert_idx_primal = jnp.argmax(opt_state.primal.log_weights)
-best_expert_idx_dual = jnp.argmax(opt_state.dual.log_weights)
 print(f"Best primal expert index: {best_expert_idx_primal}")
-print(f"Best dual expert index: {best_expert_idx_dual}")
 
 # Solve with the best performing expert
 solution = jl.solve(
     jaddle_lp,
     initial_solution=solution,
     optimiser=jo.create_saddle_optimiser(
-        primal_experts[best_expert_idx_primal], dual_experts[best_expert_idx_dual]
+        primal_experts[best_expert_idx_primal], dual_optimiser
     ),
-    weight_function=lambda i: jax.lax.select(i <= int(5e4), 1e-16, 1.0),
+    verbose=True,
+    average=False,
+    iterations_per_epoch=int(5e4),
+    restarts=5,
+    epochs_per_restart=1,
+    restart_multiplier=2,
 )
 
 # %%
