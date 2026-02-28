@@ -41,14 +41,14 @@ lp = jl.to_jaddle_sparse(lp)
 # Build two expert pools with different step-size behavior.
 lr_fast = optax.exponential_decay(
     init_value=1e-1,
-    transition_steps=500,
-    decay_rate=0.95,
+    transition_steps=1000,
+    decay_rate=0.9,
     end_value=1e-3,
 )
 lr_slow = optax.exponential_decay(
     init_value=3e-2,
-    transition_steps=500,
-    decay_rate=0.98,
+    transition_steps=1000,
+    decay_rate=0.99,
     end_value=1e-4,
 )
 
@@ -67,13 +67,15 @@ ensemble_optimiser = jo.hedge_ensemble_saddle(
     dual_experts=dual_experts,
     primal_eta=5e-2,
     dual_eta=5e-2,
+    mode="bandit",  # options: "all_experts", "bandit"
+    bandit_gamma=0.05,
+    seed=0,
 )
 
 # %%
 solution = jl.solve(
     lp,
     optimiser=ensemble_optimiser,
-    iterations_per_epoch=5000,
     verbose=True,
     expert_diagnostics=True,
 )

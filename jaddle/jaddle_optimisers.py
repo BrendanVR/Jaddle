@@ -149,72 +149,6 @@ def estimate_condition_number(
     return float(sigma_max), float(sigma_min), float(kappa)
 
 
-def default_learning_rate_schedule(
-    lp: LP,
-    scale: float = 1.0,
-    transition_steps: int = int(1e3),
-    decay_rate: float = None,
-    decay_constant: float = 1.0,
-    end_value: float = 1e-5,
-    num_power_iters: int = 20,
-    kind: str = "exponential",
-):
-    """
-    Compute a problem-dependent learning rate schedule based on the estimated
-    operator norm and condition number of the constraint matrix.
-
-    The initial learning rate is set to scale / sigma_max (operator norm bound).
-    The decay rate is set to 1 - decay_constant / kappa (condition number),
-    so well-conditioned problems decay faster and ill-conditioned problems
-    decay more slowly to allow progress along poorly-conditioned directions.
-
-    Args:
-        lp: Linear program (after any scaling has been applied).
-        scale: Multiplier on 1/sigma_max for the initial LR (default 1.0).
-        transition_steps: Steps between each decay application (default 10000).
-        decay_rate: Override for decay rate. If None (default), computed from
-                    the condition number as 1 - decay_constant / kappa.
-        decay_constant: Constant c in decay_rate = 1 - c/kappa (default 0.5).
-        end_value_fraction: Floor LR as a fraction of init_value (default 1e-5).
-        num_power_iters: Power iterations for norm estimates (default 20).
-        kind: Type of decay schedule (default "exponential").
-
-    Returns:
-        (schedule, sigma_max, sigma_min, kappa): An optax schedule and the
-        estimated spectral quantities.
-    """
-    sigma_max, sigma_min, kappa = estimate_condition_number(
-        lp, num_iters=num_power_iters
-    )
-
-    init_value = scale / jnp.maximum(sigma_max, 1e-12)
-
-    if decay_rate is None:
-        # Condition-number-dependent decay: well-conditioned -> faster decay
-        decay_rate = float(jnp.clip(1.0 - decay_constant / kappa, 0.5, 0.999999))
-
-    if kind == "exponential":
-        schedule = optax.exponential_decay(
-            init_value=float(init_value),
-            transition_steps=transition_steps,
-            decay_rate=decay_rate,
-            end_value=float(end_value),
-        )
-    elif kind == "polynomial":
-        schedule = optax.polynomial_schedule(
-            init_value=float(init_value),
-            end_value=float(end_value),
-            power=1.0,
-            transition_steps=transition_steps,
-        )
-    elif kind == "constant":
-        schedule = optax.constant_schedule(float(init_value))
-    else:
-        raise ValueError(f"Unsupported schedule kind: {kind}")
-
-    return schedule, sigma_max, sigma_min, kappa, init_value, decay_rate
-
-
 def create_saddle_optimiser(
     primal_optimizer: optax.GradientTransformation,
     dual_optimizer: optax.GradientTransformation,
@@ -260,17 +194,32 @@ def _normalise_log_weights(log_weights: jnp.ndarray) -> jnp.ndarray:
     return log_weights - jax.nn.logsumexp(log_weights)
 
 
+def _exploration_mixture(weights: jnp.ndarray, gamma: float) -> jnp.ndarray:
+    if gamma <= 0.0:
+        return weights
+    num_experts = weights.shape[0]
+    uniform = jnp.ones_like(weights) / num_experts
+    return (1.0 - gamma) * weights + gamma * uniform
+
+
 def hedge_ensemble_saddle(
     primal_experts: Sequence[optax.GradientTransformation],
     dual_experts: Sequence[optax.GradientTransformation],
     primal_eta: ScheduleLike = 5e-2,
     dual_eta: ScheduleLike = 5e-2,
     loss_clip: float = 1e2,
+    mode: str = "all_experts",
+    bandit_gamma: float = 0.0,
+    seed: int = 0,
 ):
     if len(primal_experts) == 0:
         raise ValueError("primal_experts must contain at least one optimiser")
     if len(dual_experts) == 0:
         raise ValueError("dual_experts must contain at least one optimiser")
+    if mode not in ("all_experts", "bandit"):
+        raise ValueError("mode must be 'all_experts' or 'bandit'")
+    if (bandit_gamma < 0.0) or (bandit_gamma > 1.0):
+        raise ValueError("bandit_gamma must be in [0.0, 1.0]")
 
     primal_count = len(primal_experts)
     dual_count = len(dual_experts)
@@ -291,6 +240,7 @@ def hedge_ensemble_saddle(
             primal=HedgePoolState(primal_states, init_primal_log_weights),
             dual=HedgePoolState(dual_states, init_dual_log_weights),
             step=jnp.array(0, dtype=jnp.int32),
+            rng_key=jax.random.PRNGKey(seed),
         )
 
     def update_fn(
@@ -302,69 +252,182 @@ def hedge_ensemble_saddle(
         grad_dual_ineq = updates.dual_ineq
         grad_dual_eq = updates.dual_eq
 
-        primal_step_updates = []
-        primal_next_states = []
-        primal_losses = []
-
-        for expert_index, expert in enumerate(primal_experts):
-            expert_update, expert_state = expert.update(
-                grad_primal,
-                state.primal.expert_states[expert_index],
-                params.primal,
-            )
-            primal_step_updates.append(expert_update)
-            primal_next_states.append(expert_state)
-            primal_losses.append(jnp.vdot(grad_primal, expert_update).real)
-
-        primal_updates_stacked = jnp.stack(primal_step_updates, axis=0)
-        primal_losses = jnp.stack(primal_losses, axis=0)
         primal_weights = jax.nn.softmax(state.primal.log_weights)
-        mixed_primal_update = jnp.tensordot(
-            primal_weights,
-            primal_updates_stacked,
-            axes=(0, 0),
-        )
-
-        dual_step_updates_ineq = []
-        dual_step_updates_eq = []
-        dual_next_states = []
-        dual_losses = []
-
-        grad_dual = (grad_dual_ineq, grad_dual_eq)
-        params_dual = (params.dual_ineq, params.dual_eq)
-
-        for expert_index, expert in enumerate(dual_experts):
-            expert_update, expert_state = expert.update(
-                grad_dual,
-                state.dual.expert_states[expert_index],
-                params_dual,
-            )
-            update_dual_ineq, update_dual_eq = expert_update
-            dual_step_updates_ineq.append(update_dual_ineq)
-            dual_step_updates_eq.append(update_dual_eq)
-            dual_next_states.append(expert_state)
-            dual_losses.append(
-                -(
-                    jnp.vdot(grad_dual_ineq, update_dual_ineq).real
-                    + jnp.vdot(grad_dual_eq, update_dual_eq).real
-                )
-            )
-
-        dual_updates_ineq_stacked = jnp.stack(dual_step_updates_ineq, axis=0)
-        dual_updates_eq_stacked = jnp.stack(dual_step_updates_eq, axis=0)
-        dual_losses = jnp.stack(dual_losses, axis=0)
         dual_weights = jax.nn.softmax(state.dual.log_weights)
 
-        mixed_dual_ineq_update = jnp.tensordot(
-            dual_weights,
-            dual_updates_ineq_stacked,
-            axes=(0, 0),
-        )
-        mixed_dual_eq_update = jnp.tensordot(
-            dual_weights,
-            dual_updates_eq_stacked,
-            axes=(0, 0),
-        )
+        if mode == "all_experts":
+            primal_step_updates = []
+            primal_next_states = []
+            primal_losses = []
+
+            for expert_index, expert in enumerate(primal_experts):
+                expert_update, expert_state = expert.update(
+                    grad_primal,
+                    state.primal.expert_states[expert_index],
+                    params.primal,
+                )
+                primal_step_updates.append(expert_update)
+                primal_next_states.append(expert_state)
+                primal_losses.append(jnp.vdot(grad_primal, expert_update).real)
+
+            primal_updates_stacked = jnp.stack(primal_step_updates, axis=0)
+            primal_losses = jnp.stack(primal_losses, axis=0)
+            mixed_primal_update = jnp.tensordot(
+                primal_weights,
+                primal_updates_stacked,
+                axes=(0, 0),
+            )
+
+            dual_step_updates_ineq = []
+            dual_step_updates_eq = []
+            dual_next_states = []
+            dual_losses = []
+
+            grad_dual = (grad_dual_ineq, grad_dual_eq)
+            params_dual = (params.dual_ineq, params.dual_eq)
+
+            for expert_index, expert in enumerate(dual_experts):
+                expert_update, expert_state = expert.update(
+                    grad_dual,
+                    state.dual.expert_states[expert_index],
+                    params_dual,
+                )
+                update_dual_ineq, update_dual_eq = expert_update
+                dual_step_updates_ineq.append(update_dual_ineq)
+                dual_step_updates_eq.append(update_dual_eq)
+                dual_next_states.append(expert_state)
+                dual_losses.append(
+                    -(
+                        jnp.vdot(grad_dual_ineq, update_dual_ineq).real
+                        + jnp.vdot(grad_dual_eq, update_dual_eq).real
+                    )
+                )
+
+            dual_updates_ineq_stacked = jnp.stack(dual_step_updates_ineq, axis=0)
+            dual_updates_eq_stacked = jnp.stack(dual_step_updates_eq, axis=0)
+            dual_losses = jnp.stack(dual_losses, axis=0)
+
+            mixed_dual_ineq_update = jnp.tensordot(
+                dual_weights,
+                dual_updates_ineq_stacked,
+                axes=(0, 0),
+            )
+            mixed_dual_eq_update = jnp.tensordot(
+                dual_weights,
+                dual_updates_eq_stacked,
+                axes=(0, 0),
+            )
+
+            next_primal_states = tuple(primal_next_states)
+            next_dual_states = tuple(dual_next_states)
+            next_rng_key = state.rng_key
+
+        else:
+            rng_key, primal_key, dual_key = jax.random.split(state.rng_key, 3)
+
+            primal_probs = _exploration_mixture(primal_weights, bandit_gamma)
+            primal_index = jax.random.categorical(primal_key, jnp.log(primal_probs))
+            primal_one_hot = jax.nn.one_hot(
+                primal_index, primal_count, dtype=jnp.float32
+            )
+
+            primal_step_updates = []
+            primal_next_states = []
+            primal_losses_raw = []
+
+            for expert_index, expert in enumerate(primal_experts):
+
+                def _selected(_):
+                    return expert.update(
+                        grad_primal,
+                        state.primal.expert_states[expert_index],
+                        params.primal,
+                    )
+
+                def _not_selected(_):
+                    return (
+                        jnp.zeros_like(grad_primal),
+                        state.primal.expert_states[expert_index],
+                    )
+
+                expert_update, expert_state = jax.lax.cond(
+                    primal_index == expert_index,
+                    _selected,
+                    _not_selected,
+                    operand=None,
+                )
+                primal_step_updates.append(expert_update)
+                primal_next_states.append(expert_state)
+                primal_losses_raw.append(jnp.vdot(grad_primal, expert_update).real)
+
+            primal_updates_stacked = jnp.stack(primal_step_updates, axis=0)
+            mixed_primal_update = jnp.sum(primal_updates_stacked, axis=0)
+            primal_losses_raw = jnp.stack(primal_losses_raw, axis=0)
+            primal_selected_loss = jnp.sum(primal_one_hot * primal_losses_raw)
+            primal_selected_prob = jnp.maximum(
+                jnp.sum(primal_one_hot * primal_probs), 1e-12
+            )
+            primal_losses = primal_one_hot * (
+                primal_selected_loss / primal_selected_prob
+            )
+
+            grad_dual = (grad_dual_ineq, grad_dual_eq)
+            params_dual = (params.dual_ineq, params.dual_eq)
+            dual_probs = _exploration_mixture(dual_weights, bandit_gamma)
+            dual_index = jax.random.categorical(dual_key, jnp.log(dual_probs))
+            dual_one_hot = jax.nn.one_hot(dual_index, dual_count, dtype=jnp.float32)
+
+            dual_step_updates_ineq = []
+            dual_step_updates_eq = []
+            dual_next_states = []
+            dual_losses_raw = []
+
+            for expert_index, expert in enumerate(dual_experts):
+
+                def _selected(_):
+                    return expert.update(
+                        grad_dual,
+                        state.dual.expert_states[expert_index],
+                        params_dual,
+                    )
+
+                def _not_selected(_):
+                    zeros_update = (
+                        jnp.zeros_like(grad_dual_ineq),
+                        jnp.zeros_like(grad_dual_eq),
+                    )
+                    return zeros_update, state.dual.expert_states[expert_index]
+
+                expert_update, expert_state = jax.lax.cond(
+                    dual_index == expert_index,
+                    _selected,
+                    _not_selected,
+                    operand=None,
+                )
+                update_dual_ineq, update_dual_eq = expert_update
+                dual_step_updates_ineq.append(update_dual_ineq)
+                dual_step_updates_eq.append(update_dual_eq)
+                dual_next_states.append(expert_state)
+                dual_losses_raw.append(
+                    -(
+                        jnp.vdot(grad_dual_ineq, update_dual_ineq).real
+                        + jnp.vdot(grad_dual_eq, update_dual_eq).real
+                    )
+                )
+
+            dual_updates_ineq_stacked = jnp.stack(dual_step_updates_ineq, axis=0)
+            dual_updates_eq_stacked = jnp.stack(dual_step_updates_eq, axis=0)
+            mixed_dual_ineq_update = jnp.sum(dual_updates_ineq_stacked, axis=0)
+            mixed_dual_eq_update = jnp.sum(dual_updates_eq_stacked, axis=0)
+
+            dual_losses_raw = jnp.stack(dual_losses_raw, axis=0)
+            dual_selected_loss = jnp.sum(dual_one_hot * dual_losses_raw)
+            dual_selected_prob = jnp.maximum(jnp.sum(dual_one_hot * dual_probs), 1e-12)
+            dual_losses = dual_one_hot * (dual_selected_loss / dual_selected_prob)
+
+            next_primal_states = tuple(primal_next_states)
+            next_dual_states = tuple(dual_next_states)
+            next_rng_key = rng_key
 
         primal_eta_value = _resolve_schedule(primal_eta, state.step)
         dual_eta_value = _resolve_schedule(dual_eta, state.step)
@@ -380,9 +443,10 @@ def hedge_ensemble_saddle(
         )
 
         next_state = HedgeSaddleState(
-            primal=HedgePoolState(tuple(primal_next_states), next_primal_log_weights),
-            dual=HedgePoolState(tuple(dual_next_states), next_dual_log_weights),
+            primal=HedgePoolState(next_primal_states, next_primal_log_weights),
+            dual=HedgePoolState(next_dual_states, next_dual_log_weights),
             step=state.step + jnp.array(1, dtype=jnp.int32),
+            rng_key=next_rng_key,
         )
 
         mixed_update = SaddleState(

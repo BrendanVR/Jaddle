@@ -19,7 +19,7 @@ import optax
 # ## Load and presolve the LP
 # We load a MIPLIB LP from an MPS file using the `highspy` library.
 highs = hspy.Highs()
-highs.readModel("/home/brendanvr/python/Jaddle/data/boeing.mps")  # path to MPS file
+highs.readModel("/home/brendanvr/python/Jaddle/data/stp3d.mps")  # path to MPS file
 
 # %% [markdown]
 # We convert the LP to Jaddle's sparse format.
@@ -29,35 +29,31 @@ jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 # %%
 lr_fast = optax.exponential_decay(
     init_value=1e0,
-    transition_steps=10000,
-    decay_rate=0.5,
-    end_value=1e-4,
-)
-lr_slow = optax.exponential_decay(
-    init_value=1e1,
     transition_steps=1000,
     decay_rate=0.9,
     end_value=1e-4,
 )
+lr_slow = optax.exponential_decay(
+    init_value=1e0,
+    transition_steps=1000,
+    decay_rate=0.99,
+    end_value=1e-4,
+)
 
 primal_experts = [
-    optax.optimistic_adam_v2(learning_rate=lr_fast, alpha=0.05),
-    optax.optimistic_adam_v2(learning_rate=lr_slow, alpha=0.05),
+    optax.adagrad(learning_rate=lr_fast),
+    optax.adagrad(learning_rate=lr_slow),
 ]
 
-dual_experts = [optax.adagrad(learning_rate=lr) for lr in [1e0, 1e1, 1e2]] + [
-    optax.optimistic_adam_v2(learning_rate=lr_fast, alpha=0.05),
-    optax.optimistic_adam_v2(learning_rate=lr_slow, alpha=0.05),
+dual_experts = [
+    optax.adagrad(learning_rate=lr_fast),
+    optax.adagrad(learning_rate=lr_slow),
 ]
 
 ensemble_optimiser = jo.hedge_ensemble_saddle(
     primal_experts=primal_experts,
     dual_experts=dual_experts,
-)
-
-polisher = jo.create_saddle_optimiser(
-    optax.adagrad(learning_rate=1e-2),
-    optax.adagrad(learning_rate=1e-2),
+    mode="bandit",  # options: "all_experts", "bandit"
 )
 
 # %% [markdown]
@@ -67,17 +63,6 @@ solution = jl.solve(
     optimiser=ensemble_optimiser,
     verbose=True,
     expert_diagnostics=True,
-    scale="ruiz+pc",
-    constraint_tolerance=1e-1,
-    complementarity_tolerance=1e-3,
-)
-
-solution = jl.solve(
-    jaddle_lp,
-    optimiser=polisher,
-    initial_solution=solution,
-    verbose=True,
-    scale="ruiz+pc",
 )
 
 # %%

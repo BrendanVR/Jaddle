@@ -145,7 +145,7 @@ def __sps(
 
 def solve(
     lp: LP,
-    optimiser=None,
+    optimiser,
     max_epochs=None,
     initial_solution=None,
     iterations_per_epoch=int(1e4),
@@ -162,9 +162,6 @@ def solve(
     restarts=0,
     epochs_per_restart=10,
     restart_multiplier=1.0,
-    decay_kind="constant",
-    decay_constant=1.0,
-    aggression=1.0,
     expert_diagnostics=False,
 ):
     """
@@ -211,27 +208,6 @@ def solve(
     # Convert to jax arrays for use inside jitted functions
     jnp_row_scale_ineq = jnp.array(row_scale_ineq)
     jnp_row_scale_eq = jnp.array(row_scale_eq)
-
-    if optimiser is None:
-        lr, sigma_max, sigma_min, kappa, init_value, decay_rate = (
-            jo.default_learning_rate_schedule(
-                lp,
-                scale=aggression,
-                kind=decay_kind,
-                decay_constant=decay_constant,
-            )
-        )
-        if verbose:
-            print(f"Estimated sigma_max: {sigma_max:.4e}")
-            print(f"Estimated sigma_min: {sigma_min:.4e}")
-            print(f"Estimated condition number (kappa): {kappa:.4e}")
-            print(f"Initial learning rate: {init_value:.4e}")
-            print(f"Decay rate: {decay_rate:.6f}")
-            print("-----------------------------------------------")
-        optimiser = jo.optimistic_adam_metric_saddle(
-            lr,
-            lr,
-        )
 
     @jax.jit
     def compute_epoch_metrics(average_state):
