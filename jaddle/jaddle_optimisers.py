@@ -297,7 +297,7 @@ def hedge_ensemble_saddle(
                 dual_step_updates_eq.append(update_dual_eq)
                 dual_next_states.append(expert_state)
                 dual_losses.append(
-                    -(
+                    (
                         jnp.vdot(grad_dual_ineq, update_dual_ineq).real
                         + jnp.vdot(grad_dual_eq, update_dual_eq).real
                     )

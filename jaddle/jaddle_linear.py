@@ -12,6 +12,8 @@ from scipy import sparse as sp
 import jaddle.jaddle_optimisers as jo
 from jaddle.jaddle_basic_types import LP, SaddleState
 
+np.set_printoptions(precision=2, suppress=True)
+
 
 # %%
 # Solvers for constrained linear optimisation via saddle point formulation
