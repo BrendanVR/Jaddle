@@ -61,13 +61,12 @@ dual_experts = [
 ensemble_optimiser = jo.hedge_ensemble_saddle(
     primal_experts=primal_experts,
     dual_experts=dual_experts,
-    primal_eta=lambda i: jax.lax.select(i < int(5e4), 1e-2, 1e-1),
-    dual_eta=lambda i: jax.lax.select(i < int(5e4), 1e-2, 1e-1),
+    lp=jaddle_lp,
 )
 
 # %% [markdown]
 # ## Solve the presolved LP using Jaddle's saddle point solver
-solution, opt_state = jl.solve(
+solution = jl.solve(
     lp=jaddle_lp,
     optimiser=ensemble_optimiser,
     verbose=True,
@@ -81,6 +80,4 @@ print(f"Primal Equality Residual: {jaddle_lp.eq_slack(solution.primal)}")
 print(f"Primal Inequality Residual: {jaddle_lp.ineq_slack(solution.primal)}")
 print("----------------------------------------------")
 
-# %%
-jo.hedge_weights_from_state(opt_state)
 # %%
