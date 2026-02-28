@@ -60,6 +60,7 @@ primal_experts = [
 dual_experts = [
     optax.optimistic_adam_v2(learning_rate=lr_fast, alpha=0.05),
     optax.optimistic_adam_v2(learning_rate=lr_slow, alpha=0.05),
+    optax.sgd(1e-1),
 ]
 
 ensemble_optimiser = jo.hedge_ensemble_saddle(

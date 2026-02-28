@@ -268,7 +268,7 @@ def hedge_ensemble_saddle(
                 )
                 primal_step_updates.append(expert_update)
                 primal_next_states.append(expert_state)
-                primal_losses.append(jnp.vdot(grad_primal, expert_update).real)
+                primal_losses.append(-jnp.dot(grad_primal, expert_update))
 
             primal_updates_stacked = jnp.stack(primal_step_updates, axis=0)
             primal_losses = jnp.stack(primal_losses, axis=0)
@@ -297,9 +297,9 @@ def hedge_ensemble_saddle(
                 dual_step_updates_eq.append(update_dual_eq)
                 dual_next_states.append(expert_state)
                 dual_losses.append(
-                    (
-                        jnp.vdot(grad_dual_ineq, update_dual_ineq).real
-                        + jnp.vdot(grad_dual_eq, update_dual_eq).real
+                    -(
+                        jnp.dot(grad_dual_ineq, update_dual_ineq)
+                        + jnp.dot(grad_dual_eq, update_dual_eq)
                     )
                 )
 
@@ -358,7 +358,7 @@ def hedge_ensemble_saddle(
                 )
                 primal_step_updates.append(expert_update)
                 primal_next_states.append(expert_state)
-                primal_losses_raw.append(jnp.vdot(grad_primal, expert_update).real)
+                primal_losses_raw.append(-jnp.dot(grad_primal, expert_update))
 
             primal_updates_stacked = jnp.stack(primal_step_updates, axis=0)
             mixed_primal_update = jnp.sum(primal_updates_stacked, axis=0)

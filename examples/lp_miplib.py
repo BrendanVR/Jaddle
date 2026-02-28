@@ -19,7 +19,7 @@ import optax
 # ## Load and presolve the LP
 # We load a MIPLIB LP from an MPS file using the `highspy` library.
 highs = hspy.Highs()
-highs.readModel("/home/brendanvr/python/Jaddle/data/nug.mps")  # path to MPS file
+highs.readModel("/home/brendanvr/python/Jaddle/data/stp3d.mps")  # path to MPS file
 
 # %% [markdown]
 # We convert the LP to Jaddle's sparse format.
@@ -42,14 +42,16 @@ lr_slow = optax.exponential_decay(
 
 primal_experts = [
     optax.optimistic_adam_v2(learning_rate=lr_fast, alpha=0.05),
-    # optax.optimistic_adam_v2(learning_rate=lr_slow, alpha=0.05),
-    # optax.optimistic_adam_v2(learning_rate=1e0, alpha=0.05),
+    optax.optimistic_adam_v2(learning_rate=lr_slow, alpha=0.05),
+    optax.optimistic_adam_v2(learning_rate=1e0, alpha=0.05),
+    optax.sgd(learning_rate=1e-3),
 ]
 
 dual_experts = [
     optax.optimistic_adam_v2(learning_rate=lr_fast, alpha=0.05),
-    # optax.optimistic_adam_v2(learning_rate=lr_slow, alpha=0.05),
-    # optax.optimistic_adam_v2(learning_rate=1e0, alpha=0.05),
+    optax.optimistic_adam_v2(learning_rate=lr_slow, alpha=0.05),
+    optax.optimistic_adam_v2(learning_rate=1e0, alpha=0.05),
+    optax.adadelta(1.0),
 ]
 
 ensemble_optimiser = jo.hedge_ensemble_saddle(
