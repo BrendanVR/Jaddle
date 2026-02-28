@@ -255,6 +255,13 @@ def hedge_ensemble_saddle(
 
     primal_count = len(primal_experts)
     dual_count = len(dual_experts)
+    use_primal_hedge_loss = primal_count > 1
+    use_dual_hedge_loss = dual_count > 1
+    has_ineq = lp is not None and lp.num_ineq_constraints() > 0
+    has_eq = lp is not None and lp.num_eq_constraints() > 0
+
+    if lp is None and (use_primal_hedge_loss or use_dual_hedge_loss):
+        raise ValueError("lp must be provided for projected-KKT hedge losses")
 
     init_primal_log_weights = _normalise_log_weights(
         jnp.zeros((primal_count,), dtype=jnp.float32)
@@ -284,8 +291,104 @@ def hedge_ensemble_saddle(
         grad_dual_ineq = updates.dual_ineq
         grad_dual_eq = updates.dual_eq
 
-        primal_weights = jax.nn.softmax(state.primal.log_weights)
-        dual_weights = jax.nn.softmax(state.dual.log_weights)
+        if use_primal_hedge_loss:
+            primal_stationarity_grad = (
+                lp.c + lp.A_ineq_T @ params.dual_ineq + lp.A_eq_T @ params.dual_eq
+            )
+
+        if use_dual_hedge_loss:
+            objective_at_params_primal = lp.objective(params.primal)
+            complementarity_scale = 1.0 + jnp.abs(objective_at_params_primal)
+
+            if has_ineq:
+                ineq_residual_at_params_primal = lp.A_ineq @ params.primal - lp.b_ineq
+                max_ineq_violation_at_params_primal = jnp.max(
+                    jnp.maximum(ineq_residual_at_params_primal, 0.0)
+                )
+            else:
+                ineq_residual_at_params_primal = None
+                max_ineq_violation_at_params_primal = jnp.array(
+                    0.0, dtype=params.primal.dtype
+                )
+
+            if has_eq:
+                eq_residual_at_params_primal = lp.A_eq @ params.primal - lp.b_eq
+                max_eq_violation_at_params_primal = jnp.max(
+                    jnp.abs(eq_residual_at_params_primal)
+                )
+            else:
+                max_eq_violation_at_params_primal = jnp.array(
+                    0.0, dtype=params.primal.dtype
+                )
+
+            constraint_bound_at_params_primal = jnp.maximum(
+                max_ineq_violation_at_params_primal,
+                max_eq_violation_at_params_primal,
+            )
+
+        def _primal_candidate_merit(candidate_primal: jnp.ndarray) -> jnp.ndarray:
+            projected_primal = projection_box(
+                candidate_primal - primal_stationarity_grad,
+                lp.lower_bounds,
+                lp.upper_bounds,
+            )
+            primal_grad_norm = jnp.max(jnp.abs(candidate_primal - projected_primal))
+
+            objective_value = lp.objective(candidate_primal)
+
+            if has_ineq:
+                ineq_residual = lp.A_ineq @ candidate_primal - lp.b_ineq
+                max_ineq_violation = jnp.max(jnp.maximum(ineq_residual, 0.0))
+                complementarity_slack = jnp.max(
+                    jnp.abs(params.dual_ineq * ineq_residual)
+                ) / (1.0 + jnp.abs(objective_value))
+            else:
+                max_ineq_violation = jnp.array(0.0, dtype=params.primal.dtype)
+                complementarity_slack = jnp.array(0.0, dtype=params.primal.dtype)
+
+            if has_eq:
+                eq_residual = lp.A_eq @ candidate_primal - lp.b_eq
+                max_eq_violation = jnp.max(jnp.abs(eq_residual))
+            else:
+                max_eq_violation = jnp.array(0.0, dtype=params.primal.dtype)
+
+            constraint_bound = jnp.maximum(max_ineq_violation, max_eq_violation)
+            return jnp.maximum(
+                primal_grad_norm,
+                jnp.maximum(complementarity_slack, constraint_bound),
+            )
+
+        def _dual_candidate_merit(
+            candidate_dual_ineq: jnp.ndarray,
+            candidate_dual_eq: jnp.ndarray,
+        ) -> jnp.ndarray:
+            candidate_stationarity_grad = (
+                lp.c + lp.A_ineq_T @ candidate_dual_ineq + lp.A_eq_T @ candidate_dual_eq
+            )
+            projected_primal = projection_box(
+                params.primal - candidate_stationarity_grad,
+                lp.lower_bounds,
+                lp.upper_bounds,
+            )
+            primal_grad_norm = jnp.max(jnp.abs(params.primal - projected_primal))
+
+            if has_ineq:
+                complementarity_slack = (
+                    jnp.max(
+                        jnp.abs(candidate_dual_ineq * ineq_residual_at_params_primal)
+                    )
+                    / complementarity_scale
+                )
+            else:
+                complementarity_slack = jnp.array(0.0, dtype=params.primal.dtype)
+
+            return jnp.maximum(
+                primal_grad_norm,
+                jnp.maximum(
+                    complementarity_slack,
+                    constraint_bound_at_params_primal,
+                ),
+            )
 
         def _replace_tuple_entry(items, index, value):
             return items[:index] + (value,) + items[index + 1 :]
@@ -303,17 +406,15 @@ def hedge_ensemble_saddle(
                     expert_state,
                 )
 
-                candidate_primal = projection_box(
-                    params.primal + expert_update,
-                    lp.lower_bounds,
-                    lp.upper_bounds,
-                )
-                candidate_state = SaddleState(
-                    primal=candidate_primal,
-                    dual_ineq=params.dual_ineq,
-                    dual_eq=params.dual_eq,
-                )
-                loss = _projected_kkt_merit(lp, candidate_state)
+                if use_primal_hedge_loss:
+                    candidate_primal = projection_box(
+                        params.primal + expert_update,
+                        lp.lower_bounds,
+                        lp.upper_bounds,
+                    )
+                    loss = _primal_candidate_merit(candidate_primal)
+                else:
+                    loss = jnp.array(0.0, dtype=params.primal.dtype)
 
                 return next_states, (expert_update, loss)
 
@@ -333,11 +434,15 @@ def hedge_ensemble_saddle(
             jnp.arange(primal_count, dtype=jnp.int32),
         )
 
-        mixed_primal_update = jnp.tensordot(
-            primal_weights,
-            primal_updates_stacked,
-            axes=(0, 0),
-        )
+        if use_primal_hedge_loss:
+            primal_weights = jax.nn.softmax(state.primal.log_weights)
+            mixed_primal_update = jnp.tensordot(
+                primal_weights,
+                primal_updates_stacked,
+                axes=(0, 0),
+            )
+        else:
+            mixed_primal_update = primal_updates_stacked[0]
 
         grad_dual = (grad_dual_ineq, grad_dual_eq)
         params_dual = (params.dual_ineq, params.dual_eq)
@@ -356,16 +461,14 @@ def hedge_ensemble_saddle(
                     expert_state,
                 )
 
-                candidate_dual_ineq = projection_non_negative(
-                    params.dual_ineq + update_dual_ineq
-                )
-                candidate_dual_eq = params.dual_eq + update_dual_eq
-                candidate_state = SaddleState(
-                    primal=params.primal,
-                    dual_ineq=candidate_dual_ineq,
-                    dual_eq=candidate_dual_eq,
-                )
-                loss = _projected_kkt_merit(lp, candidate_state)
+                if use_dual_hedge_loss:
+                    candidate_dual_ineq = projection_non_negative(
+                        params.dual_ineq + update_dual_ineq
+                    )
+                    candidate_dual_eq = params.dual_eq + update_dual_eq
+                    loss = _dual_candidate_merit(candidate_dual_ineq, candidate_dual_eq)
+                else:
+                    loss = jnp.array(0.0, dtype=params.primal.dtype)
 
                 return next_states, ((update_dual_ineq, update_dual_eq), loss)
 
@@ -388,31 +491,39 @@ def hedge_ensemble_saddle(
             jnp.arange(dual_count, dtype=jnp.int32),
         )
 
-        mixed_dual_ineq_update = jnp.tensordot(
-            dual_weights,
-            dual_updates_ineq_stacked,
-            axes=(0, 0),
-        )
-        mixed_dual_eq_update = jnp.tensordot(
-            dual_weights,
-            dual_updates_eq_stacked,
-            axes=(0, 0),
-        )
+        if use_dual_hedge_loss:
+            dual_weights = jax.nn.softmax(state.dual.log_weights)
+            mixed_dual_ineq_update = jnp.tensordot(
+                dual_weights,
+                dual_updates_ineq_stacked,
+                axes=(0, 0),
+            )
+            mixed_dual_eq_update = jnp.tensordot(
+                dual_weights,
+                dual_updates_eq_stacked,
+                axes=(0, 0),
+            )
+        else:
+            mixed_dual_ineq_update = dual_updates_ineq_stacked[0]
+            mixed_dual_eq_update = dual_updates_eq_stacked[0]
 
-        dual_losses = jnp.asarray(dual_losses)
+        if use_primal_hedge_loss:
+            primal_eta_value = _resolve_schedule(primal_eta, state.step)
+            primal_losses = jnp.clip(primal_losses, -loss_clip, loss_clip)
+            next_primal_log_weights = _normalise_log_weights(
+                state.primal.log_weights - primal_eta_value * primal_losses
+            )
+        else:
+            next_primal_log_weights = state.primal.log_weights
 
-        primal_eta_value = _resolve_schedule(primal_eta, state.step)
-        dual_eta_value = _resolve_schedule(dual_eta, state.step)
-
-        primal_losses = jnp.clip(primal_losses, -loss_clip, loss_clip)
-        dual_losses = jnp.clip(dual_losses, -loss_clip, loss_clip)
-
-        next_primal_log_weights = _normalise_log_weights(
-            state.primal.log_weights - primal_eta_value * primal_losses
-        )
-        next_dual_log_weights = _normalise_log_weights(
-            state.dual.log_weights - dual_eta_value * dual_losses
-        )
+        if use_dual_hedge_loss:
+            dual_eta_value = _resolve_schedule(dual_eta, state.step)
+            dual_losses = jnp.clip(dual_losses, -loss_clip, loss_clip)
+            next_dual_log_weights = _normalise_log_weights(
+                state.dual.log_weights - dual_eta_value * dual_losses
+            )
+        else:
+            next_dual_log_weights = state.dual.log_weights
 
         next_state = HedgeSaddleState(
             primal=HedgePoolState(next_primal_states, next_primal_log_weights),

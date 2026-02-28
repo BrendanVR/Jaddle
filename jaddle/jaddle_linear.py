@@ -602,7 +602,7 @@ def solve(
     print("----------------------------------------------")
     print(f"Epochs to solution: {count}")
     print("----------------------------------------------")
-    print(f"Objective: {lp.objective(output.primal):.2e}")
+    print(f"Objective: {lp.objective(output.primal):.5e}")
     print("----------------------------------------------")
 
     if scale in ["ruiz", "pc", "ruiz+pc"]:
@@ -683,34 +683,6 @@ def lp_summary_statistics(lp: LP):
 
 
 # %%
-
-
-def project_onto_equality_constraints(
-    lp: LP, x: jnp.ndarray, num_iterations: int = 100, step_size: float = 0.1
-) -> jnp.ndarray:
-    """
-    Project a point onto the equality constraints of an LP using iterative projection.
-
-    Args:
-        lp: Linear program with equality constraints
-        x: Point to project
-        num_iterations: Number of projection iterations
-        step_size: Step size for each projection step
-
-    Returns:
-        Projected point satisfying A_eq @ x ≈ b_eq
-    """
-
-    def project_step(x_curr):
-        residual = lp.A_eq @ x_curr - lp.b_eq
-        gradient = lp.A_eq_T @ residual
-        return x_curr - step_size * gradient
-
-    x_proj = x
-    for _ in range(num_iterations):
-        x_proj = project_step(x_proj)
-
-    return x_proj
 
 
 def __convert_to_scipy(jsp_mat: jsp.BCOO) -> sp.csc_matrix:

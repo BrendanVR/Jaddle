@@ -68,7 +68,6 @@ ensemble_optimiser = jo.hedge_ensemble_saddle(
     dual_experts=dual_experts,
     primal_eta=5e-2,
     dual_eta=5e-2,
-    expert_loss_mode="projected_kkt_merit",
     lp=lp,
 )
 
