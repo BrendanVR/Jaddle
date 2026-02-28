@@ -40,19 +40,14 @@ jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 
 
 # %%
-learning_rate = optax.exponential_decay(
+lr = optax.exponential_decay(
     1e1,
     transition_steps=1000,
     decay_rate=0.9,
     end_value=1e-4,
-    verbose=True,
 )
 
-optimiser = jo.create_saddle_optimiser(
-    optax.optimistic_adam_v2(learning_rate, alpha=0.05),
-    optax.optimistic_adam_v2(learning_rate, alpha=0.05),
-)
-
+optimiser = jo.optimistic_adam_metric_saddle(lr, lr)
 
 # %% [markdown]
 # ## Solve the presolved LP using Jaddle's saddle point solver
@@ -60,15 +55,14 @@ optimiser = jo.create_saddle_optimiser(
 # doubling the cycle length each time (geometric growth).
 solution = jl.solve(
     lp=jaddle_lp,
-    # optimiser=optimiser,
+    optimiser=optimiser,
     scale="ruiz+pc",
     # verbose=True,
     average=False,
     constraint_tolerance=1e-3,
 )
+
 # %%
-print("----------------------------------------------")
-print(f"Primal objective value: {jaddle_lp.objective(solution.primal)}")
 print(f"Primal Equality Residual: {jaddle_lp.eq_slack(solution.primal)}")
 print(f"Primal Inequality Residual: {jaddle_lp.ineq_slack(solution.primal)}")
 print("----------------------------------------------")

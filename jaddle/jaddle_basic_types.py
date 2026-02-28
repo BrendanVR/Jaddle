@@ -15,7 +15,6 @@ class HedgeSaddleState(NamedTuple):
     primal: HedgePoolState
     dual: HedgePoolState
     step: jnp.ndarray
-    rng_key: jnp.ndarray
 
 
 # %%

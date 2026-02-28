@@ -25,7 +25,7 @@ def __sps(
     initial_solution,
     initial_avg_state=None,
     initial_opt_state=None,
-    weight_function=lambda i: jax.lax.select(i <= int(5e4), 1e-16, 1.0),
+    weight_function=lambda _: 1.0,
     total_weight=0.0,
     primal_damping=0.0,
     dual_damping_ineq=0.0,
@@ -150,14 +150,15 @@ def solve(
     optimiser,
     max_epochs=None,
     initial_solution=None,
+    initial_opt_state=None,
     iterations_per_epoch=int(1e4),
     dual_damping_ineq=0.0,
     dual_damping_eq=0.0,
     primal_damping=0.0,
     progress_tolerance=1e-2,
-    constraint_tolerance=1e-4,
-    complementarity_tolerance=1e-4,
-    weight_function=lambda i: jax.lax.select(i <= int(5e4), 1e-16, 1.0),
+    constraint_tolerance=1e-3,
+    complementarity_tolerance=1e-3,
+    weight_function=lambda _: 1.0,
     verbose=False,
     average=True,
     scale=None,
@@ -165,6 +166,7 @@ def solve(
     epochs_per_restart=10,
     restart_multiplier=1.0,
     expert_diagnostics=False,
+    output_opt_state=False,
 ):
     """
     Solve a linear program via saddle-point optimisation.
@@ -374,7 +376,11 @@ def solve(
     i = 1
     state = initial_solution
     average_state = initial_solution
-    opt_state = optimiser.init(initial_solution)
+    opt_state = (
+        initial_opt_state
+        if initial_opt_state is not None
+        else optimiser.init(initial_solution)
+    )
     previous_objective = jnp.inf
     primal_grad_norm = jnp.inf
     complementarity_slack = jnp.inf
@@ -606,7 +612,10 @@ def solve(
             dual_eq=output.dual_eq * jnp_row_scale_eq,
         )
 
-    return output
+    if output_opt_state:
+        return output, opt_state
+    else:
+        return output
 
 
 # %%
