@@ -2,10 +2,8 @@
 # # Solve a Scaled LP using Jaddle Saddle Point Optimisation
 # This example demonstrates how to load and solve a MIPLIB linear program (LP) using saddle point optimisation methods implemented in Jaddle.
 # We will use the `highspy` library to load a MIPLIB LP from an MPS file.
-# We will Scaled the LP using the `jaddle_linear_scalers` module before solving, and then unscale the solution back to the original space.
 
 # %%
-
 import os
 
 # Suppress INFO and WARNING logs from XLA/JAX
@@ -36,7 +34,7 @@ highs.readModel("/home/brendanvr/python/Jaddle/data/boeing.mps")  # path to MPS 
 # %% [markdown]
 # We convert the LP to Jaddle's sparse format, before applying ruiz scaling.
 highs_lp = highs.getLp()
-jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
+jaddle_lp = jl.to_jaddle_sparse64(hh.highs_to_standard_form_sparse(highs_lp))
 
 # %%
 lr = optax.exponential_decay(

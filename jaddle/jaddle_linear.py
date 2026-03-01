@@ -452,6 +452,7 @@ def solve(
                     ):
                         break
 
+                    start_epoch_time = time.time()
                     (
                         i,
                         state,
@@ -484,6 +485,8 @@ def solve(
                         lambda: compute_epoch_metrics(average_state),
                         lambda: compute_epoch_metrics(state),
                     )
+
+                    finish_epoch_time = time.time()
                     count += 1
 
                     if verbose:
@@ -493,6 +496,7 @@ def solve(
                             f"|PGN {primal_grad_norm:.2e}|"
                             f"|CS {complementarity_slack:.2e}|"
                             f"|CB {constraint_bound:.2e}|"
+                            f"|Time {finish_epoch_time - start_epoch_time:.2f}s|"
                         )
                         print("----------------------------------------------")
 
@@ -570,6 +574,8 @@ def solve(
             while check_convergence(
                 primal_grad_norm, complementarity_slack, constraint_bound, count
             ):
+
+                start_epoch_time = time.time()
                 (
                     i,
                     state,
@@ -602,13 +608,17 @@ def solve(
                     lambda: compute_epoch_metrics(average_state),
                     lambda: compute_epoch_metrics(state),
                 )
+
+                finish_epoch_time = time.time()
                 count += 1
 
                 print(
-                    f"|Obj {objective_value:.2e}|"
+                    f"|Epoch {count}|"
+                    f"|Obj{objective_value:.2e}|"
                     f"|PGN {primal_grad_norm:.2e}|"
                     f"|CS {complementarity_slack:.2e}|"
                     f"|CB {constraint_bound:.2e}|"
+                    f"|Time {finish_epoch_time - start_epoch_time:.2f}s|"
                 )
                 print("----------------------------------------------")
 
@@ -664,6 +674,25 @@ def to_jaddle_sparse(lp: LP):
         jnp.array(lp.b_ineq, dtype=jnp.float32),
         jnp.array(lp.lower_bounds, dtype=jnp.float32),
         jnp.array(lp.upper_bounds, dtype=jnp.float32),
+    )
+    return lp_jax
+
+
+def to_jaddle_sparse64(lp: LP):
+    A_eq_sp = lp.A_eq.astype(np.float64)
+    A_ineq_sp = lp.A_ineq.astype(np.float64)
+
+    A_eq = jsp.BCOO.from_scipy_sparse(A_eq_sp)
+    A_ineq = jsp.BCOO.from_scipy_sparse(A_ineq_sp)
+
+    lp_jax = LP(
+        jnp.array(lp.c, dtype=jnp.float64),
+        A_eq,
+        jnp.array(lp.b_eq, dtype=jnp.float64),
+        A_ineq,
+        jnp.array(lp.b_ineq, dtype=jnp.float64),
+        jnp.array(lp.lower_bounds, dtype=jnp.float64),
+        jnp.array(lp.upper_bounds, dtype=jnp.float64),
     )
     return lp_jax
 

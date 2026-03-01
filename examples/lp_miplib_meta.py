@@ -18,7 +18,7 @@ import highspy as hspy
 import optax
 
 # %%
-PROBLEM_NAME = "buildingenergy"  # name of the MIPLIB problem to load
+PROBLEM_NAME = "nug"  # name of the MIPLIB problem to load
 
 
 # %% [markdown]
@@ -36,31 +36,34 @@ jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 
 
 # %%
-def lr(decay_rate, transition_steps=int(5e4)):
+def lr(decay_rate, transition_steps, end_value):
     return optax.exponential_decay(
         init_value=1e0,
         transition_steps=transition_steps,
         decay_rate=decay_rate,
-        end_value=1e-5,
+        end_value=end_value,
     )
 
 
 learning_rates = [
-    lr(decay_rate, transition_steps)
+    lr(decay_rate, transition_steps, end_value)
     for decay_rate in [0.5, 0.9, 0.99]
-    for transition_steps in [int(5e4), int(1e5), int(1e3)]
+    for transition_steps in [int(1e3), int(1e4), int(1e5)]
+    for end_value in [1e-3, 1e-4, 1e-5]
 ]
 primal_experts = [
-    optax.optimistic_adam_v2(learning_rate=lr, alpha=0.05) for lr in learning_rates
+    optax.optimistic_adam_v2(learning_rate=lr, alpha=alpha)
+    for lr in learning_rates
+    for alpha in [
+        0.01,  # good value
+        0.9,  # bad value
+    ]
 ]
 dual_experts = [optax.adadelta(learning_rate=1.0)]
 
 ensemble_optimiser = jo.hedge_ensemble_saddle(
     primal_experts=primal_experts,
     dual_experts=dual_experts,
-    primal_eta=1e-3,
-    dual_eta=1e-3,
-    loss_clip=1e3,
 )
 
 # %%
@@ -69,9 +72,8 @@ solution = jl.solve(
     optimiser=ensemble_optimiser,
     verbose=True,
     expert_diagnostics=True,
-    iterations_per_epoch=int(5e4),
+    iterations_per_epoch=int(1e4),
     weight_function=lambda i: jax.lax.select(i <= int(5e4), 1e-16, 1.0),
-    scale="pc",
 )
 
 # %%

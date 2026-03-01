@@ -60,7 +60,9 @@ cp = jc.CP(
 
 # %% [markdown]
 # ## Solving the Convex Problem
-optimiser = jo.adamdelta_saddle(lr_primal=1e-3, lr_dual=1.0, alpha=5e-2, nesterov=True)
+optimiser = jo.optimistic_adam_saddle(
+    lr_primal=1e-3, lr_dual=1.0, alpha=5e-2, nesterov=True
+)
 
 solution = jc.solve(cp, optimiser=optimiser)
 

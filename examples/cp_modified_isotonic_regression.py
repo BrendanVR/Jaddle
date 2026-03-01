@@ -15,7 +15,7 @@ import optax
 # %% [markdown]
 # ## Generate Synthetic Data
 # We will create synthetic data that follows a cubic relationship with some added noise.
-n = 500
+n = 1000
 x = np.linspace(-1, 1, n)
 y = x**3
 y += 0.1 * np.random.randn(n)  # add noise
