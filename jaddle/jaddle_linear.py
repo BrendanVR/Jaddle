@@ -605,10 +605,10 @@ def solve(
                 count += 1
 
                 print(
-                    f"Objective {objective_value:.2e}: "
-                    f"Primal Grad Norm={primal_grad_norm:.2e}, "
-                    f"Compl. Slack={complementarity_slack:.2e}, "
-                    f"Constraint Bound={constraint_bound:.2e}"
+                    f"|Obj {objective_value:.2e}|"
+                    f"|PGN {primal_grad_norm:.2e}|"
+                    f"|CS {complementarity_slack:.2e}|"
+                    f"|CB {constraint_bound:.2e}|"
                 )
                 print("----------------------------------------------")
 
