@@ -33,11 +33,9 @@ def __sps(
     average=True,
 ):
 
-    @jax.jit
     def projection_primal(primal_state):
         return projection_box(primal_state, lp.lower_bounds, lp.upper_bounds)
 
-    @jax.jit
     def grad(state):
         grad_primal = (
             lp.c
@@ -57,7 +55,6 @@ def __sps(
             dual_eq=grad_dual_eq,
         )
 
-    @jax.jit
     def opt_update(gradient, opt_state, state):
         return optimiser.update(gradient, opt_state, state)
 
@@ -73,7 +70,6 @@ def __sps(
         opt_state,
         total_weight=0.0,
     ):
-        @jax.jit
         def step(carry, _):
             (
                 i,
@@ -269,7 +265,6 @@ def solve(
             constraint_bound,
         )
 
-    @jax.jit
     def check_convergence(
         primal_grad_norm,
         complementarity_slack,
@@ -281,11 +276,9 @@ def solve(
             | (constraint_bound > constraint_tolerance)
         )
 
-    @jax.jit
     def check_max_epochs(count):
         return count >= max_epochs
 
-    @jax.jit
     def cond_fun(loop_vars):
         (
             i,
@@ -305,7 +298,6 @@ def solve(
             primal_grad_norm, complementarity_slack, constraint_bound, count
         )
 
-    @jax.jit
     def body_fun(loop_vars):
         (
             i,
@@ -376,7 +368,6 @@ def solve(
         if initial_opt_state is not None
         else optimiser.init(initial_solution)
     )
-    previous_objective = jnp.inf
     primal_grad_norm = jnp.inf
     complementarity_slack = jnp.inf
     constraint_bound = jnp.inf
@@ -523,25 +514,6 @@ def to_jaddle_sparse(lp: LP):
         jnp.array(lp.b_ineq, dtype=jnp.float32),
         jnp.array(lp.lower_bounds, dtype=jnp.float32),
         jnp.array(lp.upper_bounds, dtype=jnp.float32),
-    )
-    return lp_jax
-
-
-def to_jaddle_sparse64(lp: LP):
-    A_eq_sp = lp.A_eq.astype(np.float64)
-    A_ineq_sp = lp.A_ineq.astype(np.float64)
-
-    A_eq = jsp.BCOO.from_scipy_sparse(A_eq_sp)
-    A_ineq = jsp.BCOO.from_scipy_sparse(A_ineq_sp)
-
-    lp_jax = LP(
-        jnp.array(lp.c, dtype=jnp.float64),
-        A_eq,
-        jnp.array(lp.b_eq, dtype=jnp.float64),
-        A_ineq,
-        jnp.array(lp.b_ineq, dtype=jnp.float64),
-        jnp.array(lp.lower_bounds, dtype=jnp.float64),
-        jnp.array(lp.upper_bounds, dtype=jnp.float64),
     )
     return lp_jax
 

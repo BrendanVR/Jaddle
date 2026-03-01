@@ -24,11 +24,9 @@ def __sps(
     average=True,
 ):
 
-    @jax.jit
     def projection_primal(primal_state):
         return projection_box(primal_state, cp.lower_bounds, cp.upper_bounds)
 
-    @jax.jit
     def langrangian(state):
         return (
             cp.objective(state.primal)
@@ -36,7 +34,6 @@ def __sps(
             + state.dual_eq @ cp.constraints_eq(state.primal)
         )
 
-    @jax.jit
     def grad(state):
         gradient = jax.grad(langrangian)(state)
         return SaddleState(
@@ -45,7 +42,6 @@ def __sps(
             dual_eq=-gradient.dual_eq,
         )
 
-    @jax.jit
     def opt_update(gradient, opt_state, state):
         return optimiser.update(gradient, opt_state, state)
 
@@ -61,7 +57,6 @@ def __sps(
         opt_state,
         total_weight=0.0,
     ):
-        @jax.jit
         def step(carry, _):
             (
                 i,
@@ -168,11 +163,9 @@ def solve(
     print("====Starting Solve====")
     print("----------------------------------------------")
 
-    @jax.jit
     def projection_primal(primal_state):
         return projection_box(primal_state, cp.lower_bounds, cp.upper_bounds)
 
-    @jax.jit
     def langrangian(state):
         return (
             cp.objective(state.primal)
@@ -180,7 +173,6 @@ def solve(
             + state.dual_eq @ cp.constraints_eq(state.primal)
         )
 
-    @jax.jit
     def grad(state):
         gradient = jax.grad(langrangian)(state)
         return SaddleState(
@@ -224,7 +216,6 @@ def solve(
             constraint_bound,
         )
 
-    @jax.jit
     def check_convergence(
         primal_grad_norm,
         complementarity_slack,
@@ -236,11 +227,9 @@ def solve(
             | (constraint_bound > constraint_tolerance)
         )
 
-    @jax.jit
     def check_max_epochs(count):
         return count >= max_epochs
 
-    @jax.jit
     def cond_fun(loop_vars):
         (
             i,
@@ -260,7 +249,6 @@ def solve(
             primal_grad_norm, complementarity_slack, constraint_bound, count
         )
 
-    @jax.jit
     def body_fun(loop_vars):
         (
             i,

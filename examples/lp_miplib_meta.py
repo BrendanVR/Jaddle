@@ -47,21 +47,21 @@ def lr(decay_rate, init_value, end_value):
 
 learning_rates = [
     lr(decay_rate, init_value, end_value)
-    for decay_rate in [0.9, 0.99]
+    for decay_rate in [0.5, 0.9, 0.99]
     for init_value in [1e0]
-    for end_value in [1e-5]
+    for end_value in [1e-4]
 ]
 primal_experts = [
     optax.optimistic_adam_v2(learning_rate=lr, alpha=alpha, beta=beta)
     for lr in learning_rates
-    for alpha in [0.01, 0.05, 0.1]
+    for alpha in [0.01, 0.05, 0.1, 0.5, 0.9]
     for beta in [1.0]
 ]
 
 dual_experts = [
     optax.optimistic_adam_v2(learning_rate=lr, alpha=alpha, beta=beta)
     for lr in learning_rates
-    for alpha in [0.01, 0.05, 0.1]
+    for alpha in [0.01, 0.05, 0.1, 0.5, 0.9]
     for beta in [1.0]
 ]
 
@@ -84,7 +84,8 @@ while (len(primal_experts) > 1 or len(dual_experts) > 1) and (not is_converged):
         expert_diagnostics=True,
         iterations_per_epoch=int(1e4),
         output_opt_state=True,
-        max_epochs=10,
+        weight_function=lambda i: jax.lax.select(i <= int(2e4), 1e-16, 1.0),
+        max_epochs=3,
     )
 
     opt_state, primal_idx, dual_idx = opt_state.prune(threshold=1e-3)
@@ -99,9 +100,9 @@ while (len(primal_experts) > 1 or len(dual_experts) > 1) and (not is_converged):
         lp=jaddle_lp,
         primal_experts=primal_experts,
         dual_experts=dual_experts,
-        primal_eta=0.001,
-        dual_eta=0.001,
-        loss_clip=1e4,
+        primal_eta=0.05,
+        dual_eta=0.05,
+        loss_clip=1e2,
     )
 
 solution, is_converged = jl.solve(
