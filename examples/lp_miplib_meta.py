@@ -64,6 +64,7 @@ dual_experts = [optax.adadelta(learning_rate=1.0)]
 ensemble_optimiser = jo.hedge_ensemble_saddle(
     primal_experts=primal_experts,
     dual_experts=dual_experts,
+    prune_threshold=1e-9,  # prune experts with weight below this threshold
 )
 
 # %%
@@ -74,7 +75,6 @@ solution, opt_state = jl.solve(
     expert_diagnostics=True,
     iterations_per_epoch=int(1e4),
     weight_function=lambda i: jax.lax.select(i <= int(5e4), 1e-16, 1.0),
-    prune_experts=1e-7,
     output_opt_state=True,
 )
 

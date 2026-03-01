@@ -201,6 +201,7 @@ def hedge_ensemble_saddle(
     primal_eta: ScheduleLike = 5e-2,
     dual_eta: ScheduleLike = 5e-2,
     loss_clip: float = 1e2,
+    prune_threshold: float = 1e-8,
 ):
     if len(primal_experts) == 0:
         raise ValueError("primal_experts must contain at least one optimiser")
@@ -245,14 +246,40 @@ def hedge_ensemble_saddle(
         primal_losses = []
 
         for expert_index, expert in enumerate(primal_experts):
-            expert_update, expert_state = expert.update(
-                grad_primal,
-                state.primal.expert_states[expert_index],
-                params.primal,
+            is_active = state.primal.log_weights[expert_index] > jnp.log(
+                prune_threshold
+            )
+
+            if not is_active:
+                state.primal.log_weights = state.primal.log_weights.at[
+                    expert_index
+                ].set(-jnp.inf)
+
+            def active_primal_update(_):
+                expert_update, expert_state = expert.update(
+                    grad_primal,
+                    state.primal.expert_states[expert_index],
+                    params.primal,
+                )
+                expert_loss = -jnp.dot(grad_primal, expert_update)
+                return expert_update, expert_state, expert_loss
+
+            def inactive_primal_update(_):
+                return (
+                    jnp.zeros_like(grad_primal),
+                    state.primal.expert_states[expert_index],
+                    jnp.asarray(0.0, dtype=grad_primal.dtype),
+                )
+
+            expert_update, expert_state, expert_loss = jax.lax.cond(
+                is_active,
+                active_primal_update,
+                inactive_primal_update,
+                operand=None,
             )
             primal_step_updates.append(expert_update)
             primal_next_states.append(expert_state)
-            primal_losses.append(-jnp.dot(grad_primal, expert_update))
+            primal_losses.append(expert_loss)
 
         primal_updates_stacked = jnp.stack(primal_step_updates, axis=0)
         primal_losses = jnp.stack(primal_losses, axis=0)
@@ -271,21 +298,38 @@ def hedge_ensemble_saddle(
         params_dual = (params.dual_ineq, params.dual_eq)
 
         for expert_index, expert in enumerate(dual_experts):
-            expert_update, expert_state = expert.update(
-                grad_dual,
-                state.dual.expert_states[expert_index],
-                params_dual,
+            is_active = state.dual.log_weights[expert_index] > jnp.log(prune_threshold)
+
+            def active_dual_update(_):
+                expert_update, expert_state = expert.update(
+                    grad_dual,
+                    state.dual.expert_states[expert_index],
+                    params_dual,
+                )
+                update_dual_ineq, update_dual_eq = expert_update
+                expert_loss = jnp.dot(grad_dual_ineq, update_dual_ineq) + jnp.dot(
+                    grad_dual_eq, update_dual_eq
+                )
+                return expert_update, expert_state, expert_loss
+
+            def inactive_dual_update(_):
+                return (
+                    (jnp.zeros_like(grad_dual_ineq), jnp.zeros_like(grad_dual_eq)),
+                    state.dual.expert_states[expert_index],
+                    jnp.asarray(0.0, dtype=grad_dual_ineq.dtype),
+                )
+
+            expert_update, expert_state, expert_loss = jax.lax.cond(
+                is_active,
+                active_dual_update,
+                inactive_dual_update,
+                operand=None,
             )
             update_dual_ineq, update_dual_eq = expert_update
             dual_step_updates_ineq.append(update_dual_ineq)
             dual_step_updates_eq.append(update_dual_eq)
             dual_next_states.append(expert_state)
-            dual_losses.append(
-                (
-                    jnp.dot(grad_dual_ineq, update_dual_ineq)
-                    + jnp.dot(grad_dual_eq, update_dual_eq)
-                )
-            )
+            dual_losses.append(expert_loss)
 
         dual_updates_ineq_stacked = jnp.stack(dual_step_updates_ineq, axis=0)
         dual_updates_eq_stacked = jnp.stack(dual_step_updates_eq, axis=0)

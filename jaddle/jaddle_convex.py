@@ -6,7 +6,7 @@ import optax
 import functools
 from typing import NamedTuple
 import time
-from jaddle.jaddle_basic_types import CP, SaddleState
+from jaddle.jaddle_basic_types import CP, SaddleState, HedgeSaddleState
 import jaddle.jaddle_optimisers as jo
 import numpy as np
 
@@ -151,6 +151,10 @@ def solve(
     restart_multiplier=1.0,
     expert_diagnostics=False,
     output_opt_state=False,
+    prune_experts=None,
+    prune_experts_interval=10,
+    prune_experts_min_primal=1,
+    prune_experts_min_dual=1,
 ):
     """
     Solve a linear program via saddle-point optimisation.
@@ -342,6 +346,18 @@ def solve(
     if initial_solution is None:
         initial_solution = cp.initial_solution()
 
+    def resolve_prune_threshold(prune_value):
+        if prune_value is None or prune_value is False:
+            return None
+        if prune_value is True:
+            return 1e-7
+        return float(prune_value)
+
+    prune_threshold = resolve_prune_threshold(prune_experts)
+    prune_interval = None
+    if prune_threshold is not None:
+        prune_interval = max(1, int(prune_experts_interval))
+
     state = initial_solution
     average_state = initial_solution
     opt_state = (
@@ -382,6 +398,55 @@ def solve(
                 f"primal={np.asarray(primal_weights)}, dual={np.asarray(dual_weights)}"
             )
             print("----------------------------------------------")
+
+    def maybe_prune_experts(epoch_count, state_for_prune):
+        if prune_threshold is None:
+            return state_for_prune
+
+        if (epoch_count % prune_interval) != 0:
+            return state_for_prune
+
+        if not isinstance(state_for_prune, HedgeSaddleState):
+            return state_for_prune
+
+        before_weights = jo.hedge_weights_from_state(state_for_prune)
+        if before_weights is None:
+            before_primal = len(state_for_prune.primal.expert_states)
+            before_dual = len(state_for_prune.dual.expert_states)
+        else:
+            before_primal = int(
+                np.sum(np.asarray(before_weights[0]) >= prune_threshold)
+            )
+            before_dual = int(np.sum(np.asarray(before_weights[1]) >= prune_threshold))
+
+        pruned_state = state_for_prune.prune(
+            threshold=prune_threshold,
+            min_primal_experts=prune_experts_min_primal,
+            min_dual_experts=prune_experts_min_dual,
+        )
+
+        after_weights = jo.hedge_weights_from_state(pruned_state)
+        if after_weights is None:
+            after_primal = len(pruned_state.primal.expert_states)
+            after_dual = len(pruned_state.dual.expert_states)
+        else:
+            after_primal = int(np.sum(np.asarray(after_weights[0]) >= prune_threshold))
+            after_dual = int(np.sum(np.asarray(after_weights[1]) >= prune_threshold))
+
+        if (
+            expert_diagnostics
+            and verbose
+            and ((after_primal != before_primal) or (after_dual != before_dual))
+        ):
+            print(
+                f"Pruned experts (epoch {epoch_count}): "
+                f"primal {before_primal}->{after_primal}, "
+                f"dual {before_dual}->{after_dual}, "
+                f"threshold={prune_threshold:.1e}"
+            )
+            print("----------------------------------------------")
+
+        return pruned_state
 
     try:
         # ---- Warm restart loop ----
@@ -440,6 +505,7 @@ def solve(
 
                     finish_epoch_time = time.time()
                     count += 1
+                    opt_state = maybe_prune_experts(count, opt_state)
 
                     if verbose:
                         print(
@@ -506,6 +572,7 @@ def solve(
                     lambda: compute_epoch_metrics(state),
                 )
                 count += 1
+                opt_state = maybe_prune_experts(count, opt_state)
 
             if average:
                 output = average_state
@@ -557,6 +624,7 @@ def solve(
 
                 finish_epoch_time = time.time()
                 count += 1
+                opt_state = maybe_prune_experts(count, opt_state)
 
                 print(
                     f"|Epoch {count}|"

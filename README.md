@@ -48,6 +48,17 @@ optimiser = jo.optimistic_adam_metric_saddle(
     dual_ineq_metric=jnp.ones(num_ineq),
     dual_eq_metric=jnp.ones(num_eq),
 )
+
+When using `hedge_ensemble_saddle`, you can intermittently prune low-weight experts to reduce per-epoch compute:
+
+```python
+solution = jl.solve(
+    lp=jaddle_lp,
+    optimiser=ensemble_optimiser,
+    prune_experts=1e-7,
+    prune_experts_interval=5,
+)
+```
 ```
 
 ---
