@@ -7,6 +7,7 @@ import os
 
 # Suppress INFO and WARNING logs from XLA/JAX
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["XLA_FLAGS"] = "--xla_disable_hlo_passes=slow-operation-alarm"
 
 import jax
 import jax.numpy as jnp
@@ -33,7 +34,7 @@ jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 # %%
 def lr(decay_rate):
     return optax.exponential_decay(
-        init_value=1e0,
+        init_value=1e-2,
         transition_steps=int(1e4),
         decay_rate=decay_rate,
         end_value=1e-5,
@@ -42,9 +43,9 @@ def lr(decay_rate):
 
 learning_rates = [lr(decay_rate) for decay_rate in [0.5, 0.6, 0.7, 0.8, 0.9, 0.99]]
 primal_experts = [
-    optax.optimistic_adam_v2(learning_rate=lr, alpha=0.1) for lr in learning_rates
+    optax.optimistic_adam_v2(learning_rate=lr, alpha=0.05) for lr in learning_rates
 ]
-dual_optimiser = optax.optimistic_adam_v2(learning_rate=lr(0.9), alpha=0.1)
+dual_optimiser = optax.adadelta(1.0)
 ensemble_optimiser = jo.hedge_ensemble_saddle(
     primal_experts=primal_experts,
     dual_experts=[dual_optimiser],
@@ -74,11 +75,7 @@ solution = jl.solve(
         primal_experts[best_expert_idx_primal], dual_optimiser
     ),
     verbose=True,
-    average=False,
-    iterations_per_epoch=int(5e4),
-    restarts=5,
-    epochs_per_restart=1,
-    restart_multiplier=2,
+    weight_function=lambda i: jax.lax.select(i < int(1e5), 1e-16, 1.0),
 )
 
 # %%

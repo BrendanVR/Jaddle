@@ -428,29 +428,98 @@ def solve(
             )
             print("----------------------------------------------")
 
-    # ---- Warm restart loop ----
-    if restarts > 0:
-        cycle_length = epochs_per_restart
+    try:
+        # ---- Warm restart loop ----
+        if restarts > 0:
+            cycle_length = epochs_per_restart
 
-        for restart in range(restarts + 1):
-            if restart > 0:
-                # Warm restart: keep iterate, reset everything else
-                opt_state = optimiser.init(state)
-                total_weight = 0.0
-                average_state = state
+            for restart in range(restarts + 1):
+                if restart > 0:
+                    # Warm restart: keep iterate, reset everything else
+                    opt_state = optimiser.init(state)
+                    total_weight = 0.0
+                    average_state = state
 
-                if verbose:
-                    print(
-                        f"--- Restart {restart}/{restarts} "
-                        f"(cycle: {cycle_length} epochs) ---"
+                    if verbose:
+                        print(
+                            f"--- Restart {restart}/{restarts} "
+                            f"(cycle: {cycle_length} epochs) ---"
+                        )
+
+                for epoch in range(cycle_length):
+                    if is_converged(
+                        primal_grad_norm, complementarity_slack, constraint_bound
+                    ):
+                        break
+
+                    (
+                        i,
+                        state,
+                        average_state,
+                        opt_state,
+                        total_weight,
+                    ) = __sps(
+                        iterations_per_epoch,
+                        i,
+                        lp,
+                        optimiser,
+                        state,
+                        average_state,
+                        opt_state,
+                        weight_function,
+                        total_weight,
+                        primal_damping,
+                        dual_damping_ineq,
+                        dual_damping_eq,
+                        average,
                     )
 
-            for epoch in range(cycle_length):
+                    (
+                        objective_value,
+                        primal_grad_norm,
+                        complementarity_slack,
+                        constraint_bound,
+                    ) = jax.lax.cond(
+                        average,
+                        lambda: compute_epoch_metrics(average_state),
+                        lambda: compute_epoch_metrics(state),
+                    )
+                    count += 1
+
+                    if verbose:
+                        print(
+                            f"|Epoch {count}|"
+                            f"|Obj{objective_value:.2e}|"
+                            f"|PGN {primal_grad_norm:.2e}|"
+                            f"|CS {complementarity_slack:.2e}|"
+                            f"|CB {constraint_bound:.2e}|"
+                        )
+                        print("----------------------------------------------")
+
+                    print_expert_weights(count, opt_state)
+
                 if is_converged(
                     primal_grad_norm, complementarity_slack, constraint_bound
                 ):
+                    if verbose:
+                        print(
+                            f"Converged after {restart} restart(s), {count} total epochs."
+                        )
                     break
 
+                # Grow cycle length geometrically for next restart
+                cycle_length = max(1, int(cycle_length * restart_multiplier))
+
+            if average:
+                output = average_state
+            else:
+                output = state
+
+        # ---- Standard loop (no restarts) ----
+        elif verbose == False:
+            while check_convergence(
+                primal_grad_norm, complementarity_slack, constraint_bound, count
+            ):
                 (
                     i,
                     state,
@@ -485,129 +554,77 @@ def solve(
                 )
                 count += 1
 
-                if verbose:
-                    print(
-                        f"Objective {objective_value:.2e}: "
-                        f"Primal Grad Norm={primal_grad_norm:.2e}, "
-                        f"Compl. Slack={complementarity_slack:.2e}, "
-                        f"Constraint Bound={constraint_bound:.2e}"
-                    )
-                    print("----------------------------------------------")
+            if average:
+                output = average_state
+            else:
+                output = state
+
+            if expert_diagnostics:
+                print(
+                    "Expert diagnostics in non-verbose mode prints only final expert weights."
+                )
+                print("----------------------------------------------")
+                print_expert_weights(count, opt_state)
+
+        else:
+            while check_convergence(
+                primal_grad_norm, complementarity_slack, constraint_bound, count
+            ):
+                (
+                    i,
+                    state,
+                    average_state,
+                    opt_state,
+                    total_weight,
+                ) = __sps(
+                    iterations_per_epoch,
+                    i,
+                    lp,
+                    optimiser,
+                    state,
+                    average_state,
+                    opt_state,
+                    weight_function,
+                    total_weight,
+                    primal_damping,
+                    dual_damping_ineq,
+                    dual_damping_eq,
+                    average,
+                )
+
+                (
+                    objective_value,
+                    primal_grad_norm,
+                    complementarity_slack,
+                    constraint_bound,
+                ) = jax.lax.cond(
+                    average,
+                    lambda: compute_epoch_metrics(average_state),
+                    lambda: compute_epoch_metrics(state),
+                )
+                count += 1
+
+                print(
+                    f"Objective {objective_value:.2e}: "
+                    f"Primal Grad Norm={primal_grad_norm:.2e}, "
+                    f"Compl. Slack={complementarity_slack:.2e}, "
+                    f"Constraint Bound={constraint_bound:.2e}"
+                )
+                print("----------------------------------------------")
 
                 print_expert_weights(count, opt_state)
 
-            if is_converged(primal_grad_norm, complementarity_slack, constraint_bound):
-                if verbose:
-                    print(
-                        f"Converged after {restart} restart(s), {count} total epochs."
-                    )
-                break
-
-            # Grow cycle length geometrically for next restart
-            cycle_length = max(1, int(cycle_length * restart_multiplier))
-
+            if average:
+                output = average_state
+            else:
+                output = state
+    except KeyboardInterrupt:
         if average:
             output = average_state
         else:
             output = state
-
-    # ---- Standard loop (no restarts) ----
-    elif verbose == False:
-        # Initialize loop variables
-        loop_vars = (
-            i,
-            state,
-            average_state,
-            opt_state,
-            previous_objective,
-            primal_grad_norm,
-            complementarity_slack,
-            constraint_bound,
-            count,
-            objective_value,
-            total_weight,
-        )
-
-        loop_vars = jax.lax.while_loop(cond_fun, body_fun, loop_vars)
-
-        (
-            i,
-            state,
-            average_state,
-            opt_state,
-            previous_objective,
-            primal_grad_norm,
-            complementarity_slack,
-            constraint_bound,
-            count,
-            objective_value,
-            total_weight,
-        ) = loop_vars
-
-        if average:
-            output = average_state
-        else:
-            output = state
-
-        if expert_diagnostics:
-            print(
-                "Expert diagnostics in non-verbose mode prints only final expert weights."
-            )
-            print("----------------------------------------------")
-            print_expert_weights(count, opt_state)
-
-    else:
-        while check_convergence(
-            primal_grad_norm, complementarity_slack, constraint_bound, count
-        ):
-            (
-                i,
-                state,
-                average_state,
-                opt_state,
-                total_weight,
-            ) = __sps(
-                iterations_per_epoch,
-                i,
-                lp,
-                optimiser,
-                state,
-                average_state,
-                opt_state,
-                weight_function,
-                total_weight,
-                primal_damping,
-                dual_damping_ineq,
-                dual_damping_eq,
-                average,
-            )
-
-            (
-                objective_value,
-                primal_grad_norm,
-                complementarity_slack,
-                constraint_bound,
-            ) = jax.lax.cond(
-                average,
-                lambda: compute_epoch_metrics(average_state),
-                lambda: compute_epoch_metrics(state),
-            )
-            count += 1
-
-            print(
-                f"Objective {objective_value:.2e}: "
-                f"Primal Grad Norm={primal_grad_norm:.2e}, "
-                f"Compl. Slack={complementarity_slack:.2e}, "
-                f"Constraint Bound={constraint_bound:.2e}"
-            )
-            print("----------------------------------------------")
-
-            print_expert_weights(count, opt_state)
-
-        if average:
-            output = average_state
-        else:
-            output = state
+        print("KeyboardInterrupt received. Returning current solution.")
+        print("----------------------------------------------")
 
     output = jax.block_until_ready(output)
     end_time = time.time()
@@ -661,6 +678,7 @@ def lp_summary_statistics(lp: LP):
         max_A_eq = np.maximum(np.max(lp.A_eq.data), 0.0)
         min_b_eq = np.min(lp.b_eq)
         max_b_eq = np.max(lp.b_eq)
+        num_nnz_A_eq = lp.A_eq.data.size
     else:
         min_A_eq = None
         max_A_eq = None
@@ -672,6 +690,7 @@ def lp_summary_statistics(lp: LP):
         max_A_ineq = np.maximum(np.max(lp.A_ineq.data), 0.0)
         min_b_ineq = np.min(lp.b_ineq)
         max_b_ineq = np.max(lp.b_ineq)
+        num_nnz_A_ineq = lp.A_ineq.data.size
     else:
         min_A_ineq = None
         max_A_ineq = None
@@ -687,6 +706,8 @@ def lp_summary_statistics(lp: LP):
     print(f"Number of variables: {num_vars}")
     print(f"Number of equality constraints: {num_eq}")
     print(f"Number of inequality constraints: {num_ineq}")
+    print(f"Number of nonzeros in A_eq: {num_nnz_A_eq}")
+    print(f"Number of nonzeros in A_ineq: {num_nnz_A_ineq}")
     print(f"[Min, Max] of c: [{min_c}, {max_c}]")
     print(f"[Min, Max] of A_eq: [{min_A_eq}, {max_A_eq}]")
     print(f"[Min, Max] of b_eq: [{min_b_eq}, {max_b_eq}]")

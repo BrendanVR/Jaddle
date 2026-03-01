@@ -38,7 +38,6 @@ highs.readModel("/home/brendanvr/python/Jaddle/data/boeing.mps")  # path to MPS 
 highs_lp = highs.getLp()
 jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 
-
 # %%
 lr = optax.exponential_decay(
     1e1,
@@ -47,7 +46,7 @@ lr = optax.exponential_decay(
     end_value=1e-4,
 )
 
-optimiser = jo.optimistic_adam_metric_saddle(lr, lr)
+optimiser = jo.optimistic_adam_saddle(lr, lr)
 
 # %% [markdown]
 # ## Solve the presolved LP using Jaddle's saddle point solver
@@ -57,9 +56,7 @@ solution = jl.solve(
     lp=jaddle_lp,
     optimiser=optimiser,
     scale="ruiz+pc",
-    # verbose=True,
     average=False,
-    constraint_tolerance=1e-3,
 )
 
 # %%

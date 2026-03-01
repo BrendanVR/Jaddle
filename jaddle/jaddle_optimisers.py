@@ -165,7 +165,7 @@ def create_saddle_optimiser(
     return optimiser
 
 
-def optimistic_adam_metric_saddle(
+def optimistic_adam_saddle(
     lr_primal=1e-3,
     lr_dual=1e-3,
     alpha: float = 5e-2,
@@ -193,41 +193,6 @@ def _resolve_schedule(schedule: ScheduleLike, step: jnp.ndarray) -> jnp.ndarray:
 
 def _normalise_log_weights(log_weights: jnp.ndarray) -> jnp.ndarray:
     return log_weights - jax.nn.logsumexp(log_weights)
-
-
-def _projected_kkt_merit(lp: LP, state: SaddleState) -> jnp.ndarray:
-    objective_value = lp.objective(state.primal)
-
-    grad_primal = lp.c + lp.A_ineq_T @ state.dual_ineq + lp.A_eq_T @ state.dual_eq
-    projected_primal = projection_box(
-        state.primal - grad_primal,
-        lp.lower_bounds,
-        lp.upper_bounds,
-    )
-    projected_gradient_residual = state.primal - projected_primal
-    primal_grad_norm = jnp.max(jnp.abs(projected_gradient_residual))
-
-    if lp.num_ineq_constraints() > 0:
-        ineq_residual = lp.A_ineq @ state.primal - lp.b_ineq
-        max_ineq_violation = jnp.max(jnp.maximum(ineq_residual, 0.0))
-        complementarity_slack = jnp.max(jnp.abs(state.dual_ineq * ineq_residual)) / (
-            1.0 + jnp.abs(objective_value)
-        )
-    else:
-        max_ineq_violation = jnp.array(0.0, dtype=state.primal.dtype)
-        complementarity_slack = jnp.array(0.0, dtype=state.primal.dtype)
-
-    if lp.num_eq_constraints() > 0:
-        eq_residual = lp.A_eq @ state.primal - lp.b_eq
-        max_eq_violation = jnp.max(jnp.abs(eq_residual))
-    else:
-        max_eq_violation = jnp.array(0.0, dtype=state.primal.dtype)
-
-    constraint_bound = jnp.maximum(max_ineq_violation, max_eq_violation)
-    return jnp.maximum(
-        primal_grad_norm,
-        jnp.maximum(complementarity_slack, constraint_bound),
-    )
 
 
 def hedge_ensemble_saddle(
