@@ -2,6 +2,7 @@ import jax.numpy as jnp
 from typing import NamedTuple
 import optax
 from typing import Any, Callable, NamedTuple, Sequence, Union
+import jax
 
 ScheduleLike = Union[float, Callable[[jnp.ndarray], jnp.ndarray]]
 

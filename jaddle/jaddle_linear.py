@@ -9,8 +9,8 @@ import functools
 from typing import NamedTuple
 import time
 from scipy import sparse as sp
+from jaddle.jaddle_basic_types import LP, SaddleState, HedgeSaddleState
 import jaddle.jaddle_optimisers as jo
-from jaddle.jaddle_basic_types import LP, SaddleState
 
 np.set_printoptions(precision=2, suppress=True)
 
@@ -167,6 +167,7 @@ def solve(
     restart_multiplier=1.0,
     expert_diagnostics=False,
     output_opt_state=False,
+    prune_experts=None,
 ):
     """
     Solve a linear program via saddle-point optimisation.
@@ -370,7 +371,8 @@ def solve(
             lambda: compute_epoch_metrics(state),
         )
 
-        count += 1
+        if type(opt_state) == HedgeSaddleState and prune_experts is not None:
+            opt_state = opt_state.prune(threshold=prune_experts)
 
         return (
             i,
