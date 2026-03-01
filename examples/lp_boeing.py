@@ -29,7 +29,7 @@ import optax
 # ## Load the LP
 # We load a MIPLIB LP from an MPS file using the `highspy` library.
 highs = hspy.Highs()
-highs.readModel("/home/brendanvr/python/Jaddle/data/boeing.mps")  # path to MPS file
+highs.readModel("/home/brendanvr/python/Jaddle/data/nug.mps")  # path to MPS file
 
 # %% [markdown]
 # We convert the LP to Jaddle's sparse format, before applying ruiz scaling.
@@ -38,7 +38,7 @@ jaddle_lp = jl.to_jaddle_sparse64(hh.highs_to_standard_form_sparse(highs_lp))
 
 # %%
 lr = optax.exponential_decay(
-    1e1,
+    1e0,
     transition_steps=1000,
     decay_rate=0.9,
     end_value=1e-4,

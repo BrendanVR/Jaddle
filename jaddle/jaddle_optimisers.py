@@ -340,19 +340,37 @@ def hedge_ensemble_saddle(
         dual_losses = []
 
         for expert_solution in primal_expert_solutions:
-            primal_loss = jnp.sum(
+            primal_loss = (
                 lp.c @ expert_solution
-                + mixed_dual_ineq_solution @ (lp.A_ineq @ expert_solution)
-                + mixed_dual_eq_solution @ (lp.A_eq @ expert_solution)
-            )  # Linearized loss for this expert
+                + mixed_dual_ineq_solution @ (lp.A_ineq @ expert_solution - lp.b_ineq)
+                + mixed_dual_eq_solution @ (lp.A_eq @ expert_solution - lp.b_eq)
+            ) - (
+                lp.c @ mixed_primal_solution
+                + mixed_dual_ineq_solution
+                @ (lp.A_ineq @ mixed_primal_solution - lp.b_ineq)
+                + mixed_dual_eq_solution @ (lp.A_eq @ mixed_primal_solution - lp.b_eq)
+            )
             primal_losses.append(primal_loss)
 
         for expert_solution_ineq, expert_solution_eq in zip(
             dual_expert_solutions_ineq, dual_expert_solutions_eq
         ):
-            dual_loss_ineq = expert_solution_ineq @ (lp.A_ineq @ mixed_primal_solution)
-            dual_loss_eq = expert_solution_eq @ (lp.A_eq @ mixed_primal_solution)
-            dual_loss = dual_loss_ineq + dual_loss_eq
+            dual_loss_ineq = expert_solution_ineq @ (
+                lp.A_ineq @ mixed_primal_solution - lp.b_ineq
+            )
+            dual_loss_eq = expert_solution_eq @ (
+                lp.A_eq @ mixed_primal_solution - lp.b_eq
+            )
+            dual_loss = (
+                dual_loss_ineq
+                + dual_loss_eq
+                - (
+                    mixed_dual_ineq_solution
+                    @ (lp.A_ineq @ mixed_primal_solution - lp.b_ineq)
+                    + mixed_dual_eq_solution
+                    @ (lp.A_eq @ mixed_primal_solution - lp.b_eq)
+                )
+            )
             dual_losses.append(-dual_loss)
 
         primal_losses = jnp.array(primal_losses)
