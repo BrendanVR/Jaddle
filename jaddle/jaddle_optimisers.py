@@ -199,8 +199,8 @@ def hedge_ensemble_saddle(
     lp: LP,
     primal_experts: Sequence[optax.GradientTransformation],
     dual_experts: Sequence[optax.GradientTransformation],
-    primal_eta: ScheduleLike = 5e-2,
-    dual_eta: ScheduleLike = 5e-2,
+    primal_eta: ScheduleLike = 1.0,
+    dual_eta: ScheduleLike = 1.0,
     loss_clip: float = 1e2,
 ):
     if len(primal_experts) == 0:
@@ -350,8 +350,8 @@ def hedge_ensemble_saddle(
         for expert_solution_ineq, expert_solution_eq in zip(
             dual_expert_solutions_ineq, dual_expert_solutions_eq
         ):
-            dual_loss_ineq = -expert_solution_ineq @ (lp.A_ineq @ mixed_primal_solution)
-            dual_loss_eq = -expert_solution_eq @ (lp.A_eq @ mixed_primal_solution)
+            dual_loss_ineq = expert_solution_ineq @ (lp.A_ineq @ mixed_primal_solution)
+            dual_loss_eq = expert_solution_eq @ (lp.A_eq @ mixed_primal_solution)
             dual_loss = dual_loss_ineq + dual_loss_eq
             dual_losses.append(-dual_loss)
 
