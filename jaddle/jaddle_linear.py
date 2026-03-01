@@ -162,9 +162,6 @@ def solve(
     verbose=False,
     average=True,
     scale=None,
-    restarts=0,
-    epochs_per_restart=10,
-    restart_multiplier=1.0,
     expert_diagnostics=False,
     output_opt_state=False,
 ):
@@ -182,7 +179,10 @@ def solve(
             (default 1.0 = fixed length, 2.0 = doubling).
         primal_dual_lr_ratio: Ratio of primal to dual learning rates (default 1.0).
     """
-    lp_summary_statistics(lp)
+
+    print("----------------------------------------------")
+    print("====Starting Solve====")
+    print("----------------------------------------------")
 
     if initial_solution is None:
         initial_solution = lp.initial_solution()
@@ -269,37 +269,21 @@ def solve(
             constraint_bound,
         )
 
-    if max_epochs:
-
-        @jax.jit
-        def check_convergence(
-            primal_grad_norm, complementarity_slack, constraint_bound, count
-        ):
-            return (
-                (primal_grad_norm > progress_tolerance)
-                | (complementarity_slack > complementarity_tolerance)
-                | (constraint_bound > constraint_tolerance)
-            ) & (count < max_epochs)
-
-    else:
-
-        @jax.jit
-        def check_convergence(
-            primal_grad_norm, complementarity_slack, constraint_bound, count
-        ):
-            return (
-                (primal_grad_norm > progress_tolerance)
-                | (complementarity_slack > complementarity_tolerance)
-                | (constraint_bound > constraint_tolerance)
-            )
-
-    def is_converged(primal_grad_norm, complementarity_slack, constraint_bound):
-        """Check if all tolerances are met (ignoring epoch count)."""
+    @jax.jit
+    def check_convergence(
+        primal_grad_norm,
+        complementarity_slack,
+        constraint_bound,
+    ):
         return (
-            (primal_grad_norm <= progress_tolerance)
-            & (complementarity_slack <= complementarity_tolerance)
-            & (constraint_bound <= constraint_tolerance)
+            (primal_grad_norm > progress_tolerance)
+            | (complementarity_slack > complementarity_tolerance)
+            | (constraint_bound > constraint_tolerance)
         )
+
+    @jax.jit
+    def check_max_epochs(count):
+        return count >= max_epochs
 
     @jax.jit
     def cond_fun(loop_vars):
@@ -399,6 +383,7 @@ def solve(
     objective_value = jnp.inf
     count = 0
     total_weight = 0.0
+    is_converged = True
 
     start_time = time.time()
     missing_expert_state_warning_printed = False
@@ -427,206 +412,73 @@ def solve(
             print("----------------------------------------------")
 
     try:
-        # ---- Warm restart loop ----
-        if restarts > 0:
-            cycle_length = epochs_per_restart
-
-            for restart in range(restarts + 1):
-                if restart > 0:
-                    # Warm restart: keep iterate, reset everything else
-                    opt_state = optimiser.init(state)
-                    total_weight = 0.0
-                    average_state = state
-
-                    if verbose:
-                        print(
-                            f"--- Restart {restart}/{restarts} "
-                            f"(cycle: {cycle_length} epochs) ---"
-                        )
-
-                for epoch in range(cycle_length):
-                    if is_converged(
-                        primal_grad_norm, complementarity_slack, constraint_bound
-                    ):
-                        break
-
-                    start_epoch_time = time.time()
-                    (
-                        i,
-                        state,
-                        average_state,
-                        opt_state,
-                        total_weight,
-                    ) = __sps(
-                        iterations_per_epoch,
-                        i,
-                        lp,
-                        optimiser,
-                        state,
-                        average_state,
-                        opt_state,
-                        weight_function,
-                        total_weight,
-                        primal_damping,
-                        dual_damping_ineq,
-                        dual_damping_eq,
-                        average,
-                    )
-
-                    (
-                        objective_value,
-                        primal_grad_norm,
-                        complementarity_slack,
-                        constraint_bound,
-                    ) = jax.lax.cond(
-                        average,
-                        lambda: compute_epoch_metrics(average_state),
-                        lambda: compute_epoch_metrics(state),
-                    )
-
-                    finish_epoch_time = time.time()
-                    count += 1
-
-                    if verbose:
-                        print(
-                            f"|Epoch {count}|"
-                            f"|Obj{objective_value:.2e}|"
-                            f"|PGN {primal_grad_norm:.2e}|"
-                            f"|CS {complementarity_slack:.2e}|"
-                            f"|CB {constraint_bound:.2e}|"
-                            f"|Time {finish_epoch_time - start_epoch_time:.2f}s|"
-                        )
-                        print("----------------------------------------------")
-
-                    print_expert_weights(count, opt_state)
-
-                if is_converged(
-                    primal_grad_norm, complementarity_slack, constraint_bound
-                ):
-                    if verbose:
-                        print(
-                            f"Converged after {restart} restart(s), {count} total epochs."
-                        )
+        while check_convergence(
+            primal_grad_norm,
+            complementarity_slack,
+            constraint_bound,
+        ):
+            if max_epochs:
+                if check_max_epochs(count):
+                    is_converged = False
+                    print(f"Reached maximum epochs: {max_epochs}. Stopping.")
+                    print("----------------------------------------------")
                     break
 
-                # Grow cycle length geometrically for next restart
-                cycle_length = max(1, int(cycle_length * restart_multiplier))
+            start_epoch_time = time.time()
+            (
+                i,
+                state,
+                average_state,
+                opt_state,
+                total_weight,
+            ) = __sps(
+                iterations_per_epoch,
+                i,
+                lp,
+                optimiser,
+                state,
+                average_state,
+                opt_state,
+                weight_function,
+                total_weight,
+                primal_damping,
+                dual_damping_ineq,
+                dual_damping_eq,
+                average,
+            )
 
-            if average:
-                output = average_state
-            else:
-                output = state
+            (
+                objective_value,
+                primal_grad_norm,
+                complementarity_slack,
+                constraint_bound,
+            ) = jax.lax.cond(
+                average,
+                lambda: compute_epoch_metrics(average_state),
+                lambda: compute_epoch_metrics(state),
+            )
 
-        # ---- Standard loop (no restarts) ----
-        elif verbose == False:
-            while check_convergence(
-                primal_grad_norm, complementarity_slack, constraint_bound, count
-            ):
-                (
-                    i,
-                    state,
-                    average_state,
-                    opt_state,
-                    total_weight,
-                ) = __sps(
-                    iterations_per_epoch,
-                    i,
-                    lp,
-                    optimiser,
-                    state,
-                    average_state,
-                    opt_state,
-                    weight_function,
-                    total_weight,
-                    primal_damping,
-                    dual_damping_ineq,
-                    dual_damping_eq,
-                    average,
-                )
+            finish_epoch_time = time.time()
+            count += 1
 
-                (
-                    objective_value,
-                    primal_grad_norm,
-                    complementarity_slack,
-                    constraint_bound,
-                ) = jax.lax.cond(
-                    average,
-                    lambda: compute_epoch_metrics(average_state),
-                    lambda: compute_epoch_metrics(state),
-                )
-                count += 1
+            print(
+                f"|Epoch {count}|"
+                f"|Obj{objective_value:.2e}|"
+                f"|PGN {primal_grad_norm:.2e}|"
+                f"|CS {complementarity_slack:.2e}|"
+                f"|CB {constraint_bound:.2e}|"
+                f"|Time {finish_epoch_time - start_epoch_time:.2f}s|"
+            )
+            print("----------------------------------------------")
 
-            if average:
-                output = average_state
-            else:
-                output = state
+            print_expert_weights(count, opt_state)
 
-            if expert_diagnostics:
-                print(
-                    "Expert diagnostics in non-verbose mode prints only final expert weights."
-                )
-                print("----------------------------------------------")
-                print_expert_weights(count, opt_state)
-
+        if average:
+            output = average_state
         else:
-            while check_convergence(
-                primal_grad_norm, complementarity_slack, constraint_bound, count
-            ):
-
-                start_epoch_time = time.time()
-                (
-                    i,
-                    state,
-                    average_state,
-                    opt_state,
-                    total_weight,
-                ) = __sps(
-                    iterations_per_epoch,
-                    i,
-                    lp,
-                    optimiser,
-                    state,
-                    average_state,
-                    opt_state,
-                    weight_function,
-                    total_weight,
-                    primal_damping,
-                    dual_damping_ineq,
-                    dual_damping_eq,
-                    average,
-                )
-
-                (
-                    objective_value,
-                    primal_grad_norm,
-                    complementarity_slack,
-                    constraint_bound,
-                ) = jax.lax.cond(
-                    average,
-                    lambda: compute_epoch_metrics(average_state),
-                    lambda: compute_epoch_metrics(state),
-                )
-
-                finish_epoch_time = time.time()
-                count += 1
-
-                print(
-                    f"|Epoch {count}|"
-                    f"|Obj{objective_value:.2e}|"
-                    f"|PGN {primal_grad_norm:.2e}|"
-                    f"|CS {complementarity_slack:.2e}|"
-                    f"|CB {constraint_bound:.2e}|"
-                    f"|Time {finish_epoch_time - start_epoch_time:.2f}s|"
-                )
-                print("----------------------------------------------")
-
-                print_expert_weights(count, opt_state)
-
-            if average:
-                output = average_state
-            else:
-                output = state
+            output = state
     except KeyboardInterrupt:
+        is_converged = False
         if average:
             output = average_state
         else:
@@ -649,11 +501,10 @@ def solve(
             dual_ineq=output.dual_ineq * jnp_row_scale_ineq,
             dual_eq=output.dual_eq * jnp_row_scale_eq,
         )
-
     if output_opt_state:
-        return output, opt_state
+        return output, is_converged, opt_state
     else:
-        return output
+        return output, is_converged
 
 
 # %%

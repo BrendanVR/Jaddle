@@ -196,12 +196,12 @@ def _normalise_log_weights(log_weights: jnp.ndarray) -> jnp.ndarray:
 
 
 def hedge_ensemble_saddle(
+    lp: LP,
     primal_experts: Sequence[optax.GradientTransformation],
     dual_experts: Sequence[optax.GradientTransformation],
     primal_eta: ScheduleLike = 5e-2,
     dual_eta: ScheduleLike = 5e-2,
     loss_clip: float = 1e2,
-    prune_threshold: float = 1e-8,
 ):
     if len(primal_experts) == 0:
         raise ValueError("primal_experts must contain at least one optimiser")
@@ -243,97 +243,73 @@ def hedge_ensemble_saddle(
 
         primal_step_updates = []
         primal_next_states = []
-        primal_losses = []
+        primal_expert_solutions = []
+        primal_next_states = []
 
         for expert_index, expert in enumerate(primal_experts):
-            is_active = state.primal.log_weights[expert_index] > jnp.log(
-                prune_threshold
+
+            expert_update, expert_state = expert.update(
+                grad_primal,
+                state.primal.expert_states[expert_index],
+                params.primal,
             )
 
-            if not is_active:
-                state.primal.log_weights = state.primal.log_weights.at[
-                    expert_index
-                ].set(-jnp.inf)
-
-            def active_primal_update(_):
-                expert_update, expert_state = expert.update(
-                    grad_primal,
-                    state.primal.expert_states[expert_index],
-                    params.primal,
-                )
-                expert_loss = -jnp.dot(grad_primal, expert_update)
-                return expert_update, expert_state, expert_loss
-
-            def inactive_primal_update(_):
-                return (
-                    jnp.zeros_like(grad_primal),
-                    state.primal.expert_states[expert_index],
-                    jnp.asarray(0.0, dtype=grad_primal.dtype),
-                )
-
-            expert_update, expert_state, expert_loss = jax.lax.cond(
-                is_active,
-                active_primal_update,
-                inactive_primal_update,
-                operand=None,
+            primal_expert_solution = projection_box(
+                optax.apply_updates(params.primal, expert_update),
+                lp.lower_bounds,
+                lp.upper_bounds,
             )
+
+            primal_expert_solutions.append(primal_expert_solution)
             primal_step_updates.append(expert_update)
             primal_next_states.append(expert_state)
-            primal_losses.append(expert_loss)
 
         primal_updates_stacked = jnp.stack(primal_step_updates, axis=0)
-        primal_losses = jnp.stack(primal_losses, axis=0)
         mixed_primal_update = jnp.tensordot(
             primal_weights,
             primal_updates_stacked,
             axes=(0, 0),
         )
 
+        mixed_primal_solution = projection_box(
+            optax.apply_updates(params.primal, mixed_primal_update),
+            lp.lower_bounds,
+            lp.upper_bounds,
+        )
+
         dual_step_updates_ineq = []
         dual_step_updates_eq = []
+        dual_expert_solutions_ineq = []
+        dual_expert_solutions_eq = []
         dual_next_states = []
-        dual_losses = []
 
         grad_dual = (grad_dual_ineq, grad_dual_eq)
         params_dual = (params.dual_ineq, params.dual_eq)
 
         for expert_index, expert in enumerate(dual_experts):
-            is_active = state.dual.log_weights[expert_index] > jnp.log(prune_threshold)
-
-            def active_dual_update(_):
-                expert_update, expert_state = expert.update(
-                    grad_dual,
-                    state.dual.expert_states[expert_index],
-                    params_dual,
-                )
-                update_dual_ineq, update_dual_eq = expert_update
-                expert_loss = jnp.dot(grad_dual_ineq, update_dual_ineq) + jnp.dot(
-                    grad_dual_eq, update_dual_eq
-                )
-                return expert_update, expert_state, expert_loss
-
-            def inactive_dual_update(_):
-                return (
-                    (jnp.zeros_like(grad_dual_ineq), jnp.zeros_like(grad_dual_eq)),
-                    state.dual.expert_states[expert_index],
-                    jnp.asarray(0.0, dtype=grad_dual_ineq.dtype),
-                )
-
-            expert_update, expert_state, expert_loss = jax.lax.cond(
-                is_active,
-                active_dual_update,
-                inactive_dual_update,
-                operand=None,
+            expert_update, expert_state = expert.update(
+                grad_dual,
+                state.dual.expert_states[expert_index],
+                params_dual,
             )
             update_dual_ineq, update_dual_eq = expert_update
+
+            dual_expert_solution_ineq = projection_non_negative(
+                optax.apply_updates(params.dual_ineq, update_dual_ineq),
+            )
+
+            dual_expert_solution_eq = optax.apply_updates(
+                params.dual_eq, update_dual_eq
+            )
+
+            dual_expert_solutions_ineq.append(dual_expert_solution_ineq)
+            dual_expert_solutions_eq.append(dual_expert_solution_eq)
             dual_step_updates_ineq.append(update_dual_ineq)
             dual_step_updates_eq.append(update_dual_eq)
             dual_next_states.append(expert_state)
-            dual_losses.append(expert_loss)
 
         dual_updates_ineq_stacked = jnp.stack(dual_step_updates_ineq, axis=0)
         dual_updates_eq_stacked = jnp.stack(dual_step_updates_eq, axis=0)
-        dual_losses = jnp.stack(dual_losses, axis=0)
 
         mixed_dual_ineq_update = jnp.tensordot(
             dual_weights,
@@ -346,11 +322,41 @@ def hedge_ensemble_saddle(
             axes=(0, 0),
         )
 
+        mixed_dual_ineq_solution = projection_non_negative(
+            optax.apply_updates(params.dual_ineq, mixed_dual_ineq_update),
+        )
+
+        mixed_dual_eq_solution = optax.apply_updates(
+            params.dual_eq, mixed_dual_eq_update
+        )
+
         next_primal_states = tuple(primal_next_states)
         next_dual_states = tuple(dual_next_states)
 
         primal_eta_value = _resolve_schedule(primal_eta, state.step)
         dual_eta_value = _resolve_schedule(dual_eta, state.step)
+
+        primal_losses = []
+        dual_losses = []
+
+        for expert_solution in primal_expert_solutions:
+            primal_loss = jnp.sum(
+                lp.c @ expert_solution
+                + mixed_dual_ineq_solution @ (lp.A_ineq @ expert_solution)
+                + mixed_dual_eq_solution @ (lp.A_eq @ expert_solution)
+            )  # Linearized loss for this expert
+            primal_losses.append(primal_loss)
+
+        for expert_solution_ineq, expert_solution_eq in zip(
+            dual_expert_solutions_ineq, dual_expert_solutions_eq
+        ):
+            dual_loss_ineq = -expert_solution_ineq @ (lp.A_ineq @ mixed_primal_solution)
+            dual_loss_eq = -expert_solution_eq @ (lp.A_eq @ mixed_primal_solution)
+            dual_loss = dual_loss_ineq + dual_loss_eq
+            dual_losses.append(-dual_loss)
+
+        primal_losses = jnp.array(primal_losses)
+        dual_losses = jnp.array(dual_losses)
 
         primal_losses = jnp.clip(primal_losses, -loss_clip, loss_clip)
         dual_losses = jnp.clip(dual_losses, -loss_clip, loss_clip)

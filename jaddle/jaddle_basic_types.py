@@ -12,11 +12,32 @@ class HedgePoolState(NamedTuple):
     expert_states: tuple
     log_weights: jnp.ndarray
 
+    def prune(self, threshold: float):
+        """Prune experts with weight below the given threshold."""
+        keep_mask = self.log_weights > jnp.log(threshold)
+        pruned_expert_states = tuple(
+            state for state, keep in zip(self.expert_states, keep_mask) if keep
+        )
+        pruned_log_weights = self.log_weights[keep_mask]
+        # Renormalize log weights
+        pruned_log_weights -= jax.nn.logsumexp(pruned_log_weights)
+        idx = jnp.where(keep_mask)[0]
+        return HedgePoolState(pruned_expert_states, pruned_log_weights), idx
+
 
 class HedgeSaddleState(NamedTuple):
     primal: HedgePoolState
     dual: HedgePoolState
     step: jnp.ndarray
+
+    def prune(self, threshold: float):
+        pruned_primal, primal_idx = self.primal.prune(threshold)
+        pruned_dual, dual_idx = self.dual.prune(threshold)
+        return (
+            HedgeSaddleState(pruned_primal, pruned_dual, self.step),
+            primal_idx,
+            dual_idx,
+        )
 
 
 # %%

@@ -46,17 +46,16 @@ lp = jl.to_jaddle_sparse(lp)  # Convert to Jaddle sparse format
 
 # %% [markdown]
 # ## Solving the LP Problem
-lr_primal = optax.exponential_decay(
+lr = optax.exponential_decay(
     init_value=1e0,
     transition_steps=1000,
     decay_rate=0.9,
     end_value=1e-5,
 )
 
-solution = jl.solve(
+solution, _ = jl.solve(
     lp,
-    optimiser=jo.adamdelta_saddle(lr_primal),
-    iterations_per_epoch=10000,
+    optimiser=jo.optimistic_adam_saddle(lr, lr),
     verbose=True,
     average=False,
 )

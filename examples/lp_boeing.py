@@ -50,7 +50,7 @@ optimiser = jo.optimistic_adam_saddle(lr, lr)
 # ## Solve the presolved LP using Jaddle's saddle point solver
 # Using warm restarts: 5 restart cycles, starting with 10 epochs per cycle,
 # doubling the cycle length each time (geometric growth).
-solution = jl.solve(
+solution, _ = jl.solve(
     lp=jaddle_lp,
     optimiser=optimiser,
     scale="ruiz+pc",

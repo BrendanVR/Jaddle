@@ -36,46 +36,74 @@ jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 
 
 # %%
-def lr(decay_rate, transition_steps, end_value):
+def lr(decay_rate, init_value, end_value):
     return optax.exponential_decay(
-        init_value=1e0,
-        transition_steps=transition_steps,
+        init_value=init_value,
+        transition_steps=int(1e4),
         decay_rate=decay_rate,
         end_value=end_value,
     )
 
 
 learning_rates = [
-    lr(decay_rate, transition_steps, end_value)
-    for decay_rate in [0.5, 0.9, 0.99]
-    for transition_steps in [int(1e3), int(1e4), int(1e5)]
-    for end_value in [1e-3, 1e-4, 1e-5]
+    lr(decay_rate, init_value, end_value)
+    for decay_rate in [0.9, 0.99, 0.999]
+    for init_value in [1e0]
+    for end_value in [1e-5]
 ]
 primal_experts = [
     optax.optimistic_adam_v2(learning_rate=lr, alpha=alpha)
     for lr in learning_rates
-    for alpha in [
-        0.01,  # good value
-        0.9,  # bad value
-    ]
+    for alpha in [0.01, 0.05, 0.1]
 ]
-dual_experts = [optax.adadelta(learning_rate=1.0)]
+
+dual_experts = [
+    optax.optimistic_adam_v2(learning_rate=lr, alpha=alpha)
+    for lr in learning_rates
+    for alpha in [0.01, 0.05, 0.1]
+]
 
 ensemble_optimiser = jo.hedge_ensemble_saddle(
+    lp=jaddle_lp,
     primal_experts=primal_experts,
     dual_experts=dual_experts,
-    prune_threshold=1e-9,  # prune experts with weight below this threshold
 )
+is_converged = False
+solution = jaddle_lp.initial_solution()
+opt_state = None
 
-# %%
-solution, opt_state = jl.solve(
+while ((len(primal_experts) > 1) or (len(dual_experts) > 1)) and not is_converged:
+    solution, is_converged, opt_state = jl.solve(
+        lp=jaddle_lp,
+        optimiser=ensemble_optimiser,
+        initial_opt_state=opt_state,
+        initial_solution=solution,
+        verbose=True,
+        expert_diagnostics=True,
+        output_opt_state=True,
+        weight_function=lambda i: jax.lax.select(i <= int(5e4), 1e-16, 1.0),
+        max_epochs=6,
+    )
+
+    opt_state, primal_idx, dual_idx = opt_state.prune(threshold=1e-4)
+    primal_experts = [primal_experts[i] for i in primal_idx]
+    dual_experts = [dual_experts[i] for i in dual_idx]
+    print(
+        f"Pruned to {len(primal_experts)} primal experts and {len(dual_experts)} dual experts."
+    )
+
+    ensemble_optimiser = jo.hedge_ensemble_saddle(
+        lp=jaddle_lp,
+        primal_experts=primal_experts,
+        dual_experts=dual_experts,
+    )
+
+solution, is_converged = jl.solve(
     lp=jaddle_lp,
     optimiser=ensemble_optimiser,
+    initial_solution=solution,
     verbose=True,
-    expert_diagnostics=True,
-    iterations_per_epoch=int(1e4),
     weight_function=lambda i: jax.lax.select(i <= int(5e4), 1e-16, 1.0),
-    output_opt_state=True,
 )
 
 # %%
