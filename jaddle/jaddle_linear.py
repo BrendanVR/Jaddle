@@ -10,6 +10,9 @@ from typing import NamedTuple
 import time
 from scipy import sparse as sp
 from jaddle.jaddle_basic_types import LP, SaddleState, HedgeSaddleState
+from scipy.sparse.linalg import gmres
+from scipy.sparse.linalg import LinearOperator
+from jax.scipy.sparse.linalg import gmres
 import jaddle.jaddle_optimisers as jo
 
 np.set_printoptions(precision=2, suppress=True)
@@ -774,6 +777,35 @@ def pc_scaling(lp: LP, max_iter=1, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
     lp_scaled = to_jaddle_sparse(lp_scaled)
 
     return lp_scaled, row_scale, col_scale
+
+
+def project_onto_eq(lp: LP, primal: jnp.ndarray, tol: 1e-6) -> jnp.ndarray:
+    """
+    Projects a primal solution onto the equality constraints using JAX GMRES.
+
+    Solves: min ||x - primal||_2 s.t. A_eq @ x = b_eq
+
+    Args:
+        lp: Linear program with equality constraints
+        primal: Candidate primal solution to project
+        tol: Tolerance for GMRES convergence
+
+    Returns:
+        Projected primal solution satisfying A_eq @ x = b_eq
+    """
+
+    # Solve normal equations: A_eq^T @ A_eq @ delta = A_eq^T @ (b_eq - A_eq @ primal)
+    residual = lp.b_eq - lp.A_eq @ primal
+
+    def matvec(v):
+        return lp.A_eq_T @ (lp.A_eq @ v)
+
+    delta, info = gmres(matvec, lp.A_eq_T @ residual, tol=tol)
+
+    if info != 0:
+        print(f"GMRES did not converge (info={info})")
+
+    return primal + delta
 
 
 # %%

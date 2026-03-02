@@ -78,3 +78,17 @@ print(f"Primal Inequality Residual: {jaddle_lp.ineq_slack(solution.primal)}")
 print("----------------------------------------------")
 
 # %%
+projected_primal = jl.project_onto_eq(
+    jaddle_lp,
+    solution.primal,
+    1e-8,
+)
+
+# %%
+print("After projection onto equality constraints:")
+print(f"Primal Objective: {jaddle_lp.objective(projected_primal)}")
+print(f"Primal Equality Residual: {jaddle_lp.eq_slack(projected_primal)}")
+print(f"Primal Inequality Residual: {jaddle_lp.ineq_slack(projected_primal)}")
+print("----------------------------------------------")
+
+# %%
