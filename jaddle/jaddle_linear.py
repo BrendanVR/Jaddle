@@ -26,7 +26,7 @@ def __sps(
     initial_avg_state=None,
     initial_opt_state=None,
     weight_function=lambda _: 1.0,
-    exponential_weight=None,
+    exponential_weight=0.01,
     total_weight=0.0,
     primal_damping=0.0,
     dual_damping_ineq=0.0,
@@ -208,7 +208,7 @@ def solve(
     constraint_tolerance=1e-3,
     complementarity_tolerance=1e-3,
     weight_function=lambda _: 1.0,
-    exponential_weight=None,
+    exponential_weight=0.01,
     verbose=False,
     average="off",
     update_mode="synchronous",
@@ -469,25 +469,26 @@ def solve(
             finish_epoch_time = time.time()
             count += 1
 
-            print(
-                f"|Epoch {count}|"
-                f"|Obj{objective_value:.2e}|"
-                f"|PGN {primal_grad_norm:.2e}|"
-                f"|CS {complementarity_slack:.2e}|"
-                f"|CB {constraint_bound:.2e}|"
-                f"|Time {finish_epoch_time - start_epoch_time:.2f}s|"
-            )
-            print("----------------------------------------------")
+            if verbose:
+                print(
+                    f"|Epoch {count}|"
+                    f"|Obj{objective_value:.2e}|"
+                    f"|PGN {primal_grad_norm:.2e}|"
+                    f"|CS {complementarity_slack:.2e}|"
+                    f"|CB {constraint_bound:.2e}|"
+                    f"|Time {finish_epoch_time - start_epoch_time:.2f}s|"
+                )
+                print("----------------------------------------------")
 
-            print_expert_weights(count, opt_state)
+                print_expert_weights(count, opt_state)
 
-        if average:
+        if average != "off":
             output = average_state
         else:
             output = state
     except KeyboardInterrupt:
         is_converged = False
-        if average:
+        if average != "off":
             output = average_state
         else:
             output = state

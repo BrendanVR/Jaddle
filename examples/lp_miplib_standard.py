@@ -32,12 +32,11 @@ import optax
 # ## Load the LP
 # We load a MIPLIB LP from an MPS file using the `highspy` library.
 highs = hspy.Highs()
-highs.readModel("/home/brendanvr/python/Jaddle/data/ns1758913.mps")  # path to MPS file
+highs.readModel("/home/brendanvr/python/Jaddle/data/nug.mps")  # path to MPS file
 
 # %% [markdown]
 # We convert the LP to Jaddle's sparse format, before applying ruiz scaling.
-highs.presolve()
-highs_lp = highs.getPresolvedLp()
+highs_lp = highs.getLp()
 jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 
 # %%
@@ -49,7 +48,7 @@ lr = optax.cosine_decay_schedule(
 )
 
 optimiser = jo.create_saddle_optimiser(
-    optax.optimistic_adam_v2(lr, alpha=0.01),
+    optax.optimistic_adam_v2(lr, alpha=0.05),
     optax.adadelta(1.0),
 )
 
@@ -60,10 +59,10 @@ optimiser = jo.create_saddle_optimiser(
 solution, _ = jl.solve(
     lp=jaddle_lp,
     optimiser=optimiser,
-    update_mode="alternating",
-    average="polyak",
-    weight_function=lambda i: jax.lax.select(i < int(5e4), 1e-8, 1.0),
-    scale="ruiz+pc",  # Example weight function that increases with iterations
+    update_mode="synchronous",
+    average="exponential",
+    verbose=True,
+    scale="ruiz+pc",
     scaled_objective=True,
 )
 
