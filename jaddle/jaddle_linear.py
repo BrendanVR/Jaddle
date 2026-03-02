@@ -26,11 +26,12 @@ def __sps(
     initial_avg_state=None,
     initial_opt_state=None,
     weight_function=lambda _: 1.0,
+    exponential_weight=None,
     total_weight=0.0,
     primal_damping=0.0,
     dual_damping_ineq=0.0,
     dual_damping_eq=0.0,
-    average=True,
+    average="off",
     update_mode="synchronous",
 ):
 
@@ -126,11 +127,15 @@ def __sps(
                     dual_eq=state.dual_eq,
                 )
 
-                if average:
+                if average == "polyak":
                     w = weight_function(i)
                     total_weight = total_weight + w
                     average_state = optax.incremental_update(
                         state, average_state, w / total_weight
+                    )
+                elif average == "exponential":
+                    average_state = optax.incremental_update(
+                        state, average_state, exponential_weight
                     )
 
                 return (i + 1, state, average_state, opt_state, total_weight), None
@@ -203,12 +208,14 @@ def solve(
     constraint_tolerance=1e-3,
     complementarity_tolerance=1e-3,
     weight_function=lambda _: 1.0,
+    exponential_weight=None,
     verbose=False,
-    average=True,
+    average="off",
     update_mode="synchronous",
     scale=None,
     expert_diagnostics=False,
     output_opt_state=False,
+    scaled_objective=False,
 ):
     """
     Solve a linear program via saddle-point optimisation.
@@ -268,6 +275,13 @@ def solve(
     jnp_row_scale_ineq = jnp.array(row_scale_ineq)
     jnp_row_scale_eq = jnp.array(row_scale_eq)
 
+    if scaled_objective:
+        c_max = jnp.max(jnp.abs(lp.c))
+        lp.c = lp.c / c_max
+
+    else:
+        c_max = 1.0
+
     initial_solution = SaddleState(
         primal=initial_solution.primal / col_scale,
         dual_ineq=initial_solution.dual_ineq / jnp_row_scale_ineq,
@@ -276,7 +290,7 @@ def solve(
 
     @jax.jit
     def compute_epoch_metrics(average_state):
-        objective_value = lp.objective(average_state.primal)
+        objective_value = lp.objective(average_state.primal) * c_max
 
         grad_primal = (
             lp.c
@@ -330,88 +344,6 @@ def solve(
 
     def check_max_epochs(count):
         return count >= max_epochs
-
-    def cond_fun(loop_vars):
-        (
-            i,
-            state,
-            average_state,
-            opt_state,
-            previous_objective,
-            primal_grad_norm,
-            complementarity_slack,
-            constraint_bound,
-            count,
-            objective_value,
-            total_weight,
-        ) = loop_vars
-
-        return check_convergence(
-            primal_grad_norm, complementarity_slack, constraint_bound, count
-        )
-
-    def body_fun(loop_vars):
-        (
-            i,
-            state,
-            average_state,
-            opt_state,
-            previous_objective,
-            primal_grad_norm,
-            complementarity_slack,
-            constraint_bound,
-            count,
-            objective_value,
-            total_weight,
-        ) = loop_vars
-
-        (
-            i,
-            state,
-            average_state,
-            opt_state,
-            total_weight,
-        ) = __sps(
-            iterations_per_epoch,
-            i,
-            lp,
-            optimiser,
-            state,
-            average_state,
-            opt_state,
-            weight_function,
-            total_weight,
-            primal_damping,
-            dual_damping_ineq,
-            dual_damping_eq,
-            average,
-            update_mode,
-        )
-
-        (
-            objective_value,
-            primal_grad_norm,
-            complementarity_slack,
-            constraint_bound,
-        ) = jax.lax.cond(
-            average,
-            lambda: compute_epoch_metrics(average_state),
-            lambda: compute_epoch_metrics(state),
-        )
-
-        return (
-            i,
-            state,
-            average_state,
-            opt_state,
-            previous_objective,
-            primal_grad_norm,
-            complementarity_slack,
-            constraint_bound,
-            count,
-            objective_value,
-            total_weight,
-        )
 
     i = 1
     state = initial_solution
@@ -514,6 +446,7 @@ def solve(
                 average_state,
                 opt_state,
                 weight_function,
+                exponential_weight,
                 total_weight,
                 primal_damping,
                 dual_damping_ineq,
@@ -528,7 +461,7 @@ def solve(
                 complementarity_slack,
                 constraint_bound,
             ) = jax.lax.cond(
-                average,
+                average == "exponential" or average == "polyak",
                 lambda: compute_epoch_metrics(average_state),
                 lambda: compute_epoch_metrics(state),
             )
@@ -563,6 +496,7 @@ def solve(
 
     output = jax.block_until_ready(output)
     end_time = time.time()
+    lp.c = lp.c * c_max
     print(f"Time to solution: {end_time - start_time:.2f} seconds")
     print("----------------------------------------------")
     print(f"Epochs to solution: {count}")

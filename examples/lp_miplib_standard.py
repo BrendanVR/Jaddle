@@ -49,7 +49,7 @@ lr = optax.cosine_decay_schedule(
 )
 
 optimiser = jo.create_saddle_optimiser(
-    optax.optimistic_adam_v2(lr, alpha=0.05),
+    optax.optimistic_adam_v2(lr, alpha=0.01),
     optax.adadelta(1.0),
 )
 
@@ -60,10 +60,11 @@ optimiser = jo.create_saddle_optimiser(
 solution, _ = jl.solve(
     lp=jaddle_lp,
     optimiser=optimiser,
-    # scale="ruiz+pc",
     update_mode="alternating",
-    weight_function=lambda i: jnp.sqrt(i + 1),
+    average="polyak",
+    weight_function=lambda i: jax.lax.select(i < int(5e4), 1e-8, 1.0),
     scale="ruiz+pc",  # Example weight function that increases with iterations
+    scaled_objective=True,
 )
 
 # %%
