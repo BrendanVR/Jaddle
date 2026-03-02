@@ -18,6 +18,9 @@ import jaddle.jaddle_optimisers as jo
 np.set_printoptions(precision=2, suppress=True)
 
 
+_LINEAR_RUN_EPOCH_CACHE = {}
+
+
 # %%
 # Solvers for constrained linear optimisation via saddle point formulation
 def __sps(
@@ -84,136 +87,153 @@ def __sps(
             dual_eq=updates.dual_eq,
         )
 
-    @functools.partial(
-        jax.jit,
-        static_argnames=("max_iter",),
+    cache_key = (
+        id(lp),
+        id(optimiser),
+        id(weight_function),
+        float(exponential_weight),
+        float(primal_damping),
+        float(dual_damping_ineq),
+        float(dual_damping_eq),
+        average,
+        update_mode,
     )
-    def run_epoch(
-        max_iter,
-        start_iter,
-        state,
-        average_state,
-        opt_state,
-        total_weight=0.0,
-    ):
-        apply_updates = optax.apply_updates
+    run_epoch = _LINEAR_RUN_EPOCH_CACHE.get(cache_key)
 
-        if update_mode == "alternating":
+    if run_epoch is None:
 
-            def step(carry, _):
-                i, state, average_state, opt_state, total_weight = carry
-
-                # 1) Primal-only update
-                g0 = grad(state)
-                primal_updates, _ = opt_update(zero_dual(g0), opt_state, state)
-                state = apply_updates(state, keep_only_primal(primal_updates))
-                state = SaddleState(
-                    primal=projection_primal(state.primal),
-                    dual_ineq=state.dual_ineq,
-                    dual_eq=state.dual_eq,
-                )
-
-                # 2) Dual-only update (using post-primal dual gradients)
-                g1 = grad(state)
-                combined_gradient = SaddleState(
-                    primal=g0.primal,
-                    dual_ineq=g1.dual_ineq,
-                    dual_eq=g1.dual_eq,
-                )
-                dual_updates, opt_state = opt_update(
-                    combined_gradient, opt_state, state
-                )
-                state = apply_updates(state, keep_only_dual(dual_updates))
-                state = SaddleState(
-                    primal=state.primal,
-                    dual_ineq=projection_non_negative(state.dual_ineq),
-                    dual_eq=state.dual_eq,
-                )
-
-                def _polyak(_):
-                    w = weight_function(i)
-                    new_total_weight = total_weight + w
-                    new_average_state = optax.incremental_update(
-                        state, average_state, w / new_total_weight
-                    )
-                    return new_average_state, new_total_weight
-
-                def _exponential(_):
-                    new_average_state = optax.incremental_update(
-                        state, average_state, exponential_weight
-                    )
-                    return new_average_state, total_weight
-
-                def _no_average(_):
-                    return average_state, total_weight
-
-                average_state, total_weight = jax.lax.cond(
-                    jnp.array(average == "polyak"),
-                    _polyak,
-                    lambda _: jax.lax.cond(
-                        jnp.array(average == "exponential"),
-                        _exponential,
-                        _no_average,
-                        operand=None,
-                    ),
-                    operand=None,
-                )
-
-                return (i + 1, state, average_state, opt_state, total_weight), None
-
-        else:
-
-            def step(carry, _):
-                i, state, average_state, opt_state, total_weight = carry
-
-                g = grad(state)
-                updates, opt_state = opt_update(g, opt_state, state)
-                state = apply_updates(state, updates)
-                state = SaddleState(
-                    primal=projection_primal(state.primal),
-                    dual_ineq=projection_non_negative(state.dual_ineq),
-                    dual_eq=state.dual_eq,
-                )
-
-                def _polyak(_):
-                    w = weight_function(i)
-                    new_total_weight = total_weight + w
-                    new_average_state = optax.incremental_update(
-                        state, average_state, w / new_total_weight
-                    )
-                    return new_average_state, new_total_weight
-
-                def _exponential(_):
-                    new_average_state = optax.incremental_update(
-                        state, average_state, exponential_weight
-                    )
-                    return new_average_state, total_weight
-
-                def _no_average(_):
-                    return average_state, total_weight
-
-                average_state, total_weight = jax.lax.cond(
-                    jnp.array(average == "polyak"),
-                    _polyak,
-                    lambda _: jax.lax.cond(
-                        jnp.array(average == "exponential"),
-                        _exponential,
-                        _no_average,
-                        operand=None,
-                    ),
-                    operand=None,
-                )
-
-                return (i + 1, state, average_state, opt_state, total_weight), None
-
-        (i, state, average_state, opt_state, total_weight), _ = jax.lax.scan(
-            step,
-            (start_iter, state, average_state, opt_state, total_weight),
-            None,
-            length=max_iter,
+        @functools.partial(
+            jax.jit,
+            static_argnames=("max_iter",),
         )
+        def run_epoch(
+            max_iter,
+            start_iter,
+            state,
+            average_state,
+            opt_state,
+            total_weight=0.0,
+        ):
+            apply_updates = optax.apply_updates
 
-        return i, state, average_state, opt_state, total_weight
+            if update_mode == "alternating":
+
+                def step(carry, _):
+                    i, state, average_state, opt_state, total_weight = carry
+
+                    # 1) Primal-only update
+                    g0 = grad(state)
+                    primal_updates, _ = opt_update(zero_dual(g0), opt_state, state)
+                    state = apply_updates(state, keep_only_primal(primal_updates))
+                    state = SaddleState(
+                        primal=projection_primal(state.primal),
+                        dual_ineq=state.dual_ineq,
+                        dual_eq=state.dual_eq,
+                    )
+
+                    # 2) Dual-only update (using post-primal dual gradients)
+                    g1 = grad(state)
+                    combined_gradient = SaddleState(
+                        primal=g0.primal,
+                        dual_ineq=g1.dual_ineq,
+                        dual_eq=g1.dual_eq,
+                    )
+                    dual_updates, opt_state = opt_update(
+                        combined_gradient, opt_state, state
+                    )
+                    state = apply_updates(state, keep_only_dual(dual_updates))
+                    state = SaddleState(
+                        primal=state.primal,
+                        dual_ineq=projection_non_negative(state.dual_ineq),
+                        dual_eq=state.dual_eq,
+                    )
+
+                    def _polyak(_):
+                        w = weight_function(i)
+                        new_total_weight = total_weight + w
+                        new_average_state = optax.incremental_update(
+                            state, average_state, w / new_total_weight
+                        )
+                        return new_average_state, new_total_weight
+
+                    def _exponential(_):
+                        new_average_state = optax.incremental_update(
+                            state, average_state, exponential_weight
+                        )
+                        return new_average_state, total_weight
+
+                    def _no_average(_):
+                        return average_state, total_weight
+
+                    average_state, total_weight = jax.lax.cond(
+                        jnp.array(average == "polyak"),
+                        _polyak,
+                        lambda _: jax.lax.cond(
+                            jnp.array(average == "exponential"),
+                            _exponential,
+                            _no_average,
+                            operand=None,
+                        ),
+                        operand=None,
+                    )
+
+                    return (i + 1, state, average_state, opt_state, total_weight), None
+
+            else:
+
+                def step(carry, _):
+                    i, state, average_state, opt_state, total_weight = carry
+
+                    g = grad(state)
+                    updates, opt_state = opt_update(g, opt_state, state)
+                    state = apply_updates(state, updates)
+                    state = SaddleState(
+                        primal=projection_primal(state.primal),
+                        dual_ineq=projection_non_negative(state.dual_ineq),
+                        dual_eq=state.dual_eq,
+                    )
+
+                    def _polyak(_):
+                        w = weight_function(i)
+                        new_total_weight = total_weight + w
+                        new_average_state = optax.incremental_update(
+                            state, average_state, w / new_total_weight
+                        )
+                        return new_average_state, new_total_weight
+
+                    def _exponential(_):
+                        new_average_state = optax.incremental_update(
+                            state, average_state, exponential_weight
+                        )
+                        return new_average_state, total_weight
+
+                    def _no_average(_):
+                        return average_state, total_weight
+
+                    average_state, total_weight = jax.lax.cond(
+                        jnp.array(average == "polyak"),
+                        _polyak,
+                        lambda _: jax.lax.cond(
+                            jnp.array(average == "exponential"),
+                            _exponential,
+                            _no_average,
+                            operand=None,
+                        ),
+                        operand=None,
+                    )
+
+                    return (i + 1, state, average_state, opt_state, total_weight), None
+
+            (i, state, average_state, opt_state, total_weight), _ = jax.lax.scan(
+                step,
+                (start_iter, state, average_state, opt_state, total_weight),
+                None,
+                length=max_iter,
+            )
+
+            return i, state, average_state, opt_state, total_weight
+
+        _LINEAR_RUN_EPOCH_CACHE[cache_key] = run_epoch
 
     state = initial_solution
 
@@ -253,6 +273,7 @@ def solve(
     weight_function=lambda _: 1.0,
     exponential_weight=0.01,
     verbose=False,
+    log_every=10,
     average="off",
     update_mode="synchronous",
     scale=None,
@@ -275,25 +296,32 @@ def solve(
         primal_dual_lr_ratio: Ratio of primal to dual learning rates (default 1.0).
     """
 
-    print("----------------------------------------------")
+    if log_every < 1:
+        raise ValueError("log_every must be >= 1")
+
+    if verbose:
+        print("----------------------------------------------")
 
     if update_mode not in ["synchronous", "alternating"]:
         raise ValueError("update_mode must be one of ['synchronous', 'alternating']")
-    print("====Starting Solve====")
-    print("----------------------------------------------")
+    if verbose:
+        print("====Starting Solve====")
+        print("----------------------------------------------")
 
     if initial_solution is None:
         initial_solution = lp.initial_solution()
 
     if scale == "ruiz":
         lp, row_scale, col_scale = ruiz_scaling(lp)
-        print("Applied Ruiz scaling to the LP.")
-        print("----------------------------------------------")
+        if verbose:
+            print("Applied Ruiz scaling to the LP.")
+            print("----------------------------------------------")
 
     elif scale == "pc":
         lp, row_scale, col_scale = pc_scaling(lp)
-        print("Applied PC scaling to the LP.")
-        print("----------------------------------------------")
+        if verbose:
+            print("Applied PC scaling to the LP.")
+            print("----------------------------------------------")
 
     elif scale == "ruiz+pc":
         lp, row_scale_ruiz, col_scale_ruiz = ruiz_scaling(lp)
@@ -304,8 +332,9 @@ def solve(
             col_scale_ruiz * col_scale_pc,
         )
 
-        print("Applied combined Ruiz + PC scaling to the LP.")
-        print("----------------------------------------------")
+        if verbose:
+            print("Applied combined Ruiz + PC scaling to the LP.")
+            print("----------------------------------------------")
 
     else:
         row_scale = np.ones(lp.A_eq.shape[0] + lp.A_ineq.shape[0])
@@ -512,7 +541,7 @@ def solve(
             finish_epoch_time = time.time()
             count += 1
 
-            if verbose:
+            if verbose and (count == 1 or count % log_every == 0):
                 print(
                     f"|Epoch {count}|"
                     f"|Obj{objective_value:.2e}|"
@@ -563,10 +592,17 @@ def solve(
 # %%
 def to_jaddle_sparse(lp: LP):
     A_eq_sp = lp.A_eq.astype(np.float32)
-    A_ineq_sp = lp.A_ineq.astype(np.float32)
+    A_eq_sp = A_eq_sp.sorted_indices()
+    A_eq_sp.sum_duplicates()
+    A_eq_sp = A_eq_sp.tocoo()
 
-    A_eq = jsp.BCOO.from_scipy_sparse(A_eq_sp)
-    A_ineq = jsp.BCOO.from_scipy_sparse(A_ineq_sp)
+    A_ineq_sp = lp.A_ineq.astype(np.float32)
+    A_ineq_sp = A_ineq_sp.sorted_indices()
+    A_ineq_sp.sum_duplicates()
+    A_ineq_sp = A_ineq_sp.tocoo()
+
+    A_eq = jsp.BCOO.from_scipy_sparse(A_eq_sp).sort_indices()
+    A_ineq = jsp.BCOO.from_scipy_sparse(A_ineq_sp).sort_indices()
 
     lp_jax = LP(
         jnp.array(lp.c, dtype=jnp.float32),
@@ -596,6 +632,7 @@ def lp_summary_statistics(lp: LP):
         max_A_eq = None
         min_b_eq = None
         max_b_eq = None
+        num_nnz_A_eq = None
 
     if lp.A_ineq.data.size > 0:
         min_A_ineq = np.minimum(np.min(lp.A_ineq.data), 0.0)
@@ -608,6 +645,7 @@ def lp_summary_statistics(lp: LP):
         max_A_ineq = None
         min_b_ineq = None
         max_b_ineq = None
+        num_nnz_A_ineq = None
 
     min_c = np.min(lp.c)
     max_c = np.max(lp.c)

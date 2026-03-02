@@ -45,7 +45,6 @@ def configure_jax(jax_profile: Optional[str] = None):
             "JAX_COMPILATION_CACHE_DIR",
             os.path.expanduser("~/.cache/jaddle_jax"),
         )
-        _append_xla_flag("--xla_disable_hlo_passes=slow-operation-alarm")
 
     if JAX_PROFILE == "max_speed":
         os.environ.setdefault("JAX_DEFAULT_MATMUL_PRECISION", "tensorfloat32")
@@ -248,6 +247,25 @@ def _normalise_log_weights(log_weights: jnp.ndarray) -> jnp.ndarray:
     return log_weights - jax.nn.logsumexp(log_weights)
 
 
+def _normalise_log_weights_with_mask(
+    log_weights: jnp.ndarray, active_mask: jnp.ndarray
+) -> jnp.ndarray:
+    mask = jnp.asarray(active_mask, dtype=jnp.float32)
+    safe_mask = jnp.where(jnp.sum(mask) > 0, mask, jnp.ones_like(mask))
+    masked_logits = jnp.where(
+        safe_mask > 0, log_weights, jnp.full_like(log_weights, -1e30)
+    )
+    return masked_logits - jax.nn.logsumexp(masked_logits)
+
+
+def _masked_softmax(log_weights: jnp.ndarray, active_mask: jnp.ndarray) -> jnp.ndarray:
+    logits = _normalise_log_weights_with_mask(log_weights, active_mask)
+    probs = jax.nn.softmax(logits)
+    mask = jnp.asarray(active_mask, dtype=jnp.float32)
+    denom = jnp.maximum(jnp.sum(probs * mask), 1e-30)
+    return (probs * mask) / denom
+
+
 def _mean_abs(x: jnp.ndarray) -> jnp.ndarray:
     if x.size == 0:
         return jnp.array(0.0, dtype=jnp.float32)
@@ -293,6 +311,7 @@ def hedge_ensemble_saddle(
             primal=HedgePoolState(
                 expert_states=primal_states,
                 log_weights=init_primal_log_weights,
+                active_mask=jnp.ones((primal_count,), dtype=jnp.float32),
                 loss_scale=jnp.array(1.0, dtype=jnp.float32),
                 last_raw_losses=jnp.zeros((primal_count,), dtype=jnp.float32),
                 last_normalized_losses=jnp.zeros((primal_count,), dtype=jnp.float32),
@@ -302,6 +321,7 @@ def hedge_ensemble_saddle(
             dual=HedgePoolState(
                 expert_states=dual_states,
                 log_weights=init_dual_log_weights,
+                active_mask=jnp.ones((dual_count,), dtype=jnp.float32),
                 loss_scale=jnp.array(1.0, dtype=jnp.float32),
                 last_raw_losses=jnp.zeros((dual_count,), dtype=jnp.float32),
                 last_normalized_losses=jnp.zeros((dual_count,), dtype=jnp.float32),
@@ -322,8 +342,14 @@ def hedge_ensemble_saddle(
         grad_dual_ineq = updates.dual_ineq
         grad_dual_eq = updates.dual_eq
 
-        primal_base_weights = jax.nn.softmax(state.primal.log_weights)
-        dual_base_weights = jax.nn.softmax(state.dual.log_weights)
+        primal_base_weights = _masked_softmax(
+            state.primal.log_weights,
+            state.primal.active_mask,
+        )
+        dual_base_weights = _masked_softmax(
+            state.dual.log_weights,
+            state.dual.active_mask,
+        )
 
         primal_weights = (1.0 - exploration_rate) * primal_base_weights + (
             exploration_rate / primal_count
@@ -331,6 +357,12 @@ def hedge_ensemble_saddle(
         dual_weights = (1.0 - exploration_rate) * dual_base_weights + (
             exploration_rate / dual_count
         )
+        primal_active_mask = jnp.asarray(state.primal.active_mask, dtype=jnp.float32)
+        dual_active_mask = jnp.asarray(state.dual.active_mask, dtype=jnp.float32)
+        primal_weights = primal_weights * primal_active_mask
+        dual_weights = dual_weights * dual_active_mask
+        primal_weights = primal_weights / jnp.maximum(jnp.sum(primal_weights), 1e-30)
+        dual_weights = dual_weights / jnp.maximum(jnp.sum(dual_weights), 1e-30)
 
         # ---------- Primal experts ----------
         primal_step_updates = []
@@ -409,6 +441,8 @@ def hedge_ensemble_saddle(
 
         primal_losses = jnp.asarray(primal_losses, dtype=jnp.float32)
         dual_losses = jnp.asarray(dual_losses, dtype=jnp.float32)
+        primal_losses = jnp.where(primal_active_mask > 0, primal_losses, 0.0)
+        dual_losses = jnp.where(dual_active_mask > 0, dual_losses, 0.0)
 
         primal_loss_scale = loss_scale_ema_decay * state.primal.loss_scale + (
             1.0 - loss_scale_ema_decay
@@ -445,17 +479,20 @@ def hedge_ensemble_saddle(
             centered_primal_losses = clipped_primal_losses
             centered_dual_losses = clipped_dual_losses
 
-        next_primal_log_weights = _normalise_log_weights(
-            state.primal.log_weights - primal_eta_value * centered_primal_losses
+        next_primal_log_weights = _normalise_log_weights_with_mask(
+            state.primal.log_weights - primal_eta_value * centered_primal_losses,
+            primal_active_mask,
         )
-        next_dual_log_weights = _normalise_log_weights(
-            state.dual.log_weights - dual_eta_value * centered_dual_losses
+        next_dual_log_weights = _normalise_log_weights_with_mask(
+            state.dual.log_weights - dual_eta_value * centered_dual_losses,
+            dual_active_mask,
         )
 
         next_state = HedgeSaddleState(
             primal=HedgePoolState(
                 expert_states=tuple(primal_next_states),
                 log_weights=next_primal_log_weights,
+                active_mask=primal_active_mask,
                 loss_scale=primal_loss_scale,
                 last_raw_losses=primal_losses,
                 last_normalized_losses=normalized_primal_losses,
@@ -465,6 +502,7 @@ def hedge_ensemble_saddle(
             dual=HedgePoolState(
                 expert_states=tuple(dual_next_states),
                 log_weights=next_dual_log_weights,
+                active_mask=dual_active_mask,
                 loss_scale=dual_loss_scale,
                 last_raw_losses=dual_losses,
                 last_normalized_losses=normalized_dual_losses,
@@ -497,21 +535,34 @@ def hedge_weights_from_state(opt_state: Any):
     try:
         primal_log_weights = opt_state.primal.log_weights
         dual_log_weights = opt_state.dual.log_weights
+        primal_active_mask = opt_state.primal.active_mask
+        dual_active_mask = opt_state.dual.active_mask
     except AttributeError:
         return None
 
-    return jax.nn.softmax(primal_log_weights), jax.nn.softmax(dual_log_weights)
+    return _masked_softmax(primal_log_weights, primal_active_mask), _masked_softmax(
+        dual_log_weights,
+        dual_active_mask,
+    )
 
 
 def hedge_diagnostics_from_state(opt_state: Any):
     """Extract hedge diagnostics (weights, losses, scales, eta) if available."""
     try:
-        primal_weights = jax.nn.softmax(opt_state.primal.log_weights)
-        dual_weights = jax.nn.softmax(opt_state.dual.log_weights)
+        primal_weights = _masked_softmax(
+            opt_state.primal.log_weights,
+            opt_state.primal.active_mask,
+        )
+        dual_weights = _masked_softmax(
+            opt_state.dual.log_weights,
+            opt_state.dual.active_mask,
+        )
 
         return {
             "primal_weights": primal_weights,
             "dual_weights": dual_weights,
+            "primal_active_mask": opt_state.primal.active_mask,
+            "dual_active_mask": opt_state.dual.active_mask,
             "primal_raw_losses": opt_state.primal.last_raw_losses,
             "dual_raw_losses": opt_state.dual.last_raw_losses,
             "primal_normalized_losses": opt_state.primal.last_normalized_losses,

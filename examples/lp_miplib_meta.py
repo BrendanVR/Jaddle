@@ -13,7 +13,7 @@ import optax
 import highspy as hspy
 
 # %%
-PROBLEM_NAME = "ns1758913"  # name of the MIPLIB problem to load
+PROBLEM_NAME = input("Enter the MIPLIB problem name: ")
 
 # %% [markdown]
 # ## Load and presolve the LP
@@ -26,23 +26,20 @@ highs.readModel(
 
 # %% [markdown]
 # We convert the LP to Jaddle's sparse format.
-highs.presolve()
-highs_lp = highs.getPresolvedLp()
+highs_lp = highs.getLp()
 jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 
 # %%
 learning_rates = [
     optax.cosine_decay_schedule(
-        init_value=1e0,
+        init_value=1e-1,
         decay_steps=decay_steps,
         exponent=exponent,
-        alpha=1e-4,
+        alpha=1e-5,
     )
     for exponent in [1, 2, 3]
     for decay_steps in [int(1e3), int(1e4), int(1e5)]
 ]
-alphas = [0.05]
-betas = [1.0]
 
 HEDGE_ETA = 0.05
 LOSS_CLIP = 20.0
@@ -51,15 +48,8 @@ PRUNE_THRESHOLD = 5e-3
 PRUNE_MIN_KEEP = 1
 PRUNE_MIN_STEP = 1
 
-primal_experts = [
-    optax.optimistic_adam_v2(learning_rate=lr, alpha=alpha, beta=beta)
-    for lr in learning_rates
-    for alpha in alphas
-    for beta in betas
-]
-
-dual_experts = [optax.adadelta(1.0)]
-
+primal_experts = [optax.sgd(learning_rate=lr) for lr in learning_rates]
+dual_experts = [optax.sgd(learning_rate=lr) for lr in learning_rates]
 ensemble_optimiser = jo.hedge_ensemble_saddle(
     lp=jaddle_lp,
     primal_experts=primal_experts,
@@ -70,24 +60,38 @@ ensemble_optimiser = jo.hedge_ensemble_saddle(
     exploration_rate=EXPLORATION_RATE,
     center_losses=True,
 )
+
 is_converged = False
 solution = jaddle_lp.initial_solution()
 opt_state = None
 
-while (len(primal_experts) > 1 or len(dual_experts) > 1) and (not is_converged):
+
+def active_expert_counts(state):
+    if state is None:
+        return len(primal_experts), len(dual_experts)
+
+    primal_active = int(jnp.sum(state.primal.active_mask > 0))
+    dual_active = int(jnp.sum(state.dual.active_mask > 0))
+    return primal_active, dual_active
+
+
+while not is_converged:
+    primal_active, dual_active = active_expert_counts(opt_state)
+    if primal_active <= 1 and dual_active <= 1:
+        break
+
     solution, is_converged, opt_state = jl.solve(
         lp=jaddle_lp,
         optimiser=ensemble_optimiser,
         initial_opt_state=opt_state,
         initial_solution=solution,
-        verbose=True,
         expert_diagnostics=True,
         iterations_per_epoch=int(1e4),
         output_opt_state=True,
         max_epochs=4,
         average="polyak",
         weight_function=lambda i: jax.lax.select(i <= int(3e4), 0.5, 1.0),
-        scale="ruiz+pc",
+        scale="ruiz",
         scaled_objective=True,
         update_mode="alternating",
     )
@@ -100,23 +104,9 @@ while (len(primal_experts) > 1 or len(dual_experts) > 1) and (not is_converged):
         min_keep=PRUNE_MIN_KEEP,
         min_step=PRUNE_MIN_STEP,
     )
-    primal_experts = [primal_experts[i] for i in primal_idx]
-    dual_experts = [dual_experts[i] for i in dual_idx]
+    primal_active, dual_active = active_expert_counts(opt_state)
 
-    print(
-        f"Pruned to {len(primal_experts)} primal experts and {len(dual_experts)} dual experts."
-    )
-
-    ensemble_optimiser = jo.hedge_ensemble_saddle(
-        lp=jaddle_lp,
-        primal_experts=primal_experts,
-        dual_experts=dual_experts,
-        primal_eta=HEDGE_ETA,
-        dual_eta=HEDGE_ETA,
-        loss_clip=LOSS_CLIP,
-        exploration_rate=EXPLORATION_RATE,
-        center_losses=True,
-    )
+    print(f"Active experts: {primal_active} primal and {dual_active} dual.")
 
 if not is_converged:
     solution, is_converged = jl.solve(
@@ -124,10 +114,9 @@ if not is_converged:
         optimiser=ensemble_optimiser,
         initial_solution=solution,
         initial_opt_state=opt_state,
-        verbose=True,
         iterations_per_epoch=int(1e4),
         weight_function=lambda i: jax.lax.select(i <= int(5e4), 1e-8, 1.0),
-        scale="ruiz+pc",
+        scale="ruiz",
         scaled_objective=True,
         update_mode="alternating",
     )

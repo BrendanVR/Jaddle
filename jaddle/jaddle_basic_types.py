@@ -11,6 +11,7 @@ ScheduleLike = Union[float, Callable[[jnp.ndarray], jnp.ndarray]]
 class HedgePoolState(NamedTuple):
     expert_states: tuple
     log_weights: jnp.ndarray
+    active_mask: jnp.ndarray
     loss_scale: jnp.ndarray
     last_raw_losses: jnp.ndarray
     last_normalized_losses: jnp.ndarray
@@ -18,37 +19,41 @@ class HedgePoolState(NamedTuple):
     last_centered_losses: jnp.ndarray
 
     def prune(self, threshold: float, min_keep: int = 1):
-        """Prune experts with weight below the given threshold."""
+        """Mask experts with low weight while keeping state size fixed."""
         weights = np.asarray(jax.nn.softmax(self.log_weights))
-        keep_mask = weights > threshold
+        active_mask = np.asarray(self.active_mask) > 0
+        effective_weights = np.where(active_mask, weights, 0.0)
+        keep_mask = np.logical_and(active_mask, effective_weights > threshold)
 
         if keep_mask.sum() < min_keep:
-            topk_idx = np.argsort(-weights)[:min_keep]
-            keep_mask = np.zeros_like(weights, dtype=bool)
+            active_idx = np.where(active_mask)[0]
+            if active_idx.size == 0:
+                active_idx = np.arange(weights.shape[0])
+
+            ranked_active = active_idx[np.argsort(-effective_weights[active_idx])]
+            topk_idx = ranked_active[: min(min_keep, ranked_active.size)]
+            keep_mask = np.zeros_like(effective_weights, dtype=bool)
             keep_mask[topk_idx] = True
 
-        pruned_expert_states = tuple(
-            state for state, keep in zip(self.expert_states, keep_mask) if keep
-        )
         idx = np.where(keep_mask)[0]
-        pruned_log_weights = self.log_weights[idx]
-        # Renormalize log weights
-        pruned_log_weights -= jax.nn.logsumexp(pruned_log_weights)
-
-        def maybe_prune(arr):
-            if arr.shape[0] == len(self.expert_states):
-                return arr[idx]
-            return arr
+        keep_mask_jnp = jnp.array(keep_mask, dtype=jnp.float32)
+        masked_logits = jnp.where(
+            keep_mask_jnp > 0,
+            self.log_weights,
+            jnp.full_like(self.log_weights, -1e30),
+        )
+        pruned_log_weights = masked_logits - jax.nn.logsumexp(masked_logits)
 
         return (
             HedgePoolState(
-                expert_states=pruned_expert_states,
+                expert_states=self.expert_states,
                 log_weights=pruned_log_weights,
+                active_mask=keep_mask_jnp,
                 loss_scale=self.loss_scale,
-                last_raw_losses=maybe_prune(self.last_raw_losses),
-                last_normalized_losses=maybe_prune(self.last_normalized_losses),
-                last_clipped_losses=maybe_prune(self.last_clipped_losses),
-                last_centered_losses=maybe_prune(self.last_centered_losses),
+                last_raw_losses=self.last_raw_losses,
+                last_normalized_losses=self.last_normalized_losses,
+                last_clipped_losses=self.last_clipped_losses,
+                last_centered_losses=self.last_centered_losses,
             ),
             jnp.array(idx),
         )
@@ -149,10 +154,10 @@ class LP:
     ):
         self.c = c
         self.A_eq = A_eq
-        self.A_eq_T = self.A_eq.T
+        self.A_eq_T = self.A_eq.T.sort_indices()
         self.b_eq = b_eq
         self.A_ineq = A_ineq
-        self.A_ineq_T = self.A_ineq.T
+        self.A_ineq_T = self.A_ineq.T.sort_indices()
         self.b_ineq = b_ineq
         self.lower_bounds = lower_bounds
         self.upper_bounds = upper_bounds

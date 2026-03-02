@@ -11,6 +11,9 @@ import jaddle.jaddle_optimisers as jo
 import numpy as np
 
 
+_CONVEX_RUN_EPOCH_CACHE = {}
+
+
 def __sps(
     max_iter,
     start_iter,
@@ -67,101 +70,115 @@ def __sps(
             dual_eq=updates.dual_eq,
         )
 
-    @functools.partial(
-        jax.jit,
-        static_argnames=("max_iter",),
+    cache_key = (
+        id(cp),
+        id(optimiser),
+        id(weight_function),
+        bool(average),
+        update_mode,
     )
-    def run_epoch(
-        max_iter,
-        start_iter,
-        state,
-        average_state,
-        opt_state,
-        total_weight=0.0,
-    ):
-        def step(carry, _):
-            (
-                i,
-                state,
-                average_state,
-                opt_state,
-                total_weight,
-            ) = carry
+    run_epoch = _CONVEX_RUN_EPOCH_CACHE.get(cache_key)
 
-            if update_mode == "alternating":
-                gradient_start = grad(state)
+    if run_epoch is None:
 
-                primal_updates, _ = opt_update(
-                    zero_dual(gradient_start),
-                    opt_state,
-                    state,
-                )
-                primal_updates = keep_only_primal(primal_updates)
-                state = optax.apply_updates(state, primal_updates)
-                state = SaddleState(
-                    primal=projection_primal(state.primal),
-                    dual_ineq=state.dual_ineq,
-                    dual_eq=state.dual_eq,
-                )
-
-                gradient_after_primal = grad(state)
-                combined_gradient = SaddleState(
-                    primal=gradient_start.primal,
-                    dual_ineq=gradient_after_primal.dual_ineq,
-                    dual_eq=gradient_after_primal.dual_eq,
-                )
-                combined_updates, opt_state = opt_update(
-                    combined_gradient,
-                    opt_state,
-                    state,
-                )
-                dual_updates = keep_only_dual(combined_updates)
-                state = optax.apply_updates(state, dual_updates)
-                state = SaddleState(
-                    primal=state.primal,
-                    dual_ineq=projection_non_negative(state.dual_ineq),
-                    dual_eq=state.dual_eq,
-                )
-            else:
-                gradient = grad(state)
-                updates, opt_state = opt_update(gradient, opt_state, state)
-                state = optax.apply_updates(state, updates)
-                state = SaddleState(
-                    primal=projection_primal(state.primal),
-                    dual_ineq=projection_non_negative(state.dual_ineq),
-                    dual_eq=state.dual_eq,
-                )
-
-            total_weight = jax.lax.cond(
-                average,
-                lambda: total_weight + weight_function(i),
-                lambda: total_weight,
-            )
-
-            average_state = jax.lax.cond(
-                average,
-                lambda: optax.incremental_update(
-                    state, average_state, weight_function(i) / total_weight
-                ),
-                lambda: average_state,
-            )
-
-            return (
-                i + 1,
-                state,
-                average_state,
-                opt_state,
-                total_weight,
-            ), None
-
-        (i, state, average_state, opt_state, total_weight), _ = jax.lax.scan(
-            step,
-            (start_iter, state, average_state, opt_state, total_weight),
-            None,
-            length=max_iter,
+        @functools.partial(
+            jax.jit,
+            static_argnames=("max_iter",),
         )
+        def run_epoch(
+            max_iter,
+            start_iter,
+            state,
+            average_state,
+            opt_state,
+            total_weight=0.0,
+        ):
+            def step(carry, _):
+                (
+                    i,
+                    state,
+                    average_state,
+                    opt_state,
+                    total_weight,
+                ) = carry
 
-        return i, state, average_state, opt_state, total_weight
+                if update_mode == "alternating":
+                    gradient_start = grad(state)
+
+                    primal_updates, _ = opt_update(
+                        zero_dual(gradient_start),
+                        opt_state,
+                        state,
+                    )
+                    primal_updates = keep_only_primal(primal_updates)
+                    state = optax.apply_updates(state, primal_updates)
+                    state = SaddleState(
+                        primal=projection_primal(state.primal),
+                        dual_ineq=state.dual_ineq,
+                        dual_eq=state.dual_eq,
+                    )
+
+                    gradient_after_primal = grad(state)
+                    combined_gradient = SaddleState(
+                        primal=gradient_start.primal,
+                        dual_ineq=gradient_after_primal.dual_ineq,
+                        dual_eq=gradient_after_primal.dual_eq,
+                    )
+                    combined_updates, opt_state = opt_update(
+                        combined_gradient,
+                        opt_state,
+                        state,
+                    )
+                    dual_updates = keep_only_dual(combined_updates)
+                    state = optax.apply_updates(state, dual_updates)
+                    state = SaddleState(
+                        primal=state.primal,
+                        dual_ineq=projection_non_negative(state.dual_ineq),
+                        dual_eq=state.dual_eq,
+                    )
+                else:
+                    gradient = grad(state)
+                    updates, opt_state = opt_update(gradient, opt_state, state)
+                    state = optax.apply_updates(state, updates)
+                    state = SaddleState(
+                        primal=projection_primal(state.primal),
+                        dual_ineq=projection_non_negative(state.dual_ineq),
+                        dual_eq=state.dual_eq,
+                    )
+
+                w = weight_function(i)
+                total_weight = jax.lax.cond(
+                    average,
+                    lambda: total_weight + w,
+                    lambda: total_weight,
+                )
+
+                average_state = jax.lax.cond(
+                    average,
+                    lambda: optax.incremental_update(
+                        state, average_state, w / total_weight
+                    ),
+                    lambda: average_state,
+                )
+
+                return (
+                    i + 1,
+                    state,
+                    average_state,
+                    opt_state,
+                    total_weight,
+                ), None
+
+            (i, state, average_state, opt_state, total_weight), _ = jax.lax.scan(
+                step,
+                (start_iter, state, average_state, opt_state, total_weight),
+                None,
+                length=max_iter,
+            )
+
+            return i, state, average_state, opt_state, total_weight
+
+        _CONVEX_RUN_EPOCH_CACHE[cache_key] = run_epoch
 
     state = initial_solution
 
@@ -197,6 +214,7 @@ def solve(
     complementarity_tolerance=1e-3,
     weight_function=lambda _: 1.0,
     verbose=False,
+    log_every=10,
     average=True,
     update_mode="synchronous",
     expert_diagnostics=False,
@@ -217,12 +235,17 @@ def solve(
         primal_dual_lr_ratio: Ratio of primal to dual learning rates (default 1.0).
     """
 
-    print("----------------------------------------------")
+    if log_every < 1:
+        raise ValueError("log_every must be >= 1")
+
+    if verbose:
+        print("----------------------------------------------")
 
     if update_mode not in ["synchronous", "alternating"]:
         raise ValueError("update_mode must be one of ['synchronous', 'alternating']")
-    print("====Starting Solve====")
-    print("----------------------------------------------")
+    if verbose:
+        print("====Starting Solve====")
+        print("----------------------------------------------")
 
     def projection_primal(primal_state):
         return projection_box(primal_state, cp.lower_bounds, cp.upper_bounds)
@@ -496,17 +519,18 @@ def solve(
             finish_epoch_time = time.time()
             count += 1
 
-            print(
-                f"|Epoch {count}|"
-                f"|Obj{objective_value:.2e}|"
-                f"|PGN {primal_grad_norm:.2e}|"
-                f"|CS {complementarity_slack:.2e}|"
-                f"|CB {constraint_bound:.2e}|"
-                f"|Time {finish_epoch_time - start_epoch_time:.2f}s|"
-            )
-            print("----------------------------------------------")
+            if verbose and (count == 1 or count % log_every == 0):
+                print(
+                    f"|Epoch {count}|"
+                    f"|Obj{objective_value:.2e}|"
+                    f"|PGN {primal_grad_norm:.2e}|"
+                    f"|CS {complementarity_slack:.2e}|"
+                    f"|CB {constraint_bound:.2e}|"
+                    f"|Time {finish_epoch_time - start_epoch_time:.2f}s|"
+                )
+                print("----------------------------------------------")
 
-            print_expert_weights(count, opt_state)
+                print_expert_weights(count, opt_state)
 
         if average:
             output = average_state

@@ -19,6 +19,8 @@ import jax.numpy as jnp
 #     "jax_enable_x64", True
 # )  # Use 64-bit precision for better numerical stability
 
+jax.config.update("eager_constant_folding", True)
+
 import jaddle.jaddle_linear as jl
 import jaddle.highs_helpers as hh
 import jaddle.jaddle_optimisers as jo
@@ -29,7 +31,7 @@ import highspy as hspy
 import optax
 
 # %%
-PROBLEM_NAME = "ns1758913"  # name of the MIPLIB problem to load
+PROBLEM_NAME = input("Enter the MIPLIB problem name: ")
 
 # %% [markdown]
 # ## Load the LP
@@ -41,21 +43,21 @@ highs.readModel(
 
 # %% [markdown]
 # We convert the LP to Jaddle's sparse format, before applying ruiz scaling.
-highs.presolve()
-highs_lp = highs.getPresolvedLp()
+# highs.presolve()
+highs_lp = highs.getLp()
 jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 
 # %%
 lr = optax.cosine_decay_schedule(
-    init_value=1e0,
+    init_value=1e-1,
     decay_steps=int(1e5),
     exponent=3,
-    alpha=1e-4,
+    alpha=1e-5,
 )
 
 optimiser = jo.create_saddle_optimiser(
-    optax.optimistic_adam_v2(lr, alpha=0.05),
-    optax.adadelta(1.0),
+    optax.sgd(learning_rate=lr),
+    optax.sgd(learning_rate=lr),
 )
 
 # %% [markdown]
@@ -65,30 +67,18 @@ optimiser = jo.create_saddle_optimiser(
 solution, _ = jl.solve(
     lp=jaddle_lp,
     optimiser=optimiser,
-    update_mode="synchronous",
-    average="exponential",
+    update_mode="alternating",
+    average="polyak",
+    weight_function=lambda i: jax.lax.select(i <= int(5e4), 1e-8, 1.0),
     verbose=True,
-    scale="ruiz+pc",
+    log_every=1,
+    scale="ruiz",
     scaled_objective=True,
 )
 
 # %%
 print(f"Primal Equality Residual: {jaddle_lp.eq_slack(solution.primal)}")
 print(f"Primal Inequality Residual: {jaddle_lp.ineq_slack(solution.primal)}")
-print("----------------------------------------------")
-
-# %%
-projected_primal = jl.project_onto_eq(
-    jaddle_lp,
-    solution.primal,
-    1e-8,
-)
-
-# %%
-print("After projection onto equality constraints:")
-print(f"Primal Objective: {jaddle_lp.objective(projected_primal)}")
-print(f"Primal Equality Residual: {jaddle_lp.eq_slack(projected_primal)}")
-print(f"Primal Inequality Residual: {jaddle_lp.ineq_slack(projected_primal)}")
 print("----------------------------------------------")
 
 # %%
