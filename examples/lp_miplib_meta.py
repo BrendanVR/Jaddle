@@ -130,6 +130,7 @@ while (len(primal_experts) > 1 or len(dual_experts) > 1) and (not is_converged):
         max_epochs=10,
         weight_function=lambda i: jax.lax.select(i <= int(5e4), 0.5, 1.0),
         scale="ruiz+pc",
+        update_mode="alternating",
     )
 
     if is_converged:

@@ -57,8 +57,11 @@ solution = jl.solve(
     optimiser=ensemble_optimiser,
     prune_experts=1e-7,
     prune_experts_interval=5,
+    update_mode="alternating",  # or "synchronous" (default)
 )
 ```
+
+`update_mode` controls the SPS player updates: use `"synchronous"` (default) for joint primal/dual updates, or `"alternating"` for primal-then-dual updates within each iteration.
 ```
 
 ---

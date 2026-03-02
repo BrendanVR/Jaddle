@@ -12,16 +12,19 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 import jax
 import jax.numpy as jnp
 
-jax.config.update(
-    "jax_platform_name", "cpu"
-)  # Using CPU for this example, as the problem is not large and we want to avoid GPU overhead
-jax.config.update(
-    "jax_enable_x64", True
-)  # Use 64-bit precision for better numerical stability
+# jax.config.update(
+#     "jax_platform_name", "cpu"
+# )  # Using CPU for this example, as the problem is not large and we want to avoid GPU overhead
+# jax.config.update(
+#     "jax_enable_x64", True
+# )  # Use 64-bit precision for better numerical stability
 
 import jaddle.jaddle_linear as jl
 import jaddle.highs_helpers as hh
 import jaddle.jaddle_optimisers as jo
+
+jo.configure_jax("max_speed")
+
 import highspy as hspy
 import optax
 
@@ -38,7 +41,7 @@ jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 
 # %%
 lr = optax.exponential_decay(
-    1e0,
+    1e1,
     transition_steps=1000,
     decay_rate=0.9,
     end_value=1e-4,
@@ -54,7 +57,8 @@ solution, _ = jl.solve(
     lp=jaddle_lp,
     optimiser=optimiser,
     # scale="ruiz+pc",
-    average=False,
+    update_mode="synchronous",
+    weight_function=lambda i: jax.lax.select(i < int(3e4), 1e-8, 1.0),
 )
 
 # %%

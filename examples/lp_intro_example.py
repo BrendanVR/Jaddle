@@ -58,6 +58,7 @@ solution, _ = jl.solve(
     optimiser=jo.optimistic_adam_saddle(lr, lr),
     verbose=True,
     average=False,
+    update_mode="alternating",
 )
 # %%
 print(f"x1 = {solution.primal[0]:.4f}, x2 = {solution.primal[1]:.4f}")

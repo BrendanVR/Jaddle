@@ -22,6 +22,7 @@ def __sps(
     weight_function=lambda _: 1.0,
     total_weight=0.0,
     average=True,
+    update_mode="synchronous",
 ):
 
     def projection_primal(primal_state):
@@ -45,6 +46,27 @@ def __sps(
     def opt_update(gradient, opt_state, state):
         return optimiser.update(gradient, opt_state, state)
 
+    def zero_dual(gradient):
+        return SaddleState(
+            primal=gradient.primal,
+            dual_ineq=jnp.zeros_like(gradient.dual_ineq),
+            dual_eq=jnp.zeros_like(gradient.dual_eq),
+        )
+
+    def keep_only_primal(updates):
+        return SaddleState(
+            primal=updates.primal,
+            dual_ineq=jnp.zeros_like(updates.dual_ineq),
+            dual_eq=jnp.zeros_like(updates.dual_eq),
+        )
+
+    def keep_only_dual(updates):
+        return SaddleState(
+            primal=jnp.zeros_like(updates.primal),
+            dual_ineq=updates.dual_ineq,
+            dual_eq=updates.dual_eq,
+        )
+
     @functools.partial(
         jax.jit,
         static_argnames=("max_iter",),
@@ -66,14 +88,49 @@ def __sps(
                 total_weight,
             ) = carry
 
-            gradient = grad(state)
-            updates, opt_state = opt_update(gradient, opt_state, state)
-            state = optax.apply_updates(state, updates)
-            state = SaddleState(
-                primal=projection_primal(state.primal),
-                dual_ineq=projection_non_negative(state.dual_ineq),
-                dual_eq=state.dual_eq,
-            )
+            if update_mode == "alternating":
+                gradient_start = grad(state)
+
+                primal_updates, _ = opt_update(
+                    zero_dual(gradient_start),
+                    opt_state,
+                    state,
+                )
+                primal_updates = keep_only_primal(primal_updates)
+                state = optax.apply_updates(state, primal_updates)
+                state = SaddleState(
+                    primal=projection_primal(state.primal),
+                    dual_ineq=state.dual_ineq,
+                    dual_eq=state.dual_eq,
+                )
+
+                gradient_after_primal = grad(state)
+                combined_gradient = SaddleState(
+                    primal=gradient_start.primal,
+                    dual_ineq=gradient_after_primal.dual_ineq,
+                    dual_eq=gradient_after_primal.dual_eq,
+                )
+                combined_updates, opt_state = opt_update(
+                    combined_gradient,
+                    opt_state,
+                    state,
+                )
+                dual_updates = keep_only_dual(combined_updates)
+                state = optax.apply_updates(state, dual_updates)
+                state = SaddleState(
+                    primal=state.primal,
+                    dual_ineq=projection_non_negative(state.dual_ineq),
+                    dual_eq=state.dual_eq,
+                )
+            else:
+                gradient = grad(state)
+                updates, opt_state = opt_update(gradient, opt_state, state)
+                state = optax.apply_updates(state, updates)
+                state = SaddleState(
+                    primal=projection_primal(state.primal),
+                    dual_ineq=projection_non_negative(state.dual_ineq),
+                    dual_eq=state.dual_eq,
+                )
 
             total_weight = jax.lax.cond(
                 average,
@@ -141,6 +198,7 @@ def solve(
     weight_function=lambda _: 1.0,
     verbose=False,
     average=True,
+    update_mode="synchronous",
     expert_diagnostics=False,
     output_opt_state=False,
 ):
@@ -160,6 +218,9 @@ def solve(
     """
 
     print("----------------------------------------------")
+
+    if update_mode not in ["synchronous", "alternating"]:
+        raise ValueError("update_mode must be one of ['synchronous', 'alternating']")
     print("====Starting Solve====")
     print("----------------------------------------------")
 
@@ -281,6 +342,7 @@ def solve(
             weight_function,
             total_weight,
             average,
+            update_mode,
         )
 
         (
@@ -417,6 +479,7 @@ def solve(
                 weight_function,
                 total_weight,
                 average,
+                update_mode,
             )
 
             (

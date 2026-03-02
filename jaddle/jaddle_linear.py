@@ -31,6 +31,7 @@ def __sps(
     dual_damping_ineq=0.0,
     dual_damping_eq=0.0,
     average=True,
+    update_mode="synchronous",
 ):
 
     def projection_primal(primal_state):
@@ -58,6 +59,27 @@ def __sps(
     def opt_update(gradient, opt_state, state):
         return optimiser.update(gradient, opt_state, state)
 
+    def zero_dual(gradient):
+        return SaddleState(
+            primal=gradient.primal,
+            dual_ineq=jnp.zeros_like(gradient.dual_ineq),
+            dual_eq=jnp.zeros_like(gradient.dual_eq),
+        )
+
+    def keep_only_primal(updates):
+        return SaddleState(
+            primal=updates.primal,
+            dual_ineq=jnp.zeros_like(updates.dual_ineq),
+            dual_eq=jnp.zeros_like(updates.dual_eq),
+        )
+
+    def keep_only_dual(updates):
+        return SaddleState(
+            primal=jnp.zeros_like(updates.primal),
+            dual_ineq=updates.dual_ineq,
+            dual_eq=updates.dual_eq,
+        )
+
     @functools.partial(
         jax.jit,
         static_argnames=("max_iter",),
@@ -70,45 +92,71 @@ def __sps(
         opt_state,
         total_weight=0.0,
     ):
-        def step(carry, _):
-            (
-                i,
-                state,
-                average_state,
-                opt_state,
-                total_weight,
-            ) = carry
+        apply_updates = optax.apply_updates
 
-            gradient = grad(state)
-            updates, opt_state = opt_update(gradient, opt_state, state)
-            state = jax.tree_util.tree_map(lambda s, u: s + u, state, updates)
-            state = SaddleState(
-                primal=projection_primal(state.primal),
-                dual_ineq=projection_non_negative(state.dual_ineq),
-                dual_eq=state.dual_eq,
-            )
+        if update_mode == "alternating":
 
-            total_weight = jax.lax.cond(
-                average,
-                lambda: total_weight + weight_function(i),
-                lambda: total_weight,
-            )
+            def step(carry, _):
+                i, state, average_state, opt_state, total_weight = carry
 
-            average_state = jax.lax.cond(
-                average,
-                lambda: optax.incremental_update(
-                    state, average_state, weight_function(i) / total_weight
-                ),
-                lambda: average_state,
-            )
+                # 1) Primal-only update
+                g0 = grad(state)
+                primal_updates, _ = opt_update(zero_dual(g0), opt_state, state)
+                state = apply_updates(state, keep_only_primal(primal_updates))
+                state = SaddleState(
+                    primal=projection_primal(state.primal),
+                    dual_ineq=state.dual_ineq,
+                    dual_eq=state.dual_eq,
+                )
 
-            return (
-                i + 1,
-                state,
-                average_state,
-                opt_state,
-                total_weight,
-            ), None
+                # 2) Dual-only update (using post-primal dual gradients)
+                g1 = grad(state)
+                combined_gradient = SaddleState(
+                    primal=g0.primal,
+                    dual_ineq=g1.dual_ineq,
+                    dual_eq=g1.dual_eq,
+                )
+                dual_updates, opt_state = opt_update(
+                    combined_gradient, opt_state, state
+                )
+                state = apply_updates(state, keep_only_dual(dual_updates))
+                state = SaddleState(
+                    primal=state.primal,
+                    dual_ineq=projection_non_negative(state.dual_ineq),
+                    dual_eq=state.dual_eq,
+                )
+
+                if average:
+                    w = weight_function(i)
+                    total_weight = total_weight + w
+                    average_state = optax.incremental_update(
+                        state, average_state, w / total_weight
+                    )
+
+                return (i + 1, state, average_state, opt_state, total_weight), None
+
+        else:
+
+            def step(carry, _):
+                i, state, average_state, opt_state, total_weight = carry
+
+                g = grad(state)
+                updates, opt_state = opt_update(g, opt_state, state)
+                state = apply_updates(state, updates)
+                state = SaddleState(
+                    primal=projection_primal(state.primal),
+                    dual_ineq=projection_non_negative(state.dual_ineq),
+                    dual_eq=state.dual_eq,
+                )
+
+                if average:
+                    w = weight_function(i)
+                    total_weight = total_weight + w
+                    average_state = optax.incremental_update(
+                        state, average_state, w / total_weight
+                    )
+
+                return (i + 1, state, average_state, opt_state, total_weight), None
 
         (i, state, average_state, opt_state, total_weight), _ = jax.lax.scan(
             step,
@@ -157,6 +205,7 @@ def solve(
     weight_function=lambda _: 1.0,
     verbose=False,
     average=True,
+    update_mode="synchronous",
     scale=None,
     expert_diagnostics=False,
     output_opt_state=False,
@@ -177,6 +226,9 @@ def solve(
     """
 
     print("----------------------------------------------")
+
+    if update_mode not in ["synchronous", "alternating"]:
+        raise ValueError("update_mode must be one of ['synchronous', 'alternating']")
     print("====Starting Solve====")
     print("----------------------------------------------")
 
@@ -333,6 +385,7 @@ def solve(
             dual_damping_ineq,
             dual_damping_eq,
             average,
+            update_mode,
         )
 
         (
@@ -466,6 +519,7 @@ def solve(
                 dual_damping_ineq,
                 dual_damping_eq,
                 average,
+                update_mode,
             )
 
             (

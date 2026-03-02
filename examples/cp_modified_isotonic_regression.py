@@ -64,7 +64,12 @@ optimiser = jo.create_saddle_optimiser(
     optax.optimistic_adam_v2(primal_lr, alpha=0.05),
 )
 
-solution, _ = jc.solve(cp, optimiser=optimiser, average=False)
+solution, _ = jc.solve(
+    cp,
+    optimiser=optimiser,
+    average=False,
+    update_mode="alternating",
+)
 
 
 # %%

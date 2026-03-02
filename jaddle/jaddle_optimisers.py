@@ -1,3 +1,5 @@
+import os
+
 import optax
 import jax
 import jax.numpy as jnp
@@ -10,6 +12,57 @@ from jaddle.jaddle_basic_types import (
     LP,
     SaddleState,
 )
+import os
+
+
+def configure_jax(jax_profile: Optional[str] = None):
+    """
+    Configure JAX environment variables for different profiling modes.
+
+    Args:
+        jax_profile: Optional string to specify the profiling mode. Can be "balanced", "max_speed", or None.
+                     If None, it will read from the JADDLE_JAX_PROFILE environment variable, defaulting to "max_speed".
+
+    This function sets environment variables to optimize JAX's performance based on the chosen profile.
+    It also prints out the active configuration for verification.
+    """
+    if jax_profile is not None:
+        os.environ["JADDLE_JAX_PROFILE"] = jax_profile
+
+    JAX_PROFILE = os.environ.get("JADDLE_JAX_PROFILE", "safe").lower()
+
+    def _append_xla_flag(flag: str):
+        current = os.environ.get("XLA_FLAGS", "")
+        if flag not in current:
+            os.environ["XLA_FLAGS"] = f"{current} {flag}".strip()
+
+    # Suppress INFO and WARNING logs from XLA/JAX
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
+    if JAX_PROFILE in ["balanced", "max_speed"]:
+        os.environ.setdefault("JAX_ENABLE_X64", "0")
+        os.environ.setdefault(
+            "JAX_COMPILATION_CACHE_DIR",
+            os.path.expanduser("~/.cache/jaddle_jax"),
+        )
+        _append_xla_flag("--xla_disable_hlo_passes=slow-operation-alarm")
+
+    if JAX_PROFILE == "max_speed":
+        os.environ.setdefault("JAX_DEFAULT_MATMUL_PRECISION", "tensorfloat32")
+        os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "true")
+        os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.90")
+        _append_xla_flag("--xla_gpu_autotune_level=4")
+    elif JAX_PROFILE == "balanced":
+        os.environ.setdefault("JAX_DEFAULT_MATMUL_PRECISION", "high")
+
+    print(
+        "[JAX Profile] "
+        f"mode={JAX_PROFILE}, "
+        f"x64={os.environ.get('JAX_ENABLE_X64', 'default')}, "
+        f"matmul_precision={os.environ.get('JAX_DEFAULT_MATMUL_PRECISION', 'default')}, "
+        f"cache={os.environ.get('JAX_COMPILATION_CACHE_DIR', 'disabled')}, "
+        f"xla_flags='{os.environ.get('XLA_FLAGS', '')}'"
+    )
 
 
 def _saddle_param_labels(params):
