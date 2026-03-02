@@ -40,11 +40,11 @@ highs_lp = highs.getLp()
 jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 
 # %%
-lr = optax.exponential_decay(
-    1e1,
-    transition_steps=1000,
-    decay_rate=0.9,
-    end_value=1e-4,
+lr = optax.cosine_decay_schedule(
+    init_value=1e0,
+    decay_steps=int(1e5),
+    exponent=3,
+    alpha=1e-4,
 )
 
 optimiser = jo.optimistic_adam_saddle(lr, lr)
