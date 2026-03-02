@@ -36,7 +36,8 @@ highs.readModel("/home/brendanvr/python/Jaddle/data/ns1758913.mps")  # path to M
 
 # %% [markdown]
 # We convert the LP to Jaddle's sparse format, before applying ruiz scaling.
-highs_lp = highs.getLp()
+highs.presolve()
+highs_lp = highs.getPresolvedLp()
 jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 
 # %%
@@ -47,7 +48,10 @@ lr = optax.cosine_decay_schedule(
     alpha=1e-4,
 )
 
-optimiser = jo.optimistic_adam_saddle(lr, lr)
+optimiser = jo.create_saddle_optimiser(
+    optax.optimistic_adam_v2(lr, alpha=0.05),
+    optax.adadelta(1.0),
+)
 
 # %% [markdown]
 # ## Solve the presolved LP using Jaddle's saddle point solver
@@ -57,8 +61,9 @@ solution, _ = jl.solve(
     lp=jaddle_lp,
     optimiser=optimiser,
     # scale="ruiz+pc",
-    update_mode="synchronous",
-    weight_function=lambda i: jax.lax.select(i < int(3e4), 1e-8, 1.0),
+    update_mode="alternating",
+    weight_function=lambda i: jnp.sqrt(i + 1),
+    scale="ruiz+pc",  # Example weight function that increases with iterations
 )
 
 # %%
