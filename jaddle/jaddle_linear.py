@@ -384,7 +384,9 @@ def solve(
         if not expert_diagnostics:
             return
 
-        extracted = jo.hedge_weights_from_state(state_for_weights)
+        extracted = jo.hedge_diagnostics_from_state(state_for_weights)
+        if extracted is None:
+            extracted = jo.hedge_weights_from_state(state_for_weights)
         if extracted is None:
             if (not missing_expert_state_warning_printed) and verbose:
                 print(
@@ -394,12 +396,40 @@ def solve(
                 missing_expert_state_warning_printed = True
             return
 
-        primal_weights, dual_weights = extracted
+        if isinstance(extracted, tuple):
+            primal_weights, dual_weights = extracted
+            primal_losses = dual_losses = None
+            primal_eta = dual_eta = None
+        else:
+            primal_weights = extracted["primal_weights"]
+            dual_weights = extracted["dual_weights"]
+            primal_losses = extracted["primal_clipped_losses"]
+            dual_losses = extracted["dual_clipped_losses"]
+            primal_centered_losses = extracted["primal_centered_losses"]
+            dual_centered_losses = extracted["dual_centered_losses"]
+            primal_eta = extracted["primal_eta"]
+            dual_eta = extracted["dual_eta"]
+
         if verbose:
             print(
                 f"Expert Weights (epoch {epoch_count}): "
                 f"primal={np.asarray(primal_weights)}, dual={np.asarray(dual_weights)}"
             )
+            if primal_losses is not None and dual_losses is not None:
+                print(
+                    f"Expert Losses (epoch {epoch_count}): "
+                    f"primal={np.asarray(primal_losses)}, dual={np.asarray(dual_losses)}"
+                )
+                print(
+                    f"Centered Losses (epoch {epoch_count}): "
+                    f"primal={np.asarray(primal_centered_losses)}, "
+                    f"dual={np.asarray(dual_centered_losses)}"
+                )
+            if primal_eta is not None and dual_eta is not None:
+                print(
+                    f"Hedge Etas (epoch {epoch_count}): "
+                    f"primal={float(primal_eta):.3e}, dual={float(dual_eta):.3e}"
+                )
             print("----------------------------------------------")
 
     try:

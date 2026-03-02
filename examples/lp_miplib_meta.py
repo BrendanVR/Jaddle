@@ -47,12 +47,19 @@ def lr(decay_rate, init_value, end_value):
 
 learning_rates = [
     lr(decay_rate, init_value, end_value)
-    for decay_rate in [0.9, 0.99]
+    for decay_rate in [0.0000001, 0.9, 0.99]
     for init_value in [1e0]
     for end_value in [1e-4]
 ]
 alphas = [0.05]
 betas = [1.0]
+
+HEDGE_ETA = 0.05
+LOSS_CLIP = 20.0
+EXPLORATION_RATE = 0.02
+PRUNE_THRESHOLD = 5e-3
+PRUNE_MIN_KEEP = 2
+PRUNE_MIN_STEP = int(2e4)
 
 primal_experts = [
     optax.optimistic_adam_v2(learning_rate=lr, alpha=alpha, beta=beta)
@@ -72,6 +79,11 @@ ensemble_optimiser = jo.hedge_ensemble_saddle(
     lp=jaddle_lp,
     primal_experts=primal_experts,
     dual_experts=dual_experts,
+    primal_eta=HEDGE_ETA,
+    dual_eta=HEDGE_ETA,
+    loss_clip=LOSS_CLIP,
+    exploration_rate=EXPLORATION_RATE,
+    center_losses=True,
 )
 is_converged = False
 solution = jaddle_lp.initial_solution()
@@ -91,7 +103,11 @@ while (len(primal_experts) > 1 or len(dual_experts) > 1) and (not is_converged):
         max_epochs=6,
     )
 
-    opt_state, primal_idx, dual_idx = opt_state.prune(threshold=1e-3)
+    opt_state, primal_idx, dual_idx = opt_state.prune(
+        threshold=PRUNE_THRESHOLD,
+        min_keep=PRUNE_MIN_KEEP,
+        min_step=PRUNE_MIN_STEP,
+    )
     primal_experts = [primal_experts[i] for i in primal_idx]
     dual_experts = [dual_experts[i] for i in dual_idx]
 
@@ -103,9 +119,11 @@ while (len(primal_experts) > 1 or len(dual_experts) > 1) and (not is_converged):
         lp=jaddle_lp,
         primal_experts=primal_experts,
         dual_experts=dual_experts,
-        primal_eta=0.05,
-        dual_eta=0.05,
-        loss_clip=1e2,
+        primal_eta=HEDGE_ETA,
+        dual_eta=HEDGE_ETA,
+        loss_clip=LOSS_CLIP,
+        exploration_rate=EXPLORATION_RATE,
+        center_losses=True,
     )
 
 solution, is_converged = jl.solve(

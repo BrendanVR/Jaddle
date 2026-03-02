@@ -11,30 +11,72 @@ ScheduleLike = Union[float, Callable[[jnp.ndarray], jnp.ndarray]]
 class HedgePoolState(NamedTuple):
     expert_states: tuple
     log_weights: jnp.ndarray
+    loss_scale: jnp.ndarray
+    last_raw_losses: jnp.ndarray
+    last_normalized_losses: jnp.ndarray
+    last_clipped_losses: jnp.ndarray
+    last_centered_losses: jnp.ndarray
 
-    def prune(self, threshold: float):
+    def prune(self, threshold: float, min_keep: int = 1):
         """Prune experts with weight below the given threshold."""
-        keep_mask = self.log_weights > jnp.log(threshold)
+        weights = np.asarray(jax.nn.softmax(self.log_weights))
+        keep_mask = weights > threshold
+
+        if keep_mask.sum() < min_keep:
+            topk_idx = np.argsort(-weights)[:min_keep]
+            keep_mask = np.zeros_like(weights, dtype=bool)
+            keep_mask[topk_idx] = True
+
         pruned_expert_states = tuple(
             state for state, keep in zip(self.expert_states, keep_mask) if keep
         )
-        pruned_log_weights = self.log_weights[keep_mask]
+        idx = np.where(keep_mask)[0]
+        pruned_log_weights = self.log_weights[idx]
         # Renormalize log weights
         pruned_log_weights -= jax.nn.logsumexp(pruned_log_weights)
-        idx = jnp.where(keep_mask)[0]
-        return HedgePoolState(pruned_expert_states, pruned_log_weights), idx
+
+        def maybe_prune(arr):
+            if arr.shape[0] == len(self.expert_states):
+                return arr[idx]
+            return arr
+
+        return (
+            HedgePoolState(
+                expert_states=pruned_expert_states,
+                log_weights=pruned_log_weights,
+                loss_scale=self.loss_scale,
+                last_raw_losses=maybe_prune(self.last_raw_losses),
+                last_normalized_losses=maybe_prune(self.last_normalized_losses),
+                last_clipped_losses=maybe_prune(self.last_clipped_losses),
+                last_centered_losses=maybe_prune(self.last_centered_losses),
+            ),
+            jnp.array(idx),
+        )
 
 
 class HedgeSaddleState(NamedTuple):
     primal: HedgePoolState
     dual: HedgePoolState
     step: jnp.ndarray
+    last_primal_eta: jnp.ndarray
+    last_dual_eta: jnp.ndarray
 
-    def prune(self, threshold: float):
-        pruned_primal, primal_idx = self.primal.prune(threshold)
-        pruned_dual, dual_idx = self.dual.prune(threshold)
+    def prune(self, threshold: float, min_keep: int = 1, min_step: int = 0):
+        if int(self.step) < min_step:
+            primal_idx = jnp.arange(len(self.primal.expert_states))
+            dual_idx = jnp.arange(len(self.dual.expert_states))
+            return self, primal_idx, dual_idx
+
+        pruned_primal, primal_idx = self.primal.prune(threshold, min_keep=min_keep)
+        pruned_dual, dual_idx = self.dual.prune(threshold, min_keep=min_keep)
         return (
-            HedgeSaddleState(pruned_primal, pruned_dual, self.step),
+            HedgeSaddleState(
+                pruned_primal,
+                pruned_dual,
+                self.step,
+                self.last_primal_eta,
+                self.last_dual_eta,
+            ),
             primal_idx,
             dual_idx,
         )

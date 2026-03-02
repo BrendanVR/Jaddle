@@ -195,6 +195,12 @@ def _normalise_log_weights(log_weights: jnp.ndarray) -> jnp.ndarray:
     return log_weights - jax.nn.logsumexp(log_weights)
 
 
+def _mean_abs(x: jnp.ndarray) -> jnp.ndarray:
+    if x.size == 0:
+        return jnp.array(0.0, dtype=jnp.float32)
+    return jnp.mean(jnp.abs(x))
+
+
 def hedge_ensemble_saddle(
     lp: LP,
     primal_experts: Sequence[optax.GradientTransformation],
@@ -202,6 +208,14 @@ def hedge_ensemble_saddle(
     primal_eta: ScheduleLike = 1.0,
     dual_eta: ScheduleLike = 1.0,
     loss_clip: float = 1e2,
+    objective_weight: float = 0.05,
+    feasibility_weight: float = 1.0,
+    stationarity_weight: float = 0.25,
+    complementarity_weight: float = 0.25,
+    loss_scale_ema_decay: float = 0.95,
+    loss_scale_floor: float = 1e-4,
+    exploration_rate: float = 0.02,
+    center_losses: bool = True,
 ):
     if len(primal_experts) == 0:
         raise ValueError("primal_experts must contain at least one optimiser")
@@ -210,6 +224,9 @@ def hedge_ensemble_saddle(
 
     primal_count = len(primal_experts)
     dual_count = len(dual_experts)
+
+    if not (0.0 <= exploration_rate < 1.0):
+        raise ValueError("exploration_rate must satisfy 0 <= exploration_rate < 1")
 
     init_primal_log_weights = _normalise_log_weights(
         jnp.zeros((primal_count,), dtype=jnp.float32)
@@ -224,9 +241,27 @@ def hedge_ensemble_saddle(
         dual_states = tuple(opt.init(dual_params) for opt in dual_experts)
 
         return HedgeSaddleState(
-            primal=HedgePoolState(primal_states, init_primal_log_weights),
-            dual=HedgePoolState(dual_states, init_dual_log_weights),
+            primal=HedgePoolState(
+                expert_states=primal_states,
+                log_weights=init_primal_log_weights,
+                loss_scale=jnp.array(1.0, dtype=jnp.float32),
+                last_raw_losses=jnp.zeros((primal_count,), dtype=jnp.float32),
+                last_normalized_losses=jnp.zeros((primal_count,), dtype=jnp.float32),
+                last_clipped_losses=jnp.zeros((primal_count,), dtype=jnp.float32),
+                last_centered_losses=jnp.zeros((primal_count,), dtype=jnp.float32),
+            ),
+            dual=HedgePoolState(
+                expert_states=dual_states,
+                log_weights=init_dual_log_weights,
+                loss_scale=jnp.array(1.0, dtype=jnp.float32),
+                last_raw_losses=jnp.zeros((dual_count,), dtype=jnp.float32),
+                last_normalized_losses=jnp.zeros((dual_count,), dtype=jnp.float32),
+                last_clipped_losses=jnp.zeros((dual_count,), dtype=jnp.float32),
+                last_centered_losses=jnp.zeros((dual_count,), dtype=jnp.float32),
+            ),
             step=jnp.array(0, dtype=jnp.int32),
+            last_primal_eta=jnp.array(0.0, dtype=jnp.float32),
+            last_dual_eta=jnp.array(0.0, dtype=jnp.float32),
         )
 
     def update_fn(
@@ -238,13 +273,27 @@ def hedge_ensemble_saddle(
         grad_dual_ineq = updates.dual_ineq
         grad_dual_eq = updates.dual_eq
 
-        primal_weights = jax.nn.softmax(state.primal.log_weights)
-        dual_weights = jax.nn.softmax(state.dual.log_weights)
+        primal_base_weights = jax.nn.softmax(state.primal.log_weights)
+        dual_base_weights = jax.nn.softmax(state.dual.log_weights)
+
+        primal_weights = (1.0 - exploration_rate) * primal_base_weights + (
+            exploration_rate / primal_count
+        )
+        dual_weights = (1.0 - exploration_rate) * dual_base_weights + (
+            exploration_rate / dual_count
+        )
 
         # ---------- Primal experts ----------
         primal_step_updates = []
         primal_next_states = []
         primal_losses = []
+
+        eq_residual_before = lp.diff_eq_slack(params.primal)
+        ineq_residual_before = lp.A_ineq @ params.primal - lp.b_ineq
+        feasibility_before = _mean_abs(eq_residual_before) + _mean_abs(
+            jnp.maximum(ineq_residual_before, 0.0)
+        )
+        objective_before = lp.objective(params.primal)
 
         for i, expert in enumerate(primal_experts):
             expert_update, expert_state = expert.update(
@@ -258,9 +307,26 @@ def hedge_ensemble_saddle(
                 lp.lower_bounds,
                 lp.upper_bounds,
             )
-            primal_loss = grad_primal @ expert_update
+            primal_effective_update = primal_candidate - params.primal
 
-            primal_step_updates.append(expert_update)
+            eq_residual_after = lp.diff_eq_slack(primal_candidate)
+            ineq_residual_after = lp.A_ineq @ primal_candidate - lp.b_ineq
+            feasibility_after = _mean_abs(eq_residual_after) + _mean_abs(
+                jnp.maximum(ineq_residual_after, 0.0)
+            )
+
+            objective_after = lp.objective(primal_candidate)
+            objective_change = objective_after - objective_before
+            feasibility_change = feasibility_after - feasibility_before
+            stationarity_step_loss = grad_primal @ primal_effective_update
+
+            primal_loss = (
+                stationarity_weight * stationarity_step_loss
+                + feasibility_weight * feasibility_change
+                + objective_weight * objective_change
+            )
+
+            primal_step_updates.append(primal_effective_update)
             primal_next_states.append(expert_state)
             primal_losses.append(primal_loss)
 
@@ -288,12 +354,41 @@ def hedge_ensemble_saddle(
             dual_candidate_ineq = projection_non_negative(params.dual_ineq + upd_ineq)
             dual_candidate_eq = params.dual_eq + upd_eq  # No projection for eq dual
 
-            dual_loss = (
-                grad_dual_ineq @ dual_candidate_ineq + grad_dual_eq @ dual_candidate_eq
+            dual_effective_update_ineq = dual_candidate_ineq - params.dual_ineq
+            dual_effective_update_eq = dual_candidate_eq - params.dual_eq
+
+            ascent_reward = (
+                grad_dual_ineq @ dual_effective_update_ineq
+                + grad_dual_eq @ dual_effective_update_eq
             )
 
-            dual_step_updates_ineq.append(upd_ineq)
-            dual_step_updates_eq.append(upd_eq)
+            stationarity_before = (
+                lp.c + lp.A_ineq_T @ params.dual_ineq + lp.A_eq_T @ params.dual_eq
+            )
+            stationarity_after = (
+                lp.c + lp.A_ineq_T @ dual_candidate_ineq + lp.A_eq_T @ dual_candidate_eq
+            )
+            stationarity_change = _mean_abs(stationarity_after) - _mean_abs(
+                stationarity_before
+            )
+
+            complementarity_residual = lp.A_ineq @ params.primal - lp.b_ineq
+            complementarity_before = _mean_abs(
+                params.dual_ineq * complementarity_residual
+            )
+            complementarity_after = _mean_abs(
+                dual_candidate_ineq * complementarity_residual
+            )
+            complementarity_change = complementarity_after - complementarity_before
+
+            dual_loss = (
+                -ascent_reward
+                + stationarity_weight * stationarity_change
+                + complementarity_weight * complementarity_change
+            )
+
+            dual_step_updates_ineq.append(dual_effective_update_ineq)
+            dual_step_updates_eq.append(dual_effective_update_eq)
             dual_next_states.append(expert_state)
             dual_losses.append(dual_loss)
 
@@ -311,20 +406,73 @@ def hedge_ensemble_saddle(
         primal_eta_value = _resolve_schedule(primal_eta, state.step)
         dual_eta_value = _resolve_schedule(dual_eta, state.step)
 
-        primal_losses = jnp.clip(jnp.array(primal_losses), -loss_clip, loss_clip)
-        dual_losses = jnp.clip(jnp.array(dual_losses), -loss_clip, loss_clip)
+        primal_losses = jnp.asarray(primal_losses, dtype=jnp.float32)
+        dual_losses = jnp.asarray(dual_losses, dtype=jnp.float32)
+
+        primal_loss_scale = loss_scale_ema_decay * state.primal.loss_scale + (
+            1.0 - loss_scale_ema_decay
+        ) * _mean_abs(primal_losses)
+        primal_loss_scale = jnp.maximum(primal_loss_scale, loss_scale_floor)
+
+        dual_loss_scale = loss_scale_ema_decay * state.dual.loss_scale + (
+            1.0 - loss_scale_ema_decay
+        ) * _mean_abs(dual_losses)
+        dual_loss_scale = jnp.maximum(dual_loss_scale, loss_scale_floor)
+
+        normalized_primal_losses = primal_losses / primal_loss_scale
+        normalized_dual_losses = dual_losses / dual_loss_scale
+
+        clipped_primal_losses = jnp.clip(
+            normalized_primal_losses,
+            -loss_clip,
+            loss_clip,
+        )
+        clipped_dual_losses = jnp.clip(
+            normalized_dual_losses,
+            -loss_clip,
+            loss_clip,
+        )
+
+        if center_losses:
+            centered_primal_losses = clipped_primal_losses - jnp.sum(
+                primal_weights * clipped_primal_losses
+            )
+            centered_dual_losses = clipped_dual_losses - jnp.sum(
+                dual_weights * clipped_dual_losses
+            )
+        else:
+            centered_primal_losses = clipped_primal_losses
+            centered_dual_losses = clipped_dual_losses
 
         next_primal_log_weights = _normalise_log_weights(
-            state.primal.log_weights - primal_eta_value * primal_losses
+            state.primal.log_weights - primal_eta_value * centered_primal_losses
         )
         next_dual_log_weights = _normalise_log_weights(
-            state.dual.log_weights - dual_eta_value * dual_losses
+            state.dual.log_weights - dual_eta_value * centered_dual_losses
         )
 
         next_state = HedgeSaddleState(
-            primal=HedgePoolState(tuple(primal_next_states), next_primal_log_weights),
-            dual=HedgePoolState(tuple(dual_next_states), next_dual_log_weights),
+            primal=HedgePoolState(
+                expert_states=tuple(primal_next_states),
+                log_weights=next_primal_log_weights,
+                loss_scale=primal_loss_scale,
+                last_raw_losses=primal_losses,
+                last_normalized_losses=normalized_primal_losses,
+                last_clipped_losses=clipped_primal_losses,
+                last_centered_losses=centered_primal_losses,
+            ),
+            dual=HedgePoolState(
+                expert_states=tuple(dual_next_states),
+                log_weights=next_dual_log_weights,
+                loss_scale=dual_loss_scale,
+                last_raw_losses=dual_losses,
+                last_normalized_losses=normalized_dual_losses,
+                last_clipped_losses=clipped_dual_losses,
+                last_centered_losses=centered_dual_losses,
+            ),
             step=state.step + jnp.array(1, dtype=jnp.int32),
+            last_primal_eta=primal_eta_value,
+            last_dual_eta=dual_eta_value,
         )
 
         mixed_update = SaddleState(
@@ -352,3 +500,30 @@ def hedge_weights_from_state(opt_state: Any):
         return None
 
     return jax.nn.softmax(primal_log_weights), jax.nn.softmax(dual_log_weights)
+
+
+def hedge_diagnostics_from_state(opt_state: Any):
+    """Extract hedge diagnostics (weights, losses, scales, eta) if available."""
+    try:
+        primal_weights = jax.nn.softmax(opt_state.primal.log_weights)
+        dual_weights = jax.nn.softmax(opt_state.dual.log_weights)
+
+        return {
+            "primal_weights": primal_weights,
+            "dual_weights": dual_weights,
+            "primal_raw_losses": opt_state.primal.last_raw_losses,
+            "dual_raw_losses": opt_state.dual.last_raw_losses,
+            "primal_normalized_losses": opt_state.primal.last_normalized_losses,
+            "dual_normalized_losses": opt_state.dual.last_normalized_losses,
+            "primal_clipped_losses": opt_state.primal.last_clipped_losses,
+            "dual_clipped_losses": opt_state.dual.last_clipped_losses,
+            "primal_centered_losses": opt_state.primal.last_centered_losses,
+            "dual_centered_losses": opt_state.dual.last_centered_losses,
+            "primal_loss_scale": opt_state.primal.loss_scale,
+            "dual_loss_scale": opt_state.dual.loss_scale,
+            "primal_eta": opt_state.last_primal_eta,
+            "dual_eta": opt_state.last_dual_eta,
+            "step": opt_state.step,
+        }
+    except AttributeError:
+        return None
