@@ -32,12 +32,18 @@ def highs_to_standard_form_sparse(lp: hspy.HighsLp) -> jl.LP:
     row_lower = np.array(lp.row_lower_, dtype=np.float32)
     row_upper = np.array(lp.row_upper_, dtype=np.float32)
 
-    # Equality constraints: row_lower == row_upper
-    eq_mask = np.equal(row_lower, row_upper)
-    A_eq = A[eq_mask, :].tocsc()
-    b_eq = row_lower[eq_mask]
+    # Equality constraints: use a numeric tolerance and require finite bounds
+    eps = 1e-8
+    finite_lower_all = np.isfinite(row_lower)
+    finite_upper_all = np.isfinite(row_upper)
+    eq_mask = (
+        finite_lower_all & finite_upper_all & (np.abs(row_lower - row_upper) <= eps)
+    )
 
-    # Inequality constraints
+    A_eq = A[eq_mask, :].tocsc().astype(np.float32)
+    b_eq = row_lower[eq_mask].astype(np.float32)
+
+    # Inequality constraints (rows not treated as equalities)
     ineq_mask = ~eq_mask
     A_ineq_rows = A[ineq_mask, :]
     row_lower_ineq = row_lower[ineq_mask]
@@ -51,14 +57,19 @@ def highs_to_standard_form_sparse(lp: hspy.HighsLp) -> jl.LP:
     vectors = []
 
     if finite_upper.any():
-        matrices.append(A_ineq_rows[finite_upper].tocsc())
-        vectors.append(row_upper_ineq[finite_upper])
+        matrices.append(A_ineq_rows[finite_upper].tocsc().astype(np.float32))
+        vectors.append(row_upper_ineq[finite_upper].astype(np.float32))
 
     if finite_lower.any():
-        matrices.append((-A_ineq_rows[finite_lower]).tocsc())
-        vectors.append(-row_lower_ineq[finite_lower])
+        matrices.append((-A_ineq_rows[finite_lower]).tocsc().astype(np.float32))
+        vectors.append((-row_lower_ineq[finite_lower]).astype(np.float32))
 
-    A_ineq = sp.vstack(matrices, format="csc")
-    b_ineq = np.concatenate(vectors)
+    if len(matrices) > 0:
+        A_ineq = sp.vstack(matrices, format="csc")
+        b_ineq = np.concatenate(vectors)
+    else:
+        # No inequality rows: return empty (0 x num_col) matrix and empty RHS
+        A_ineq = sp.csc_matrix((0, num_col), dtype=np.float32)
+        b_ineq = np.empty(0, dtype=np.float32)
 
     return jl.LP(c, A_eq, b_eq, A_ineq, b_ineq, lower_bounds, upper_bounds)

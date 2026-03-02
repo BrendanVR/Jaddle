@@ -208,10 +208,6 @@ def hedge_ensemble_saddle(
     primal_eta: ScheduleLike = 1.0,
     dual_eta: ScheduleLike = 1.0,
     loss_clip: float = 1e2,
-    objective_weight: float = 0.05,
-    feasibility_weight: float = 1.0,
-    stationarity_weight: float = 0.25,
-    complementarity_weight: float = 0.25,
     loss_scale_ema_decay: float = 0.95,
     loss_scale_floor: float = 1e-4,
     exploration_rate: float = 0.02,
@@ -288,13 +284,6 @@ def hedge_ensemble_saddle(
         primal_next_states = []
         primal_losses = []
 
-        eq_residual_before = lp.diff_eq_slack(params.primal)
-        ineq_residual_before = lp.A_ineq @ params.primal - lp.b_ineq
-        feasibility_before = _mean_abs(eq_residual_before) + _mean_abs(
-            jnp.maximum(ineq_residual_before, 0.0)
-        )
-        objective_before = lp.objective(params.primal)
-
         for i, expert in enumerate(primal_experts):
             expert_update, expert_state = expert.update(
                 grad_primal,
@@ -308,23 +297,7 @@ def hedge_ensemble_saddle(
                 lp.upper_bounds,
             )
             primal_effective_update = primal_candidate - params.primal
-
-            eq_residual_after = lp.diff_eq_slack(primal_candidate)
-            ineq_residual_after = lp.A_ineq @ primal_candidate - lp.b_ineq
-            feasibility_after = _mean_abs(eq_residual_after) + _mean_abs(
-                jnp.maximum(ineq_residual_after, 0.0)
-            )
-
-            objective_after = lp.objective(primal_candidate)
-            objective_change = objective_after - objective_before
-            feasibility_change = feasibility_after - feasibility_before
-            stationarity_step_loss = grad_primal @ primal_effective_update
-
-            primal_loss = (
-                stationarity_weight * stationarity_step_loss
-                + feasibility_weight * feasibility_change
-                + objective_weight * objective_change
-            )
+            primal_loss = grad_primal @ primal_effective_update
 
             primal_step_updates.append(primal_effective_update)
             primal_next_states.append(expert_state)
@@ -357,40 +330,15 @@ def hedge_ensemble_saddle(
             dual_effective_update_ineq = dual_candidate_ineq - params.dual_ineq
             dual_effective_update_eq = dual_candidate_eq - params.dual_eq
 
-            ascent_reward = (
+            dual_loss = (
                 grad_dual_ineq @ dual_effective_update_ineq
                 + grad_dual_eq @ dual_effective_update_eq
-            )
-
-            stationarity_before = (
-                lp.c + lp.A_ineq_T @ params.dual_ineq + lp.A_eq_T @ params.dual_eq
-            )
-            stationarity_after = (
-                lp.c + lp.A_ineq_T @ dual_candidate_ineq + lp.A_eq_T @ dual_candidate_eq
-            )
-            stationarity_change = _mean_abs(stationarity_after) - _mean_abs(
-                stationarity_before
-            )
-
-            complementarity_residual = lp.A_ineq @ params.primal - lp.b_ineq
-            complementarity_before = _mean_abs(
-                params.dual_ineq * complementarity_residual
-            )
-            complementarity_after = _mean_abs(
-                dual_candidate_ineq * complementarity_residual
-            )
-            complementarity_change = complementarity_after - complementarity_before
-
-            dual_loss = (
-                -ascent_reward
-                + stationarity_weight * stationarity_change
-                + complementarity_weight * complementarity_change
             )
 
             dual_step_updates_ineq.append(dual_effective_update_ineq)
             dual_step_updates_eq.append(dual_effective_update_eq)
             dual_next_states.append(expert_state)
-            dual_losses.append(dual_loss)
+            dual_losses.append(-dual_loss)
 
         dual_updates_ineq_stacked = jnp.stack(dual_step_updates_ineq, axis=0)
         dual_updates_eq_stacked = jnp.stack(dual_step_updates_eq, axis=0)
