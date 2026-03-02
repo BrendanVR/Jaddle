@@ -10,6 +10,9 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import jaddle.jaddle_convex as jc
 import jaddle.jaddle_optimisers as jo
+
+jo.configure_jax("max_speed")
+
 import optax
 
 # %% [markdown]
@@ -34,11 +37,11 @@ def constraints_ineq(y_pred):
 
 
 def constraints_eq(y_pred):
-    return jnp.array([y_pred.mean() - 0.1])  # mean of y_pred should be 0.1
+    return jnp.array([0.0])  # No equality constraints in this example
 
 
-lower_bounds = -jnp.inf * jnp.ones(n)
-upper_bounds = jnp.inf * jnp.ones(n)
+lower_bounds = -np.ones(n)
+upper_bounds = jnp.ones(n)
 
 cp = jc.CP(
     num_variables=n,
@@ -68,7 +71,7 @@ solution, _ = jc.solve(
     cp,
     optimiser=optimiser,
     average=False,
-    update_mode="alternating",
+    update_mode="synchronous",
 )
 
 

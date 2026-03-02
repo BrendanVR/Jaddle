@@ -127,16 +127,34 @@ def __sps(
                     dual_eq=state.dual_eq,
                 )
 
-                if average == "polyak":
+                def _polyak(_):
                     w = weight_function(i)
-                    total_weight = total_weight + w
-                    average_state = optax.incremental_update(
-                        state, average_state, w / total_weight
+                    new_total_weight = total_weight + w
+                    new_average_state = optax.incremental_update(
+                        state, average_state, w / new_total_weight
                     )
-                elif average == "exponential":
-                    average_state = optax.incremental_update(
+                    return new_average_state, new_total_weight
+
+                def _exponential(_):
+                    new_average_state = optax.incremental_update(
                         state, average_state, exponential_weight
                     )
+                    return new_average_state, total_weight
+
+                def _no_average(_):
+                    return average_state, total_weight
+
+                average_state, total_weight = jax.lax.cond(
+                    jnp.array(average == "polyak"),
+                    _polyak,
+                    lambda _: jax.lax.cond(
+                        jnp.array(average == "exponential"),
+                        _exponential,
+                        _no_average,
+                        operand=None,
+                    ),
+                    operand=None,
+                )
 
                 return (i + 1, state, average_state, opt_state, total_weight), None
 
@@ -154,12 +172,34 @@ def __sps(
                     dual_eq=state.dual_eq,
                 )
 
-                if average:
+                def _polyak(_):
                     w = weight_function(i)
-                    total_weight = total_weight + w
-                    average_state = optax.incremental_update(
-                        state, average_state, w / total_weight
+                    new_total_weight = total_weight + w
+                    new_average_state = optax.incremental_update(
+                        state, average_state, w / new_total_weight
                     )
+                    return new_average_state, new_total_weight
+
+                def _exponential(_):
+                    new_average_state = optax.incremental_update(
+                        state, average_state, exponential_weight
+                    )
+                    return new_average_state, total_weight
+
+                def _no_average(_):
+                    return average_state, total_weight
+
+                average_state, total_weight = jax.lax.cond(
+                    jnp.array(average == "polyak"),
+                    _polyak,
+                    lambda _: jax.lax.cond(
+                        jnp.array(average == "exponential"),
+                        _exponential,
+                        _no_average,
+                        operand=None,
+                    ),
+                    operand=None,
+                )
 
                 return (i + 1, state, average_state, opt_state, total_weight), None
 

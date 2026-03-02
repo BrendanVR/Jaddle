@@ -28,15 +28,21 @@ jo.configure_jax("max_speed")
 import highspy as hspy
 import optax
 
+# %%
+PROBLEM_NAME = "ns1758913"  # name of the MIPLIB problem to load
+
 # %% [markdown]
 # ## Load the LP
 # We load a MIPLIB LP from an MPS file using the `highspy` library.
 highs = hspy.Highs()
-highs.readModel("/home/brendanvr/python/Jaddle/data/nug.mps")  # path to MPS file
+highs.readModel(
+    f"/home/brendanvr/python/Jaddle/data/{PROBLEM_NAME}.mps"
+)  # path to MPS file
 
 # %% [markdown]
 # We convert the LP to Jaddle's sparse format, before applying ruiz scaling.
-highs_lp = highs.getLp()
+highs.presolve()
+highs_lp = highs.getPresolvedLp()
 jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 
 # %%
