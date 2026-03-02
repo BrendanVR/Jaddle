@@ -34,7 +34,7 @@ highs.readModel("/home/brendanvr/python/Jaddle/data/nug.mps")  # path to MPS fil
 # %% [markdown]
 # We convert the LP to Jaddle's sparse format, before applying ruiz scaling.
 highs_lp = highs.getLp()
-jaddle_lp = jl.to_jaddle_sparse64(hh.highs_to_standard_form_sparse(highs_lp))
+jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 
 # %%
 lr = optax.exponential_decay(
@@ -53,7 +53,7 @@ optimiser = jo.optimistic_adam_saddle(lr, lr)
 solution, _ = jl.solve(
     lp=jaddle_lp,
     optimiser=optimiser,
-    scale="ruiz+pc",
+    # scale="ruiz+pc",
     average=False,
 )
 

@@ -39,7 +39,7 @@ jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 def lr(decay_rate, init_value, end_value):
     return optax.exponential_decay(
         init_value=init_value,
-        transition_steps=int(1e4),
+        transition_steps=int(1e3),
         decay_rate=decay_rate,
         end_value=end_value,
     )
@@ -47,22 +47,25 @@ def lr(decay_rate, init_value, end_value):
 
 learning_rates = [
     lr(decay_rate, init_value, end_value)
-    for decay_rate in [0.5, 0.9, 0.99]
+    for decay_rate in [0.9, 0.99]
     for init_value in [1e0]
     for end_value in [1e-4]
 ]
+alphas = [0.05]
+betas = [1.0]
+
 primal_experts = [
     optax.optimistic_adam_v2(learning_rate=lr, alpha=alpha, beta=beta)
     for lr in learning_rates
-    for alpha in [0.01, 0.05, 0.1, 0.5, 0.9]
-    for beta in [1.0]
+    for alpha in alphas
+    for beta in betas
 ]
 
 dual_experts = [
     optax.optimistic_adam_v2(learning_rate=lr, alpha=alpha, beta=beta)
     for lr in learning_rates
-    for alpha in [0.01, 0.05, 0.1, 0.5, 0.9]
-    for beta in [1.0]
+    for alpha in alphas
+    for beta in betas
 ]
 
 ensemble_optimiser = jo.hedge_ensemble_saddle(
@@ -84,8 +87,8 @@ while (len(primal_experts) > 1 or len(dual_experts) > 1) and (not is_converged):
         expert_diagnostics=True,
         iterations_per_epoch=int(1e4),
         output_opt_state=True,
-        weight_function=lambda i: jax.lax.select(i <= int(2e4), 1e-16, 1.0),
-        max_epochs=3,
+        weight_function=lambda i: jax.lax.select(i <= int(5e4), 1e-16, 1.0),
+        max_epochs=6,
     )
 
     opt_state, primal_idx, dual_idx = opt_state.prune(threshold=1e-3)

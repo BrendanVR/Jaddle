@@ -244,7 +244,7 @@ def hedge_ensemble_saddle(
         # ---------- Primal experts ----------
         primal_step_updates = []
         primal_next_states = []
-        primal_expert_solutions = []
+        primal_losses = []
 
         for i, expert in enumerate(primal_experts):
             expert_update, expert_state = expert.update(
@@ -252,32 +252,28 @@ def hedge_ensemble_saddle(
                 state.primal.expert_states[i],
                 params.primal,
             )
-            sol = projection_box(
+
+            primal_candidate = projection_box(
                 optax.apply_updates(params.primal, expert_update),
                 lp.lower_bounds,
                 lp.upper_bounds,
             )
+            primal_loss = grad_primal @ expert_update
+
             primal_step_updates.append(expert_update)
             primal_next_states.append(expert_state)
-            primal_expert_solutions.append(sol)
+            primal_losses.append(primal_loss)
 
         primal_updates_stacked = jnp.stack(primal_step_updates, axis=0)
         mixed_primal_update = jnp.tensordot(
             primal_weights, primal_updates_stacked, axes=(0, 0)
         )
 
-        mixed_primal_solution = projection_box(
-            optax.apply_updates(params.primal, mixed_primal_update),
-            lp.lower_bounds,
-            lp.upper_bounds,
-        )
-
         # ---------- Dual experts ----------
         dual_step_updates_ineq = []
         dual_step_updates_eq = []
-        dual_expert_solutions_ineq = []
-        dual_expert_solutions_eq = []
         dual_next_states = []
+        dual_losses = []
 
         grad_dual = (grad_dual_ineq, grad_dual_eq)
         params_dual = (params.dual_ineq, params.dual_eq)
@@ -289,17 +285,17 @@ def hedge_ensemble_saddle(
                 params_dual,
             )
             upd_ineq, upd_eq = expert_update
+            dual_candidate_ineq = projection_non_negative(params.dual_ineq + upd_ineq)
+            dual_candidate_eq = params.dual_eq + upd_eq  # No projection for eq dual
 
-            sol_ineq = projection_non_negative(
-                optax.apply_updates(params.dual_ineq, upd_ineq)
+            dual_loss = (
+                grad_dual_ineq @ dual_candidate_ineq + grad_dual_eq @ dual_candidate_eq
             )
-            sol_eq = optax.apply_updates(params.dual_eq, upd_eq)
 
-            dual_expert_solutions_ineq.append(sol_ineq)
-            dual_expert_solutions_eq.append(sol_eq)
             dual_step_updates_ineq.append(upd_ineq)
             dual_step_updates_eq.append(upd_eq)
             dual_next_states.append(expert_state)
+            dual_losses.append(dual_loss)
 
         dual_updates_ineq_stacked = jnp.stack(dual_step_updates_ineq, axis=0)
         dual_updates_eq_stacked = jnp.stack(dual_step_updates_eq, axis=0)
@@ -311,68 +307,18 @@ def hedge_ensemble_saddle(
             dual_weights, dual_updates_eq_stacked, axes=(0, 0)
         )
 
-        mixed_dual_ineq_solution = projection_non_negative(
-            optax.apply_updates(params.dual_ineq, mixed_dual_ineq_update),
-        )
-        mixed_dual_eq_solution = optax.apply_updates(
-            params.dual_eq, mixed_dual_eq_update
-        )
-
-        # ---------- Vectorized loss calculations ----------
-        expert_primal_sols = jnp.stack(primal_expert_solutions, axis=0)  # (K, n)
-        # A_ineq @ expert_sols -> (m_ineq, K)
-        Aineq_expert = lp.A_ineq @ expert_primal_sols.T
-        Aeq_expert = lp.A_eq @ expert_primal_sols.T
-
-        # Compute per-expert contributions efficiently
-        c_dot = jnp.dot(expert_primal_sols, lp.c)  # (K,)
-        # residuals per expert: (K, m)
-        res_ineq = Aineq_expert.T - lp.b_ineq  # (K, m_ineq)
-        res_eq = Aeq_expert.T - lp.b_eq  # (K, m_eq)
-
-        dual_ineq_term = jnp.dot(res_ineq, mixed_dual_ineq_solution)  # (K,)
-        dual_eq_term = jnp.dot(res_eq, mixed_dual_eq_solution)  # (K,)
-
-        mixed_c = lp.c @ mixed_primal_solution
-        mixed_res_ineq = (lp.A_ineq @ mixed_primal_solution) - lp.b_ineq
-        mixed_res_eq = (lp.A_eq @ mixed_primal_solution) - lp.b_eq
-        mixed_dual_terms = (mixed_dual_ineq_solution @ mixed_res_ineq) + (
-            mixed_dual_eq_solution @ mixed_res_eq
-        )
-
-        primal_losses = (
-            c_dot + dual_ineq_term + dual_eq_term - (mixed_c + mixed_dual_terms)
-        )
-        primal_losses = jnp.clip(primal_losses, -loss_clip, loss_clip)
-
-        # Dual losses vectorized
-        expert_dual_sols_ineq = jnp.stack(
-            dual_expert_solutions_ineq, axis=0
-        )  # (L, m_ineq)
-        expert_dual_sols_eq = jnp.stack(dual_expert_solutions_eq, axis=0)  # (L, m_eq)
-
-        r_ineq = mixed_res_ineq  # (m_ineq,)
-        r_eq = mixed_res_eq  # (m_eq,)
-
-        dual_loss_ineq = jnp.dot(expert_dual_sols_ineq, r_ineq)  # (L,)
-        dual_loss_eq = jnp.dot(expert_dual_sols_eq, r_eq)  # (L,)
-
-        mixed_dual_r = (
-            mixed_dual_ineq_solution @ r_ineq + mixed_dual_eq_solution @ r_eq
-        )  # scalar
-
-        dual_losses = dual_loss_ineq + dual_loss_eq - mixed_dual_r
-        dual_losses = jnp.clip(dual_losses, -loss_clip, loss_clip)
-
         # ---------- Update log-weights ----------
         primal_eta_value = _resolve_schedule(primal_eta, state.step)
         dual_eta_value = _resolve_schedule(dual_eta, state.step)
+
+        primal_losses = jnp.clip(jnp.array(primal_losses), -loss_clip, loss_clip)
+        dual_losses = jnp.clip(jnp.array(dual_losses), -loss_clip, loss_clip)
 
         next_primal_log_weights = _normalise_log_weights(
             state.primal.log_weights - primal_eta_value * primal_losses
         )
         next_dual_log_weights = _normalise_log_weights(
-            state.dual.log_weights + dual_eta_value * dual_losses
+            state.dual.log_weights - dual_eta_value * dual_losses
         )
 
         next_state = HedgeSaddleState(

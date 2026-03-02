@@ -81,7 +81,7 @@ def __sps(
 
             gradient = grad(state)
             updates, opt_state = opt_update(gradient, opt_state, state)
-            state = optax.apply_updates(state, updates)
+            state = jax.tree_util.tree_map(lambda s, u: s + u, state, updates)
             state = SaddleState(
                 primal=projection_primal(state.primal),
                 dual_ineq=projection_non_negative(state.dual_ineq),
