@@ -48,11 +48,11 @@ if float_precision:
 else:
     jax.config.update("jax_enable_x64", True)
 
-presolve = input("Presolve the problem using Highs? (y/n): ").lower() == "y"
 alternating = input("Use alternating updates? (y/n): ").lower() == "y"
 use_fancy_algorithm = input("Use fancy algorithm? (y/n): ").lower() == "y"
 average = input("Averaging strategy (polyak/exponential/off): ").lower()
 scale = input("Scaling strategy (ruiz/pc/ruiz+pc): ").lower()
+polish = input("Polish the solution? (y/n): ").lower() == "y"
 
 # %% [markdown]
 # ## Load the LP
@@ -65,11 +65,7 @@ highs.readModel(
 
 # %% [markdown]
 # We convert the LP to Jaddle's sparse format, before applying the selected scaling strategy.
-if presolve:
-    highs.presolve()
-    highs_lp = highs.getPresolvedLp()
-else:
-    highs_lp = highs.getLp()
+highs_lp = highs.getLp()
 jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 
 # %%
@@ -129,12 +125,5 @@ else:
 print(f"Primal Equality Residual: {jaddle_lp.eq_slack(solution.primal)}")
 print(f"Primal Inequality Residual: {jaddle_lp.ineq_slack(solution.primal)}")
 print("----------------------------------------------")
-
-# %%
-if presolve:
-    sol = hspy.HighsSolution()
-    sol.col_value = solution.primal.tolist()
-    highs.postsolve(sol)
-    print(f"Highs Objective Value: {highs.getObjectiveValue()}")
 
 # %%

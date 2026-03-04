@@ -661,6 +661,14 @@ def solve(
             dual_ineq=output.dual_ineq * jnp_row_scale_ineq,
             dual_eq=output.dual_eq * jnp_row_scale_eq,
         )
+
+    if scaled_objective:
+        output = SaddleState(
+            primal=output.primal,
+            dual_ineq=output.dual_ineq * c_max,
+            dual_eq=output.dual_eq * c_max,
+        )
+
     if output_opt_state:
         return output, is_converged, opt_state
     else:
