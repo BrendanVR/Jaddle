@@ -46,20 +46,11 @@ lp = jl.to_jaddle_sparse(lp)  # Convert to Jaddle sparse format
 
 # %% [markdown]
 # ## Solving the LP Problem
-lr = optax.exponential_decay(
-    init_value=1e0,
-    transition_steps=1000,
-    decay_rate=0.9,
-    end_value=1e-5,
+optimiser = jo.create_saddle_optimiser(
+    optax.optimistic_gradient_descent(learning_rate=1e-1)
 )
 
-solution, _ = jl.solve(
-    lp,
-    optimiser=jo.optimistic_adam_saddle(lr, lr),
-    verbose=True,
-    average=False,
-    update_mode="alternating",
-)
+solution, _ = jl.solve(lp, optimiser=optimiser)
 # %%
 print(f"x1 = {solution.primal[0]:.4f}, x2 = {solution.primal[1]:.4f}")
 print(f"Optimal objective value: {lp.objective(solution.primal):.4f}")

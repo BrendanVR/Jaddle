@@ -51,7 +51,7 @@ def configure_jax(jax_profile: Optional[str] = None):
         os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "true")
         os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.90")
         _append_xla_flag("--xla_gpu_autotune_level=4")
-    elif JAX_PROFILE == "balanced":
+    elif JAX_PROFILE in ["safe", "balanced"]:
         os.environ.setdefault("JAX_DEFAULT_MATMUL_PRECISION", "high")
 
     print(
@@ -204,8 +204,10 @@ def estimate_condition_number(
 
 def create_saddle_optimiser(
     primal_optimizer: optax.GradientTransformation,
-    dual_optimizer: optax.GradientTransformation,
+    dual_optimizer: optax.GradientTransformation | None = None,
 ):
+    if dual_optimizer is None:
+        dual_optimizer = primal_optimizer
     optimiser = optax.partition(
         {
             "primal_opt": primal_optimizer,
@@ -215,26 +217,6 @@ def create_saddle_optimiser(
     )
 
     return optimiser
-
-
-def optimistic_adam_saddle(
-    lr_primal=1e-3,
-    lr_dual=1e-3,
-    alpha: float = 5e-2,
-    nesterov=True,
-):
-    primal_optimiser = optax.inject_hyperparams(optax.optimistic_adam_v2)(
-        learning_rate=lr_primal,
-        alpha=alpha,
-        nesterov=nesterov,
-    )
-    dual_optimiser = optax.inject_hyperparams(optax.optimistic_adam_v2)(
-        learning_rate=lr_dual,
-        alpha=alpha,
-        nesterov=nesterov,
-    )
-
-    return create_saddle_optimiser(primal_optimiser, dual_optimiser)
 
 
 def _resolve_schedule(schedule: ScheduleLike, step: jnp.ndarray) -> jnp.ndarray:

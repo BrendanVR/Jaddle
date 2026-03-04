@@ -265,6 +265,8 @@ def solve(
             dual_eq=gradient.dual_eq,
         )
 
+    has_dual_bound = cp.dual_bound is not None
+
     @jax.jit
     def compute_epoch_metrics(average_state):
         objective_value = cp.objective(average_state.primal)
@@ -293,11 +295,23 @@ def solve(
 
         constraint_bound = jnp.maximum(max_ineq_violation, max_eq_violation)
 
+        if has_dual_bound:
+            dual_bound = cp.dual_bound(
+                average_state.dual_ineq,
+                average_state.dual_eq,
+            )
+            duality_gap = objective_value - dual_bound
+        else:
+            duality_gap = jnp.nan
+        dual_gap_is_finite = has_dual_bound & jnp.isfinite(duality_gap)
+
         return (
             objective_value,
             primal_grad_norm,
             complementarity_slack,
             constraint_bound,
+            duality_gap,
+            dual_gap_is_finite,
         )
 
     def check_convergence(
@@ -326,6 +340,8 @@ def solve(
             constraint_bound,
             count,
             objective_value,
+            duality_gap,
+            dual_gap_is_finite,
             total_weight,
         ) = loop_vars
 
@@ -345,6 +361,8 @@ def solve(
             constraint_bound,
             count,
             objective_value,
+            duality_gap,
+            dual_gap_is_finite,
             total_weight,
         ) = loop_vars
 
@@ -373,6 +391,8 @@ def solve(
             primal_grad_norm,
             complementarity_slack,
             constraint_bound,
+            duality_gap,
+            dual_gap_is_finite,
         ) = jax.lax.cond(
             average,
             lambda: compute_epoch_metrics(average_state),
@@ -392,6 +412,8 @@ def solve(
             constraint_bound,
             count,
             objective_value,
+            duality_gap,
+            dual_gap_is_finite,
             total_weight,
         )
 
@@ -412,6 +434,8 @@ def solve(
     complementarity_slack = jnp.inf
     constraint_bound = jnp.inf
     objective_value = jnp.inf
+    duality_gap = jnp.inf
+    dual_gap_is_finite = False
     count = 0
     total_weight = 0.0
 
@@ -510,6 +534,8 @@ def solve(
                 primal_grad_norm,
                 complementarity_slack,
                 constraint_bound,
+                duality_gap,
+                dual_gap_is_finite,
             ) = jax.lax.cond(
                 average,
                 lambda: compute_epoch_metrics(average_state),
@@ -520,12 +546,18 @@ def solve(
             count += 1
 
             if verbose and (count == 1 or count % log_every == 0):
+                dual_gap_status = (
+                    "finite"
+                    if bool(dual_gap_is_finite)
+                    else ("unavailable" if not has_dual_bound else "dual-infeasible")
+                )
                 print(
                     f"|Epoch {count}|"
                     f"|Obj{objective_value:.2e}|"
                     f"|PGN {primal_grad_norm:.2e}|"
                     f"|CS {complementarity_slack:.2e}|"
                     f"|CB {constraint_bound:.2e}|"
+                    f"|DG {duality_gap:.2e} ({dual_gap_status})|"
                     f"|Time {finish_epoch_time - start_epoch_time:.2f}s|"
                 )
                 print("----------------------------------------------")

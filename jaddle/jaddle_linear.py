@@ -11,7 +11,6 @@ import time
 from scipy import sparse as sp
 from jaddle.jaddle_basic_types import LP, SaddleState, HedgeSaddleState
 from scipy.sparse.linalg import gmres
-from scipy.sparse.linalg import LinearOperator
 from jax.scipy.sparse.linalg import gmres
 import jaddle.jaddle_optimisers as jo
 
@@ -267,9 +266,11 @@ def solve(
     dual_damping_ineq=0.0,
     dual_damping_eq=0.0,
     primal_damping=0.0,
-    progress_tolerance=1e-2,
-    constraint_tolerance=1e-3,
+    progress_tolerance=1e-3,
+    primal_feasibility_tolerance=1e-3,
     complementarity_tolerance=1e-3,
+    dual_feasibility_tolerance=1e-3,
+    dual_gap_tolerance=1e-3,
     weight_function=lambda _: 1.0,
     exponential_weight=0.01,
     verbose=False,
@@ -360,6 +361,13 @@ def solve(
         dual_eq=initial_solution.dual_eq / jnp_row_scale_eq,
     )
 
+    dual_feasibility_atol = (
+        float(dual_feasibility_tolerance)
+        if dual_feasibility_tolerance is not None
+        else 0.0
+    )
+    dual_feasibility_threshold = dual_feasibility_atol
+
     @jax.jit
     def compute_epoch_metrics(average_state):
         objective_value = lp.objective(average_state.primal) * c_max
@@ -396,22 +404,78 @@ def solve(
 
         constraint_bound = jnp.maximum(max_ineq_violation, max_eq_violation)
 
+        reduced_cost = grad_primal
+        lower_bounds = lp.lower_bounds
+        upper_bounds = lp.upper_bounds
+        finite_lower = jnp.isfinite(lower_bounds)
+        finite_upper = jnp.isfinite(upper_bounds)
+
+        has_both_bounds = finite_lower & finite_upper
+        has_only_lower = finite_lower & (~finite_upper)
+        has_only_upper = (~finite_lower) & finite_upper
+        has_no_bounds = (~finite_lower) & (~finite_upper)
+
+        lower_term = reduced_cost * lower_bounds
+        upper_term = reduced_cost * upper_bounds
+
+        box_infimum = jnp.where(
+            has_both_bounds,
+            jnp.minimum(lower_term, upper_term),
+            jnp.where(
+                has_only_lower,
+                lower_term,
+                jnp.where(has_only_upper, upper_term, 0.0),
+            ),
+        )
+
+        dual_feasibility_violation = jnp.where(
+            has_only_lower,
+            jnp.maximum(-reduced_cost, 0.0),
+            jnp.where(
+                has_only_upper,
+                jnp.maximum(reduced_cost, 0.0),
+                jnp.where(has_no_bounds, jnp.abs(reduced_cost), 0.0),
+            ),
+        )
+        dual_feasibility_residual = jnp.max(dual_feasibility_violation)
+        dual_feasible = dual_feasibility_residual <= dual_feasibility_threshold
+
+        dual_bound_scaled = (
+            -(average_state.dual_ineq @ lp.b_ineq)
+            - (average_state.dual_eq @ lp.b_eq)
+            + jnp.sum(box_infimum)
+        )
+        duality_gap = jnp.where(
+            dual_feasible,
+            objective_value - dual_bound_scaled * c_max,
+            jnp.nan,
+        )
+        dual_gap_is_finite = dual_feasible & jnp.isfinite(duality_gap)
+
         return (
             objective_value,
             primal_grad_norm,
             complementarity_slack,
             constraint_bound,
+            dual_feasibility_residual,
+            duality_gap,
+            dual_gap_is_finite,
         )
 
     def check_convergence(
         primal_grad_norm,
         complementarity_slack,
         constraint_bound,
+        dual_feasibility_residual,
+        duality_gap,
+        dual_gap_is_finite,
     ):
         return (
             (primal_grad_norm > progress_tolerance)
             | (complementarity_slack > complementarity_tolerance)
-            | (constraint_bound > constraint_tolerance)
+            | (constraint_bound > primal_feasibility_tolerance)
+            | (dual_feasibility_residual > dual_feasibility_threshold)
+            | (duality_gap > dual_gap_tolerance if dual_gap_is_finite else True)
         )
 
     def check_max_epochs(count):
@@ -428,7 +492,10 @@ def solve(
     primal_grad_norm = jnp.inf
     complementarity_slack = jnp.inf
     constraint_bound = jnp.inf
+    dual_feasibility_residual = jnp.inf
     objective_value = jnp.inf
+    duality_gap = jnp.inf
+    dual_gap_is_finite = False
     count = 0
     total_weight = 0.0
     is_converged = True
@@ -494,6 +561,9 @@ def solve(
             primal_grad_norm,
             complementarity_slack,
             constraint_bound,
+            dual_feasibility_residual,
+            duality_gap,
+            dual_gap_is_finite,
         ):
             if max_epochs:
                 if check_max_epochs(count):
@@ -532,6 +602,9 @@ def solve(
                 primal_grad_norm,
                 complementarity_slack,
                 constraint_bound,
+                dual_feasibility_residual,
+                duality_gap,
+                dual_gap_is_finite,
             ) = jax.lax.cond(
                 average == "exponential" or average == "polyak",
                 lambda: compute_epoch_metrics(average_state),
@@ -542,12 +615,17 @@ def solve(
             count += 1
 
             if verbose and (count == 1 or count % log_every == 0):
+                dual_gap_status = (
+                    "finite" if bool(dual_gap_is_finite) else "dual-infeasible"
+                )
                 print(
                     f"|Epoch {count}|"
                     f"|Obj{objective_value:.2e}|"
                     f"|PGN {primal_grad_norm:.2e}|"
                     f"|CS {complementarity_slack:.2e}|"
-                    f"|CB {constraint_bound:.2e}|"
+                    f"|PFR {constraint_bound:.2e}|"
+                    f"|DFR {dual_feasibility_residual:.2e}|"
+                    f"|DG {duality_gap:.2e} ({dual_gap_status})|"
                     f"|Time {finish_epoch_time - start_epoch_time:.2f}s|"
                 )
                 print("----------------------------------------------")

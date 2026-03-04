@@ -104,6 +104,7 @@ class CP:
         constraints_ineq,
         lower_bounds,
         upper_bounds,
+        dual_bound=None,
     ):
         self.num_variables = num_variables
         self.objective = objective
@@ -111,6 +112,7 @@ class CP:
         self.constraints_ineq = constraints_ineq
         self.lower_bounds = lower_bounds
         self.upper_bounds = upper_bounds
+        self.dual_bound = dual_bound
 
     def initial_primal_solution(self):
         return jnp.zeros(self.num_variables)
