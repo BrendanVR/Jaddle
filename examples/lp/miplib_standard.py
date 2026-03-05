@@ -48,11 +48,7 @@ if float_precision:
 else:
     jax.config.update("jax_enable_x64", True)
 
-alternating = input("Use alternating updates? (y/n): ").lower() == "y"
-use_fancy_algorithm = input("Use fancy algorithm? (y/n): ").lower() == "y"
-average = input("Averaging strategy (polyak/exponential/off): ").lower()
 scale = input("Scaling strategy (ruiz/pc/ruiz+pc): ").lower()
-polish = input("Polish the solution? (y/n): ").lower() == "y"
 
 # %% [markdown]
 # ## Load the LP
@@ -70,56 +66,29 @@ jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 
 # %%
 
-if use_fancy_algorithm:
-    lr = optax.cosine_decay_schedule(
-        init_value=1e0,
-        decay_steps=int(1e5),
-        exponent=0.5,
-        alpha=1e-1,
-    )
-    optimiser = jo.create_saddle_optimiser(
-        optax.optimistic_adam_v2(learning_rate=lr, alpha=0.05),
-    )
-else:
-    lr = optax.cosine_decay_schedule(
-        init_value=1e-1,
-        decay_steps=int(1e5),
-        exponent=0.5,
-        alpha=1e-2,
-    )
-    optimiser = jo.create_saddle_optimiser(
-        optax.optimistic_gradient_descent(learning_rate=lr),
-    )
+
+def slingshot_lr(step):
+    return 1e-1 * jnp.cos(jnp.pi * step / 1000) * jnp.exp(-step / 1000) + 1e-3
+
+
+optimiser = jo.create_saddle_optimiser(
+    optax.sgd(learning_rate=slingshot_lr),
+    optax.sgd(learning_rate=lambda step: -slingshot_lr(step)),
+)
 
 # %% [markdown]
 # ## Solve the presolved LP using Jaddle's saddle point solver
 jl.lp_summary_statistics(jaddle_lp)
 
 
-if alternating:
-    solution, _ = jl.solve(
-        lp=jaddle_lp,
-        optimiser=optimiser,
-        verbose=True,
-        log_every=1,
-        scale=scale,
-        # scaled_objective=True,
-        update_mode="alternating",
-        average=average,
-        weight_function=lambda i: jax.lax.select(i < int(5e4), 1e-16, 1.0),
-    )
-
-else:
-    solution, _ = jl.solve(
-        lp=jaddle_lp,
-        optimiser=optimiser,
-        verbose=True,
-        log_every=1,
-        scale=scale,
-        # scaled_objective=True,
-        average=average,
-        weight_function=lambda i: jax.lax.select(i < int(5e4), 1e-16, 1.0),
-    )
+solution, _ = jl.solve(
+    lp=jaddle_lp,
+    optimiser=optimiser,
+    verbose=True,
+    log_every=1,
+    scale=scale,
+    scaled_objective=True,
+)
 
 # %%
 print(f"Primal Equality Residual: {jaddle_lp.eq_slack(solution.primal)}")
