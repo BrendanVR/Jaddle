@@ -66,15 +66,7 @@ jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 
 # %%
 
-
-def slingshot_lr(step):
-    return 1e-1 * jnp.cos(jnp.pi * step / 1000) * jnp.exp(-step / 1000) + 1e-3
-
-
-optimiser = jo.create_saddle_optimiser(
-    optax.sgd(learning_rate=slingshot_lr),
-    optax.sgd(learning_rate=lambda step: -slingshot_lr(step)),
-)
+optimiser = jo.create_saddle_optimiser(optax.sgd(learning_rate=1e-1))
 
 # %% [markdown]
 # ## Solve the presolved LP using Jaddle's saddle point solver
