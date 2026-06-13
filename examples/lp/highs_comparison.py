@@ -7,8 +7,7 @@
 import highspy as hspy
 
 # %%
-PROBLEM_NAME = input("Enter the MIPLIB problem name: ")
-presolve = input("Presolve the problem using HiGHS? (y/n): ").lower() == "y"
+PROBLEM_NAME = "stp3d"
 
 # %% [markdown]
 # ## Load the LP
@@ -25,8 +24,7 @@ info = highs.getInfo()
 for col in range(highs.numVariables):
     highs.changeColIntegrality(col, hspy.HighsVarType.kContinuous)
 
-if not presolve:
-    highs.setOptionValue("presolve", "off")
-
 highs.setOptionValue("solver", "pdlp")
 highs.solve()
+
+# %%

@@ -30,10 +30,10 @@ import optax
 
 # %%
 PROBLEM_NAME = "stp3d"
-jax_mode = "safe"
+jax_mode = "max_speed"
 gpu = "y"
-float_precision = "n"
-scale = "ruiz"
+float_precision = "y"
+scale = "ruiz+pc"
 
 if jax_mode in ["balanced", "safe", "max_speed"]:
     jo.configure_jax(jax_mode)
@@ -68,10 +68,15 @@ jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 # ## Solve the presolved LP using Jaddle's saddle point solver
 jl.lp_summary_statistics(jaddle_lp)
 
-optimiser =jo.create_saddle_optimiser(optax.adam(learning_rate=1e-3))
+
+learning_rate = optax.exponential_decay(
+    init_value=1e-2, transition_steps=1000, decay_rate=0.9,
+)
+
+optimiser =jo.create_saddle_optimiser(optax.optimistic_adam_v2(learning_rate=learning_rate,alpha=0.01))
 solution, _ = jl.solve(
     lp=jaddle_lp,
-    optimiser=optimiser,
+    optimiser=optimiser, 
     verbose=True,
     log_every=1,
     scale=scale,
