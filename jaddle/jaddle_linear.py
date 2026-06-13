@@ -281,20 +281,43 @@ def solve(
     expert_diagnostics=False,
     output_opt_state=False,
     scaled_objective=False,
+    restarts=0,
+    epochs_per_restart=10,
+    restart_multiplier=1.0,
+    restart_decay=0.2,
 ):
     """
     Solve a linear program via saddle-point optimisation.
 
+    Termination uses the standard LP optimality certificate: primal feasibility
+    (``primal_feasibility_tolerance``), dual feasibility
+    (``dual_feasibility_tolerance``), and a finite duality gap within
+    ``dual_gap_tolerance``. ``progress_tolerance`` and
+    ``complementarity_tolerance`` are retained for backward compatibility but no
+    longer gate termination — the corresponding ``primal_grad_norm`` and
+    ``complementarity_slack`` quantities are reported as diagnostics only.
+
+    Adaptive restarts (PDLP-style) accelerate ill-conditioned problems. A
+    restart resets the optimiser momentum/averaging while keeping the current
+    iterate as a warm start, which prevents the saddle iteration from settling
+    into slow rotational orbits. A restart fires when either the normalised KKT
+    merit decays past ``restart_decay`` of its value at the last restart
+    (sufficient-progress restart) or the current cycle reaches its length cap
+    (no-progress restart). Set ``restarts=0`` to disable.
+
     Args:
-        restarts: Number of warm restarts. 0 = no restarts (default).
-            Each restart resets the optimizer state (momentum) and averaging
-            while keeping the current iterate as a warm start. The LR schedule
-            also restarts from its initial value.
-        epochs_per_restart: Number of epochs in the first restart cycle
-            (default 10). Subsequent cycles grow by restart_multiplier.
-        restart_multiplier: Geometric growth factor for cycle lengths
+        restarts: Maximum number of warm restarts. 0 = no restarts (default).
+            Each restart resets the optimiser state (momentum) and averaging
+            while keeping the current iterate as a warm start. The LR schedule /
+            ``weight_function`` iteration counter also restarts from its initial
+            value.
+        epochs_per_restart: Length cap (in epochs) of the first restart cycle
+            (default 10). Subsequent cycle caps grow by ``restart_multiplier``.
+        restart_multiplier: Geometric growth factor for cycle-length caps
             (default 1.0 = fixed length, 2.0 = doubling).
-        primal_dual_lr_ratio: Ratio of primal to dual learning rates (default 1.0).
+        restart_decay: Sufficient-progress threshold (default 0.2). A restart
+            fires early if the KKT merit drops below ``restart_decay`` times its
+            value at the last restart.
     """
 
     if log_every < 1:
@@ -399,7 +422,7 @@ def solve(
         max_eq_violation = jnp.max(eq_violations)
 
         complementarity_slack = jnp.max(
-            jnp.abs(average_state.dual_ineq * grad_dual_ineq)
+            jnp.abs(average_state.dual_ineq * grad_dual_ineq_unscaled)
         ) / (1.0 + jnp.abs(objective_value))
 
         constraint_bound = jnp.maximum(max_ineq_violation, max_eq_violation)
@@ -470,12 +493,18 @@ def solve(
         duality_gap,
         dual_gap_is_finite,
     ):
+        # Standard LP optimality certificate: primal feasibility, dual
+        # feasibility, and a finite, small duality gap. `primal_grad_norm` and
+        # `complementarity_slack` are computed/printed as diagnostics only — they
+        # are redundant with (or implied by) these three conditions.
+        # The gap is NaN exactly when the dual is infeasible, which is already
+        # gated by `dual_feasibility_residual`, so requiring a finite gap here
+        # does not deadlock termination.
         return (
-            (primal_grad_norm > progress_tolerance)
-            | (complementarity_slack > complementarity_tolerance)
-            | (constraint_bound > primal_feasibility_tolerance)
+            (constraint_bound > primal_feasibility_tolerance)
             | (dual_feasibility_residual > dual_feasibility_threshold)
-            | (duality_gap > dual_gap_tolerance if dual_gap_is_finite else True)
+            | (~dual_gap_is_finite)
+            | (jnp.abs(duality_gap) > dual_gap_tolerance)
         )
 
     def check_max_epochs(count):
@@ -499,6 +528,29 @@ def solve(
     count = 0
     total_weight = 0.0
     is_converged = True
+
+    # Adaptive restart bookkeeping. `restart_i_offset` is subtracted from the
+    # global iteration counter `i` before it is handed to the optimiser /
+    # weight_function, so a restart re-zeros the LR schedule without disturbing
+    # the running epoch/iteration accounting.
+    restarts_done = 0
+    restart_i_offset = 0
+    epochs_since_restart = 0
+    current_cycle_cap = float(epochs_per_restart)
+    merit_at_last_restart = jnp.inf
+
+    def kkt_merit(constraint_bound, dual_feasibility_residual, duality_gap, dual_gap_is_finite, objective_value):
+        # Single scalar quality measure driving the restart trigger. The gap is
+        # normalised and only counted when finite (dual feasible); otherwise the
+        # feasibility residuals dominate.
+        gap_term = jnp.where(
+            dual_gap_is_finite,
+            jnp.abs(duality_gap) / (1.0 + jnp.abs(objective_value)),
+            jnp.inf,
+        )
+        return jnp.maximum(
+            jnp.maximum(constraint_bound, dual_feasibility_residual), gap_term
+        )
 
     start_time = time.time()
     missing_expert_state_warning_printed = False
@@ -574,14 +626,14 @@ def solve(
 
             start_epoch_time = time.time()
             (
-                i,
+                shifted_i,
                 state,
                 average_state,
                 opt_state,
                 total_weight,
             ) = __sps(
                 iterations_per_epoch,
-                i,
+                i - restart_i_offset,
                 lp,
                 optimiser,
                 state,
@@ -596,6 +648,8 @@ def solve(
                 average,
                 update_mode,
             )
+            # __sps increments the (restart-shifted) counter; restore global i.
+            i = shifted_i + restart_i_offset
 
             (
                 objective_value,
@@ -631,6 +685,53 @@ def solve(
                 print("----------------------------------------------")
 
                 print_expert_weights(count, opt_state)
+
+            # --- Adaptive restart decision ---
+            if restarts and restarts_done < restarts:
+                epochs_since_restart += 1
+                merit = kkt_merit(
+                    constraint_bound,
+                    dual_feasibility_residual,
+                    duality_gap,
+                    dual_gap_is_finite,
+                    objective_value,
+                )
+
+                # Seed the baseline on the first finite merit so the
+                # sufficient-progress test has something real to compare against
+                # (avoids a spurious restart against the initial inf baseline).
+                if not jnp.isfinite(merit_at_last_restart):
+                    merit_at_last_restart = merit
+
+                sufficient_progress = bool(
+                    merit <= restart_decay * merit_at_last_restart
+                )
+                cycle_exhausted = epochs_since_restart >= current_cycle_cap
+
+                if sufficient_progress or cycle_exhausted:
+                    # Warm-start restart: keep the current iterate, reset
+                    # momentum, averaging, weight accumulation and the LR /
+                    # weight_function schedule (via the iteration offset).
+                    opt_state = optimiser.init(state)
+                    average_state = state
+                    total_weight = 0.0
+                    restart_i_offset = i - 1
+                    merit_at_last_restart = merit
+                    epochs_since_restart = 0
+                    current_cycle_cap *= restart_multiplier
+                    restarts_done += 1
+                    if verbose:
+                        reason = (
+                            "sufficient-progress"
+                            if sufficient_progress
+                            else "cycle-cap"
+                        )
+                        print(
+                            f"Restart {restarts_done}/{restarts} at epoch {count} "
+                            f"({reason}, merit={float(merit):.2e}, "
+                            f"next cap={current_cycle_cap:.0f} epochs)"
+                        )
+                        print("----------------------------------------------")
 
         if average != "off":
             output = average_state
