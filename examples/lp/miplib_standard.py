@@ -20,7 +20,6 @@ import jax.numpy as jnp
 # )  # Use 64-bit precision for better numerical stability
 
 jax.config.update("eager_constant_folding", True)
-jax.config.update("jax_bcoo_cusparse_lowering", True)
 
 import jaddle.jaddle_linear as jl
 import jaddle.highs_helpers as hh
@@ -29,7 +28,7 @@ import highspy as hspy
 import optax
 
 # %%
-PROBLEM_NAME = "stp3d"
+PROBLEM_NAME = "nug"
 jax_mode = "max_speed"
 gpu = "y"
 scale = "ruiz+pc"
@@ -55,22 +54,21 @@ highs.readModel(
 
 # %% [markdown]
 # We convert the LP to Jaddle's sparse format, before applying the selected scaling strategy.
-highs.presolve()
-highs_lp = highs.getPresolvedLp()
+highs_lp = highs.getLp()
 jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 
 # %% [markdown]
 # ## Solve the presolved LP using Jaddle's saddle point solver
 jl.lp_summary_statistics(jaddle_lp)
 
-
-learning_rate = optax.exponential_decay(
-    init_value=1e-1, transition_steps=5000, decay_rate=0.95, end_value=1e-6
+learning_rate = optax.cosine_decay_schedule(
+    init_value=1e0,
+    decay_steps=10000,
+    alpha=1e-3,
 )
 
 optimiser = jo.create_saddle_optimiser(
-    optax.optimistic_adam_v2(learning_rate=learning_rate, alpha=0.1),
-    optax.optimistic_adam_v2(learning_rate=learning_rate, alpha=0.1),
+    optax.optimistic_adam_v2(learning_rate=learning_rate, alpha=0.01),
 )
 solution, _ = jl.solve(
     lp=jaddle_lp,

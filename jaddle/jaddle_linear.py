@@ -266,9 +266,7 @@ def solve(
     dual_damping_ineq=0.0,
     dual_damping_eq=0.0,
     primal_damping=0.0,
-    progress_tolerance=1e-3,
     primal_feasibility_tolerance=1e-3,
-    complementarity_tolerance=1e-3,
     dual_feasibility_tolerance=1e-3,
     dual_gap_tolerance=1e-3,
     weight_function=lambda _: 1.0,
@@ -470,10 +468,24 @@ def solve(
         )
         duality_gap = jnp.where(
             dual_feasible,
-            objective_value - dual_bound_scaled * c_max,
+            objective_value - dual_bound_scaled,
             jnp.nan,
         )
         dual_gap_is_finite = dual_feasible & jnp.isfinite(duality_gap)
+
+        # Three-way decomposition of the duality gap (diagnostic only). At a
+        # dual-feasible point these three terms sum exactly to `duality_gap`:
+        #   gap = [rᵀx − Σ box_infimum]        bound / reduced-cost complementarity
+        #       + yᵢₙₑ_qᵀ(bᵢₙₑ_q − Aᵢₙₑ_q x)     inequality complementarity (slack·dual)
+        #       + y_eqᵀ(b_eq − A_eq x)         equality primal-residual coupling
+        # All are computed in scaled space then rescaled by `c_max` to match the
+        # units of `duality_gap`. Watching which term dominates localises why a
+        # large gap persists even when per-constraint complementarity looks tiny.
+        gap_bound_comp = (
+            reduced_cost @ average_state.primal - jnp.sum(box_infimum)
+        ) * c_max
+        gap_ineq_comp = -(average_state.dual_ineq @ grad_dual_ineq) * c_max
+        gap_eq_comp = -(average_state.dual_eq @ grad_dual_eq) * c_max
 
         return (
             objective_value,
@@ -483,11 +495,12 @@ def solve(
             dual_feasibility_residual,
             duality_gap,
             dual_gap_is_finite,
+            gap_bound_comp,
+            gap_ineq_comp,
+            gap_eq_comp,
         )
 
     def check_convergence(
-        primal_grad_norm,
-        complementarity_slack,
         constraint_bound,
         dual_feasibility_residual,
         duality_gap,
@@ -539,7 +552,13 @@ def solve(
     current_cycle_cap = float(epochs_per_restart)
     merit_at_last_restart = jnp.inf
 
-    def kkt_merit(constraint_bound, dual_feasibility_residual, duality_gap, dual_gap_is_finite, objective_value):
+    def kkt_merit(
+        constraint_bound,
+        dual_feasibility_residual,
+        duality_gap,
+        dual_gap_is_finite,
+        objective_value,
+    ):
         # Single scalar quality measure driving the restart trigger. The gap is
         # normalised and only counted when finite (dual feasible); otherwise the
         # feasibility residuals dominate.
@@ -610,8 +629,6 @@ def solve(
 
     try:
         while check_convergence(
-            primal_grad_norm,
-            complementarity_slack,
             constraint_bound,
             dual_feasibility_residual,
             duality_gap,
@@ -659,6 +676,9 @@ def solve(
                 dual_feasibility_residual,
                 duality_gap,
                 dual_gap_is_finite,
+                gap_bound_comp,
+                gap_ineq_comp,
+                gap_eq_comp,
             ) = jax.lax.cond(
                 average == "exponential" or average == "polyak",
                 lambda: compute_epoch_metrics(average_state),
@@ -681,6 +701,13 @@ def solve(
                     f"|DFR {dual_feasibility_residual:.2e}|"
                     f"|DG {duality_gap:.2e} ({dual_gap_status})|"
                     f"|Time {finish_epoch_time - start_epoch_time:.2f}s|"
+                )
+                print(
+                    f"  DG decomp: "
+                    f"bound={gap_bound_comp:.2e} "
+                    f"ineq={gap_ineq_comp:.2e} "
+                    f"eq={gap_eq_comp:.2e} "
+                    f"(sum={gap_bound_comp + gap_ineq_comp + gap_eq_comp:.2e})"
                 )
                 print("----------------------------------------------")
 
