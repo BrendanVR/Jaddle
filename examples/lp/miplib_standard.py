@@ -29,26 +29,26 @@ import highspy as hspy
 import optax
 
 # %%
-PROBLEM_NAME = input("Enter the MIPLIB problem name: ")
-jax_mode = input("Set JAX mode (balanced/safe/max_speed): ")
+PROBLEM_NAME = "stp3d"
+jax_mode = "safe"
+gpu = "y"
+float_precision = "n"
+scale = "ruiz"
 
 if jax_mode in ["balanced", "safe", "max_speed"]:
     jo.configure_jax(jax_mode)
 else:
     print("Invalid JAX mode. Using default precision.")
-gpu = input("Use GPU? (y/n): ").lower() == "y"
-if gpu:
+
+if gpu == "y":
     jax.config.update("jax_platform_name", "gpu")
 else:
     jax.config.update("jax_platform_name", "cpu")
 
-float_precision = input("Use 32-bit precision? (y/n): ").lower() == "y"
-if float_precision:
+if float_precision == "y":
     jax.config.update("jax_enable_x64", False)
 else:
     jax.config.update("jax_enable_x64", True)
-
-scale = input("Scaling strategy (ruiz/pc/ruiz+pc): ").lower()
 
 # %% [markdown]
 # ## Load the LP
@@ -64,15 +64,11 @@ highs.readModel(
 highs_lp = highs.getLp()
 jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 
-# %%
-
-optimiser = jo.create_saddle_optimiser(optax.sgd(learning_rate=1e-1))
-
 # %% [markdown]
 # ## Solve the presolved LP using Jaddle's saddle point solver
 jl.lp_summary_statistics(jaddle_lp)
 
-
+optimiser =jo.create_saddle_optimiser(optax.adam(learning_rate=1e-3))
 solution, _ = jl.solve(
     lp=jaddle_lp,
     optimiser=optimiser,
@@ -80,6 +76,7 @@ solution, _ = jl.solve(
     log_every=1,
     scale=scale,
     scaled_objective=True,
+    update_mode="alternating",
 )
 
 # %%

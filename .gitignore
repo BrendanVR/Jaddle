@@ -3,3 +3,4 @@
 /jaddle.egg-info
 *.pyc
 /build
+/venv
