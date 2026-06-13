@@ -28,7 +28,7 @@ import highspy as hspy
 import optax
 
 # %%
-PROBLEM_NAME = "nug"
+PROBLEM_NAME = "stp3d"
 jax_mode = "max_speed"
 gpu = "y"
 scale = "ruiz+pc"
@@ -42,6 +42,7 @@ if gpu == "y":
     jax.config.update("jax_platform_name", "gpu")
 else:
     jax.config.update("jax_platform_name", "cpu")
+
 
 # %% [markdown]
 # ## Load the LP
@@ -62,25 +63,24 @@ jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 jl.lp_summary_statistics(jaddle_lp)
 
 learning_rate = optax.cosine_decay_schedule(
-    init_value=1e0,
-    decay_steps=10000,
-    alpha=1e-3,
+    init_value=5e-1,
+    decay_steps=int(5e5),
+    alpha=1e-4,
 )
 
 optimiser = jo.create_saddle_optimiser(
-    optax.optimistic_adam_v2(learning_rate=learning_rate, alpha=0.01),
+    optax.optimistic_gradient_descent(learning_rate=learning_rate)
 )
 solution, _ = jl.solve(
     lp=jaddle_lp,
     optimiser=optimiser,
     scale=scale,
     scaled_objective=True,
-    restarts=30,
-    epochs_per_restart=10,
-    restart_multiplier=1.3,
-    dual_gap_tolerance=1e0,
+    dual_gap_tolerance=1e-2,
     verbose=True,
     log_every=1,
+    update_mode="alternating",
+    average="off",
 )
 
 # %%

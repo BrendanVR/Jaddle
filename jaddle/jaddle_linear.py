@@ -290,10 +290,9 @@ def solve(
     Termination uses the standard LP optimality certificate: primal feasibility
     (``primal_feasibility_tolerance``), dual feasibility
     (``dual_feasibility_tolerance``), and a finite duality gap within
-    ``dual_gap_tolerance``. ``progress_tolerance`` and
-    ``complementarity_tolerance`` are retained for backward compatibility but no
-    longer gate termination — the corresponding ``primal_grad_norm`` and
-    ``complementarity_slack`` quantities are reported as diagnostics only.
+    ``dual_gap_tolerance``. ``primal_grad_norm`` and ``complementarity_slack``
+    are reported as diagnostics only — they are redundant with these three
+    conditions and do not gate termination.
 
     Adaptive restarts (PDLP-style) accelerate ill-conditioned problems. A
     restart resets the optimiser momentum/averaging while keeping the current
@@ -382,12 +381,11 @@ def solve(
         dual_eq=initial_solution.dual_eq / jnp_row_scale_eq,
     )
 
-    dual_feasibility_atol = (
+    dual_feasibility_threshold = (
         float(dual_feasibility_tolerance)
         if dual_feasibility_tolerance is not None
         else 0.0
     )
-    dual_feasibility_threshold = dual_feasibility_atol
 
     @jax.jit
     def compute_epoch_metrics(average_state):
@@ -459,33 +457,25 @@ def solve(
             ),
         )
         dual_feasibility_residual = jnp.max(dual_feasibility_violation)
-        dual_feasible = dual_feasibility_residual <= dual_feasibility_threshold
 
-        dual_bound_scaled = (
-            -(average_state.dual_ineq @ lp.b_ineq)
-            - (average_state.dual_eq @ lp.b_eq)
-            + jnp.sum(box_infimum)
-        )
-        duality_gap = jnp.where(
-            dual_feasible,
-            objective_value - dual_bound_scaled,
-            jnp.nan,
-        )
-        dual_gap_is_finite = dual_feasible & jnp.isfinite(duality_gap)
-
-        # Three-way decomposition of the duality gap (diagnostic only). At a
-        # dual-feasible point these three terms sum exactly to `duality_gap`:
+        # Duality gap, computed directly as its three-way decomposition. At a
+        # dual-feasible point these terms sum to the gap in true (unscaled-
+        # objective) units:
         #   gap = [rᵀx − Σ box_infimum]        bound / reduced-cost complementarity
         #       + yᵢₙₑ_qᵀ(bᵢₙₑ_q − Aᵢₙₑ_q x)     inequality complementarity (slack·dual)
         #       + y_eqᵀ(b_eq − A_eq x)         equality primal-residual coupling
-        # All are computed in scaled space then rescaled by `c_max` to match the
-        # units of `duality_gap`. Watching which term dominates localises why a
-        # large gap persists even when per-constraint complementarity looks tiny.
+        # Each is computed in scaled space then rescaled by `c_max`, so summing
+        # them gives a unit-consistent gap (this is why the gap is built from the
+        # decomposition rather than `objective − dual_bound`, which mixed scaled
+        # and true units). Watching which term dominates localises why a large gap
+        # persists even when per-constraint complementarity looks tiny.
         gap_bound_comp = (
             reduced_cost @ average_state.primal - jnp.sum(box_infimum)
         ) * c_max
         gap_ineq_comp = -(average_state.dual_ineq @ grad_dual_ineq) * c_max
         gap_eq_comp = -(average_state.dual_eq @ grad_dual_eq) * c_max
+
+        duality_gap = gap_bound_comp + gap_ineq_comp + gap_eq_comp
 
         return (
             objective_value,
@@ -494,30 +484,31 @@ def solve(
             constraint_bound,
             dual_feasibility_residual,
             duality_gap,
-            dual_gap_is_finite,
+            jnp.isfinite(duality_gap),
             gap_bound_comp,
             gap_ineq_comp,
             gap_eq_comp,
         )
 
-    def check_convergence(
+    def converged(
         constraint_bound,
         dual_feasibility_residual,
         duality_gap,
         dual_gap_is_finite,
     ):
-        # Standard LP optimality certificate: primal feasibility, dual
-        # feasibility, and a finite, small duality gap. `primal_grad_norm` and
-        # `complementarity_slack` are computed/printed as diagnostics only — they
-        # are redundant with (or implied by) these three conditions.
-        # The gap is NaN exactly when the dual is infeasible, which is already
-        # gated by `dual_feasibility_residual`, so requiring a finite gap here
-        # does not deadlock termination.
+        # Standard LP optimality certificate — all three conditions must hold:
+        #   * primal feasibility: constraint_bound within tolerance
+        #   * dual feasibility: reduced-cost residual within tolerance
+        #   * a finite, small duality gap
+        # The gap is NaN exactly when the dual is infeasible, so `dual_gap_is_finite`
+        # already implies dual feasibility; the residual check is kept for clarity.
+        # `primal_grad_norm` and `complementarity_slack` are diagnostics only — they
+        # are redundant with these conditions and do not gate termination.
         return (
-            (constraint_bound > primal_feasibility_tolerance)
-            | (dual_feasibility_residual > dual_feasibility_threshold)
-            | (~dual_gap_is_finite)
-            | (jnp.abs(duality_gap) > dual_gap_tolerance)
+            (constraint_bound <= primal_feasibility_tolerance)
+            & (dual_feasibility_residual <= dual_feasibility_threshold)
+            & dual_gap_is_finite
+            & (jnp.abs(duality_gap) <= dual_gap_tolerance)
         )
 
     def check_max_epochs(count):
@@ -564,7 +555,7 @@ def solve(
         # feasibility residuals dominate.
         gap_term = jnp.where(
             dual_gap_is_finite,
-            jnp.abs(duality_gap) / (1.0 + jnp.abs(objective_value)),
+            jnp.abs(duality_gap),
             jnp.inf,
         )
         return jnp.maximum(
@@ -628,7 +619,7 @@ def solve(
             print("----------------------------------------------")
 
     try:
-        while check_convergence(
+        while not converged(
             constraint_bound,
             dual_feasibility_residual,
             duality_gap,
