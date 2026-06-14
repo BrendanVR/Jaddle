@@ -147,34 +147,21 @@ def __sps(
                         dual_eq=state.dual_eq,
                     )
 
-                    def _polyak(_):
+                    # `average` is a Python-level static, so dispatch the
+                    # averaging mode at trace time. When averaging is "off" the
+                    # incremental_update (a full read/write pass over the state
+                    # tree) is dropped from the hot loop entirely, and the
+                    # polyak-only weight_function call is skipped otherwise.
+                    if average == "polyak":
                         w = weight_function(i)
-                        new_total_weight = total_weight + w
-                        new_average_state = optax.incremental_update(
-                            state, average_state, w / new_total_weight
+                        total_weight = total_weight + w
+                        average_state = optax.incremental_update(
+                            state, average_state, w / total_weight
                         )
-                        return new_average_state, new_total_weight
-
-                    def _exponential(_):
-                        new_average_state = optax.incremental_update(
+                    elif average == "exponential":
+                        average_state = optax.incremental_update(
                             state, average_state, exponential_weight
                         )
-                        return new_average_state, total_weight
-
-                    def _no_average(_):
-                        return average_state, total_weight
-
-                    average_state, total_weight = jax.lax.cond(
-                        jnp.array(average == "polyak"),
-                        _polyak,
-                        lambda _: jax.lax.cond(
-                            jnp.array(average == "exponential"),
-                            _exponential,
-                            _no_average,
-                            operand=None,
-                        ),
-                        operand=None,
-                    )
 
                     return (i + 1, state, average_state, opt_state, total_weight), None
 
@@ -192,34 +179,21 @@ def __sps(
                         dual_eq=state.dual_eq,
                     )
 
-                    def _polyak(_):
+                    # `average` is a Python-level static, so dispatch the
+                    # averaging mode at trace time. When averaging is "off" the
+                    # incremental_update (a full read/write pass over the state
+                    # tree) is dropped from the hot loop entirely, and the
+                    # polyak-only weight_function call is skipped otherwise.
+                    if average == "polyak":
                         w = weight_function(i)
-                        new_total_weight = total_weight + w
-                        new_average_state = optax.incremental_update(
-                            state, average_state, w / new_total_weight
+                        total_weight = total_weight + w
+                        average_state = optax.incremental_update(
+                            state, average_state, w / total_weight
                         )
-                        return new_average_state, new_total_weight
-
-                    def _exponential(_):
-                        new_average_state = optax.incremental_update(
+                    elif average == "exponential":
+                        average_state = optax.incremental_update(
                             state, average_state, exponential_weight
                         )
-                        return new_average_state, total_weight
-
-                    def _no_average(_):
-                        return average_state, total_weight
-
-                    average_state, total_weight = jax.lax.cond(
-                        jnp.array(average == "polyak"),
-                        _polyak,
-                        lambda _: jax.lax.cond(
-                            jnp.array(average == "exponential"),
-                            _exponential,
-                            _no_average,
-                            operand=None,
-                        ),
-                        operand=None,
-                    )
 
                     return (i + 1, state, average_state, opt_state, total_weight), None
 

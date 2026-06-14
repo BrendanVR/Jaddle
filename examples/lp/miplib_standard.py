@@ -12,13 +12,6 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 import jax
 import jax.numpy as jnp
 
-# jax.config.update(
-#     "jax_platform_name", "cpu"
-# )  # Using CPU for this example, as the problem is not large and we want to avoid GPU overhead
-# jax.config.update(
-#     "jax_enable_x64", True
-# )  # Use 64-bit precision for better numerical stability
-
 jax.config.update("eager_constant_folding", True)
 
 import jaddle.jaddle_linear as jl
@@ -77,8 +70,6 @@ solution, _ = jl.solve(
     scale=scale,
     scaled_objective=True,
     dual_gap_tolerance=1e-2,
-    verbose=True,
-    log_every=1,
     update_mode="alternating",
     average="off",
 )
