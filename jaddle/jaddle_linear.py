@@ -9,7 +9,7 @@ import functools
 from typing import NamedTuple
 import time
 from scipy import sparse as sp
-from jaddle.jaddle_basic_types import LP, SaddleState, HedgeSaddleState
+from jaddle.jaddle_basic_types import LP, JaddleLP, SaddleState
 from scipy.sparse.linalg import gmres
 from jax.scipy.sparse.linalg import gmres
 import jaddle.jaddle_optimisers as jo
@@ -25,7 +25,7 @@ _LINEAR_RUN_EPOCH_CACHE = {}
 def __sps(
     max_iter,
     start_iter,
-    lp: LP,
+    lp: JaddleLP,
     optimiser,
     initial_solution,
     initial_avg_state=None,
@@ -46,8 +46,8 @@ def __sps(
     def grad(state):
         # Fused matvecs: 2 sparse ops instead of 4
         dual = jnp.concatenate([state.dual_eq, state.dual_ineq])
-        Ax = lp.A @ state.primal          # shape: (n_eq + n_ineq,)
-        ATd = lp.A_T @ dual               # shape: (n_vars,)
+        Ax = lp.A @ state.primal  # shape: (n_eq + n_ineq,)
+        ATd = lp.A_T @ dual  # shape: (n_vars,)
         grad_primal = lp.c + ATd + primal_damping * state.primal
         residual = lp.b - Ax
         grad_dual_eq = residual[: lp.n_eq] + dual_damping_eq * state.dual_eq
@@ -778,7 +778,7 @@ def to_jaddle_sparse(lp: LP):
     A_eq = jsp.BCOO.from_scipy_sparse(A_eq_sp).sort_indices()
     A_ineq = jsp.BCOO.from_scipy_sparse(A_ineq_sp).sort_indices()
 
-    lp_jax = LP(
+    lp_jax = JaddleLP(
         jnp.array(lp.c, dtype=jnp.float32),
         A_eq,
         jnp.array(lp.b_eq, dtype=jnp.float32),

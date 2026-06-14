@@ -17,13 +17,14 @@ highs.readModel(
     f"/home/brendanvr/python/Jaddle/data/{PROBLEM_NAME}.mps"
 )  # path to MPS file
 
-
+# %%
 # Relax integrality
 info = highs.getInfo()
 
 for col in range(highs.numVariables):
     highs.changeColIntegrality(col, hspy.HighsVarType.kContinuous)
 
+# %%
 highs.setOptionValue("solver", "pdlp")
 highs.solve()
 

@@ -21,10 +21,9 @@ import highspy as hspy
 import optax
 
 # %%
-PROBLEM_NAME = "stp3d"
+PROBLEM_NAME = "sing2"
 jax_mode = "max_speed"
 gpu = "y"
-scale = "ruiz+pc"
 
 if jax_mode in ["balanced", "safe", "max_speed"]:
     jo.configure_jax(jax_mode)
@@ -48,30 +47,35 @@ highs.readModel(
 
 # %% [markdown]
 # We convert the LP to Jaddle's sparse format, before applying the selected scaling strategy.
-highs_lp = highs.getLp()
+highs.presolve()
+highs_lp = highs.getPresolvedLp()
 jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 
 # %% [markdown]
 # ## Solve the presolved LP using Jaddle's saddle point solver
-jl.lp_summary_statistics(jaddle_lp)
-
+k = 2
 learning_rate = optax.cosine_decay_schedule(
-    init_value=5e-1,
+    init_value=1e-1 / k,
     decay_steps=int(5e5),
-    alpha=1e-4,
+    alpha=1e-5,
 )
 
+learning_rate_primal = lambda i: learning_rate(i) / k
+learning_rate_dual = lambda i: learning_rate(i) * k
 optimiser = jo.create_saddle_optimiser(
-    optax.optimistic_gradient_descent(learning_rate=learning_rate)
+    optax.optimistic_gradient_descent(learning_rate=learning_rate_primal),
+    optax.optimistic_gradient_descent(learning_rate=learning_rate_dual),
 )
+
+jl.lp_summary_statistics(jaddle_lp)
 solution, _ = jl.solve(
     lp=jaddle_lp,
     optimiser=optimiser,
-    scale=scale,
+    scale="ruiz+pc",
     scaled_objective=True,
     dual_gap_tolerance=1e-2,
-    update_mode="alternating",
-    average="off",
+    verbose=True,
+    log_every=1,
 )
 
 # %%
