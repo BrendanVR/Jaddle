@@ -163,6 +163,12 @@ class LP:
         self.b_ineq = b_ineq
         self.lower_bounds = lower_bounds
         self.upper_bounds = upper_bounds
+        # Fused [A_eq; A_ineq] for 2-matvec gradient computation
+        import jax.experimental.sparse as _jsp
+        self.n_eq = A_eq.shape[0]
+        self.A = _jsp.bcoo_concatenate([A_eq, A_ineq], dimension=0).sort_indices()
+        self.A_T = self.A.T.sort_indices()
+        self.b = jnp.concatenate([b_eq, b_ineq])
 
     def objective(self, x):
         return self.c @ x

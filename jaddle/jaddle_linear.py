@@ -44,18 +44,14 @@ def __sps(
         return projection_box(primal_state, lp.lower_bounds, lp.upper_bounds)
 
     def grad(state):
-        grad_primal = (
-            lp.c
-            + lp.A_ineq_T @ state.dual_ineq
-            + lp.A_eq_T @ state.dual_eq
-            + primal_damping * state.primal
-        )
-        grad_dual_ineq = (
-            lp.b_ineq - lp.A_ineq @ state.primal + dual_damping_ineq * state.dual_ineq
-        )
-        grad_dual_eq = (
-            lp.b_eq - lp.A_eq @ state.primal + dual_damping_eq * state.dual_eq
-        )
+        # Fused matvecs: 2 sparse ops instead of 4
+        dual = jnp.concatenate([state.dual_eq, state.dual_ineq])
+        Ax = lp.A @ state.primal          # shape: (n_eq + n_ineq,)
+        ATd = lp.A_T @ dual               # shape: (n_vars,)
+        grad_primal = lp.c + ATd + primal_damping * state.primal
+        residual = lp.b - Ax
+        grad_dual_eq = residual[: lp.n_eq] + dual_damping_eq * state.dual_eq
+        grad_dual_ineq = residual[lp.n_eq :] + dual_damping_ineq * state.dual_ineq
         return SaddleState(
             primal=grad_primal,
             dual_ineq=grad_dual_ineq,
@@ -365,13 +361,12 @@ def solve(
     def compute_epoch_metrics(average_state):
         objective_value = lp.objective(average_state.primal) * c_max
 
-        grad_primal = (
-            lp.c
-            + lp.A_ineq_T @ average_state.dual_ineq
-            + lp.A_eq_T @ average_state.dual_eq
-        )
-        grad_dual_ineq = lp.A_ineq @ average_state.primal - lp.b_ineq
-        grad_dual_eq = lp.A_eq @ average_state.primal - lp.b_eq
+        dual_avg = jnp.concatenate([average_state.dual_eq, average_state.dual_ineq])
+        Ax_avg = lp.A @ average_state.primal
+        grad_primal = lp.c + lp.A_T @ dual_avg
+        Ax_minus_b = Ax_avg - lp.b
+        grad_dual_eq = Ax_minus_b[: lp.n_eq]
+        grad_dual_ineq = Ax_minus_b[lp.n_eq :]
 
         # Unscale constraint violations to original space
         grad_dual_ineq_unscaled = grad_dual_ineq / jnp_row_scale_ineq
