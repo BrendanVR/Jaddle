@@ -6,12 +6,10 @@
 # %%
 import highspy as hspy
 
-# %%
-PROBLEM_NAME = "stp3d"
-
 # %% [markdown]
 # ## Load the LP
 # We load a MIPLIB LP from an MPS file using the `highspy` library.
+PROBLEM_NAME = "boeing"
 highs = hspy.Highs()
 highs.readModel(
     f"/home/brendanvr/python/Jaddle/data/{PROBLEM_NAME}.mps"
@@ -19,13 +17,11 @@ highs.readModel(
 
 # %%
 # Relax integrality
-info = highs.getInfo()
-
 for col in range(highs.numVariables):
     highs.changeColIntegrality(col, hspy.HighsVarType.kContinuous)
 
 # %%
-highs.setOptionValue("solver", "pdlp")
+# highs.setOptionValue("solver", "pdlp")
 highs.solve()
 
 # %%

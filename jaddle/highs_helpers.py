@@ -16,9 +16,10 @@ def highs_to_standard_form_sparse(lp: hspy.HighsLp) -> jl.LP:
              x <= upper_bounds
     Returns: jl.LP
     """
-    c = np.array(lp.col_cost_, dtype=np.float32)
-    lower_bounds = np.array(lp.col_lower_, dtype=np.float32)
-    upper_bounds = np.array(lp.col_upper_, dtype=np.float32)
+
+    c = np.array(lp.col_cost_, dtype=np.float64)
+    lower_bounds = np.array(lp.col_lower_, dtype=np.float64)
+    upper_bounds = np.array(lp.col_upper_, dtype=np.float64)
 
     # Build A matrix from sparse representation
     num_row = lp.a_matrix_.num_row_
@@ -26,11 +27,11 @@ def highs_to_standard_form_sparse(lp: hspy.HighsLp) -> jl.LP:
     A = sp.csc_matrix(
         (lp.a_matrix_.value_, lp.a_matrix_.index_, lp.a_matrix_.start_),
         shape=(num_row, num_col),
-        dtype=np.float32,
+        dtype=np.float64,
     )
 
-    row_lower = np.array(lp.row_lower_, dtype=np.float32)
-    row_upper = np.array(lp.row_upper_, dtype=np.float32)
+    row_lower = np.array(lp.row_lower_, dtype=np.float64)
+    row_upper = np.array(lp.row_upper_, dtype=np.float64)
 
     # Equality constraints: use a numeric tolerance and require finite bounds
     eps = 1e-8
@@ -40,8 +41,8 @@ def highs_to_standard_form_sparse(lp: hspy.HighsLp) -> jl.LP:
         finite_lower_all & finite_upper_all & (np.abs(row_lower - row_upper) <= eps)
     )
 
-    A_eq = A[eq_mask, :].tocsc().astype(np.float32)
-    b_eq = row_lower[eq_mask].astype(np.float32)
+    A_eq = A[eq_mask, :].tocsc().astype(np.float64)
+    b_eq = row_lower[eq_mask].astype(np.float64)
 
     # Inequality constraints (rows not treated as equalities)
     ineq_mask = ~eq_mask
@@ -57,19 +58,19 @@ def highs_to_standard_form_sparse(lp: hspy.HighsLp) -> jl.LP:
     vectors = []
 
     if finite_upper.any():
-        matrices.append(A_ineq_rows[finite_upper].tocsc().astype(np.float32))
-        vectors.append(row_upper_ineq[finite_upper].astype(np.float32))
+        matrices.append(A_ineq_rows[finite_upper].tocsc().astype(np.float64))
+        vectors.append(row_upper_ineq[finite_upper].astype(np.float64))
 
     if finite_lower.any():
-        matrices.append((-A_ineq_rows[finite_lower]).tocsc().astype(np.float32))
-        vectors.append((-row_lower_ineq[finite_lower]).astype(np.float32))
+        matrices.append((-A_ineq_rows[finite_lower]).tocsc().astype(np.float64))
+        vectors.append((-row_lower_ineq[finite_lower]).astype(np.float64))
 
     if len(matrices) > 0:
         A_ineq = sp.vstack(matrices, format="csc")
         b_ineq = np.concatenate(vectors)
     else:
         # No inequality rows: return empty (0 x num_col) matrix and empty RHS
-        A_ineq = sp.csc_matrix((0, num_col), dtype=np.float32)
-        b_ineq = np.empty(0, dtype=np.float32)
+        A_ineq = sp.csc_matrix((0, num_col), dtype=np.float64)
+        b_ineq = np.empty(0, dtype=np.float64)
 
     return jl.LP(c, A_eq, b_eq, A_ineq, b_ineq, lower_bounds, upper_bounds)

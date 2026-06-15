@@ -36,7 +36,7 @@ class HedgePoolState(NamedTuple):
             keep_mask[topk_idx] = True
 
         idx = np.where(keep_mask)[0]
-        keep_mask_jnp = jnp.array(keep_mask, dtype=jnp.float32)
+        keep_mask_jnp = jnp.array(keep_mask, dtype=jnp.float64)
         masked_logits = jnp.where(
             keep_mask_jnp > 0,
             self.log_weights,
