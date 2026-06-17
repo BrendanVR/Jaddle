@@ -6,12 +6,10 @@
 # %%
 import cuopt
 
-# %%
-PROBLEM_NAME = "sing2"
-
 # %% [markdown]
 # ## Load the LP
 # We load a MIPLIB LP from an MPS file using the `cuopt` library.
+PROBLEM_NAME = "momentum1"  # name of MIPLIB problem (without .mps extension)
 problem = cuopt.linear_programming.Problem.read(
     f"/home/brendanvr/python/Jaddle/data/{PROBLEM_NAME}.mps"
 ).relax()  # path to MPS file

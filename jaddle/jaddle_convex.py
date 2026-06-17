@@ -459,39 +459,31 @@ def solve(
                 missing_expert_state_warning_printed = True
             return
 
-        if isinstance(extracted, tuple):
-            primal_weights, dual_weights = extracted
-            primal_losses = dual_losses = None
-            primal_eta = dual_eta = None
+        if isinstance(extracted, dict):
+            weights = extracted["weights"]
+            losses = extracted["clipped_losses"]
+            centered_losses = extracted["centered_losses"]
+            hedge_eta = extracted["eta"]
         else:
-            primal_weights = extracted["primal_weights"]
-            dual_weights = extracted["dual_weights"]
-            primal_losses = extracted["primal_clipped_losses"]
-            dual_losses = extracted["dual_clipped_losses"]
-            primal_centered_losses = extracted["primal_centered_losses"]
-            dual_centered_losses = extracted["dual_centered_losses"]
-            primal_eta = extracted["primal_eta"]
-            dual_eta = extracted["dual_eta"]
+            # hedge_weights_from_state fallback: bare weight vector.
+            weights = extracted
+            losses = centered_losses = hedge_eta = None
 
         if verbose:
             print(
-                f"Expert Weights (epoch {epoch_count}): "
-                f"primal={np.asarray(primal_weights)}, dual={np.asarray(dual_weights)}"
+                f"Player Weights (epoch {epoch_count}): {np.asarray(weights)}"
             )
-            if primal_losses is not None and dual_losses is not None:
+            if losses is not None:
                 print(
-                    f"Expert Losses (epoch {epoch_count}): "
-                    f"primal={np.asarray(primal_losses)}, dual={np.asarray(dual_losses)}"
+                    f"Player Losses (epoch {epoch_count}): {np.asarray(losses)}"
                 )
                 print(
                     f"Centered Losses (epoch {epoch_count}): "
-                    f"primal={np.asarray(primal_centered_losses)}, "
-                    f"dual={np.asarray(dual_centered_losses)}"
+                    f"{np.asarray(centered_losses)}"
                 )
-            if primal_eta is not None and dual_eta is not None:
+            if hedge_eta is not None:
                 print(
-                    f"Hedge Etas (epoch {epoch_count}): "
-                    f"primal={float(primal_eta):.3e}, dual={float(dual_eta):.3e}"
+                    f"Hedge Eta (epoch {epoch_count}): {float(hedge_eta):.3e}"
                 )
             print("----------------------------------------------")
 

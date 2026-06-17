@@ -9,7 +9,14 @@ ScheduleLike = Union[float, Callable[[jnp.ndarray], jnp.ndarray]]
 
 
 class HedgePoolState(NamedTuple):
-    expert_states: tuple
+    # A pool of joint primal/dual players. `primal_states` and `dual_states`
+    # are tuples of equal length; index i is one player's optax state for its
+    # primal optimiser and its dual optimiser respectively. A single
+    # `log_weights` / `active_mask` governs the whole pool — primal and dual
+    # updates of a player are mixed with the SAME weight, which is what makes
+    # the players jointly selected rather than two independent populations.
+    primal_states: tuple
+    dual_states: tuple
     log_weights: jnp.ndarray
     active_mask: jnp.ndarray
     loss_scale: jnp.ndarray
@@ -17,6 +24,9 @@ class HedgePoolState(NamedTuple):
     last_normalized_losses: jnp.ndarray
     last_clipped_losses: jnp.ndarray
     last_centered_losses: jnp.ndarray
+    # Per-player step-ratio (k) control, a (count,) array. Populated only when
+    # the ensemble is built with per_expert_k; otherwise held at 1.0 and unused.
+    expert_k: jnp.ndarray = None
 
     def prune(self, threshold: float, min_keep: int = 1):
         """Mask experts with low weight while keeping state size fixed."""
@@ -46,7 +56,8 @@ class HedgePoolState(NamedTuple):
 
         return (
             HedgePoolState(
-                expert_states=self.expert_states,
+                primal_states=self.primal_states,
+                dual_states=self.dual_states,
                 log_weights=pruned_log_weights,
                 active_mask=keep_mask_jnp,
                 loss_scale=self.loss_scale,
@@ -54,37 +65,42 @@ class HedgePoolState(NamedTuple):
                 last_normalized_losses=self.last_normalized_losses,
                 last_clipped_losses=self.last_clipped_losses,
                 last_centered_losses=self.last_centered_losses,
+                expert_k=self.expert_k,
             ),
             jnp.array(idx),
         )
 
 
 class HedgeSaddleState(NamedTuple):
-    primal: HedgePoolState
-    dual: HedgePoolState
+    # Single pool of joint primal/dual players. `eta` is the Hedge temperature
+    # for the (one) weight vector.
+    pool: HedgePoolState
     step: jnp.ndarray
-    last_primal_eta: jnp.ndarray
-    last_dual_eta: jnp.ndarray
+    last_eta: jnp.ndarray
 
     def prune(self, threshold: float, min_keep: int = 1, min_step: int = 0):
         if int(self.step) < min_step:
-            primal_idx = jnp.arange(len(self.primal.expert_states))
-            dual_idx = jnp.arange(len(self.dual.expert_states))
-            return self, primal_idx, dual_idx
+            idx = jnp.arange(len(self.pool.primal_states))
+            return self, idx
 
-        pruned_primal, primal_idx = self.primal.prune(threshold, min_keep=min_keep)
-        pruned_dual, dual_idx = self.dual.prune(threshold, min_keep=min_keep)
+        pruned_pool, idx = self.pool.prune(threshold, min_keep=min_keep)
         return (
             HedgeSaddleState(
-                pruned_primal,
-                pruned_dual,
+                pruned_pool,
                 self.step,
-                self.last_primal_eta,
-                self.last_dual_eta,
+                self.last_eta,
             ),
-            primal_idx,
-            dual_idx,
+            idx,
         )
+
+
+class ExtragradientState(NamedTuple):
+    # Stored look-ahead point x_half = params - lr * grad (phase 0 output).
+    x_half: Any
+    # 0 = look-ahead phase (next call stores x_half, returns zero update),
+    # 1 = corrector phase  (next call returns corrector, advances step).
+    phase: jnp.ndarray
+    step: jnp.ndarray
 
 
 # %%
@@ -143,6 +159,24 @@ class CP:
         )
 
 
+_LEAST_NORM_DUAL_MAX_DENSE = 5_000_000  # skip if dense A would exceed ~5M elements (~40MB f64)
+
+
+def _least_norm_dual(A_eq, A_ineq, c, n_eq, n_ineq):
+    """Least-norm dual: min ‖y‖ s.t. Aᵀy ≈ -c (LP stationarity condition).
+
+    Returns (dual_eq, dual_ineq). ineq duals are clipped to ≥ 0.
+    Falls back to zeros when A is too large to densify cheaply.
+    """
+    n_vars = c.shape[0]
+    n_constraints = n_eq + n_ineq
+    if n_constraints * n_vars > _LEAST_NORM_DUAL_MAX_DENSE:
+        return jnp.zeros(n_eq), jnp.zeros(n_ineq)
+    A = jnp.concatenate([A_eq, A_ineq], axis=0)
+    y, _, _, _ = jnp.linalg.lstsq(A.T, -c)
+    return y[:n_eq], jnp.maximum(y[n_eq:], 0.0)
+
+
 class LP:
     def __init__(
         self,
@@ -190,15 +224,19 @@ class LP:
         return (dual_ineq * (self.A_ineq @ x - self.b_ineq)).sum()
 
     def initial_solution(self):
-        return SaddleState(
-            primal=optax.projections.projection_box(
-                jnp.zeros(self.num_variables()),
-                self.lower_bounds,
-                self.upper_bounds,
-            ),
-            dual_ineq=jnp.zeros(self.num_ineq_constraints()),
-            dual_eq=jnp.zeros(self.num_eq_constraints()),
+        primal = optax.projections.projection_box(
+            jnp.zeros(self.num_variables()),
+            self.lower_bounds,
+            self.upper_bounds,
         )
+        dual_eq, dual_ineq = _least_norm_dual(
+            jnp.array(self.A_eq),
+            jnp.array(self.A_ineq),
+            jnp.array(self.c),
+            self.num_eq_constraints(),
+            self.num_ineq_constraints(),
+        )
+        return SaddleState(primal=primal, dual_ineq=dual_ineq, dual_eq=dual_eq)
 
 
 class JaddleLP:
@@ -255,12 +293,22 @@ class JaddleLP:
         return (dual_ineq * (self.A_ineq @ x - self.b_ineq)).sum()
 
     def initial_solution(self):
-        return SaddleState(
-            primal=optax.projections.projection_box(
-                jnp.zeros(self.num_variables()),
-                self.lower_bounds,
-                self.upper_bounds,
-            ),
-            dual_ineq=jnp.zeros(self.num_ineq_constraints()),
-            dual_eq=jnp.zeros(self.num_eq_constraints()),
+        primal = optax.projections.projection_box(
+            jnp.zeros(self.num_variables()),
+            self.lower_bounds,
+            self.upper_bounds,
         )
+        n_eq = self.num_eq_constraints()
+        n_ineq = self.num_ineq_constraints()
+        n_vars = self.num_variables()
+        if (n_eq + n_ineq) * n_vars <= _LEAST_NORM_DUAL_MAX_DENSE:
+            dual_eq, dual_ineq = _least_norm_dual(
+                self.A_eq.todense(),
+                self.A_ineq.todense(),
+                self.c,
+                n_eq,
+                n_ineq,
+            )
+        else:
+            dual_eq, dual_ineq = jnp.zeros(n_eq), jnp.zeros(n_ineq)
+        return SaddleState(primal=primal, dual_ineq=dual_ineq, dual_eq=dual_eq)

@@ -130,10 +130,7 @@ def __sps(
 
     if run_epoch is None:
 
-        @functools.partial(
-            jax.jit,
-            static_argnames=("max_iter",),
-        )
+        @jax.jit
         def run_epoch(
             max_iter,
             start_iter,
@@ -303,7 +300,6 @@ def __sps(
                     return (i + 1, state, average_state, opt_state, total_weight), None
 
             elif per_iterate_k:
-
                 # Per-iterate primal/dual step-ratio control, the matvec-free
                 # lesson borrowed from PDHG/PDLP. PDLP's value is not its line
                 # search (which is what makes update_mode="pdhg" slow — a
@@ -339,8 +335,10 @@ def __sps(
                     updates, opt_state = opt_update(g, opt_state, state)
 
                     # --- ratio control (k) ---
-                    # Raw (pre-split) movement magnitudes from the updates the
-                    # optimiser just produced — no matvec, no extra state.
+                    # Use raw optimizer update norms (before split and projection).
+                    # A large primal update that gets clipped by box constraints
+                    # correctly signals the dual is under-powered: the primal is
+                    # already at its bound and the dual needs more force to move it.
                     up = updates.primal
                     ud = jnp.concatenate([updates.dual_eq, updates.dual_ineq])
                     norm_p = jnp.sqrt(up @ up) + 1e-30
@@ -437,11 +435,16 @@ def __sps(
 
                     return (i + 1, state, average_state, opt_state, total_weight), None
 
-            (i, state, average_state, opt_state, total_weight), _ = jax.lax.scan(
-                step,
+            end_iter = start_iter + max_iter
+
+            def cond(carry):
+                i, *_ = carry
+                return i < end_iter
+
+            i, state, average_state, opt_state, total_weight = jax.lax.while_loop(
+                cond,
+                lambda carry: step(carry, None)[0],
                 (start_iter, state, average_state, opt_state, total_weight),
-                None,
-                length=max_iter,
             )
 
             return i, state, average_state, opt_state, total_weight
@@ -553,13 +556,13 @@ def solve(
     max_epochs=None,
     initial_solution=None,
     initial_opt_state=None,
-    iterations_per_epoch=int(1e4),
+    iterations_per_epoch=int(1e3),
     dual_damping_ineq=0.0,
     dual_damping_eq=0.0,
     primal_damping=0.0,
     primal_feasibility_tolerance=1e-3,
     dual_feasibility_tolerance=1e-3,
-    dual_gap_tolerance=1e-3,
+    dual_gap_tolerance=1e-2,
     weight_function=lambda _: 1.0,
     exponential_weight=0.01,
     verbose=False,
@@ -597,6 +600,8 @@ def solve(
     primal_stop=False,
     primal_stop_window=5,
     primal_stop_obj_tol=1e-4,
+    iterations_per_epoch_decay=1.0,
+    iterations_per_epoch_min=100,
 ):
     """
     Solve a linear program via saddle-point optimisation.
@@ -717,9 +722,6 @@ def solve(
         print("====Starting Solve====")
         print("----------------------------------------------")
 
-    if initial_solution is None:
-        initial_solution = lp.initial_solution()
-
     if scale == "ruiz":
         lp, row_scale, col_scale = ruiz_scaling(lp)
         if verbose:
@@ -748,6 +750,9 @@ def solve(
     else:
         row_scale = np.ones(lp.A_eq.shape[0] + lp.A_ineq.shape[0])
         col_scale = np.ones(lp.c.shape[0])
+
+    if initial_solution is None:
+        initial_solution = lp.initial_solution()
 
     row_scale_ineq = row_scale[len(lp.b_eq) :]
     row_scale_eq = row_scale[: len(lp.b_eq)]
@@ -894,10 +899,13 @@ def solve(
         #   * primal feasibility: constraint_bound within tolerance
         #   * dual feasibility: reduced-cost residual within tolerance
         #   * a finite, small duality gap
-        # The gap is NaN exactly when the dual is infeasible, so `dual_gap_is_finite`
-        # already implies dual feasibility; the residual check is kept for clarity.
-        # `primal_grad_norm` and `complementarity_slack` are diagnostics only — they
-        # are redundant with these conditions and do not gate termination.
+        # The gap is computed in scaled space (Ruiz+PC) and the objective is in
+        # true units (column scaling cancels in c^T x), so normalising by
+        # objective_value would mix units. Instead we normalise by
+        # (1 + |gap_at_start|) — but since we don't track that, we just use an
+        # absolute tolerance on the scaled gap. The kkt_merit used for restarts
+        # already does the right relative normalisation; this gate just needs
+        # to be loose enough to not block when the gap is genuinely small.
         return (
             (constraint_bound <= primal_feasibility_tolerance)
             & (dual_feasibility_residual <= dual_feasibility_threshold)
@@ -956,6 +964,7 @@ def solve(
     count = 0
     total_weight = 0.0
     is_converged = True
+    current_iterations_per_epoch = iterations_per_epoch
 
     # Rolling window of recent objective values for the opt-in primal_stop rule
     # (oldest first). Seeded with inf so the window is not "full" until enough
@@ -1037,40 +1046,26 @@ def solve(
                 missing_expert_state_warning_printed = True
             return
 
-        if isinstance(extracted, tuple):
-            primal_weights, dual_weights = extracted
-            primal_losses = dual_losses = None
-            primal_eta = dual_eta = None
+        if isinstance(extracted, dict):
+            weights = extracted["weights"]
+            losses = extracted["clipped_losses"]
+            centered_losses = extracted["centered_losses"]
+            hedge_eta = extracted["eta"]
         else:
-            primal_weights = extracted["primal_weights"]
-            dual_weights = extracted["dual_weights"]
-            primal_losses = extracted["primal_clipped_losses"]
-            dual_losses = extracted["dual_clipped_losses"]
-            primal_centered_losses = extracted["primal_centered_losses"]
-            dual_centered_losses = extracted["dual_centered_losses"]
-            primal_eta = extracted["primal_eta"]
-            dual_eta = extracted["dual_eta"]
+            # hedge_weights_from_state fallback: bare weight vector.
+            weights = extracted
+            losses = centered_losses = hedge_eta = None
 
         if verbose:
-            print(
-                f"Expert Weights (epoch {epoch_count}): "
-                f"primal={np.asarray(primal_weights)}, dual={np.asarray(dual_weights)}"
-            )
-            if primal_losses is not None and dual_losses is not None:
-                print(
-                    f"Expert Losses (epoch {epoch_count}): "
-                    f"primal={np.asarray(primal_losses)}, dual={np.asarray(dual_losses)}"
-                )
+            print(f"Player Weights (epoch {epoch_count}): {np.asarray(weights)}")
+            if losses is not None:
+                print(f"Player Losses (epoch {epoch_count}): {np.asarray(losses)}")
                 print(
                     f"Centered Losses (epoch {epoch_count}): "
-                    f"primal={np.asarray(primal_centered_losses)}, "
-                    f"dual={np.asarray(dual_centered_losses)}"
+                    f"{np.asarray(centered_losses)}"
                 )
-            if primal_eta is not None and dual_eta is not None:
-                print(
-                    f"Hedge Etas (epoch {epoch_count}): "
-                    f"primal={float(primal_eta):.3e}, dual={float(dual_eta):.3e}"
-                )
+            if hedge_eta is not None:
+                print(f"Hedge Eta (epoch {epoch_count}): {float(hedge_eta):.3e}")
             print("----------------------------------------------")
 
     def is_done():
@@ -1102,7 +1097,7 @@ def solve(
                 opt_state,
                 total_weight,
             ) = __sps(
-                iterations_per_epoch,
+                current_iterations_per_epoch,
                 i - restart_i_offset,
                 lp,
                 optimiser,
@@ -1206,14 +1201,19 @@ def solve(
                     f"|DG {duality_gap:.2e} ({dual_gap_status})|"
                     f"|Time {finish_epoch_time - start_epoch_time:.2f}s|"
                 )
-                print(
-                    f"  DG decomp: "
-                    f"bound={gap_bound_comp:.2e} "
-                    f"ineq={gap_ineq_comp:.2e} "
-                    f"eq={gap_eq_comp:.2e} "
-                    f"(sum={gap_bound_comp + gap_ineq_comp + gap_eq_comp:.2e})"
-                )
                 print("----------------------------------------------")
+
+                # Per-iterate k/eta carry in the packed opt_state as
+                # (optax_state, k, eta, prev_Ax, prev_dual); surface the values
+                # the controller settled on at the end of this epoch.
+                if per_iterate_k:
+                    print(
+                        f"  per-iterate k={float(opt_state[1]):.3f}"
+                        f" eta={float(opt_state[2]):.3e}"
+                        f" (τ={float(opt_state[2]) / float(opt_state[1]):.2e},"
+                        f" σ={float(opt_state[2]) * float(opt_state[1]):.2e})"
+                    )
+                    print("----------------------------------------------")
 
                 print_expert_weights(count, opt_state)
 
@@ -1302,6 +1302,10 @@ def solve(
                     merit_at_last_restart = restart_merit
                     epochs_since_restart = 0
                     current_cycle_cap *= restart_multiplier
+                    current_iterations_per_epoch = max(
+                        iterations_per_epoch_min,
+                        int(current_iterations_per_epoch * iterations_per_epoch_decay),
+                    )
                     restarts_done += 1
                     if verbose:
                         reason = (
@@ -1313,7 +1317,8 @@ def solve(
                         print(
                             f"Restart {restarts_done}/{restarts} at epoch {count} "
                             f"({reason}, merit={float(restart_merit):.2e} "
-                            f"[{which}], next cap={current_cycle_cap:.0f} epochs)"
+                            f"[{which}], next cap={current_cycle_cap:.0f} epochs, "
+                            f"iters/epoch={current_iterations_per_epoch})"
                         )
                         print("----------------------------------------------")
 
@@ -1454,7 +1459,7 @@ def __convert_to_scipy(jsp_mat: jsp.BCOO) -> sp.csc_matrix:
     return sp.csc_matrix((data, (row, col)), shape=jsp_mat.shape)
 
 
-def ruiz_scaling(lp: LP, max_iter=10, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
+def ruiz_scaling(lp: LP, max_iter=20, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
     """
     Applies Ruiz scaling to an LP in standard form with sparse matrices:
         min c^T x
