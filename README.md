@@ -62,7 +62,6 @@ solution = jl.solve(
 ```
 
 `update_mode` controls the SPS player updates: use `"synchronous"` (default) for joint primal/dual updates, or `"alternating"` for primal-then-dual updates within each iteration.
-```
 
 ---
 

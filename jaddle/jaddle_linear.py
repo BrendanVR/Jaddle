@@ -53,6 +53,7 @@ def __sps(
     per_iterate_eta_lo=1e-4,
     per_iterate_eta_hi=1e4,
     eta_init=1.0,
+    extragradient=False,
 ):
 
     def projection_primal(primal_state):
@@ -125,6 +126,7 @@ def __sps(
         float(per_iterate_eta_theta),
         float(per_iterate_eta_lo),
         float(per_iterate_eta_hi),
+        bool(extragradient),
     )
     run_epoch = _LINEAR_RUN_EPOCH_CACHE.get(cache_key)
 
@@ -403,6 +405,116 @@ def __sps(
 
                     return (i + 1, state, average_state, opt_state, total_weight), None
 
+            elif extragradient:
+                # Extragradient (Korpelevich) using jo.extragradient's two-call
+                # protocol, but routing gradients through the user-supplied
+                # optimiser for adaptive scaling (adam etc.). This gives the
+                # stabilising effect of the base optimiser plus the corrector
+                # step's second gradient evaluation.
+                #
+                # Each iteration:
+                #   Look-ahead: pass g at state through optimiser → la_updates,
+                #       la_opt_state (non-committed); state_half = proj(state +
+                #       la_updates).
+                #   Corrector:  pass g_half at state_half through the ORIGINAL
+                #       opt_state (not la_opt_state) → corr_updates, opt_state
+                #       (committed); state = proj(state + corr_updates).
+                #
+                # The (eta/k, eta*k) split is applied to each gradient before
+                # passing it to opt_update, exactly as in the per_iterate_k path.
+                # k and eta adapt from the look-ahead gradient norms.
+                def step(carry, _):
+                    i, state, average_state, opt_state, total_weight = carry
+                    opt_state, k, eta, prev_Ax, prev_dual = opt_state
+
+                    # --- Look-ahead gradient ---
+                    g, Ax = grad_with_Ax(state)
+
+                    # --- per-iterate k (ratio) from look-ahead gradient norms ---
+                    up = g.primal
+                    ud = jnp.concatenate([g.dual_eq, g.dual_ineq])
+                    norm_p = jnp.sqrt(up @ up) + 1e-30
+                    norm_d = jnp.sqrt(ud @ ud) + 1e-30
+                    k_target = jnp.sqrt(norm_p / norm_d)
+                    log_k = per_iterate_k_theta * jnp.log(k_target) + (
+                        1.0 - per_iterate_k_theta
+                    ) * jnp.log(k)
+                    k = jnp.clip(jnp.exp(log_k), per_iterate_k_lo, per_iterate_k_hi)
+
+                    # --- per-iterate eta (magnitude) ---
+                    if per_iterate_eta:
+                        dual_now = jnp.concatenate([state.dual_eq, state.dual_ineq])
+                        A_dx = Ax - prev_Ax
+                        dy = dual_now - prev_dual
+                        omega = k * k
+                        norm_w = omega * (norm_p * norm_p) + (dy @ dy) / omega
+                        interaction = jnp.abs(dy @ A_dx)
+                        eta_bar = jnp.where(
+                            interaction > 1e-30,
+                            norm_w / (2.0 * interaction),
+                            eta,
+                        )
+                        log_eta = per_iterate_eta_theta * jnp.log(eta_bar) + (
+                            1.0 - per_iterate_eta_theta
+                        ) * jnp.log(eta)
+                        eta = jnp.clip(
+                            jnp.exp(log_eta),
+                            per_iterate_eta_lo,
+                            per_iterate_eta_hi,
+                        )
+                        prev_Ax = Ax
+                        prev_dual = dual_now
+
+                    # Look-ahead: run the user's optimiser on g at state to
+                    # get the look-ahead point. la_opt_state is NOT committed —
+                    # we discard it and reuse the original opt_state for the
+                    # corrector so that momentum/statistics only advance once.
+                    scaled_g = SaddleState(
+                        primal=g.primal * (eta / k),
+                        dual_ineq=g.dual_ineq * (eta * k),
+                        dual_eq=g.dual_eq * (eta * k),
+                    )
+                    la_updates, _ = opt_update(scaled_g, opt_state, state)
+                    state_half = apply_updates(state, la_updates)
+                    state_half = SaddleState(
+                        primal=projection_primal(state_half.primal),
+                        dual_ineq=projection_non_negative(state_half.dual_ineq),
+                        dual_eq=state_half.dual_eq,
+                    )
+
+                    # Corrector: run the user's optimiser on g_half at
+                    # state_half, but applied from original state (Korpelevich
+                    # convention). opt_state IS committed here.
+                    g_half, _ = grad_with_Ax(state_half)
+                    scaled_g_half = SaddleState(
+                        primal=g_half.primal * (eta / k),
+                        dual_ineq=g_half.dual_ineq * (eta * k),
+                        dual_eq=g_half.dual_eq * (eta * k),
+                    )
+                    corr_updates, opt_state = opt_update(
+                        scaled_g_half, opt_state, state
+                    )
+                    state = apply_updates(state, corr_updates)
+                    state = SaddleState(
+                        primal=projection_primal(state.primal),
+                        dual_ineq=projection_non_negative(state.dual_ineq),
+                        dual_eq=state.dual_eq,
+                    )
+                    opt_state = (opt_state, k, eta, prev_Ax, prev_dual)
+
+                    if average == "polyak":
+                        w = weight_function(i)
+                        total_weight = total_weight + w
+                        average_state = optax.incremental_update(
+                            state, average_state, w / total_weight
+                        )
+                    elif average == "exponential":
+                        average_state = optax.incremental_update(
+                            state, average_state, exponential_weight
+                        )
+
+                    return (i + 1, state, average_state, opt_state, total_weight), None
+
             else:
 
                 def step(carry, _):
@@ -463,7 +575,7 @@ def __sps(
     elif update_mode == "pdhg":
         # PDHG carries its scalar step + primal weight in lieu of an optax state.
         opt_state = jnp.array([pdhg_eta_init, pdhg_omega_init])
-    elif per_iterate_k:
+    elif per_iterate_k or extragradient:
         # Pack the running step-ratio k, magnitude eta, and the previous-iterate
         # caches (prev_Ax, prev_dual) alongside the optax state. `solve` threads
         # this packed tuple opaquely across epochs.
@@ -563,6 +675,8 @@ def solve(
     primal_feasibility_tolerance=1e-3,
     dual_feasibility_tolerance=1e-3,
     dual_gap_tolerance=1e-2,
+    primal_grad_norm_tolerance=None,
+    complementarity_slack_tolerance=None,
     weight_function=lambda _: 1.0,
     exponential_weight=0.01,
     verbose=False,
@@ -582,6 +696,7 @@ def solve(
     per_iterate_eta_lo=1e-4,
     per_iterate_eta_hi=1e4,
     eta_init=1.0,
+    extragradient=False,
     scale=None,
     expert_diagnostics=False,
     output_opt_state=False,
@@ -609,9 +724,11 @@ def solve(
     Termination uses the standard LP optimality certificate: primal feasibility
     (``primal_feasibility_tolerance``), dual feasibility
     (``dual_feasibility_tolerance``), and a finite duality gap within
-    ``dual_gap_tolerance``. ``primal_grad_norm`` and ``complementarity_slack``
-    are reported as diagnostics only — they are redundant with these three
-    conditions and do not gate termination.
+    ``dual_gap_tolerance``). An alternative KKT certificate — primal feasibility
+    + complementary slackness + small primal gradient norm (‖c + Aᵀy‖) — fires
+    when both ``primal_grad_norm_tolerance`` and
+    ``complementarity_slack_tolerance`` are set; convergence is declared when
+    either certificate is satisfied.
 
     ``update_mode='pdhg'`` selects true PDHG (Chambolle–Pock) with a PDLP-style
     *per-iteration* adaptive step size and primal weight, bypassing the optax
@@ -713,10 +830,26 @@ def solve(
             "the scan); adaptive_k adapts it once per epoch from the certificate "
             "residuals."
         )
-    if per_iterate_eta and not per_iterate_k:
+    if per_iterate_eta and not per_iterate_k and not extragradient:
         raise ValueError(
-            "per_iterate_eta (magnitude control) requires per_iterate_k=True: the "
-            "two share the same packed step-state and the (eta/k, eta*k) split."
+            "per_iterate_eta (magnitude control) requires per_iterate_k=True or "
+            "extragradient=True: the two share the same packed step-state and the "
+            "(eta/k, eta*k) split."
+        )
+    if extragradient and update_mode != "synchronous":
+        raise ValueError(
+            "extragradient is only implemented for update_mode='synchronous'."
+        )
+    if extragradient and per_iterate_k:
+        raise ValueError(
+            "extragradient and per_iterate_k both control per-iterate stepping; "
+            "use extragradient=True to get the look-ahead/corrector step with "
+            "built-in k/eta adaptation."
+        )
+    if extragradient and adaptive_k:
+        raise ValueError(
+            "extragradient and adaptive_k both control the primal/dual step ratio; "
+            "use one."
         )
     if verbose:
         print("====Starting Solve====")
@@ -894,6 +1027,8 @@ def solve(
         dual_feasibility_residual,
         duality_gap,
         dual_gap_is_finite,
+        primal_grad_norm,
+        complementarity_slack,
     ):
         # Standard LP optimality certificate — all three conditions must hold:
         #   * primal feasibility: constraint_bound within tolerance
@@ -906,12 +1041,23 @@ def solve(
         # absolute tolerance on the scaled gap. The kkt_merit used for restarts
         # already does the right relative normalisation; this gate just needs
         # to be loose enough to not block when the gap is genuinely small.
-        return (
+        standard = (
             (constraint_bound <= primal_feasibility_tolerance)
             & (dual_feasibility_residual <= dual_feasibility_threshold)
             & dual_gap_is_finite
             & (jnp.abs(duality_gap) <= dual_gap_tolerance)
         )
+        # Alternative KKT certificate: primal feasibility + complementary
+        # slackness + small primal gradient norm (‖c + Aᵀy‖). Active only when
+        # both tolerances are set; otherwise this branch never fires.
+        if primal_grad_norm_tolerance is not None and complementarity_slack_tolerance is not None:
+            kkt_alt = (
+                (constraint_bound <= primal_feasibility_tolerance)
+                & (primal_grad_norm <= primal_grad_norm_tolerance)
+                & (complementarity_slack <= complementarity_slack_tolerance)
+            )
+            return standard | kkt_alt
+        return standard
 
     def converged_primal(constraint_bound, obj_window):
         # Dual-free, opt-in stopping rule for "I just want the primal solved".
@@ -941,7 +1087,7 @@ def solve(
         # PDHG carries its own [eta, omega] step-state; the optax optimiser is
         # unused in this mode.
         opt_state = jnp.array([pdhg_eta_init, pdhg_omega_init])
-    elif per_iterate_k:
+    elif per_iterate_k or extragradient:
         # Pack the per-iterate step-ratio k, magnitude eta, and previous-iterate
         # caches (prev_Ax, prev_dual) with the optax state.
         _pik_dtype = initial_solution.primal.dtype
@@ -1077,6 +1223,8 @@ def solve(
                 dual_feasibility_residual,
                 duality_gap,
                 dual_gap_is_finite,
+                primal_grad_norm,
+                complementarity_slack,
             )
         )
 
@@ -1126,6 +1274,7 @@ def solve(
                 per_iterate_eta_lo=per_iterate_eta_lo,
                 per_iterate_eta_hi=per_iterate_eta_hi,
                 eta_init=eta_init,
+                extragradient=extragradient,
             )
             # __sps increments the (restart-shifted) counter; restore global i.
             i = shifted_i + restart_i_offset
@@ -1206,7 +1355,7 @@ def solve(
                 # Per-iterate k/eta carry in the packed opt_state as
                 # (optax_state, k, eta, prev_Ax, prev_dual); surface the values
                 # the controller settled on at the end of this epoch.
-                if per_iterate_k:
+                if per_iterate_k or extragradient:
                     print(
                         f"  per-iterate k={float(opt_state[1]):.3f}"
                         f" eta={float(opt_state[2]):.3e}"
@@ -1278,7 +1427,7 @@ def solve(
                         # Reset PDHG's step/primal-weight to its initial guess;
                         # the iterate (warm start) is preserved.
                         opt_state = jnp.array([pdhg_eta_init, pdhg_omega_init])
-                    elif per_iterate_k:
+                    elif per_iterate_k or extragradient:
                         # Reset momentum but carry the learned k and eta; reseed
                         # the previous-iterate caches at the current warm-start.
                         opt_state = (
@@ -1459,6 +1608,25 @@ def __convert_to_scipy(jsp_mat: jsp.BCOO) -> sp.csc_matrix:
     return sp.csc_matrix((data, (row, col)), shape=jsp_mat.shape)
 
 
+def spectral_norm(lp: JaddleLP, n_iter: int = 30) -> float:
+    """Estimate ‖[A_eq; A_ineq]‖₂ via power iteration.
+
+    Returns the spectral norm, which gives the theoretically safe step size
+    bound ``η ≤ 1 / spectral_norm(lp)`` for PDHG-style solvers.
+    """
+    key = jax.random.PRNGKey(0)
+    v = jax.random.normal(key, (lp.A_eq.shape[1],))
+    v = v / jnp.linalg.norm(v)
+
+    A_eq, A_ineq = lp.A_eq, lp.A_ineq
+    for _ in range(n_iter):
+        v2 = A_eq.T @ (A_eq @ v) + A_ineq.T @ (A_ineq @ v)
+        sigma = jnp.linalg.norm(v2)
+        v = v2 / sigma
+
+    return float(jnp.sqrt(sigma))
+
+
 def ruiz_scaling(lp: LP, max_iter=20, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
     """
     Applies Ruiz scaling to an LP in standard form with sparse matrices:
@@ -1613,7 +1781,7 @@ def pc_scaling(lp: LP, max_iter=1, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
     return lp_scaled, dr, dc
 
 
-def project_onto_eq(lp: LP, primal: jnp.ndarray, tol: 1e-6) -> jnp.ndarray:
+def project_onto_eq(lp: JaddleLP, primal: jnp.ndarray, tol: 1e-6) -> jnp.ndarray:
     """
     Projects a primal solution onto the equality constraints using JAX GMRES.
 
@@ -1629,12 +1797,15 @@ def project_onto_eq(lp: LP, primal: jnp.ndarray, tol: 1e-6) -> jnp.ndarray:
     """
 
     # Solve normal equations: A_eq^T @ A_eq @ delta = A_eq^T @ (b_eq - A_eq @ primal)
+
+    A_eq_T = lp.A_eq.transpose()
+
     residual = lp.b_eq - lp.A_eq @ primal
 
     def matvec(v):
-        return lp.A_eq_T @ (lp.A_eq @ v)
+        return A_eq_T @ (lp.A_eq @ v)
 
-    delta, info = gmres(matvec, lp.A_eq_T @ residual, tol=tol)
+    delta, info = gmres(matvec, A_eq_T @ residual, tol=tol)
 
     if info != 0:
         print(f"GMRES did not converge (info={info})")
