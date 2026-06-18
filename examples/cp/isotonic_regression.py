@@ -18,10 +18,10 @@ import optax
 # %% [markdown]
 # ## Generate Synthetic Data
 # We will create synthetic data that follows a cubic relationship with some added noise.
-n = 100
+n = 1000
 x = np.linspace(-1, 1, n)
 y = x**3
-y += 0.1 * np.random.randn(n)  # add noise
+y += 0.05 * np.random.randn(n)  # add noise
 
 
 # %% [markdown]
@@ -37,10 +37,10 @@ def constraints_ineq(y_pred):
 
 
 def constraints_eq(y_pred):
-    return jnp.array([0.0])  # No equality constraints in this example
+    return jnp.zeros(0)  # No equality constraints in this example
 
 
-lower_bounds = -np.ones(n)
+lower_bounds = -jnp.ones(n)
 upper_bounds = jnp.ones(n)
 
 cp = jc.CP(
@@ -64,11 +64,14 @@ solution, _ = jc.solve(
     optimiser=optimiser,
     average=True,
     update_mode="synchronous",
-    extragradient=True,
-    per_iterate_k_hi=k_max,
-    per_iterate_k_lo=1 / k_max,
+    # per_iterate_k=True,
+    # per_iterate_k_hi=k_max,
+    # per_iterate_k_lo=1 / k_max,
     verbose=True,
     log_every=1,
+    restarts=10,
+    restart_multiplier=1.5,
+    iterations_per_epoch_min=100,
 )
 
 
@@ -92,9 +95,7 @@ plt.show()
 # Verify that the solution satisfies the constraints
 y_pred = solution.primal
 ineq_violations = constraints_ineq(y_pred)
-eq_violations = constraints_eq(y_pred)
 print("Max Inequality Constraint Violation (should be <= 0):", cp.ineq_slack(y_pred))
-print("Max Equality Constraint Violation (should be == 0):", cp.eq_slack(y_pred))
 print("Optimal Objective Value:", objective(y_pred))
 
 # %%

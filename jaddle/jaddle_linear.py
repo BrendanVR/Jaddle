@@ -675,8 +675,8 @@ def solve(
     primal_feasibility_tolerance=1e-3,
     dual_feasibility_tolerance=1e-3,
     dual_gap_tolerance=1e-2,
-    primal_grad_norm_tolerance=None,
-    complementarity_slack_tolerance=None,
+    primal_grad_norm_tolerance=1e-3,
+    complementarity_slack_tolerance=1e-3,
     weight_function=lambda _: 1.0,
     exponential_weight=0.01,
     verbose=False,
@@ -717,6 +717,10 @@ def solve(
     primal_stop_obj_tol=1e-4,
     iterations_per_epoch_decay=1.0,
     iterations_per_epoch_min=100,
+    polish_optimiser=None,
+    polish_lr_scale_threshold=1e-2,
+    polish_merit_threshold=None,
+    eq_projection_threshold=None,
 ):
     """
     Solve a linear program via saddle-point optimisation.
@@ -801,6 +805,23 @@ def solve(
         primal_stop_obj_tol: Relative-change threshold for the objective stall:
             stop when ``|obj_now - obj_{window ago}| / (1 + |obj_now|)`` falls
             below this (default 1e-4). Only used when ``primal_stop=True``.
+        polish_optimiser: Optional optax optimiser to cross over to once the
+            base learning rate has decayed sufficiently. When ``lr_scale`` drops
+            below ``polish_lr_scale_threshold`` on a restart, the main optimiser
+            is replaced by this one and ``lr_scale`` is reset to 1.0 so the
+            polisher's own learning rate is unaffected by the main solver's
+            accumulated decay. The polisher warm-starts from the current restart
+            point and runs for the remainder of the solve budget. Default
+            ``None`` disables crossover.
+        polish_lr_scale_threshold: ``lr_scale`` value below which crossover to
+            ``polish_optimiser`` fires (default 1e-2). Only meaningful when
+            ``polish_optimiser`` is set.
+        eq_projection_threshold: When set, after each epoch the unscaled equality
+            residual is checked; if it exceeds this value the primal (and average)
+            are projected onto the equality manifold ``A_eq x = b_eq`` via the
+            precomputed factorisation of ``A_eq A_eq^T``. Default ``None``
+            disables projection. Only useful when equality feasibility is the
+            bottleneck; has no effect when there are no equality constraints.
     """
 
     if log_every < 1:
@@ -894,6 +915,27 @@ def solve(
     jnp_row_scale_ineq = jnp.array(row_scale_ineq)
     jnp_row_scale_eq = jnp.array(row_scale_eq)
 
+    # Precompute equality-constraint projection: x ← x - A_eq^T (A_eq A_eq^T)^{-1} (A_eq x - b_eq).
+    # The factorisation is done once in scipy (scaled space); the apply is a cheap
+    # pair of matvecs. Only built when eq_projection_threshold is set and there are
+    # equality constraints.
+    _eq_project = None
+    if eq_projection_threshold is not None and lp.A_eq.shape[0] > 0:
+        import scipy.sparse.linalg as spla
+
+        _A_eq_sp = __convert_to_scipy(lp.A_eq)
+        AeqAeqT = _A_eq_sp @ _A_eq_sp.T
+        _eq_factor = spla.factorized(AeqAeqT.tocsc())
+        _b_eq_np = np.array(lp.b_eq)
+
+        def _eq_project(primal):
+            # Run entirely in numpy/scipy to avoid materialising large JAX sparse
+            # intermediates on the GPU. Pull the primal to CPU, project, push back.
+            x = np.asarray(primal)
+            residual = _A_eq_sp @ x - _b_eq_np
+            correction = _eq_factor(residual)
+            return jnp.array(x - _A_eq_sp.T @ correction)
+
     if scaled_objective:
         c_max = jnp.max(jnp.abs(lp.c))
         lp.c = lp.c / c_max
@@ -978,13 +1020,23 @@ def solve(
             ),
         )
 
+        # For box-constrained variables the violation is the projected-gradient
+        # magnitude: |x - proj(x - r, lb, ub)|.  For one-sided or free
+        # variables the classical reduced-cost sign rules apply.
+        proj_box = projection_box(
+            average_state.primal - reduced_cost, lower_bounds, upper_bounds
+        )
         dual_feasibility_violation = jnp.where(
-            has_only_lower,
-            jnp.maximum(-reduced_cost, 0.0),
+            has_both_bounds,
+            jnp.abs(average_state.primal - proj_box),
             jnp.where(
-                has_only_upper,
-                jnp.maximum(reduced_cost, 0.0),
-                jnp.where(has_no_bounds, jnp.abs(reduced_cost), 0.0),
+                has_only_lower,
+                jnp.maximum(-reduced_cost, 0.0),
+                jnp.where(
+                    has_only_upper,
+                    jnp.maximum(reduced_cost, 0.0),
+                    jnp.abs(reduced_cost),  # has_no_bounds (free variable)
+                ),
             ),
         )
         dual_feasibility_residual = jnp.max(dual_feasibility_violation)
@@ -1050,7 +1102,10 @@ def solve(
         # Alternative KKT certificate: primal feasibility + complementary
         # slackness + small primal gradient norm (‖c + Aᵀy‖). Active only when
         # both tolerances are set; otherwise this branch never fires.
-        if primal_grad_norm_tolerance is not None and complementarity_slack_tolerance is not None:
+        if (
+            primal_grad_norm_tolerance is not None
+            and complementarity_slack_tolerance is not None
+        ):
             kkt_alt = (
                 (constraint_bound <= primal_feasibility_tolerance)
                 & (primal_grad_norm <= primal_grad_norm_tolerance)
@@ -1111,6 +1166,8 @@ def solve(
     total_weight = 0.0
     is_converged = True
     current_iterations_per_epoch = iterations_per_epoch
+    active_extragradient = extragradient
+    active_per_iterate_k = per_iterate_k
 
     # Rolling window of recent objective values for the opt-in primal_stop rule
     # (oldest first). Seeded with inf so the window is not "full" until enough
@@ -1122,8 +1179,10 @@ def solve(
     # learning rates are rewritten as (base_lr(t)/k, base_lr(t)*k), decoupling
     # ratio-adaptation from magnitude-decay. `base_lr` may be a constant or a
     # callable of the epoch count for an annealing schedule.
+    lr_scale = 1.0
+
     def base_lr_at(epoch):
-        return base_lr(epoch) if callable(base_lr) else base_lr
+        return (base_lr(epoch) if callable(base_lr) else base_lr) * lr_scale
 
     k = jnp.asarray(k_init)
     if adaptive_k:
@@ -1264,7 +1323,7 @@ def solve(
                 pdhg_omega_init=pdhg_omega_init,
                 pdhg_reduce=pdhg_reduce,
                 pdhg_grow=pdhg_grow,
-                per_iterate_k=per_iterate_k,
+                per_iterate_k=active_per_iterate_k,
                 per_iterate_k_theta=per_iterate_k_theta,
                 per_iterate_k_lo=per_iterate_k_lo,
                 per_iterate_k_hi=per_iterate_k_hi,
@@ -1274,7 +1333,7 @@ def solve(
                 per_iterate_eta_lo=per_iterate_eta_lo,
                 per_iterate_eta_hi=per_iterate_eta_hi,
                 eta_init=eta_init,
-                extragradient=extragradient,
+                extragradient=active_extragradient,
             )
             # __sps increments the (restart-shifted) counter; restore global i.
             i = shifted_i + restart_i_offset
@@ -1299,6 +1358,37 @@ def solve(
 
             finish_epoch_time = time.time()
             count += 1
+
+            # Equality-constraint projection: if the unscaled equality residual
+            # exceeds the threshold, project the primal (and average) onto the
+            # equality manifold. Done after metrics so the logged residual reflects
+            # the pre-projection state; the projected iterate is the warm-start for
+            # the next epoch.
+            if _eq_project is not None:
+                eq_residual = float(
+                    np.max(
+                        np.abs(_A_eq_sp @ np.asarray(state.primal) - _b_eq_np)
+                        / np.asarray(jnp_row_scale_eq)
+                    )
+                )
+                if eq_residual > eq_projection_threshold:
+                    projected_primal = _eq_project(state.primal)
+                    state = SaddleState(
+                        primal=projected_primal,
+                        dual_eq=state.dual_eq,
+                        dual_ineq=state.dual_ineq,
+                    )
+                    if average != "off":
+                        projected_avg_primal = _eq_project(average_state.primal)
+                        average_state = SaddleState(
+                            primal=projected_avg_primal,
+                            dual_eq=average_state.dual_eq,
+                            dual_ineq=average_state.dual_ineq,
+                        )
+                    if verbose:
+                        print(
+                            f"  → Equality projection (eq_residual={eq_residual:.2e})"
+                        )
 
             # Roll the latest objective into the primal_stop window (oldest first).
             obj_window = jnp.concatenate(
@@ -1355,7 +1445,7 @@ def solve(
                 # Per-iterate k/eta carry in the packed opt_state as
                 # (optax_state, k, eta, prev_Ax, prev_dual); surface the values
                 # the controller settled on at the end of this epoch.
-                if per_iterate_k or extragradient:
+                if active_per_iterate_k or active_extragradient:
                     print(
                         f"  per-iterate k={float(opt_state[1]):.3f}"
                         f" eta={float(opt_state[2]):.3e}"
@@ -1367,7 +1457,29 @@ def solve(
                 print_expert_weights(count, opt_state)
 
             # --- Adaptive restart decision ---
-            if restarts and restarts_done < restarts:
+            if (
+                restarts
+                and restarts_done >= restarts
+                and polish_optimiser is not None
+                and optimiser is not polish_optimiser
+            ):
+                optimiser = polish_optimiser
+                state = average_state if average != "off" else state
+                opt_state = optimiser.init(state)
+                active_per_iterate_k = False
+                active_extragradient = False
+                lr_scale = 1.0
+                average_state = state
+                total_weight = 0.0
+                if verbose:
+                    print(f"  → Crossing over to polish optimiser (restarts exhausted)")
+                    print("----------------------------------------------")
+
+            if (
+                restarts
+                and restarts_done < restarts
+                and optimiser is not polish_optimiser
+            ):
                 epochs_since_restart += 1
 
                 # `merit` is the metric of the point the epoch metrics were
@@ -1427,7 +1539,7 @@ def solve(
                         # Reset PDHG's step/primal-weight to its initial guess;
                         # the iterate (warm start) is preserved.
                         opt_state = jnp.array([pdhg_eta_init, pdhg_omega_init])
-                    elif per_iterate_k or extragradient:
+                    elif active_per_iterate_k or active_extragradient:
                         # Reset momentum but carry the learned k and eta; reseed
                         # the previous-iterate caches at the current warm-start.
                         opt_state = (
@@ -1449,6 +1561,44 @@ def solve(
                     total_weight = 0.0
                     restart_i_offset = i - 1
                     merit_at_last_restart = restart_merit
+                    # Decay the base LR proportional to the current merit: smaller
+                    # merit (near-optimal) → larger cut, collapsing the orbit radius
+                    # around the already-good solution. sqrt softens the decay so a
+                    # merit of 0.01 gives ×0.1 rather than ×0.01.
+                    if jnp.isfinite(restart_merit) and restart_merit < 1.0:
+                        lr_scale *= float(restart_merit) ** 0.5
+                    # Crossover: if lr_scale has decayed below threshold and a
+                    # polishing optimiser was provided, swap to it once. The
+                    # polisher warm-starts from the current restart point and
+                    # runs the rest of the solve budget with lr_scale reset to 1
+                    # (so the polisher's own learning rate is unaffected by the
+                    # main solver's accumulated decay).
+                    crossover_lr = (
+                        polish_optimiser is not None
+                        and optimiser is not polish_optimiser
+                        and lr_scale < polish_lr_scale_threshold
+                    )
+                    crossover_merit = (
+                        polish_optimiser is not None
+                        and optimiser is not polish_optimiser
+                        and polish_merit_threshold is not None
+                        and bool(restart_merit < polish_merit_threshold)
+                    )
+                    if crossover_lr or crossover_merit:
+                        optimiser = polish_optimiser
+                        opt_state = optimiser.init(state)
+                        active_per_iterate_k = False
+                        active_extragradient = False
+                        lr_scale = 1.0
+                        if verbose:
+                            reason = (
+                                f"lr_scale crossed {polish_lr_scale_threshold:.2e}"
+                                if crossover_lr
+                                else f"merit crossed {polish_merit_threshold:.2e}"
+                            )
+                            print(
+                                f"  → Crossing over to polish optimiser ({reason})"
+                            )
                     epochs_since_restart = 0
                     current_cycle_cap *= restart_multiplier
                     current_iterations_per_epoch = max(
@@ -1466,7 +1616,8 @@ def solve(
                         print(
                             f"Restart {restarts_done}/{restarts} at epoch {count} "
                             f"({reason}, merit={float(restart_merit):.2e} "
-                            f"[{which}], next cap={current_cycle_cap:.0f} epochs, "
+                            f"[{which}], lr_scale={lr_scale:.3f}, "
+                            f"next cap={current_cycle_cap:.0f} epochs, "
                             f"iters/epoch={current_iterations_per_epoch})"
                         )
                         print("----------------------------------------------")
@@ -1594,7 +1745,7 @@ def lp_summary_statistics(lp: LP):
     print(f"[Min, Max] of b_eq: [{min_b_eq}, {max_b_eq}]")
     print(f"[Min, Max] of A_ineq: [{min_A_ineq}, {max_A_ineq}]")
     print(f"[Min, Max] of b_ineq: [{min_b_ineq}, {max_b_ineq}]")
-    print("-----------------------------------------------")
+    print("----------------------------------------------")
 
 
 # %%

@@ -314,6 +314,12 @@ def solve(
     per_iterate_k_hi=10.0,
     extragradient=False,
     k_init=1.0,
+    restarts=0,
+    epochs_per_restart=10,
+    restart_multiplier=1.0,
+    restart_decay=0.2,
+    iterations_per_epoch_decay=1.0,
+    iterations_per_epoch_min=100,
 ):
     """
     Solve a convex saddle-point problem via saddle-point optimisation.
@@ -331,6 +337,25 @@ def solve(
             adaptation from look-ahead gradient norms. Mutually exclusive with
             ``per_iterate_k``.
         k_init: Initial value of ``k`` (default 1.0 = symmetric steps).
+        restarts: Maximum number of warm restarts (default 0 = disabled). Each
+            restart resets the optimiser momentum and averaging while keeping the
+            current iterate as a warm start. A restart fires when the normalised
+            KKT merit drops below ``restart_decay`` × the merit at the last
+            restart (sufficient-progress restart) or the cycle-length cap is
+            exhausted (no-progress restart).
+        epochs_per_restart: Length cap (epochs) of the first restart cycle
+            (default 10). Subsequent caps grow by ``restart_multiplier``.
+        restart_multiplier: Geometric growth factor for cycle-length caps
+            (default 1.0 = fixed length, 2.0 = doubling).
+        restart_decay: Sufficient-progress threshold (default 0.2). A restart
+            fires early when the merit drops below this fraction of the merit at
+            the last restart.
+        iterations_per_epoch_decay: Multiplicative decay applied to
+            ``iterations_per_epoch`` after each restart (default 1.0 = no
+            decay). Values < 1 shrink the epoch length at each restart to spend
+            more time checking convergence.
+        iterations_per_epoch_min: Floor for the decayed epoch length (default
+            100). Only used when ``iterations_per_epoch_decay < 1``.
     """
 
     if log_every < 1:
@@ -563,6 +588,24 @@ def solve(
     dual_gap_is_finite = False
     count = 0
     total_weight = 0.0
+    current_iterations_per_epoch = iterations_per_epoch
+
+    restarts_done = 0
+    restart_i_offset = 0
+    epochs_since_restart = 0
+    current_cycle_cap = float(epochs_per_restart)
+    merit_at_last_restart = jnp.inf
+
+    def kkt_merit(primal_grad_norm, complementarity_slack, constraint_bound):
+        # Normalised KKT merit for the restart trigger. Each term is divided by
+        # (1 + its initial value) so all three are O(1) at the start. Since we
+        # don't track initial values, just use 1.0 as the normaliser (the merit
+        # is only compared with itself at successive restarts, so the scale
+        # cancels). The maximum of the three terms drives the trigger.
+        return jnp.maximum(
+            jnp.maximum(primal_grad_norm, complementarity_slack),
+            constraint_bound,
+        )
 
     start_time = time.time()
     missing_expert_state_warning_printed = False
@@ -627,14 +670,14 @@ def solve(
 
             start_epoch_time = time.time()
             (
-                i,
+                shifted_i,
                 state,
                 average_state,
                 opt_state,
                 total_weight,
             ) = __sps(
-                iterations_per_epoch,
-                i,
+                current_iterations_per_epoch,
+                i - restart_i_offset,
                 cp,
                 optimiser,
                 state,
@@ -651,6 +694,7 @@ def solve(
                 extragradient,
                 k_init,
             )
+            i = shifted_i + restart_i_offset
 
             (
                 objective_value,
@@ -685,7 +729,77 @@ def solve(
                 )
                 print("----------------------------------------------")
 
+                if per_iterate_k or extragradient:
+                    print(f"  per-iterate k={float(opt_state[1]):.3f}")
+                    print("----------------------------------------------")
+
                 print_expert_weights(count, opt_state)
+
+            # --- Adaptive restart decision ---
+            if restarts and restarts_done < restarts:
+                epochs_since_restart += 1
+
+                merit = kkt_merit(primal_grad_norm, complementarity_slack, constraint_bound)
+
+                # Two-point restart: pick the better of average and iterate.
+                restart_point = average_state if average else state
+                restart_merit = merit
+                restart_used_avg = bool(average)
+                if average:
+                    (
+                        _obj,
+                        st_pgn,
+                        st_cs,
+                        st_cb,
+                        _dg,
+                        _dgf,
+                    ) = compute_epoch_metrics(state)
+                    state_merit = kkt_merit(st_pgn, st_cs, st_cb)
+                    if bool(state_merit < merit):
+                        restart_point = state
+                        restart_merit = state_merit
+                        restart_used_avg = False
+
+                if not jnp.isfinite(merit_at_last_restart):
+                    merit_at_last_restart = restart_merit
+
+                sufficient_progress = bool(
+                    restart_merit <= restart_decay * merit_at_last_restart
+                )
+                cycle_exhausted = epochs_since_restart >= current_cycle_cap
+
+                if sufficient_progress or cycle_exhausted:
+                    state = restart_point
+                    if per_iterate_k or extragradient:
+                        opt_state = (
+                            optimiser.init(state),
+                            opt_state[1],
+                        )
+                    else:
+                        opt_state = optimiser.init(state)
+                    average_state = state
+                    total_weight = 0.0
+                    restart_i_offset = i - 1
+                    merit_at_last_restart = restart_merit
+                    epochs_since_restart = 0
+                    current_cycle_cap *= restart_multiplier
+                    current_iterations_per_epoch = max(
+                        iterations_per_epoch_min,
+                        int(current_iterations_per_epoch * iterations_per_epoch_decay),
+                    )
+                    restarts_done += 1
+                    if verbose:
+                        reason = (
+                            "sufficient-progress" if sufficient_progress else "cycle-cap"
+                        )
+                        which = "avg" if restart_used_avg else "iterate"
+                        print(
+                            f"Restart {restarts_done}/{restarts} at epoch {count} "
+                            f"({reason}, merit={float(restart_merit):.2e} "
+                            f"[{which}], next cap={current_cycle_cap:.0f} epochs, "
+                            f"iters/epoch={current_iterations_per_epoch})"
+                        )
+                        print("----------------------------------------------")
 
         if average:
             output = average_state

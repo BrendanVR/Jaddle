@@ -159,22 +159,36 @@ class CP:
         )
 
 
-_LEAST_NORM_DUAL_MAX_DENSE = 5_000_000  # skip if dense A would exceed ~5M elements (~40MB f64)
-
-
 def _least_norm_dual(A_eq, A_ineq, c, n_eq, n_ineq):
     """Least-norm dual: min ‖y‖ s.t. Aᵀy ≈ -c (LP stationarity condition).
 
     Returns (dual_eq, dual_ineq). ineq duals are clipped to ≥ 0.
-    Falls back to zeros when A is too large to densify cheaply.
+    Works with both dense JAX arrays and BCOO sparse matrices via scipy lsqr.
+    Falls back to zeros on failure.
     """
-    n_vars = c.shape[0]
-    n_constraints = n_eq + n_ineq
-    if n_constraints * n_vars > _LEAST_NORM_DUAL_MAX_DENSE:
+    import scipy.sparse
+    import scipy.sparse.linalg
+
+    def _to_scipy_csr(mat, n_rows, n_cols):
+        if hasattr(mat, "indices"):  # BCOO
+            mat = mat.sum_duplicates()
+            rows = np.asarray(mat.indices[:, 0])
+            cols = np.asarray(mat.indices[:, 1])
+            data = np.asarray(mat.data)
+            return scipy.sparse.csr_matrix((data, (rows, cols)), shape=(n_rows, n_cols))
+        return scipy.sparse.csr_matrix(np.asarray(mat))
+
+    try:
+        n_vars = int(c.shape[0])
+        A_eq_sp = _to_scipy_csr(A_eq, n_eq, n_vars)
+        A_ineq_sp = _to_scipy_csr(A_ineq, n_ineq, n_vars)
+        A = scipy.sparse.vstack([A_eq_sp, A_ineq_sp], format="csr")
+        rhs = -np.asarray(c)
+        y, *_ = scipy.sparse.linalg.lsqr(A.T, rhs)
+        y = jnp.array(y)
+        return y[:n_eq], jnp.maximum(y[n_eq:], 0.0)
+    except Exception:
         return jnp.zeros(n_eq), jnp.zeros(n_ineq)
-    A = jnp.concatenate([A_eq, A_ineq], axis=0)
-    y, _, _, _ = jnp.linalg.lstsq(A.T, -c)
-    return y[:n_eq], jnp.maximum(y[n_eq:], 0.0)
 
 
 class LP:
@@ -293,22 +307,19 @@ class JaddleLP:
         return (dual_ineq * (self.A_ineq @ x - self.b_ineq)).sum()
 
     def initial_solution(self):
-        primal = optax.projections.projection_box(
-            jnp.zeros(self.num_variables()),
-            self.lower_bounds,
-            self.upper_bounds,
-        )
-        n_eq = self.num_eq_constraints()
-        n_ineq = self.num_ineq_constraints()
-        n_vars = self.num_variables()
-        if (n_eq + n_ineq) * n_vars <= _LEAST_NORM_DUAL_MAX_DENSE:
-            dual_eq, dual_ineq = _least_norm_dual(
-                self.A_eq.todense(),
-                self.A_ineq.todense(),
-                self.c,
-                n_eq,
-                n_ineq,
-            )
-        else:
-            dual_eq, dual_ineq = jnp.zeros(n_eq), jnp.zeros(n_ineq)
+        # print("---> Computing least-norm dual initial solution...")
+        # print("----------------------------------------------")
+        # primal = optax.projections.projection_box(
+        #     jnp.zeros(self.num_variables()),
+        #     self.lower_bounds,
+        #     self.upper_bounds,
+        # )
+        primal = jnp.zeros(self.num_variables())
+        # n_eq = self.num_eq_constraints()
+        # n_ineq = self.num_ineq_constraints()
+        # dual_eq, dual_ineq = _least_norm_dual(
+        #     self.A_eq, self.A_ineq, self.c, n_eq, n_ineq
+        # )
+        dual_eq = jnp.zeros(self.num_eq_constraints())
+        dual_ineq = jnp.zeros(self.num_ineq_constraints())
         return SaddleState(primal=primal, dual_ineq=dual_ineq, dual_eq=dual_eq)
