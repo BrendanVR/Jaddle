@@ -54,23 +54,21 @@ cp = jc.CP(
 
 # %% [markdown]
 # ## Solve the problem using Jaddle Convex SPS optimizer
-lr = optax.exponential_decay(
-    init_value=1e0,
-    transition_steps=1000,
-    decay_rate=0.9,
-    end_value=1e-5,
-    staircase=True,
-)
+lr = 1 / 2
+k_max = 1e3
 
-optimiser = jo.create_saddle_optimiser(
-    optax.optimistic_adam_v2(lr, alpha=0.05),
-)
+optimiser = jo.create_saddle_optimiser(optax.sgd(lr, nesterov=True))
 
 solution, _ = jc.solve(
     cp,
     optimiser=optimiser,
-    average=False,
+    average=True,
     update_mode="synchronous",
+    extragradient=True,
+    per_iterate_k_hi=k_max,
+    per_iterate_k_lo=1 / k_max,
+    verbose=True,
+    log_every=1,
 )
 
 

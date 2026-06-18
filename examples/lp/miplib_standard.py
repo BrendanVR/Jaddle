@@ -26,7 +26,7 @@ jo.configure_jax("x64")
 # %% [markdown]
 # ## Load the LP
 # We load a MIPLIB LP from an MPS file using the `highspy` library.
-PROBLEM_NAME = "momentum1"  # name of MIPLIB problem (without .mps extension)
+PROBLEM_NAME = "nug"  # name of MIPLIB problem (without .mps extension)
 highs = hspy.Highs()
 highs.readModel(
     f"/home/brendanvr/python/Jaddle/data/{PROBLEM_NAME}.mps"
@@ -57,8 +57,6 @@ def dual(lr):
     )
 
 
-# PDHG convergence requires σ·τ·‖A‖² ≤ 1; with symmetric steps η = σ = τ
-# the safe upper bound is η ≤ 1/‖A‖.
 k_max = 1e3
 eta_max = 1e3
 base_lr = 1.0 / 2

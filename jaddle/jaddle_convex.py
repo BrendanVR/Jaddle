@@ -26,6 +26,12 @@ def __sps(
     total_weight=0.0,
     average=True,
     update_mode="synchronous",
+    per_iterate_k=False,
+    per_iterate_k_theta=0.1,
+    per_iterate_k_lo=0.1,
+    per_iterate_k_hi=10.0,
+    extragradient=False,
+    k_init=1.0,
 ):
 
     def projection_primal(primal_state):
@@ -76,6 +82,11 @@ def __sps(
         id(weight_function),
         bool(average),
         update_mode,
+        bool(per_iterate_k),
+        float(per_iterate_k_theta),
+        float(per_iterate_k_lo),
+        float(per_iterate_k_hi),
+        bool(extragradient),
     )
     run_epoch = _CONVEX_RUN_EPOCH_CACHE.get(cache_key)
 
@@ -136,6 +147,78 @@ def __sps(
                         dual_ineq=projection_non_negative(state.dual_ineq),
                         dual_eq=state.dual_eq,
                     )
+                elif per_iterate_k:
+                    opt_state, k = opt_state
+
+                    g = grad(state)
+                    updates, opt_state = opt_update(g, opt_state, state)
+
+                    up = updates.primal
+                    ud = jnp.concatenate([updates.dual_eq, updates.dual_ineq])
+                    norm_p = jnp.sqrt(up @ up) + 1e-30
+                    norm_d = jnp.sqrt(ud @ ud) + 1e-30
+                    k_target = jnp.sqrt(norm_p / norm_d)
+                    log_k = per_iterate_k_theta * jnp.log(k_target) + (
+                        1.0 - per_iterate_k_theta
+                    ) * jnp.log(k)
+                    k = jnp.clip(jnp.exp(log_k), per_iterate_k_lo, per_iterate_k_hi)
+
+                    updates = SaddleState(
+                        primal=updates.primal / k,
+                        dual_ineq=updates.dual_ineq * k,
+                        dual_eq=updates.dual_eq * k,
+                    )
+                    state = optax.apply_updates(state, updates)
+                    state = SaddleState(
+                        primal=projection_primal(state.primal),
+                        dual_ineq=projection_non_negative(state.dual_ineq),
+                        dual_eq=state.dual_eq,
+                    )
+                    opt_state = (opt_state, k)
+                elif extragradient:
+                    opt_state, k = opt_state
+
+                    # --- Look-ahead gradient ---
+                    g = grad(state)
+
+                    up = g.primal
+                    ud = jnp.concatenate([g.dual_eq, g.dual_ineq])
+                    norm_p = jnp.sqrt(up @ up) + 1e-30
+                    norm_d = jnp.sqrt(ud @ ud) + 1e-30
+                    k_target = jnp.sqrt(norm_p / norm_d)
+                    log_k = per_iterate_k_theta * jnp.log(k_target) + (
+                        1.0 - per_iterate_k_theta
+                    ) * jnp.log(k)
+                    k = jnp.clip(jnp.exp(log_k), per_iterate_k_lo, per_iterate_k_hi)
+
+                    scaled_g = SaddleState(
+                        primal=g.primal / k,
+                        dual_ineq=g.dual_ineq * k,
+                        dual_eq=g.dual_eq * k,
+                    )
+                    la_updates, _ = opt_update(scaled_g, opt_state, state)
+                    state_half = optax.apply_updates(state, la_updates)
+                    state_half = SaddleState(
+                        primal=projection_primal(state_half.primal),
+                        dual_ineq=projection_non_negative(state_half.dual_ineq),
+                        dual_eq=state_half.dual_eq,
+                    )
+
+                    # Corrector: gradient at look-ahead point, applied from original state
+                    g_half = grad(state_half)
+                    scaled_g_half = SaddleState(
+                        primal=g_half.primal / k,
+                        dual_ineq=g_half.dual_ineq * k,
+                        dual_eq=g_half.dual_eq * k,
+                    )
+                    corr_updates, opt_state = opt_update(scaled_g_half, opt_state, state)
+                    state = optax.apply_updates(state, corr_updates)
+                    state = SaddleState(
+                        primal=projection_primal(state.primal),
+                        dual_ineq=projection_non_negative(state.dual_ineq),
+                        dual_eq=state.dual_eq,
+                    )
+                    opt_state = (opt_state, k)
                 else:
                     gradient = grad(state)
                     updates, opt_state = opt_update(gradient, opt_state, state)
@@ -189,6 +272,12 @@ def __sps(
 
     if initial_opt_state is not None:
         opt_state = initial_opt_state
+    elif per_iterate_k or extragradient:
+        dtype = initial_solution.primal.dtype
+        opt_state = (
+            optimiser.init(initial_solution),
+            jnp.asarray(k_init, dtype),
+        )
     else:
         opt_state = optimiser.init(initial_solution)
 
@@ -219,20 +308,29 @@ def solve(
     update_mode="synchronous",
     expert_diagnostics=False,
     output_opt_state=False,
+    per_iterate_k=False,
+    per_iterate_k_theta=0.1,
+    per_iterate_k_lo=0.1,
+    per_iterate_k_hi=10.0,
+    extragradient=False,
+    k_init=1.0,
 ):
     """
-    Solve a linear program via saddle-point optimisation.
+    Solve a convex saddle-point problem via saddle-point optimisation.
 
     Args:
-        restarts: Number of warm restarts. 0 = no restarts (default).
-            Each restart resets the optimizer state (momentum) and averaging
-            while keeping the current iterate as a warm start. The LR schedule
-            also restarts from its initial value.
-        epochs_per_restart: Number of epochs in the first restart cycle
-            (default 10). Subsequent cycles grow by restart_multiplier.
-        restart_multiplier: Geometric growth factor for cycle lengths
-            (default 1.0 = fixed length, 2.0 = doubling).
-        primal_dual_lr_ratio: Ratio of primal to dual learning rates (default 1.0).
+        per_iterate_k: Adapt the primal/dual step ratio ``k`` every iteration
+            inside the scan, matvec-free. The ratio target is
+            ``sqrt(||u_primal|| / ||u_dual||)``; log-space smoothed by
+            ``per_iterate_k_theta`` and clamped to ``[per_iterate_k_lo,
+            per_iterate_k_hi]``. Mutually exclusive with ``extragradient``.
+        per_iterate_k_theta: Smoothing coefficient for the log-space k update
+            (default 0.1). Smaller = slower adaptation.
+        per_iterate_k_lo, per_iterate_k_hi: Clamp band for k (default [0.1, 10]).
+        extragradient: Korpelevich extragradient (two-call) with per-iterate k
+            adaptation from look-ahead gradient norms. Mutually exclusive with
+            ``per_iterate_k``.
+        k_init: Initial value of ``k`` (default 1.0 = symmetric steps).
     """
 
     if log_every < 1:
@@ -243,6 +341,20 @@ def solve(
 
     if update_mode not in ["synchronous", "alternating"]:
         raise ValueError("update_mode must be one of ['synchronous', 'alternating']")
+    if per_iterate_k and update_mode != "synchronous":
+        raise ValueError(
+            "per_iterate_k is only implemented for update_mode='synchronous'."
+        )
+    if extragradient and update_mode != "synchronous":
+        raise ValueError(
+            "extragradient is only implemented for update_mode='synchronous'."
+        )
+    if per_iterate_k and extragradient:
+        raise ValueError(
+            "per_iterate_k and extragradient both control per-iterate stepping; "
+            "use extragradient=True to get the look-ahead/corrector step with "
+            "built-in k adaptation."
+        )
     if verbose:
         print("====Starting Solve====")
         print("----------------------------------------------")
@@ -284,13 +396,15 @@ def solve(
         primal_grad_norm = jnp.max(jnp.abs(projected_gradient_residual))
 
         ineq_violations = jnp.maximum(grad_dual_ineq, 0.0)
-        max_ineq_violation = jnp.max(ineq_violations)
+        max_ineq_violation = jnp.max(ineq_violations) if ineq_violations.size > 0 else jnp.zeros(())
 
         eq_violations = jnp.abs(grad_dual_eq)
-        max_eq_violation = jnp.max(eq_violations)
+        max_eq_violation = jnp.max(eq_violations) if eq_violations.size > 0 else jnp.zeros(())
 
-        complementarity_slack = jnp.max(
-            jnp.abs(average_state.dual_ineq * grad_dual_ineq)
+        complementarity_slack = (
+            jnp.max(jnp.abs(average_state.dual_ineq * grad_dual_ineq))
+            if average_state.dual_ineq.size > 0
+            else jnp.zeros(())
         ) / (1.0 + jnp.abs(objective_value))
 
         constraint_bound = jnp.maximum(max_ineq_violation, max_eq_violation)
@@ -346,7 +460,7 @@ def solve(
         ) = loop_vars
 
         return check_convergence(
-            primal_grad_norm, complementarity_slack, constraint_bound, count
+            primal_grad_norm, complementarity_slack, constraint_bound
         )
 
     def body_fun(loop_vars):
@@ -384,6 +498,12 @@ def solve(
             total_weight,
             average,
             update_mode,
+            per_iterate_k,
+            per_iterate_k_theta,
+            per_iterate_k_lo,
+            per_iterate_k_hi,
+            extragradient,
+            k_init,
         )
 
         (
@@ -425,11 +545,16 @@ def solve(
     is_converged = True
     state = initial_solution
     average_state = initial_solution
-    opt_state = (
-        initial_opt_state
-        if initial_opt_state is not None
-        else optimiser.init(initial_solution)
-    )
+    if initial_opt_state is not None:
+        opt_state = initial_opt_state
+    elif per_iterate_k or extragradient:
+        dtype = initial_solution.primal.dtype
+        opt_state = (
+            optimiser.init(initial_solution),
+            jnp.asarray(k_init, dtype),
+        )
+    else:
+        opt_state = optimiser.init(initial_solution)
     primal_grad_norm = jnp.inf
     complementarity_slack = jnp.inf
     constraint_bound = jnp.inf
@@ -519,6 +644,12 @@ def solve(
                 total_weight,
                 average,
                 update_mode,
+                per_iterate_k,
+                per_iterate_k_theta,
+                per_iterate_k_lo,
+                per_iterate_k_hi,
+                extragradient,
+                k_init,
             )
 
             (
