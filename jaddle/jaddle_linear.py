@@ -1468,7 +1468,7 @@ def solve(
                 opt_state = optimiser.init(state)
                 active_per_iterate_k = False
                 active_extragradient = False
-                lr_scale = 1.0
+                # lr_scale = 1.0  # Don't reset lr_scale on crossover; the polisher should inherit the main solver's accumulated decay so it is already in the right regime to take over and finish the solve. Resetting to 1.0 would risk a disruptive jump in learning rates.
                 average_state = state
                 total_weight = 0.0
                 if verbose:
@@ -1589,16 +1589,14 @@ def solve(
                         opt_state = optimiser.init(state)
                         active_per_iterate_k = False
                         active_extragradient = False
-                        lr_scale = 1.0
+                        # lr_scale = 1.0  # Don't reset lr_scale on crossover; the polisher should inherit the main solver's accumulated decay so it is already in the right regime to take over and finish the solve. Resetting to 1.0 would risk a disruptive jump in learning rates.
                         if verbose:
                             reason = (
                                 f"lr_scale crossed {polish_lr_scale_threshold:.2e}"
                                 if crossover_lr
                                 else f"merit crossed {polish_merit_threshold:.2e}"
                             )
-                            print(
-                                f"  → Crossing over to polish optimiser ({reason})"
-                            )
+                            print(f"  → Crossing over to polish optimiser ({reason})")
                     epochs_since_restart = 0
                     current_cycle_cap *= restart_multiplier
                     current_iterations_per_epoch = max(
