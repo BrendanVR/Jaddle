@@ -46,28 +46,32 @@ k_max = 1e3
 
 
 def opt(lr):
-    def primal(lr):
-        return optax.inject_hyperparams(optax.adadelta)(
-            learning_rate=lr,
-        )
+    primal = optax.inject_hyperparams(optax.adadelta)(
+        learning_rate=lr,
+    )
 
-    def dual(lr):
-        return optax.inject_hyperparams(optax.sgd)(
-            learning_rate=lr,
-            momentum=0.3,
-            nesterov=True,
-        )
+    dual = optax.inject_hyperparams(optax.sgd)(
+        learning_rate=lr,
+        momentum=0.3,
+        nesterov=True,
+    )
 
     return jo.create_saddle_optimiser(
-        primal(lr),
-        dual(lr),
+        primal,
+        dual,
     )
 
 
 def polisher(lr):
     return jo.create_saddle_optimiser(
-        optax.inject_hyperparams(optax.adadelta)(learning_rate=lr),
-        optax.inject_hyperparams(optax.adadelta)(learning_rate=lr),
+        optax.inject_hyperparams(optax.amsgrad)(
+            learning_rate=lr,
+            b1=0,
+        ),
+        optax.inject_hyperparams(optax.amsgrad)(
+            learning_rate=lr,
+            b1=0,
+        ),
     )
 
 
@@ -77,21 +81,23 @@ jl.lp_summary_statistics(jaddle_lp)
 solution, _ = jl.solve(
     lp=jaddle_lp,
     optimiser=opt(1),
+    iterations_per_epoch=1000,
     scale="ruiz+pc",
     verbose=True,
     log_every=1,
     extragradient=True,
-    per_iterate_k_theta=0.3,
+    per_iterate_k_theta=0.1,
     per_iterate_k_lo=1 / k_max,
     per_iterate_k_hi=k_max,
     restarts=20,
-    epochs_per_restart=5,
-    restart_multiplier=1,
+    epochs_per_restart=10,
+    restart_multiplier=1.5,
     iterations_per_epoch_decay=0.9,
-    iterations_per_epoch_min=1.5,
+    iterations_per_epoch_min=10,
     average="polyak",
-    polish_optimiser=polisher(1),
-    dual_gap_tolerance=1e-1,
+    polish_optimiser=polisher(1e-3),
+    polish_merit_threshold=1e-2,
+    dual_gap_tolerance=1e0,
 )
 
 print(f"Primal Equality Residual: {jaddle_lp.eq_slack(solution.primal)}")

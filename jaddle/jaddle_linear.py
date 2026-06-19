@@ -48,10 +48,6 @@ def __sps(
     per_iterate_k_lo=0.1,
     per_iterate_k_hi=10.0,
     k_init=1.0,
-    per_iterate_eta=False,
-    per_iterate_eta_theta=0.1,
-    per_iterate_eta_lo=1e-4,
-    per_iterate_eta_hi=1e4,
     eta_init=1.0,
     extragradient=False,
 ):
@@ -122,10 +118,6 @@ def __sps(
         float(per_iterate_k_theta),
         float(per_iterate_k_lo),
         float(per_iterate_k_hi),
-        bool(per_iterate_eta),
-        float(per_iterate_eta_theta),
-        float(per_iterate_eta_lo),
-        float(per_iterate_eta_hi),
         bool(extragradient),
     )
     run_epoch = _LINEAR_RUN_EPOCH_CACHE.get(cache_key)
@@ -302,38 +294,20 @@ def __sps(
                     return (i + 1, state, average_state, opt_state, total_weight), None
 
             elif per_iterate_k:
-                # Per-iterate primal/dual step-ratio control, the matvec-free
-                # lesson borrowed from PDHG/PDLP. PDLP's value is not its line
-                # search (which is what makes update_mode="pdhg" slow — a
-                # data-dependent while_loop that breaks scan fusion and costs an
-                # extra A@dx matvec per trial); its value is the per-iterate
-                # *primal-weight* signal. We reconstruct that signal for free
-                # from the optimiser updates already computed each step, with no
-                # extra matvec and no inner loop, so the epoch stays a single
-                # fused lax.scan.
-                #
-                # `k` (ratio) and, optionally, `eta` (magnitude) are carried
-                # alongside the optax state as (opt_state, k, eta, prev_Ax,
-                # prev_dual). The combined split scales the applied updates by
-                # (eta/k, eta*k) for (primal, dual), so the dual/primal step
-                # ratio is k**2 (same convention as the epoch-level update_k) and
-                # eta sets the shared magnitude.
+                # Per-iterate primal/dual step-ratio control. The split scales
+                # applied updates by (eta/k, eta*k) for (primal, dual), so the
+                # dual/primal step ratio is k**2. `k` (ratio) and `eta`
+                # (magnitude, set by lr_scale on restarts) are carried alongside
+                # the optax state as (opt_state, k, eta).
                 #
                 #   k_target = sqrt(||u_primal|| / ||u_dual||)   (movement balance)
                 #
-                # The magnitude target is PDLP's adaptive-step bound, made
-                # matvec-free: the descent bound is
-                #   eta_bar = ||dz||^2_omega / (2 |dy^T (A dx)|),
-                # and A·dx is recovered for free as Ax_k - Ax_{k-1} (Ax is already
-                # computed every iteration by grad_with_Ax), so no extra matvec
-                # and no while_loop are needed. Movement is measured from the
-                # *previous* iterate (a one-step lag), then both controls are
                 # log-space smoothed and clamped.
                 def step(carry, _):
                     i, state, average_state, opt_state, total_weight = carry
-                    opt_state, k, eta, prev_Ax, prev_dual = opt_state
+                    opt_state, k, eta = opt_state
 
-                    g, Ax = grad_with_Ax(state)
+                    g = grad(state)
                     updates, opt_state = opt_update(g, opt_state, state)
 
                     # --- ratio control (k) ---
@@ -351,33 +325,6 @@ def __sps(
                     ) * jnp.log(k)
                     k = jnp.clip(jnp.exp(log_k), per_iterate_k_lo, per_iterate_k_hi)
 
-                    # --- magnitude control (eta) ---
-                    if per_iterate_eta:
-                        dual_now = jnp.concatenate([state.dual_eq, state.dual_ineq])
-                        # A·dx from cached Ax (free); dy from cached dual.
-                        A_dx = Ax - prev_Ax
-                        dy = dual_now - prev_dual
-                        # omega-weighted movement norm with omega = k**2 (so the
-                        # weighting matches the (1/k, k) split we apply).
-                        omega = k * k
-                        norm_w = omega * (norm_p * norm_p) + (dy @ dy) / omega
-                        interaction = jnp.abs(dy @ A_dx)
-                        eta_bar = jnp.where(
-                            interaction > 1e-30,
-                            norm_w / (2.0 * interaction),
-                            eta,  # no coupling movement → keep current eta
-                        )
-                        log_eta = per_iterate_eta_theta * jnp.log(eta_bar) + (
-                            1.0 - per_iterate_eta_theta
-                        ) * jnp.log(eta)
-                        eta = jnp.clip(
-                            jnp.exp(log_eta),
-                            per_iterate_eta_lo,
-                            per_iterate_eta_hi,
-                        )
-                        prev_Ax = Ax
-                        prev_dual = dual_now
-
                     # Apply the (eta/k, eta*k) split to the updates.
                     updates = SaddleState(
                         primal=updates.primal * (eta / k),
@@ -390,7 +337,7 @@ def __sps(
                         dual_ineq=projection_non_negative(state.dual_ineq),
                         dual_eq=state.dual_eq,
                     )
-                    opt_state = (opt_state, k, eta, prev_Ax, prev_dual)
+                    opt_state = (opt_state, k, eta)
 
                     if average == "polyak":
                         w = weight_function(i)
@@ -422,13 +369,13 @@ def __sps(
                 #
                 # The (eta/k, eta*k) split is applied to each gradient before
                 # passing it to opt_update, exactly as in the per_iterate_k path.
-                # k and eta adapt from the look-ahead gradient norms.
+                # k adapts from the look-ahead gradient norms.
                 def step(carry, _):
                     i, state, average_state, opt_state, total_weight = carry
-                    opt_state, k, eta, prev_Ax, prev_dual = opt_state
+                    opt_state, k, eta = opt_state
 
                     # --- Look-ahead gradient ---
-                    g, Ax = grad_with_Ax(state)
+                    g = grad(state)
 
                     # --- per-iterate k (ratio) from look-ahead gradient norms ---
                     up = g.primal
@@ -440,30 +387,6 @@ def __sps(
                         1.0 - per_iterate_k_theta
                     ) * jnp.log(k)
                     k = jnp.clip(jnp.exp(log_k), per_iterate_k_lo, per_iterate_k_hi)
-
-                    # --- per-iterate eta (magnitude) ---
-                    if per_iterate_eta:
-                        dual_now = jnp.concatenate([state.dual_eq, state.dual_ineq])
-                        A_dx = Ax - prev_Ax
-                        dy = dual_now - prev_dual
-                        omega = k * k
-                        norm_w = omega * (norm_p * norm_p) + (dy @ dy) / omega
-                        interaction = jnp.abs(dy @ A_dx)
-                        eta_bar = jnp.where(
-                            interaction > 1e-30,
-                            norm_w / (2.0 * interaction),
-                            eta,
-                        )
-                        log_eta = per_iterate_eta_theta * jnp.log(eta_bar) + (
-                            1.0 - per_iterate_eta_theta
-                        ) * jnp.log(eta)
-                        eta = jnp.clip(
-                            jnp.exp(log_eta),
-                            per_iterate_eta_lo,
-                            per_iterate_eta_hi,
-                        )
-                        prev_Ax = Ax
-                        prev_dual = dual_now
 
                     # Look-ahead: run the user's optimiser on g at state to
                     # get the look-ahead point. la_opt_state is NOT committed —
@@ -485,7 +408,7 @@ def __sps(
                     # Corrector: run the user's optimiser on g_half at
                     # state_half, but applied from original state (Korpelevich
                     # convention). opt_state IS committed here.
-                    g_half, _ = grad_with_Ax(state_half)
+                    g_half = grad(state_half)
                     scaled_g_half = SaddleState(
                         primal=g_half.primal * (eta / k),
                         dual_ineq=g_half.dual_ineq * (eta * k),
@@ -500,7 +423,7 @@ def __sps(
                         dual_ineq=projection_non_negative(state.dual_ineq),
                         dual_eq=state.dual_eq,
                     )
-                    opt_state = (opt_state, k, eta, prev_Ax, prev_dual)
+                    opt_state = (opt_state, k, eta)
 
                     if average == "polyak":
                         w = weight_function(i)
@@ -576,20 +499,12 @@ def __sps(
         # PDHG carries its scalar step + primal weight in lieu of an optax state.
         opt_state = jnp.array([pdhg_eta_init, pdhg_omega_init])
     elif per_iterate_k or extragradient:
-        # Pack the running step-ratio k, magnitude eta, and the previous-iterate
-        # caches (prev_Ax, prev_dual) alongside the optax state. `solve` threads
-        # this packed tuple opaquely across epochs.
+        # Pack the running step-ratio k and magnitude eta alongside the optax state.
         dtype = initial_solution.primal.dtype
-        prev_Ax = lp.A @ initial_solution.primal
-        prev_dual = jnp.concatenate(
-            [initial_solution.dual_eq, initial_solution.dual_ineq]
-        )
         opt_state = (
             optimiser.init(initial_solution),
             jnp.asarray(k_init, dtype),
             jnp.asarray(eta_init, dtype),
-            prev_Ax,
-            prev_dual,
         )
     else:
         opt_state = optimiser.init(initial_solution)
@@ -602,42 +517,6 @@ def __sps(
         opt_state,
         total_weight,
     )
-
-
-def update_k(k, primal_feas, dual_feas, theta=0.5, lo=0.3, hi=3.0, deadband=2.0):
-    """Residual-balancing update for the primal/dual step-ratio scalar ``k``,
-    where the dual/primal step ratio is ``k**2`` (primal step ``∝ 1/k``, dual
-    step ``∝ k``).
-
-    The mapping respects which *player resolves* which residual, not which
-    residual is named after which player:
-
-      * ``primal_feas`` = ‖Ax − b‖ (primal-feasibility / constraint residual) is
-        resolved by the **dual** — the dual prices constraint violation, and that
-        price ``Aᵀy`` is the only force pulling x toward feasibility. So a large
-        primal-feasibility residual means the dual is under-powered → grow ``k``.
-      * ``dual_feas`` = ‖c + Aᵀy − z‖ (dual-feasibility / reduced-cost residual)
-        is resolved by the **primal** — x must respond to the prices. A large
-        dual-feasibility residual means the primal is under-powered → shrink
-        ``k``.
-
-    Hence ``k ← k · (primal_feas / dual_feas)**(theta/2)``: constraint
-    infeasibility drives the dual, reduced-cost infeasibility drives the primal.
-
-    Both residuals must be supplied in the *scaled* space the solver iterates in
-    (not un-scaled certificate units) so the controller reacts to primal/dual
-    dynamics rather than the conditioning PC/Ruiz scaling has already removed.
-
-    The update is damped (``theta`` < 1), suppressed inside a multiplicative
-    ``deadband`` around balance, and clamped to ``[lo, hi]``. Hitting a clamp is
-    the signal that step-size rebalancing alone cannot fix the iteration (the
-    failure is directional GDA instability, not an imbalance) and the fix is
-    averaging / alternating updates / optimistic-EG correction, not more ``k``.
-    """
-    ratio = (primal_feas + 1e-30) / (dual_feas + 1e-30)
-    in_band = (ratio < deadband) & (ratio > 1.0 / deadband)
-    factor = jnp.where(in_band, 1.0, ratio ** (0.5 * theta))
-    return jnp.clip(k * factor, lo, hi)
 
 
 def set_saddle_lrs(opt_state, primal_lr, dual_lr):
@@ -691,10 +570,7 @@ def solve(
     per_iterate_k_theta=0.1,
     per_iterate_k_lo=0.1,
     per_iterate_k_hi=10.0,
-    per_iterate_eta=False,
-    per_iterate_eta_theta=0.1,
-    per_iterate_eta_lo=1e-4,
-    per_iterate_eta_hi=1e4,
+    k_init=1.0,
     eta_init=1.0,
     extragradient=False,
     scale=None,
@@ -705,13 +581,6 @@ def solve(
     epochs_per_restart=10,
     restart_multiplier=1.0,
     restart_decay=0.2,
-    adaptive_k=False,
-    base_lr=1e-1,
-    k_init=1.0,
-    k_theta=0.5,
-    k_lo=0.3,
-    k_hi=3.0,
-    k_deadband=2.0,
     primal_stop=False,
     primal_stop_window=5,
     primal_stop_obj_tol=1e-4,
@@ -744,8 +613,7 @@ def solve(
     ``pdhg_reduce`` the backtracking on rejection). This tracks the local
     interaction norm of ``A`` instead of a fixed ``1/||A||`` step, which is the
     main reason PDLP outruns plain GDA on ill-balanced / rotational instances.
-    ``adaptive_k`` is incompatible with this mode (PDHG adapts the ratio
-    itself); ``restarts`` and ``average`` still apply and are recommended.
+    ``restarts`` and ``average`` still apply and are recommended.
 
     Adaptive restarts (PDLP-style) accelerate ill-conditioned problems. A
     restart resets the optimiser momentum/averaging while keeping the current
@@ -768,30 +636,13 @@ def solve(
         restart_decay: Sufficient-progress threshold (default 0.2). A restart
             fires early if the KKT merit drops below ``restart_decay`` times its
             value at the last restart.
-        adaptive_k: Enable the per-epoch residual-balancing controller for the
-            primal/dual step ratio (dual/primal step ratio is ``k**2``). The two
-            sub-optimisers MUST be built with
-            ``optax.inject_hyperparams(...)(learning_rate=...)`` so their learning
-            rates are live array leaves; otherwise this raises. Default ``False``
-            leaves the optimiser learning rates untouched.
-        base_lr: Geometric-mean learning-rate *magnitude* the controller splits
-            as ``(base_lr / k, base_lr * k)`` for (primal, dual). Either a float
-            (constant) or a callable ``base_lr(epoch) -> float`` for an annealing
-            schedule, evaluated once per epoch. The controller adapts the ratio
-            ``k`` independently of this magnitude decay. Only used when
-            ``adaptive_k=True``.
         k_init: Initial value of ``k`` (default 1.0 = symmetric steps, the
-            PC/Ruiz-scaled baseline).
-        k_theta: Damping on the controller update (default 0.5). The effective
-            per-epoch exponent on the residual ratio is ``k_theta / 2``; smaller
-            is slower/safer.
-        k_lo, k_hi: Clamp band for ``k`` (default ``[0.3, 3.0]``). Sitting at a
-            clamp is the signal that step-size rebalancing alone cannot fix the
-            iteration (directional GDA instability) — the fix is optimistic/
-            extragradient correction on both players, not widening the band.
-        k_deadband: Multiplicative deadband around balance (default 2.0); the
-            controller does not react while ``r_dual/r_primal`` is within
-            ``[1/k_deadband, k_deadband]``, preventing limit-cycle hunting.
+            PC/Ruiz-scaled baseline). Only used when ``per_iterate_k=True`` or
+            ``extragradient=True``.
+        eta_init: Initial value of the step magnitude ``eta`` (default 1.0).
+            On restarts, ``eta`` is scaled by ``lr_scale`` to track the
+            magnitude decay. Only used when ``per_iterate_k=True`` or
+            ``extragradient=True``.
         primal_stop: Opt-in, dual-free termination (default ``False``). When
             ``True``, termination ignores the dual certificate entirely and stops
             on **primal feasibility** (``constraint_bound`` within
@@ -834,28 +685,9 @@ def solve(
         raise ValueError(
             "update_mode must be one of ['synchronous', 'alternating', 'pdhg']"
         )
-    if update_mode == "pdhg" and adaptive_k:
-        raise ValueError(
-            "adaptive_k is incompatible with update_mode='pdhg': PDHG adapts its "
-            "own step size (eta) and primal weight (omega) per iteration, so the "
-            "epoch-level k controller and set_saddle_lrs do not apply."
-        )
     if per_iterate_k and update_mode != "synchronous":
         raise ValueError(
             "per_iterate_k is only implemented for update_mode='synchronous'."
-        )
-    if per_iterate_k and adaptive_k:
-        raise ValueError(
-            "per_iterate_k and adaptive_k both control the primal/dual step ratio; "
-            "use one. per_iterate_k adapts k every iteration (matvec-free, inside "
-            "the scan); adaptive_k adapts it once per epoch from the certificate "
-            "residuals."
-        )
-    if per_iterate_eta and not per_iterate_k and not extragradient:
-        raise ValueError(
-            "per_iterate_eta (magnitude control) requires per_iterate_k=True or "
-            "extragradient=True: the two share the same packed step-state and the "
-            "(eta/k, eta*k) split."
         )
     if extragradient and update_mode != "synchronous":
         raise ValueError(
@@ -866,11 +698,6 @@ def solve(
             "extragradient and per_iterate_k both control per-iterate stepping; "
             "use extragradient=True to get the look-ahead/corrector step with "
             "built-in k/eta adaptation."
-        )
-    if extragradient and adaptive_k:
-        raise ValueError(
-            "extragradient and adaptive_k both control the primal/dual step ratio; "
-            "use one."
         )
     if verbose:
         print("====Starting Solve====")
@@ -978,12 +805,6 @@ def solve(
         projected_gradient_residual = average_state.primal - projected_primal
         primal_grad_norm = jnp.max(jnp.abs(projected_gradient_residual))
 
-        # Scaled-space constraint residual (∞-norm), used by the adaptive-k
-        # controller. Kept in scaled units (unlike the certificate residuals
-        # below) so it is comparable with `primal_grad_norm` and reflects the
-        # primal/dual dynamics rather than the conditioning scaling removed.
-        constraint_residual_scaled = jnp.max(jnp.abs(Ax_minus_b))
-
         ineq_violations = jnp.maximum(grad_dual_ineq_unscaled, 0.0)
         max_ineq_violation = jnp.max(ineq_violations)
 
@@ -1071,7 +892,6 @@ def solve(
             gap_bound_comp,
             gap_ineq_comp,
             gap_eq_comp,
-            constraint_residual_scaled,
         )
 
     def converged(
@@ -1143,15 +963,12 @@ def solve(
         # unused in this mode.
         opt_state = jnp.array([pdhg_eta_init, pdhg_omega_init])
     elif per_iterate_k or extragradient:
-        # Pack the per-iterate step-ratio k, magnitude eta, and previous-iterate
-        # caches (prev_Ax, prev_dual) with the optax state.
+        # Pack the per-iterate step-ratio k and magnitude eta with the optax state.
         _pik_dtype = initial_solution.primal.dtype
         opt_state = (
             optimiser.init(initial_solution),
             jnp.asarray(k_init, _pik_dtype),
             jnp.asarray(eta_init, _pik_dtype),
-            lp.A @ initial_solution.primal,
-            jnp.concatenate([initial_solution.dual_eq, initial_solution.dual_ineq]),
         )
     else:
         opt_state = optimiser.init(initial_solution)
@@ -1174,20 +991,7 @@ def solve(
     # real epochs have elapsed.
     obj_window = jnp.full((max(int(primal_stop_window), 1),), jnp.inf)
 
-    # Adaptive-k state. k carries across epochs; on each epoch the controller
-    # nudges the *ratio* (k) while `base_lr` sets the *magnitude*. The injected
-    # learning rates are rewritten as (base_lr(t)/k, base_lr(t)*k), decoupling
-    # ratio-adaptation from magnitude-decay. `base_lr` may be a constant or a
-    # callable of the epoch count for an annealing schedule.
     lr_scale = 1.0
-
-    def base_lr_at(epoch):
-        return (base_lr(epoch) if callable(base_lr) else base_lr) * lr_scale
-
-    k = jnp.asarray(k_init)
-    if adaptive_k:
-        lr0 = base_lr_at(0)
-        opt_state = set_saddle_lrs(opt_state, lr0 / k, lr0 * k)
 
     # Adaptive restart bookkeeping. `restart_i_offset` is subtracted from the
     # global iteration counter `i` before it is handed to the optimiser /
@@ -1328,10 +1132,6 @@ def solve(
                 per_iterate_k_lo=per_iterate_k_lo,
                 per_iterate_k_hi=per_iterate_k_hi,
                 k_init=k_init,
-                per_iterate_eta=per_iterate_eta,
-                per_iterate_eta_theta=per_iterate_eta_theta,
-                per_iterate_eta_lo=per_iterate_eta_lo,
-                per_iterate_eta_hi=per_iterate_eta_hi,
                 eta_init=eta_init,
                 extragradient=active_extragradient,
             )
@@ -1349,7 +1149,6 @@ def solve(
                 gap_bound_comp,
                 gap_ineq_comp,
                 gap_eq_comp,
-                constraint_residual_scaled,
             ) = jax.lax.cond(
                 average == "exponential" or average == "polyak",
                 lambda: compute_epoch_metrics(average_state),
@@ -1395,37 +1194,6 @@ def solve(
                 [obj_window[1:], jnp.reshape(objective_value, (1,))]
             )
 
-            # --- Adaptive k (primal/dual step-ratio) update ---
-            # Run on the outer (per-epoch) cadence the damping assumes. Only the
-            # learning-rate *values* in opt_state are overwritten, so the jitted
-            # epoch loop is not retraced.
-            if adaptive_k:
-                # primal_feas (‖Ax−b‖, scaled) is resolved by the dual → drives
-                # k up; dual_feas (‖c+Aᵀy−z‖, already scaled) is resolved by the
-                # primal → drives k down.
-                k = update_k(
-                    k,
-                    primal_feas=constraint_residual_scaled,
-                    dual_feas=dual_feasibility_residual,
-                    theta=k_theta,
-                    lo=k_lo,
-                    hi=k_hi,
-                    deadband=k_deadband,
-                )
-                lr_t = base_lr_at(count)
-                opt_state = set_saddle_lrs(opt_state, lr_t / k, lr_t * k)
-                if verbose and (count == 1 or count % log_every == 0):
-                    at_rail = bool((k <= k_lo + 1e-6) | (k >= k_hi - 1e-6))
-                    print(
-                        f"  adaptive k={float(k):.3f} base_lr={lr_t:.2e}"
-                        f" (τ={lr_t / float(k):.2e}, σ={lr_t * float(k):.2e})"
-                        + (
-                            "  [AT CLAMP — k cannot fix it; see EG/optimism]"
-                            if at_rail
-                            else ""
-                        )
-                    )
-
             if verbose and (count == 1 or count % log_every == 0):
                 dual_gap_status = (
                     "finite" if bool(dual_gap_is_finite) else "dual-infeasible"
@@ -1442,9 +1210,8 @@ def solve(
                 )
                 print("----------------------------------------------")
 
-                # Per-iterate k/eta carry in the packed opt_state as
-                # (optax_state, k, eta, prev_Ax, prev_dual); surface the values
-                # the controller settled on at the end of this epoch.
+                # Per-iterate k/eta carried in the packed opt_state as
+                # (optax_state, k, eta); surface the values settled on this epoch.
                 if active_per_iterate_k or active_extragradient:
                     print(
                         f"  per-iterate k={float(opt_state[1]):.3f}"
@@ -1465,12 +1232,14 @@ def solve(
             ):
                 optimiser = polish_optimiser
                 state = average_state if average != "off" else state
-                opt_state = optimiser.init(state)
-                active_per_iterate_k = False
+                opt_state = opt_state = (
+                    (optimiser.init(state), 1.0, lr_scale)
+                    if (active_per_iterate_k or active_extragradient)
+                    else optimiser.init(state)
+                )
+                active_per_iterate_k = True
                 active_extragradient = False
-                # lr_scale = 1.0  # Don't reset lr_scale on crossover; the polisher should inherit the main solver's accumulated decay so it is already in the right regime to take over and finish the solve. Resetting to 1.0 would risk a disruptive jump in learning rates.
-                average_state = state
-                total_weight = 0.0
+                # total_weight = 0.0
                 if verbose:
                     print(f"  → Crossing over to polish optimiser (restarts exhausted)")
                     print("----------------------------------------------")
@@ -1540,33 +1309,18 @@ def solve(
                         # the iterate (warm start) is preserved.
                         opt_state = jnp.array([pdhg_eta_init, pdhg_omega_init])
                     elif active_per_iterate_k or active_extragradient:
-                        # Reset momentum but carry the learned k and eta; reseed
-                        # the previous-iterate caches at the current warm-start.
+                        # Reset momentum but carry the learned k; apply lr_scale to eta.
                         opt_state = (
                             optimiser.init(state),
-                            opt_state[1],
-                            opt_state[2],
-                            lp.A @ state.primal,
-                            jnp.concatenate([state.dual_eq, state.dual_ineq]),
+                            1.0,
+                            lr_scale,
                         )
                     else:
                         opt_state = optimiser.init(state)
-                    # optimiser.init resets the injected learning rates to their
-                    # construction values; restore the current adaptive k at the
-                    # current point on the magnitude-decay schedule.
-                    if adaptive_k:
-                        lr_t = base_lr_at(count)
-                        opt_state = set_saddle_lrs(opt_state, lr_t / k, lr_t * k)
                     average_state = state
-                    total_weight = 0.0
+                    # total_weight = 0.0
                     restart_i_offset = i - 1
                     merit_at_last_restart = restart_merit
-                    # Decay the base LR proportional to the current merit: smaller
-                    # merit (near-optimal) → larger cut, collapsing the orbit radius
-                    # around the already-good solution. sqrt softens the decay so a
-                    # merit of 0.01 gives ×0.1 rather than ×0.01.
-                    if jnp.isfinite(restart_merit) and restart_merit < 1.0:
-                        lr_scale *= float(restart_merit) ** 0.5
                     # Crossover: if lr_scale has decayed below threshold and a
                     # polishing optimiser was provided, swap to it once. The
                     # polisher warm-starts from the current restart point and
@@ -1586,10 +1340,13 @@ def solve(
                     )
                     if crossover_lr or crossover_merit:
                         optimiser = polish_optimiser
-                        opt_state = optimiser.init(state)
-                        active_per_iterate_k = False
+                        opt_state = (
+                            (optimiser.init(state), opt_state[1], lr_scale)
+                            if (active_per_iterate_k or active_extragradient)
+                            else optimiser.init(state)
+                        )
+                        active_per_iterate_k = True
                         active_extragradient = False
-                        # lr_scale = 1.0  # Don't reset lr_scale on crossover; the polisher should inherit the main solver's accumulated decay so it is already in the right regime to take over and finish the solve. Resetting to 1.0 would risk a disruptive jump in learning rates.
                         if verbose:
                             reason = (
                                 f"lr_scale crossed {polish_lr_scale_threshold:.2e}"
