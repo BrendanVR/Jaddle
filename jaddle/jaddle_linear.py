@@ -31,18 +31,12 @@ def __sps(
     initial_avg_state=None,
     initial_opt_state=None,
     weight_function=lambda _: 1.0,
-    exponential_weight=0.01,
     total_weight=0.0,
     primal_damping=0.0,
     dual_damping_ineq=0.0,
     dual_damping_eq=0.0,
-    average="off",
+    average=True,
     update_mode="synchronous",
-    pdhg_state=None,
-    pdhg_eta_init=1.0,
-    pdhg_omega_init=1.0,
-    pdhg_reduce=0.3,
-    pdhg_grow=0.5,
     per_iterate_k=False,
     per_iterate_k_theta=0.1,
     per_iterate_k_lo=0.1,
@@ -106,14 +100,11 @@ def __sps(
         id(lp),
         id(optimiser),
         id(weight_function),
-        float(exponential_weight),
         float(primal_damping),
         float(dual_damping_ineq),
         float(dual_damping_eq),
         average,
         update_mode,
-        float(pdhg_reduce),
-        float(pdhg_grow),
         bool(per_iterate_k),
         float(per_iterate_k_theta),
         float(per_iterate_k_lo),
@@ -135,115 +126,7 @@ def __sps(
         ):
             apply_updates = optax.apply_updates
 
-            if update_mode == "pdhg":
-                # True PDHG (Chambolle–Pock) with PDLP-style per-iteration
-                # adaptive step size and primal weight. The optax `optimiser` /
-                # `opt_state` are bypassed entirely: PDHG carries its own scalar
-                # step `eta` and primal weight `omega` in `opt_state` (as a
-                # length-2 array `[eta, omega]`), since the step sizes are state
-                # adapted from iterate movement, not an optax transform.
-                #
-                # Parameterisation (PDLP): tau = eta / omega (primal step),
-                # sigma = eta * omega (dual step). The omega-weighted norm is
-                #   ||z||^2_w = omega ||x||^2 + (1/omega) ||y||^2.
-                # The adaptive rule accepts a step when
-                #   eta <= eta_bar := ||z_{k+1}-z_k||^2_w
-                #                     / ( 2 (dy)^T A (dx) ),
-                # then proposes the next trial step by interpolating toward
-                # eta_bar (grow) while backtracking (reduce) on rejection. This
-                # is the mechanism that lets PDHG track the local interaction
-                # norm of A instead of a fixed worst-case 1/||A|| step.
-
-                def pdhg_iter(i, state, eta, omega):
-                    x = state.primal
-                    y = jnp.concatenate([state.dual_eq, state.dual_ineq])
-                    ATy = lp.A_T @ y  # reused in the primal grad
-
-                    def attempt(carry):
-                        eta_try, *_ = carry
-                        tau = eta_try / omega
-                        sigma = eta_try * omega
-
-                        # True Chambolle–Pock (primal-first form with
-                        # over-relaxation). The extrapolated primal
-                        # x_bar = 2 x_new - x feeds the dual step; this is the
-                        # extrapolation that makes PDHG *contract* on the coupled
-                        # rotation instead of orbiting it like Arrow–Hurwicz/GDA.
-                        grad_primal = lp.c + ATy
-                        x_new = projection_primal(x - tau * grad_primal)
-
-                        x_bar = 2.0 * x_new - x
-                        residual = lp.A @ x_bar - lp.b
-                        y_new = y + sigma * residual
-                        # eq duals are free; ineq duals project to nonneg.
-                        y_new = jnp.concatenate(
-                            [
-                                y_new[: lp.n_eq],
-                                projection_non_negative(y_new[lp.n_eq :]),
-                            ]
-                        )
-
-                        dx = x_new - x
-                        dy = y_new - y
-                        # omega-weighted movement and the interaction term.
-                        norm_w = omega * (dx @ dx) + (dy @ dy) / omega
-                        interaction = dy @ (lp.A @ dx)
-                        # eta_bar: largest step keeping the CP descent
-                        # inequality valid. Guard the (near-)zero interaction
-                        # case (no coupling movement) with a large bound so the
-                        # step is accepted and grows.
-                        eta_bar = jnp.where(
-                            jnp.abs(interaction) > 1e-30,
-                            norm_w / (2.0 * jnp.abs(interaction)),
-                            jnp.inf,
-                        )
-                        accepted = eta_try <= eta_bar
-                        # On accept, next trial grows toward eta_bar; on reject,
-                        # backtrack. Both clamp against eta_bar for safety.
-                        eta_grow = jnp.minimum((1.0 + pdhg_grow) * eta_try, eta_bar)
-                        eta_shrink = jnp.minimum(
-                            (1.0 - pdhg_reduce) * eta_bar, pdhg_reduce * eta_try
-                        )
-                        eta_next = jnp.where(accepted, eta_grow, eta_shrink)
-                        return (eta_next, x_new, y_new, accepted)
-
-                    def cond(carry):
-                        return jnp.logical_not(carry[3])
-
-                    eta_next, x_new, y_new, _ = jax.lax.while_loop(
-                        cond,
-                        attempt,
-                        attempt((eta, x, y, False)),
-                    )
-
-                    new_state = SaddleState(
-                        primal=x_new,
-                        dual_eq=y_new[: lp.n_eq],
-                        dual_ineq=y_new[lp.n_eq :],
-                    )
-                    return new_state, eta_next
-
-                def step(carry, _):
-                    i, state, average_state, opt_state, total_weight = carry
-                    eta, omega = opt_state[0], opt_state[1]
-
-                    state, eta = pdhg_iter(i, state, eta, omega)
-                    opt_state = jnp.array([eta, omega])
-
-                    if average == "polyak":
-                        w = weight_function(i)
-                        total_weight = total_weight + w
-                        average_state = optax.incremental_update(
-                            state, average_state, w / total_weight
-                        )
-                    elif average == "exponential":
-                        average_state = optax.incremental_update(
-                            state, average_state, exponential_weight
-                        )
-
-                    return (i + 1, state, average_state, opt_state, total_weight), None
-
-            elif update_mode == "alternating":
+            if update_mode == "alternating":
 
                 def step(carry, _):
                     i, state, average_state, opt_state, total_weight = carry
@@ -275,20 +158,13 @@ def __sps(
                         dual_eq=state.dual_eq,
                     )
 
-                    # `average` is a Python-level static, so dispatch the
-                    # averaging mode at trace time. When averaging is "off" the
-                    # incremental_update (a full read/write pass over the state
-                    # tree) is dropped from the hot loop entirely, and the
-                    # polyak-only weight_function call is skipped otherwise.
-                    if average == "polyak":
+                    # `average` is a Python-level static, so when False the
+                    # incremental_update is dropped from the hot loop entirely.
+                    if average:
                         w = weight_function(i)
                         total_weight = total_weight + w
                         average_state = optax.incremental_update(
                             state, average_state, w / total_weight
-                        )
-                    elif average == "exponential":
-                        average_state = optax.incremental_update(
-                            state, average_state, exponential_weight
                         )
 
                     return (i + 1, state, average_state, opt_state, total_weight), None
@@ -339,15 +215,11 @@ def __sps(
                     )
                     opt_state = (opt_state, k, eta)
 
-                    if average == "polyak":
+                    if average:
                         w = weight_function(i)
                         total_weight = total_weight + w
                         average_state = optax.incremental_update(
                             state, average_state, w / total_weight
-                        )
-                    elif average == "exponential":
-                        average_state = optax.incremental_update(
-                            state, average_state, exponential_weight
                         )
 
                     return (i + 1, state, average_state, opt_state, total_weight), None
@@ -425,15 +297,11 @@ def __sps(
                     )
                     opt_state = (opt_state, k, eta)
 
-                    if average == "polyak":
+                    if average:
                         w = weight_function(i)
                         total_weight = total_weight + w
                         average_state = optax.incremental_update(
                             state, average_state, w / total_weight
-                        )
-                    elif average == "exponential":
-                        average_state = optax.incremental_update(
-                            state, average_state, exponential_weight
                         )
 
                     return (i + 1, state, average_state, opt_state, total_weight), None
@@ -452,20 +320,13 @@ def __sps(
                         dual_eq=state.dual_eq,
                     )
 
-                    # `average` is a Python-level static, so dispatch the
-                    # averaging mode at trace time. When averaging is "off" the
-                    # incremental_update (a full read/write pass over the state
-                    # tree) is dropped from the hot loop entirely, and the
-                    # polyak-only weight_function call is skipped otherwise.
-                    if average == "polyak":
+                    # `average` is a Python-level static, so when False the
+                    # incremental_update is dropped from the hot loop entirely.
+                    if average:
                         w = weight_function(i)
                         total_weight = total_weight + w
                         average_state = optax.incremental_update(
                             state, average_state, w / total_weight
-                        )
-                    elif average == "exponential":
-                        average_state = optax.incremental_update(
-                            state, average_state, exponential_weight
                         )
 
                     return (i + 1, state, average_state, opt_state, total_weight), None
@@ -495,9 +356,6 @@ def __sps(
 
     if initial_opt_state is not None:
         opt_state = initial_opt_state
-    elif update_mode == "pdhg":
-        # PDHG carries its scalar step + primal weight in lieu of an optax state.
-        opt_state = jnp.array([pdhg_eta_init, pdhg_omega_init])
     elif per_iterate_k or extragradient:
         # Pack the running step-ratio k and magnitude eta alongside the optax state.
         dtype = initial_solution.primal.dtype
@@ -557,15 +415,10 @@ def solve(
     primal_grad_norm_tolerance=1e-3,
     complementarity_slack_tolerance=1e-3,
     weight_function=lambda _: 1.0,
-    exponential_weight=0.01,
     verbose=False,
     log_every=10,
-    average="off",
+    average=True,
     update_mode="synchronous",
-    pdhg_eta_init=1.0,
-    pdhg_omega_init=1.0,
-    pdhg_reduce=0.3,
-    pdhg_grow=0.5,
     per_iterate_k=False,
     per_iterate_k_theta=0.1,
     per_iterate_k_lo=0.1,
@@ -589,6 +442,7 @@ def solve(
     polish_lr_scale_threshold=1e-2,
     polish_merit_threshold=None,
     eq_projection_threshold=None,
+    precompile=False,
 ):
     """
     Solve a linear program via saddle-point optimisation.
@@ -601,18 +455,6 @@ def solve(
     when both ``primal_grad_norm_tolerance`` and
     ``complementarity_slack_tolerance`` are set; convergence is declared when
     either certificate is satisfied.
-
-    ``update_mode='pdhg'`` selects true PDHG (Chambolle–Pock) with a PDLP-style
-    *per-iteration* adaptive step size and primal weight, bypassing the optax
-    ``optimiser`` entirely (it may be left ``None``). PDHG carries a scalar step
-    ``eta`` and primal weight ``omega`` (primal step ``tau = eta/omega``, dual
-    step ``sigma = eta*omega``) and, each iteration, accepts the largest step
-    consistent with the Chambolle–Pock descent inequality measured on the
-    *actual* iterate movement (``pdhg_grow`` controls the optimistic growth,
-    ``pdhg_reduce`` the backtracking on rejection). This tracks the local
-    interaction norm of ``A`` instead of a fixed ``1/||A||`` step, which is the
-    main reason PDLP outruns plain GDA on ill-balanced / rotational instances.
-    ``restarts`` and ``average`` still apply and are recommended.
 
     Adaptive restarts (PDLP-style) accelerate ill-conditioned problems. A
     restart resets the optimiser momentum/averaging while keeping the current
@@ -680,10 +522,8 @@ def solve(
     if verbose:
         print("----------------------------------------------")
 
-    if update_mode not in ["synchronous", "alternating", "pdhg"]:
-        raise ValueError(
-            "update_mode must be one of ['synchronous', 'alternating', 'pdhg']"
-        )
+    if update_mode not in ["synchronous", "alternating"]:
+        raise ValueError("update_mode must be one of ['synchronous', 'alternating']")
     if per_iterate_k and update_mode != "synchronous":
         raise ValueError(
             "per_iterate_k is only implemented for update_mode='synchronous'."
@@ -957,10 +797,6 @@ def solve(
     average_state = initial_solution
     if initial_opt_state is not None:
         opt_state = initial_opt_state
-    elif update_mode == "pdhg":
-        # PDHG carries its own [eta, omega] step-state; the optax optimiser is
-        # unused in this mode.
-        opt_state = jnp.array([pdhg_eta_init, pdhg_omega_init])
     elif per_iterate_k or extragradient:
         # Pack the per-iterate step-ratio k and magnitude eta with the optax state.
         _pik_dtype = initial_solution.primal.dtype
@@ -1034,6 +870,32 @@ def solve(
         dual_term = dual_feasibility_residual / (1.0 + c_norm)
         return jnp.maximum(jnp.maximum(primal_term, dual_term), gap_term)
 
+    if precompile:
+        _precompile_result = __sps(
+            1,
+            0,
+            lp,
+            optimiser,
+            state,
+            average_state,
+            opt_state,
+            weight_function,
+            total_weight,
+            primal_damping,
+            dual_damping_ineq,
+            dual_damping_eq,
+            average,
+            update_mode,
+            per_iterate_k=active_per_iterate_k,
+            per_iterate_k_theta=per_iterate_k_theta,
+            per_iterate_k_lo=per_iterate_k_lo,
+            per_iterate_k_hi=per_iterate_k_hi,
+            k_init=k_init,
+            eta_init=eta_init,
+            extragradient=active_extragradient,
+        )
+        jax.block_until_ready(_precompile_result)
+
     start_time = time.time()
 
     def is_done():
@@ -1075,17 +937,12 @@ def solve(
                 average_state,
                 opt_state,
                 weight_function,
-                exponential_weight,
                 total_weight,
                 primal_damping,
                 dual_damping_ineq,
                 dual_damping_eq,
                 average,
                 update_mode,
-                pdhg_eta_init=pdhg_eta_init,
-                pdhg_omega_init=pdhg_omega_init,
-                pdhg_reduce=pdhg_reduce,
-                pdhg_grow=pdhg_grow,
                 per_iterate_k=active_per_iterate_k,
                 per_iterate_k_theta=per_iterate_k_theta,
                 per_iterate_k_lo=per_iterate_k_lo,
@@ -1109,7 +966,7 @@ def solve(
                 gap_ineq_comp,
                 gap_eq_comp,
             ) = jax.lax.cond(
-                average == "exponential" or average == "polyak",
+                average,
                 lambda: compute_epoch_metrics(average_state),
                 lambda: compute_epoch_metrics(state),
             )
@@ -1136,7 +993,7 @@ def solve(
                         dual_eq=state.dual_eq,
                         dual_ineq=state.dual_ineq,
                     )
-                    if average != "off":
+                    if average:
                         projected_avg_primal = _eq_project(average_state.primal)
                         average_state = SaddleState(
                             primal=projected_avg_primal,
@@ -1188,14 +1045,14 @@ def solve(
                 and optimiser is not polish_optimiser
             ):
                 optimiser = polish_optimiser
-                state = average_state if average != "off" else state
+                state = average_state if average else state
                 opt_state = opt_state = (
                     (optimiser.init(state), 1.0, lr_scale)
                     if (active_per_iterate_k or active_extragradient)
                     else optimiser.init(state)
                 )
-                active_per_iterate_k = False
-                active_extragradient = True
+                active_per_iterate_k = per_iterate_k
+                active_extragradient = extragradient
                 # total_weight = 0.0
                 if verbose:
                     print(f"  → Crossing over to polish optimiser (restarts exhausted)")
@@ -1225,10 +1082,10 @@ def solve(
                 # start. Compute the *other* point's merit and restart to
                 # whichever is better, instead of always restarting to the last
                 # iterate (which discarded a frequently-better average).
-                restart_point = average_state if average != "off" else state
+                restart_point = average_state if average else state
                 restart_merit = merit
-                restart_used_avg = average != "off"
-                if average != "off":
+                restart_used_avg = average
+                if average:
                     (
                         st_obj,
                         _st_pgn,
@@ -1261,11 +1118,7 @@ def solve(
                     # reset momentum, averaging, weight accumulation and the LR /
                     # weight_function schedule (via the iteration offset).
                     state = restart_point
-                    if update_mode == "pdhg":
-                        # Reset PDHG's step/primal-weight to its initial guess;
-                        # the iterate (warm start) is preserved.
-                        opt_state = jnp.array([pdhg_eta_init, pdhg_omega_init])
-                    elif active_per_iterate_k or active_extragradient:
+                    if active_per_iterate_k or active_extragradient:
                         # Reset momentum but carry the learned k; apply lr_scale to eta.
                         opt_state = (
                             optimiser.init(state),
@@ -1302,8 +1155,9 @@ def solve(
                             if (active_per_iterate_k or active_extragradient)
                             else optimiser.init(state)
                         )
-                        active_per_iterate_k = False
-                        active_extragradient = True
+                        active_per_iterate_k = per_iterate_k
+                        active_extragradient = extragradient
+                        current_iterations_per_epoch = iterations_per_epoch_min
                         if verbose:
                             reason = (
                                 f"lr_scale crossed {polish_lr_scale_threshold:.2e}"
@@ -1313,10 +1167,14 @@ def solve(
                             print(f"  → Crossing over to polish optimiser ({reason})")
                     epochs_since_restart = 0
                     current_cycle_cap *= restart_multiplier
-                    current_iterations_per_epoch = max(
-                        iterations_per_epoch_min,
-                        int(current_iterations_per_epoch * iterations_per_epoch_decay),
-                    )
+                    if optimiser is not polish_optimiser:
+                        current_iterations_per_epoch = max(
+                            iterations_per_epoch_min,
+                            int(
+                                current_iterations_per_epoch
+                                * iterations_per_epoch_decay
+                            ),
+                        )
                     restarts_done += 1
                     if verbose:
                         reason = (
@@ -1334,13 +1192,13 @@ def solve(
                         )
                         print("----------------------------------------------")
 
-        if average != "off":
+        if average:
             output = average_state
         else:
             output = state
     except KeyboardInterrupt:
         is_converged = False
-        if average != "off":
+        if average:
             output = average_state
         else:
             output = state
@@ -1469,25 +1327,6 @@ def __convert_to_scipy(jsp_mat: jsp.BCOO) -> sp.csc_matrix:
     row, col = indices[:, 0], indices[:, 1]
 
     return sp.csc_matrix((data, (row, col)), shape=jsp_mat.shape)
-
-
-def spectral_norm(lp: JaddleLP, n_iter: int = 30) -> float:
-    """Estimate ‖[A_eq; A_ineq]‖₂ via power iteration.
-
-    Returns the spectral norm, which gives the theoretically safe step size
-    bound ``η ≤ 1 / spectral_norm(lp)`` for PDHG-style solvers.
-    """
-    key = jax.random.PRNGKey(0)
-    v = jax.random.normal(key, (lp.A_eq.shape[1],))
-    v = v / jnp.linalg.norm(v)
-
-    A_eq, A_ineq = lp.A_eq, lp.A_ineq
-    for _ in range(n_iter):
-        v2 = A_eq.T @ (A_eq @ v) + A_ineq.T @ (A_ineq @ v)
-        sigma = jnp.linalg.norm(v2)
-        v = v2 / sigma
-
-    return float(jnp.sqrt(sigma))
 
 
 def ruiz_scaling(lp: LP, max_iter=20, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
