@@ -52,12 +52,14 @@ jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 
 
 def opt(lr):
-    primal = optax.inject_hyperparams(optax.optimistic_gradient_descent)(
+    primal = optax.inject_hyperparams(optax.sgd)(
         learning_rate=lr,
     )
 
-    dual = optax.inject_hyperparams(optax.optimistic_gradient_descent)(
+    dual = optax.inject_hyperparams(optax.sgd)(
         learning_rate=lr,
+        nesterov=True,
+        momentum=0.3,
     )
 
     return jo.create_saddle_optimiser(
@@ -71,10 +73,15 @@ print("Solving Problem:", PROBLEM_NAME)
 jl.lp_summary_statistics(jaddle_lp)
 solution_jaddle, _ = jl.solve(
     lp=jaddle_lp,
-    optimiser=opt(1 / 2),
+    optimiser=opt(1e-1),
     scale="ruiz+pc",
-    average=False,
+    per_iterate_k=True,
+    per_iterate_k_hi=1e3,
+    per_iterate_k_lo=1e-3,
+    average=True,
     precompile=True,
+    verbose=True,
+    log_every=1,
 )
 
 print(f"Primal Equality Residual: {jaddle_lp.eq_slack(solution_jaddle.primal)}")

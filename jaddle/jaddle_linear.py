@@ -49,10 +49,11 @@ def __sps(
     def projection_primal(primal_state):
         return projection_box(primal_state, lp.lower_bounds, lp.upper_bounds)
 
-    def grad_with_Ax(state):
-        # Fused matvecs: 2 sparse ops instead of 4. Returns `Ax` alongside the
-        # gradient so the per-iterate magnitude controller can form `A·dx` for
-        # free as `Ax_k - Ax_{k-1}` (no extra matvec).
+    def grad(state):
+        # Fused matvecs: 2 sparse ops (A @ x, Aᵀ @ y) instead of 4. The
+        # controllers below act on post-optimiser update norms, not on A·dx, so
+        # there is nothing to gain from returning Ax — keep the single matvec
+        # pair and return only the gradient.
         dual = jnp.concatenate([state.dual_eq, state.dual_ineq])
         Ax = lp.A @ state.primal  # shape: (n_eq + n_ineq,)
         ATd = lp.A_T @ dual  # shape: (n_vars,)
@@ -60,17 +61,11 @@ def __sps(
         residual = lp.b - Ax
         grad_dual_eq = residual[: lp.n_eq] + dual_damping_eq * state.dual_eq
         grad_dual_ineq = residual[lp.n_eq :] + dual_damping_ineq * state.dual_ineq
-        return (
-            SaddleState(
-                primal=grad_primal,
-                dual_ineq=grad_dual_ineq,
-                dual_eq=grad_dual_eq,
-            ),
-            Ax,
+        return SaddleState(
+            primal=grad_primal,
+            dual_ineq=grad_dual_ineq,
+            dual_eq=grad_dual_eq,
         )
-
-    def grad(state):
-        return grad_with_Ax(state)[0]
 
     def opt_update(gradient, opt_state, state):
         return optimiser.update(gradient, opt_state, state)
@@ -191,10 +186,17 @@ def __sps(
                     # A large primal update that gets clipped by box constraints
                     # correctly signals the dual is under-powered: the primal is
                     # already at its bound and the dual needs more force to move it.
+                    # Norms taken block-wise to avoid allocating a concatenated
+                    # dual vector every iteration in the innermost scan.
                     up = updates.primal
-                    ud = jnp.concatenate([updates.dual_eq, updates.dual_ineq])
                     norm_p = jnp.sqrt(up @ up) + 1e-30
-                    norm_d = jnp.sqrt(ud @ ud) + 1e-30
+                    norm_d = (
+                        jnp.sqrt(
+                            updates.dual_eq @ updates.dual_eq
+                            + updates.dual_ineq @ updates.dual_ineq
+                        )
+                        + 1e-30
+                    )
                     k_target = jnp.sqrt(norm_p / norm_d)
                     log_k = per_iterate_k_theta * jnp.log(k_target) + (
                         1.0 - per_iterate_k_theta
@@ -250,10 +252,13 @@ def __sps(
                     g = grad(state)
 
                     # --- per-iterate k (ratio) from look-ahead gradient norms ---
+                    # Block-wise dual norm (no concatenate allocation in-scan).
                     up = g.primal
-                    ud = jnp.concatenate([g.dual_eq, g.dual_ineq])
                     norm_p = jnp.sqrt(up @ up) + 1e-30
-                    norm_d = jnp.sqrt(ud @ ud) + 1e-30
+                    norm_d = (
+                        jnp.sqrt(g.dual_eq @ g.dual_eq + g.dual_ineq @ g.dual_ineq)
+                        + 1e-30
+                    )
                     k_target = jnp.sqrt(norm_p / norm_d)
                     log_k = per_iterate_k_theta * jnp.log(k_target) + (
                         1.0 - per_iterate_k_theta
@@ -1082,10 +1087,22 @@ def solve(
                 # start. Compute the *other* point's merit and restart to
                 # whichever is better, instead of always restarting to the last
                 # iterate (which discarded a frequently-better average).
+                #
+                # The second `compute_epoch_metrics(state)` is a full matvec
+                # pair, paid every epoch when averaging is on. Gate it so it
+                # only runs on epochs where a restart can actually fire: either
+                # the cycle is exhausted (no-progress restart), or the average's
+                # own merit is already near the sufficient-progress threshold so
+                # the better state-point could tip it over. On all other epochs
+                # neither point would trigger, so the extra metrics are wasted.
+                cycle_exhausted = epochs_since_restart >= current_cycle_cap
                 restart_point = average_state if average else state
                 restart_merit = merit
                 restart_used_avg = average
-                if average:
+                near_threshold = bool(
+                    merit <= restart_decay * merit_at_last_restart
+                )
+                if average and (cycle_exhausted or near_threshold):
                     (
                         st_obj,
                         _st_pgn,
@@ -1111,7 +1128,6 @@ def solve(
                 sufficient_progress = bool(
                     restart_merit <= restart_decay * merit_at_last_restart
                 )
-                cycle_exhausted = epochs_since_restart >= current_cycle_cap
 
                 if sufficient_progress or cycle_exhausted:
                     # Warm-start restart from the better of {average, iterate};
