@@ -6,7 +6,7 @@ import optax
 import functools
 from typing import NamedTuple
 import time
-from jaddle.jaddle_basic_types import CP, SaddleState, HedgeSaddleState
+from jaddle.jaddle_basic_types import CP, SaddleState
 import jaddle.jaddle_optimisers as jo
 import numpy as np
 
@@ -306,7 +306,6 @@ def solve(
     log_every=10,
     average=True,
     update_mode="synchronous",
-    expert_diagnostics=False,
     output_opt_state=False,
     per_iterate_k=False,
     per_iterate_k_theta=0.1,
@@ -608,52 +607,6 @@ def solve(
         )
 
     start_time = time.time()
-    missing_expert_state_warning_printed = False
-
-    def print_expert_weights(epoch_count, state_for_weights):
-        nonlocal missing_expert_state_warning_printed
-        if not expert_diagnostics:
-            return
-
-        extracted = jo.hedge_diagnostics_from_state(state_for_weights)
-        if extracted is None:
-            extracted = jo.hedge_weights_from_state(state_for_weights)
-        if extracted is None:
-            if (not missing_expert_state_warning_printed) and verbose:
-                print(
-                    "Expert diagnostics requested, but optimiser state has no hedge weights."
-                )
-                print("----------------------------------------------")
-                missing_expert_state_warning_printed = True
-            return
-
-        if isinstance(extracted, dict):
-            weights = extracted["weights"]
-            losses = extracted["clipped_losses"]
-            centered_losses = extracted["centered_losses"]
-            hedge_eta = extracted["eta"]
-        else:
-            # hedge_weights_from_state fallback: bare weight vector.
-            weights = extracted
-            losses = centered_losses = hedge_eta = None
-
-        if verbose:
-            print(
-                f"Player Weights (epoch {epoch_count}): {np.asarray(weights)}"
-            )
-            if losses is not None:
-                print(
-                    f"Player Losses (epoch {epoch_count}): {np.asarray(losses)}"
-                )
-                print(
-                    f"Centered Losses (epoch {epoch_count}): "
-                    f"{np.asarray(centered_losses)}"
-                )
-            if hedge_eta is not None:
-                print(
-                    f"Hedge Eta (epoch {epoch_count}): {float(hedge_eta):.3e}"
-                )
-            print("----------------------------------------------")
 
     try:
         while check_convergence(
@@ -732,8 +685,6 @@ def solve(
                 if per_iterate_k or extragradient:
                     print(f"  per-iterate k={float(opt_state[1]):.3f}")
                     print("----------------------------------------------")
-
-                print_expert_weights(count, opt_state)
 
             # --- Adaptive restart decision ---
             if restarts and restarts_done < restarts:

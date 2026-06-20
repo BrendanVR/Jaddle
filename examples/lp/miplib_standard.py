@@ -26,7 +26,7 @@ jo.configure_jax("x64")
 # %% [markdown]
 # ## Load the LP
 # We load a MIPLIB LP from an MPS file using the `highspy` library.
-PROBLEM_NAME = "stp3d"  # name of MIPLIB problem (without .mps extension)
+PROBLEM_NAME = "lotsize"  # name of MIPLIB problem (without .mps extension)
 highs = hspy.Highs()
 highs.readModel(
     f"/home/brendanvr/python/Jaddle/data/{PROBLEM_NAME}.mps"
@@ -46,13 +46,13 @@ k_max = 1e3
 
 
 def opt(lr):
-    primal = optax.inject_hyperparams(optax.adadelta)(
+    primal = optax.inject_hyperparams(optax.sgd)(
         learning_rate=lr,
     )
 
     dual = optax.inject_hyperparams(optax.sgd)(
         learning_rate=lr,
-        momentum=0.3,
+        momentum=0.5,
         nesterov=True,
     )
 
@@ -63,15 +63,17 @@ def opt(lr):
 
 
 def polisher(lr):
+    primal = optax.inject_hyperparams(optax.adadelta)(
+        learning_rate=lr,
+    )
+
+    dual = optax.inject_hyperparams(optax.adadelta)(
+        learning_rate=lr,
+    )
+
     return jo.create_saddle_optimiser(
-        optax.inject_hyperparams(optax.amsgrad)(
-            learning_rate=lr,
-            b1=0,
-        ),
-        optax.inject_hyperparams(optax.amsgrad)(
-            learning_rate=lr,
-            b1=0,
-        ),
+        primal,
+        dual,
     )
 
 
@@ -80,7 +82,7 @@ print("Solving Problem:", PROBLEM_NAME)
 jl.lp_summary_statistics(jaddle_lp)
 solution, _ = jl.solve(
     lp=jaddle_lp,
-    optimiser=opt(1),
+    optimiser=opt(1 / 2),
     iterations_per_epoch=1000,
     scale="ruiz+pc",
     verbose=True,
@@ -95,8 +97,8 @@ solution, _ = jl.solve(
     iterations_per_epoch_decay=0.9,
     iterations_per_epoch_min=10,
     average="polyak",
-    polish_optimiser=polisher(1e-3),
-    polish_merit_threshold=1e-2,
+    polish_optimiser=polisher(1e0),
+    polish_merit_threshold=1e-3,
     dual_gap_tolerance=1e0,
 )
 
@@ -106,13 +108,5 @@ print("----------------------------------------------")
 
 # %%
 jaddle_lp.objective(solution.primal)
-
-# %%
-sol = jl.project_onto_eq(jaddle_lp, solution.primal, 1e-5)
-
-# %%
-print(f"Primal Equality Residual (Projected): {jaddle_lp.eq_slack(sol)}")
-print(f"Primal Inequality Residual (Projected): {jaddle_lp.ineq_slack(sol)}")
-print("----------------------------------------------")
 
 # %%

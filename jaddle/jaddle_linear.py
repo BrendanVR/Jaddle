@@ -574,7 +574,6 @@ def solve(
     eta_init=1.0,
     extragradient=False,
     scale=None,
-    expert_diagnostics=False,
     output_opt_state=False,
     scaled_objective=False,
     restarts=0,
@@ -1036,46 +1035,6 @@ def solve(
         return jnp.maximum(jnp.maximum(primal_term, dual_term), gap_term)
 
     start_time = time.time()
-    missing_expert_state_warning_printed = False
-
-    def print_expert_weights(epoch_count, state_for_weights):
-        nonlocal missing_expert_state_warning_printed
-        if not expert_diagnostics:
-            return
-
-        extracted = jo.hedge_diagnostics_from_state(state_for_weights)
-        if extracted is None:
-            extracted = jo.hedge_weights_from_state(state_for_weights)
-        if extracted is None:
-            if (not missing_expert_state_warning_printed) and verbose:
-                print(
-                    "Expert diagnostics requested, but optimiser state has no hedge weights."
-                )
-                print("----------------------------------------------")
-                missing_expert_state_warning_printed = True
-            return
-
-        if isinstance(extracted, dict):
-            weights = extracted["weights"]
-            losses = extracted["clipped_losses"]
-            centered_losses = extracted["centered_losses"]
-            hedge_eta = extracted["eta"]
-        else:
-            # hedge_weights_from_state fallback: bare weight vector.
-            weights = extracted
-            losses = centered_losses = hedge_eta = None
-
-        if verbose:
-            print(f"Player Weights (epoch {epoch_count}): {np.asarray(weights)}")
-            if losses is not None:
-                print(f"Player Losses (epoch {epoch_count}): {np.asarray(losses)}")
-                print(
-                    f"Centered Losses (epoch {epoch_count}): "
-                    f"{np.asarray(centered_losses)}"
-                )
-            if hedge_eta is not None:
-                print(f"Hedge Eta (epoch {epoch_count}): {float(hedge_eta):.3e}")
-            print("----------------------------------------------")
 
     def is_done():
         if primal_stop:
@@ -1221,8 +1180,6 @@ def solve(
                     )
                     print("----------------------------------------------")
 
-                print_expert_weights(count, opt_state)
-
             # --- Adaptive restart decision ---
             if (
                 restarts
@@ -1237,8 +1194,8 @@ def solve(
                     if (active_per_iterate_k or active_extragradient)
                     else optimiser.init(state)
                 )
-                active_per_iterate_k = True
-                active_extragradient = False
+                active_per_iterate_k = False
+                active_extragradient = True
                 # total_weight = 0.0
                 if verbose:
                     print(f"  → Crossing over to polish optimiser (restarts exhausted)")
@@ -1345,8 +1302,8 @@ def solve(
                             if (active_per_iterate_k or active_extragradient)
                             else optimiser.init(state)
                         )
-                        active_per_iterate_k = True
-                        active_extragradient = False
+                        active_per_iterate_k = False
+                        active_extragradient = True
                         if verbose:
                             reason = (
                                 f"lr_scale crossed {polish_lr_scale_threshold:.2e}"
