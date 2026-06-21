@@ -10,7 +10,6 @@ from jaddle.jaddle_basic_types import CP, SaddleState
 import jaddle.jaddle_optimisers as jo
 import numpy as np
 
-
 _CONVEX_RUN_EPOCH_CACHE = {}
 
 
@@ -26,13 +25,16 @@ def __sps(
     total_weight=0.0,
     average=True,
     update_mode="synchronous",
-    per_iterate_k=False,
     per_iterate_k_theta=0.1,
     per_iterate_k_lo=0.1,
     per_iterate_k_hi=10.0,
-    extragradient=False,
     k_init=1.0,
 ):
+    # The stepping scheme is selected by `update_mode`. These derived booleans
+    # keep the per-scheme branching below readable while the string stays the
+    # single source of truth.
+    per_iterate_k = update_mode == "per_iterate_k"
+    extragradient = update_mode == "extragradient"
 
     def projection_primal(primal_state):
         return projection_box(primal_state, cp.lower_bounds, cp.upper_bounds)
@@ -82,11 +84,9 @@ def __sps(
         id(weight_function),
         bool(average),
         update_mode,
-        bool(per_iterate_k),
         float(per_iterate_k_theta),
         float(per_iterate_k_lo),
         float(per_iterate_k_hi),
-        bool(extragradient),
     )
     run_epoch = _CONVEX_RUN_EPOCH_CACHE.get(cache_key)
 
@@ -211,7 +211,9 @@ def __sps(
                         dual_ineq=g_half.dual_ineq * k,
                         dual_eq=g_half.dual_eq * k,
                     )
-                    corr_updates, opt_state = opt_update(scaled_g_half, opt_state, state)
+                    corr_updates, opt_state = opt_update(
+                        scaled_g_half, opt_state, state
+                    )
                     state = optax.apply_updates(state, corr_updates)
                     state = SaddleState(
                         primal=projection_primal(state.primal),
@@ -297,7 +299,7 @@ def solve(
     max_epochs=None,
     initial_solution=None,
     initial_opt_state=None,
-    iterations_per_epoch=int(1e4),
+    iterations_per_epoch=int(1e3),
     progress_tolerance=1e-2,
     constraint_tolerance=1e-3,
     complementarity_tolerance=1e-3,
@@ -307,11 +309,9 @@ def solve(
     average=True,
     update_mode="synchronous",
     output_opt_state=False,
-    per_iterate_k=False,
     per_iterate_k_theta=0.1,
     per_iterate_k_lo=0.1,
     per_iterate_k_hi=10.0,
-    extragradient=False,
     k_init=1.0,
     restarts=0,
     epochs_per_restart=10,
@@ -319,22 +319,28 @@ def solve(
     restart_decay=0.2,
     iterations_per_epoch_decay=1.0,
     iterations_per_epoch_min=100,
+    precompile=True,
 ):
     """
     Solve a convex saddle-point problem via saddle-point optimisation.
 
     Args:
-        per_iterate_k: Adapt the primal/dual step ratio ``k`` every iteration
-            inside the scan, matvec-free. The ratio target is
+        update_mode: Selects the stepping scheme (single source of truth):
+            ``"synchronous"`` (default), ``"alternating"``, ``"per_iterate_k"``,
+            or ``"extragradient"``.
+
+            ``"per_iterate_k"`` adapts the primal/dual step ratio ``k`` every
+            iteration inside the scan, matvec-free. The ratio target is
             ``sqrt(||u_primal|| / ||u_dual||)``; log-space smoothed by
             ``per_iterate_k_theta`` and clamped to ``[per_iterate_k_lo,
-            per_iterate_k_hi]``. Mutually exclusive with ``extragradient``.
+            per_iterate_k_hi]``.
+
+            ``"extragradient"`` is Korpelevich extragradient (two-call) with the
+            same per-iterate ``k`` adaptation from look-ahead gradient norms.
         per_iterate_k_theta: Smoothing coefficient for the log-space k update
-            (default 0.1). Smaller = slower adaptation.
+            (default 0.1). Smaller = slower adaptation. Used by the
+            ``"per_iterate_k"`` and ``"extragradient"`` modes.
         per_iterate_k_lo, per_iterate_k_hi: Clamp band for k (default [0.1, 10]).
-        extragradient: Korpelevich extragradient (two-call) with per-iterate k
-            adaptation from look-ahead gradient norms. Mutually exclusive with
-            ``per_iterate_k``.
         k_init: Initial value of ``k`` (default 1.0 = symmetric steps).
         restarts: Maximum number of warm restarts (default 0 = disabled). Each
             restart resets the optimiser momentum and averaging while keeping the
@@ -363,22 +369,21 @@ def solve(
     if verbose:
         print("----------------------------------------------")
 
-    if update_mode not in ["synchronous", "alternating"]:
-        raise ValueError("update_mode must be one of ['synchronous', 'alternating']")
-    if per_iterate_k and update_mode != "synchronous":
-        raise ValueError(
-            "per_iterate_k is only implemented for update_mode='synchronous'."
-        )
-    if extragradient and update_mode != "synchronous":
-        raise ValueError(
-            "extragradient is only implemented for update_mode='synchronous'."
-        )
-    if per_iterate_k and extragradient:
-        raise ValueError(
-            "per_iterate_k and extragradient both control per-iterate stepping; "
-            "use extragradient=True to get the look-ahead/corrector step with "
-            "built-in k adaptation."
-        )
+    valid_update_modes = [
+        "synchronous",
+        "alternating",
+        "per_iterate_k",
+        "extragradient",
+    ]
+    if update_mode not in valid_update_modes:
+        raise ValueError(f"update_mode must be one of {valid_update_modes}")
+
+    # Derived step-scheme booleans (single source of truth: update_mode). Used
+    # for opt_state packing, restart resets, and logging below; __sps derives
+    # its own copies from update_mode.
+    per_iterate_k = update_mode == "per_iterate_k"
+    extragradient = update_mode == "extragradient"
+
     if verbose:
         print("====Starting Solve====")
         print("----------------------------------------------")
@@ -420,10 +425,14 @@ def solve(
         primal_grad_norm = jnp.max(jnp.abs(projected_gradient_residual))
 
         ineq_violations = jnp.maximum(grad_dual_ineq, 0.0)
-        max_ineq_violation = jnp.max(ineq_violations) if ineq_violations.size > 0 else jnp.zeros(())
+        max_ineq_violation = (
+            jnp.max(ineq_violations) if ineq_violations.size > 0 else jnp.zeros(())
+        )
 
         eq_violations = jnp.abs(grad_dual_eq)
-        max_eq_violation = jnp.max(eq_violations) if eq_violations.size > 0 else jnp.zeros(())
+        max_eq_violation = (
+            jnp.max(eq_violations) if eq_violations.size > 0 else jnp.zeros(())
+        )
 
         complementarity_slack = (
             jnp.max(jnp.abs(average_state.dual_ineq * grad_dual_ineq))
@@ -522,11 +531,9 @@ def solve(
             total_weight,
             average,
             update_mode,
-            per_iterate_k,
             per_iterate_k_theta,
             per_iterate_k_lo,
             per_iterate_k_hi,
-            extragradient,
             k_init,
         )
 
@@ -537,11 +544,7 @@ def solve(
             constraint_bound,
             duality_gap,
             dual_gap_is_finite,
-        ) = jax.lax.cond(
-            average,
-            lambda: compute_epoch_metrics(average_state),
-            lambda: compute_epoch_metrics(state),
-        )
+        ) = compute_epoch_metrics(average_state if average else state)
 
         count += 1
 
@@ -606,6 +609,38 @@ def solve(
             constraint_bound,
         )
 
+    if precompile:
+        # Warm both jitted functions the hot loop uses (the scan body via
+        # __sps, and the end-of-epoch metrics) with the exact argument
+        # signatures the timed loop will feed them, so epoch 1 doesn't pay
+        # their first-call compile inside the timed measurement.
+        #
+        # NOTE: convex's run_epoch takes max_iter as a *static* argname (the
+        # scan length is baked into the compile), so it must be warmed with the
+        # real `current_iterations_per_epoch` value — warming with max_iter=1
+        # would compile a throwaway length-1 executable and leave the real one
+        # to compile cold in epoch 1. (Linear can use max_iter=1 because there
+        # it's a traced while_loop bound, not a static scan length.)
+        _precompile_result = __sps(
+            current_iterations_per_epoch,
+            i - restart_i_offset,
+            cp,
+            optimiser,
+            state,
+            average_state,
+            opt_state,
+            weight_function,
+            total_weight,
+            average,
+            update_mode,
+            per_iterate_k_theta,
+            per_iterate_k_lo,
+            per_iterate_k_hi,
+            k_init,
+        )
+        _precompile_metrics = compute_epoch_metrics(average_state if average else state)
+        jax.block_until_ready((_precompile_result, _precompile_metrics))
+
     start_time = time.time()
 
     try:
@@ -640,11 +675,9 @@ def solve(
                 total_weight,
                 average,
                 update_mode,
-                per_iterate_k,
                 per_iterate_k_theta,
                 per_iterate_k_lo,
                 per_iterate_k_hi,
-                extragradient,
                 k_init,
             )
             i = shifted_i + restart_i_offset
@@ -656,11 +689,7 @@ def solve(
                 constraint_bound,
                 duality_gap,
                 dual_gap_is_finite,
-            ) = jax.lax.cond(
-                average,
-                lambda: compute_epoch_metrics(average_state),
-                lambda: compute_epoch_metrics(state),
-            )
+            ) = compute_epoch_metrics(average_state if average else state)
 
             finish_epoch_time = time.time()
             count += 1
@@ -690,7 +719,9 @@ def solve(
             if restarts and restarts_done < restarts:
                 epochs_since_restart += 1
 
-                merit = kkt_merit(primal_grad_norm, complementarity_slack, constraint_bound)
+                merit = kkt_merit(
+                    primal_grad_norm, complementarity_slack, constraint_bound
+                )
 
                 # Two-point restart: pick the better of average and iterate.
                 restart_point = average_state if average else state
@@ -741,7 +772,9 @@ def solve(
                     restarts_done += 1
                     if verbose:
                         reason = (
-                            "sufficient-progress" if sufficient_progress else "cycle-cap"
+                            "sufficient-progress"
+                            if sufficient_progress
+                            else "cycle-cap"
                         )
                         which = "avg" if restart_used_avg else "iterate"
                         print(

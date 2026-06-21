@@ -18,7 +18,7 @@ import optax
 # %% [markdown]
 # ## Generate Synthetic Data
 # We will create synthetic data that follows a cubic relationship with some added noise.
-n = 10000
+n = 1000
 x = np.linspace(-1, 1, n)
 y = x**3
 y += 0.1 * np.random.randn(n)  # add noise
@@ -65,16 +65,8 @@ optimiser = jo.create_saddle_optimiser(
 solution, _ = jc.solve(
     cp,
     optimiser=optimiser,
-    average=True,
-    update_mode="synchronous",
-    # per_iterate_k=True,
-    # per_iterate_k_hi=k_max,
-    # per_iterate_k_lo=1 / k_max,
     verbose=True,
     log_every=1,
-    restarts=10,
-    restart_multiplier=1.5,
-    iterations_per_epoch_min=100,
 )
 
 

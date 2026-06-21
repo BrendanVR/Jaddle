@@ -376,9 +376,7 @@ def __sps(
                         dual_ineq=jnp.where(
                             do_restart, state.dual_ineq, anchor.dual_ineq
                         ),
-                        dual_eq=jnp.where(
-                            do_restart, state.dual_eq, anchor.dual_eq
-                        ),
+                        dual_eq=jnp.where(do_restart, state.dual_eq, anchor.dual_eq),
                     )
                     opt_state = (opt_state, anchor, h)
 
@@ -505,8 +503,8 @@ def solve(
     primal_feasibility_tolerance=1e-3,
     dual_feasibility_tolerance=1e-3,
     dual_gap_tolerance=1e-2,
-    primal_grad_norm_tolerance=1e-3,
-    complementarity_slack_tolerance=1e-3,
+    primal_grad_norm_tolerance=None,
+    complementarity_slack_tolerance=None,
     weight_function=lambda _: 1.0,
     verbose=False,
     log_every=10,
@@ -534,7 +532,7 @@ def solve(
     polish_lr_scale_threshold=1e-2,
     polish_merit_threshold=None,
     eq_projection_threshold=None,
-    precompile=False,
+    precompile=True,
 ):
     """
     Solve a linear program via saddle-point optimisation.
@@ -1031,12 +1029,25 @@ def solve(
         # Warm the end-of-epoch metrics fn too, with the exact state the hot
         # loop will feed it (average vs iterate is a Python-static choice), so
         # epoch 1 doesn't pay its first-call compile inside the timed loop.
-        _precompile_metrics = compute_epoch_metrics(
-            average_state if average else state
-        )
+        _precompile_metrics = compute_epoch_metrics(average_state if average else state)
         jax.block_until_ready((_precompile_result, _precompile_metrics))
 
     start_time = time.time()
+
+    def print_epoch_metrics(epoch_time=None):
+        dual_gap_status = "finite" if bool(dual_gap_is_finite) else "dual-infeasible"
+        time_str = f"|Time {epoch_time:.2f}s|" if epoch_time is not None else ""
+        print(
+            f"|Epoch {count}|"
+            f"|Obj{objective_value:.2e}|"
+            f"|PGN {primal_grad_norm:.2e}|"
+            f"|CS {complementarity_slack:.2e}|"
+            f"|PFR {constraint_bound:.2e}|"
+            f"|DFR {dual_feasibility_residual:.2e}|"
+            f"|DG {duality_gap:.2e} ({dual_gap_status})|"
+            f"{time_str}"
+        )
+        print("----------------------------------------------")
 
     def is_done():
         if primal_stop:
@@ -1146,20 +1157,7 @@ def solve(
             )
 
             if verbose and (count == 1 or count % log_every == 0):
-                dual_gap_status = (
-                    "finite" if bool(dual_gap_is_finite) else "dual-infeasible"
-                )
-                print(
-                    f"|Epoch {count}|"
-                    f"|Obj{objective_value:.2e}|"
-                    f"|PGN {primal_grad_norm:.2e}|"
-                    f"|CS {complementarity_slack:.2e}|"
-                    f"|PFR {constraint_bound:.2e}|"
-                    f"|DFR {dual_feasibility_residual:.2e}|"
-                    f"|DG {duality_gap:.2e} ({dual_gap_status})|"
-                    f"|Time {finish_epoch_time - start_epoch_time:.2f}s|"
-                )
-                print("----------------------------------------------")
+                print_epoch_metrics(finish_epoch_time - start_epoch_time)
 
                 # Per-iterate k/eta carried in the packed opt_state as
                 # (optax_state, k, eta); surface the values settled on this epoch.
@@ -1237,9 +1235,7 @@ def solve(
                 restart_point = average_state if average else state
                 restart_merit = merit
                 restart_used_avg = average
-                near_threshold = bool(
-                    merit <= restart_decay * merit_at_last_restart
-                )
+                near_threshold = bool(merit <= restart_decay * merit_at_last_restart)
                 if average and (cycle_exhausted or near_threshold):
                     (
                         st_obj,
@@ -1360,6 +1356,16 @@ def solve(
                             f"iters/epoch={current_iterations_per_epoch})"
                         )
                         print("----------------------------------------------")
+
+        # The while-loop exits the iteration *after* the converging epoch, so its
+        # metrics were computed but only printed if it landed on a log_every
+        # boundary. Print the final converged epoch's criteria here (skip when we
+        # broke out via max_epochs, which prints its own message and leaves
+        # is_converged False).
+        if verbose and is_converged and count > 0:
+            print("Convergence criteria met.")
+            print("----------------------------------------------")
+            print_epoch_metrics()
 
         if average:
             output = average_state

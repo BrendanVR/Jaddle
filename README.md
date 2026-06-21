@@ -5,14 +5,14 @@
 
 ## 🚀 Introduction
 
-Jaddle isn’t here to replace your industrial solver. It’s here to show that primal–dual optimization can be elegant, lightweight, and fun. Built in ~1000 lines of JAX.
+Jaddle isn’t here to replace your industrial solver. It’s here to show that primal–dual optimization can be elegant, lightweight, and fun. Built in ~3000 lines of JAX.
 
 Jaddle performs admirably on many hard linear and convex benchmarks, while remaining simple enough for rapid experimentation. Utilizing the basic building blocks that Optax provides, one can specify many complicated variants of primal–dual optimizers all with only 10–15 lines of code.
 
 
 ## ✨ Why Jaddle?
 
-- 🪶 Minimalist: (~1000 lines of code)
+- 🪶 Minimalist: (~3000 lines of code)
 - 🧩 Modular: built on JAX + Optax primitives
 - 🤸‍♀️ Flexible: swap optimizers in ~10 lines
 - 🚀 Portable: CPU / GPU / TPU
@@ -48,22 +48,7 @@ optimiser = jo.optimistic_adam_metric_saddle(
     dual_ineq_metric=jnp.ones(num_ineq),
     dual_eq_metric=jnp.ones(num_eq),
 )
-
-When using `hedge_ensemble_saddle`, you can intermittently prune low-weight experts to reduce per-epoch compute:
-
-```python
-solution = jl.solve(
-    lp=jaddle_lp,
-    optimiser=ensemble_optimiser,
-    prune_experts=1e-7,
-    prune_experts_interval=5,
-    update_mode="alternating",  # or "synchronous" (default)
-)
 ```
-
-`update_mode` controls the SPS player updates: use `"synchronous"` (default) for joint primal/dual updates, or `"alternating"` for primal-then-dual updates within each iteration.
-
----
 
 ## 📊 Benchmarks
 
@@ -76,7 +61,7 @@ Jaddle has been tested on challenging MIPLIB relaxations.  While not a productio
 | `ns1758913`   |  17684  |  26760 |    39       | 11 |
 | `buildingenergy`   |  154978   |  277594  |    142       | 92 |
 
-The point is not to beat cuPDLP‑C outright, but to show that ~1000 lines of JAX can hang in the same ballpark.
+The point is not to beat cuPDLP‑C outright, but to show that ~3000 lines of JAX can hang in the same ballpark.
 
 ## 📦 Installation
 
