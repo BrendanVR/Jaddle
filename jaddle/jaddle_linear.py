@@ -502,7 +502,7 @@ def solve(
     primal_damping=0.0,
     primal_feasibility_tolerance=1e-3,
     dual_feasibility_tolerance=1e-3,
-    dual_gap_tolerance=1e-2,
+    dual_gap_tolerance=1e-4,
     primal_grad_norm_tolerance=None,
     complementarity_slack_tolerance=None,
     weight_function=lambda _: 1.0,
@@ -658,12 +658,18 @@ def solve(
 
     if scale == "ruiz":
         lp, row_scale, col_scale = ruiz_scaling(lp)
+
+        lp = to_jaddle_sparse(lp)
+
         if verbose:
             print("Applied Ruiz scaling to the LP.")
             print("----------------------------------------------")
 
     elif scale == "pc":
         lp, row_scale, col_scale = pc_scaling(lp)
+
+        lp = to_jaddle_sparse(lp)
+
         if verbose:
             print("Applied PC scaling to the LP.")
             print("----------------------------------------------")
@@ -677,6 +683,8 @@ def solve(
             col_scale_ruiz * col_scale_pc,
         )
 
+        lp = to_jaddle_sparse(lp)
+
         if verbose:
             print("Applied combined Ruiz + PC scaling to the LP.")
             print("----------------------------------------------")
@@ -688,12 +696,26 @@ def solve(
     if initial_solution is None:
         initial_solution = lp.initial_solution()
 
+    # lp.initial_solution() allocates with the JAX default float width (f32, or
+    # f64 under x64), which mismatches the profile dtype the LP data carries
+    # (e.g. float16). Cast the state to match so the solve runs end-to-end in
+    # the active precision instead of silently upcasting.
+    _state_dtype = lp.c.dtype
+    initial_solution = SaddleState(
+        primal=initial_solution.primal.astype(_state_dtype),
+        dual_ineq=initial_solution.dual_ineq.astype(_state_dtype),
+        dual_eq=initial_solution.dual_eq.astype(_state_dtype),
+    )
+
     row_scale_ineq = row_scale[len(lp.b_eq) :]
     row_scale_eq = row_scale[: len(lp.b_eq)]
 
-    # Convert to jax arrays for use inside jitted functions
-    jnp_row_scale_ineq = jnp.array(row_scale_ineq)
-    jnp_row_scale_eq = jnp.array(row_scale_eq)
+    # Convert to jax arrays for use inside jitted functions. Match the state
+    # dtype so dividing by the scales doesn't upcast the state back out of the
+    # profile precision (numpy float64 scale * jax float16 -> float64).
+    jnp_row_scale_ineq = jnp.array(row_scale_ineq, dtype=_state_dtype)
+    jnp_row_scale_eq = jnp.array(row_scale_eq, dtype=_state_dtype)
+    col_scale = jnp.asarray(col_scale, dtype=_state_dtype)
 
     # Precompute equality-constraint projection: x ← x - A_eq^T (A_eq A_eq^T)^{-1} (A_eq x - b_eq).
     # The factorisation is done once in scipy (scaled space); the apply is a cheap
@@ -854,23 +876,24 @@ def solve(
         dual_gap_is_finite,
         primal_grad_norm,
         complementarity_slack,
+        objective_value,
     ):
         # Standard LP optimality certificate — all three conditions must hold:
         #   * primal feasibility: constraint_bound within tolerance
         #   * dual feasibility: reduced-cost residual within tolerance
         #   * a finite, small duality gap
-        # The gap is computed in scaled space (Ruiz+PC) and the objective is in
-        # true units (column scaling cancels in c^T x), so normalising by
-        # objective_value would mix units. Instead we normalise by
-        # (1 + |gap_at_start|) — but since we don't track that, we just use an
-        # absolute tolerance on the scaled gap. The kkt_merit used for restarts
-        # already does the right relative normalisation; this gate just needs
-        # to be loose enough to not block when the gap is genuinely small.
+        # The gap decomposition is rescaled by `c_max` into true objective units
+        # (see the decomposition comment above), so it is unit-consistent with
+        # `objective_value`. We test a *relative* gap, normalised by
+        # (1 + |objective_value|), matching HiGHS/PDLP's relative-gap stopping
+        # convention so benchmark comparisons are apples-to-apples. The same
+        # (1 + |obj|) normalisation is used for `complementarity_slack` above.
+        relative_duality_gap = jnp.abs(duality_gap) / (1.0 + jnp.abs(objective_value))
         standard = (
             (constraint_bound <= primal_feasibility_tolerance)
             & (dual_feasibility_residual <= dual_feasibility_threshold)
             & dual_gap_is_finite
-            & (jnp.abs(duality_gap) <= dual_gap_tolerance)
+            & (relative_duality_gap <= dual_gap_tolerance)
         )
         # Alternative KKT certificate: primal feasibility + complementary
         # slackness + small primal gradient norm (‖c + Aᵀy‖). Active only when
@@ -1044,7 +1067,7 @@ def solve(
             f"|CS {complementarity_slack:.2e}|"
             f"|PFR {constraint_bound:.2e}|"
             f"|DFR {dual_feasibility_residual:.2e}|"
-            f"|DG {duality_gap:.2e} ({dual_gap_status})|"
+            f"|RDG {duality_gap / (1.0 + jnp.abs(objective_value)):.2e} ({dual_gap_status})|"
             f"{time_str}"
         )
         print("----------------------------------------------")
@@ -1060,6 +1083,7 @@ def solve(
                 dual_gap_is_finite,
                 primal_grad_norm,
                 complementarity_slack,
+                objective_value,
             )
         )
 
@@ -1412,11 +1436,17 @@ def solve(
 
 # %%
 def to_jaddle_sparse(lp: LP):
-    # Resolve to the active JAX float width: float64 when x64 is enabled (the
-    # "x64" profile, PDLP-style double precision), float32 otherwise. Hardcoding
-    # float64 with x64 disabled silently truncated and spammed warnings.
-    float_dtype = jnp.float64 if jax.config.jax_enable_x64 else jnp.float32
-    np_float = np.float64 if jax.config.jax_enable_x64 else np.float32
+    # Resolve to the active precision profile's float width: float64 (x64,
+    # PDLP-style double precision), float32, or float16. jaddle_dtype() is the
+    # single source of truth; float64 requires x64 to be enabled (otherwise JAX
+    # silently truncates and spams warnings), so guard against that mismatch.
+    float_dtype = jo.jaddle_dtype()
+    if float_dtype == jnp.float64 and not jax.config.jax_enable_x64:
+        float_dtype = jnp.float32
+    # scipy.sparse cannot hold float16, so build the matrices in the nearest
+    # scipy-supported width and only cast the on-device BCOO data to the profile
+    # dtype afterwards. Half precision lives in JAX, not in the scipy CSR.
+    np_float = np.float64 if float_dtype == jnp.float64 else np.float32
 
     A_eq_sp = lp.A_eq.astype(np_float)
     A_eq_sp = A_eq_sp.sorted_indices()
@@ -1430,6 +1460,11 @@ def to_jaddle_sparse(lp: LP):
 
     A_eq = jsp.BCOO.from_scipy_sparse(A_eq_sp).sort_indices()
     A_ineq = jsp.BCOO.from_scipy_sparse(A_ineq_sp).sort_indices()
+    # Cast the sparse data array (indices stay integer) to the profile dtype.
+    A_eq = jsp.BCOO((A_eq.data.astype(float_dtype), A_eq.indices), shape=A_eq.shape)
+    A_ineq = jsp.BCOO(
+        (A_ineq.data.astype(float_dtype), A_ineq.indices), shape=A_ineq.shape
+    )
 
     lp_jax = JaddleLP(
         jnp.array(lp.c, dtype=float_dtype),
@@ -1517,8 +1552,8 @@ def ruiz_scaling(lp: LP, max_iter=20, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
     both cost and constraint information drive the equilibration.
     """
 
-    A_eq = __convert_to_scipy(lp.A_eq)
-    A_ineq = __convert_to_scipy(lp.A_ineq)
+    A_eq = lp.A_eq
+    A_ineq = lp.A_ineq
     A = sp.vstack([A_eq, A_ineq]).tocsr()
     m, n = A.shape
     b = np.concatenate([lp.b_eq, lp.b_ineq])
@@ -1576,8 +1611,6 @@ def ruiz_scaling(lp: LP, max_iter=20, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
         upper_bounds_scaled,
     )
 
-    lp_scaled = to_jaddle_sparse(lp_scaled)
-
     return lp_scaled, dr, dc
 
 
@@ -1594,8 +1627,8 @@ def pc_scaling(lp: LP, max_iter=1, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
     both cost and constraint information drive the equilibration.
     """
 
-    A_eq = __convert_to_scipy(lp.A_eq)
-    A_ineq = __convert_to_scipy(lp.A_ineq)
+    A_eq = lp.A_eq
+    A_ineq = lp.A_ineq
     A = sp.vstack([A_eq, A_ineq]).tocsr()
     m, n = A.shape
     b = np.concatenate([lp.b_eq, lp.b_ineq])
@@ -1652,8 +1685,6 @@ def pc_scaling(lp: LP, max_iter=1, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
         lower_bounds_scaled,
         upper_bounds_scaled,
     )
-
-    lp_scaled = to_jaddle_sparse(lp_scaled)
 
     return lp_scaled, dr, dc
 
