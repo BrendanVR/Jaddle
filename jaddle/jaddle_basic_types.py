@@ -8,15 +8,6 @@ import numpy as np
 ScheduleLike = Union[float, Callable[[jnp.ndarray], jnp.ndarray]]
 
 
-class ExtragradientState(NamedTuple):
-    # Stored look-ahead point x_half = params - lr * grad (phase 0 output).
-    x_half: Any
-    # 0 = look-ahead phase (next call stores x_half, returns zero update),
-    # 1 = corrector phase  (next call returns corrector, advances step).
-    phase: jnp.ndarray
-    step: jnp.ndarray
-
-
 # %%
 # Basic Types
 class SaddleState(NamedTuple):
@@ -185,12 +176,38 @@ class JaddleLP:
         self.b_ineq = b_ineq
         self.lower_bounds = lower_bounds
         self.upper_bounds = upper_bounds
-        # Fused [A_eq; A_ineq] for 2-matvec gradient computation
+        # Fused [A_eq; A_ineq] for 2-matvec gradient computation.
+        #
+        # Both A and Aᵀ are kept as BCOO. BCSR was benchmarked here (Aᵀ
+        # materialised as its own row-major CSR, not a lazy `.T`) and was MUCH
+        # slower than BCOO on this workload — do not switch back to BCSR without
+        # re-benchmarking; BCOO's matvec wins for these matrices/precision/device.
+        #
+        # Aᵀ is stored as an explicit transposed BCOO (column-swapped indices)
+        # rather than the lazy `self.A.T`, so `Aᵀ @ y` runs its own matvec
+        # instead of the transposed-operand code path.
         import jax.experimental.sparse as _jsp
 
         self.n_eq = A_eq.shape[0]
-        self.A = _jsp.bcoo_concatenate([A_eq, A_ineq], dimension=0)
-        self.A_T = self.A.T
+        A_bcoo = _jsp.bcoo_concatenate([A_eq, A_ineq], dimension=0)
+        A_T_bcoo = _jsp.BCOO(
+            (A_bcoo.data, A_bcoo.indices[:, ::-1]),
+            shape=A_bcoo.shape[::-1],
+        )
+
+        # Column-swapping A's indices destroys row-major sort order, leaving A_T
+        # with indices_sorted=False/unique_indices=False. JAX's BCOO matvec has a
+        # faster kernel for sorted+unique indices (and the unsorted path can't
+        # skip duplicate accumulation), so sort A_T once at build time. The LP
+        # has no duplicate (row, col) entries, so unique_indices is safe to set.
+        A_bcoo = A_bcoo.sort_indices()
+        A_bcoo.unique_indices = True
+
+        A_T_bcoo = A_T_bcoo.sort_indices()
+        A_T_bcoo.unique_indices = True
+
+        self.A = A_bcoo
+        self.A_T = A_T_bcoo
         self.b = jnp.concatenate([b_eq, b_ineq])
 
     def objective(self, x):

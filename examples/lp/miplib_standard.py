@@ -12,6 +12,8 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 import jax
 import jax.numpy as jnp
 
+jax.config.update("jax_log_compiles", True)
+
 import optax
 import highspy as hspy
 import jaddle.jaddle_optimisers as jo
@@ -51,7 +53,7 @@ jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
 # ## Solve the presolved LP using Jaddle's saddle point solver
 
 
-def opt(lr):
+def sgd(lr):
     primal = optax.inject_hyperparams(optax.sgd)(
         learning_rate=lr,
     )
@@ -68,17 +70,31 @@ def opt(lr):
     )
 
 
+def optimistic_sgd(lr):
+    primal = optax.inject_hyperparams(optax.optimistic_gradient_descent)(
+        learning_rate=lr,
+    )
+
+    dual = optax.inject_hyperparams(optax.optimistic_gradient_descent)(
+        learning_rate=lr,
+    )
+
+    return jo.create_saddle_optimiser(
+        primal,
+        dual,
+    )
+
+
 # %%
 print("Solving Problem:", PROBLEM_NAME)
 jl.lp_summary_statistics(jaddle_lp)
 solution_jaddle, _ = jl.solve(
     lp=jaddle_lp,
-    optimiser=opt(1e-1),
+    optimiser=optimistic_sgd(1 / 2),
+    iterations_per_epoch=1000,
     scale="ruiz+pc",
-    per_iterate_k=True,
-    per_iterate_k_hi=1e3,
-    per_iterate_k_lo=1e-3,
-    average=True,
+    update_mode="synchronous",
+    average=False,
     precompile=True,
     verbose=True,
     log_every=1,

@@ -5,7 +5,6 @@ import jax
 import jax.numpy as jnp
 from typing import Any, Optional
 from jaddle.jaddle_basic_types import (
-    ExtragradientState,
     ScheduleLike,
     LP,
     SaddleState,

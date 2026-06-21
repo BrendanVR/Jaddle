@@ -37,14 +37,19 @@ def __sps(
     dual_damping_eq=0.0,
     average=True,
     update_mode="synchronous",
-    per_iterate_k=False,
     per_iterate_k_theta=0.1,
     per_iterate_k_lo=0.1,
     per_iterate_k_hi=10.0,
     k_init=1.0,
     eta_init=1.0,
-    extragradient=False,
+    halpern_period=200,
 ):
+    # The stepping scheme is selected by `update_mode`. These derived booleans
+    # keep the dense per-scheme branching below readable while the string stays
+    # the single source of truth.
+    per_iterate_k = update_mode == "per_iterate_k"
+    extragradient = update_mode == "extragradient"
+    halpern = update_mode == "halpern"
 
     def projection_primal(primal_state):
         return projection_box(primal_state, lp.lower_bounds, lp.upper_bounds)
@@ -100,11 +105,10 @@ def __sps(
         float(dual_damping_eq),
         average,
         update_mode,
-        bool(per_iterate_k),
         float(per_iterate_k_theta),
         float(per_iterate_k_lo),
         float(per_iterate_k_hi),
-        bool(extragradient),
+        int(halpern_period),
     )
     run_epoch = _LINEAR_RUN_EPOCH_CACHE.get(cache_key)
 
@@ -311,6 +315,82 @@ def __sps(
 
                     return (i + 1, state, average_state, opt_state, total_weight), None
 
+            elif halpern:
+                # Restarted Halpern anchoring. One projected base step gives
+                # T(z_k); the iterate is then pulled back toward the anchor z_a:
+                #
+                #   T(z_k)   = proj(z_k + opt_step(grad(z_k)))
+                #   z_{k+1}  = λ_h · z_a + (1 - λ_h) · T(z_k)   (then re-project)
+                #
+                # with λ_h = 1/(h + 2) decaying the anchor pull over a *within-
+                # period* counter h (NOT the global iteration). Every
+                # `halpern_period` iterations the anchor is refreshed to the
+                # current iterate and h is reset to 0. This is the crucial part:
+                # with a global counter λ collapses to ~0 within one epoch (the
+                # anchor pull dies and Halpern degenerates to plain GDA), and a
+                # stale z_a=0 anchor drags early iterates toward the origin. The
+                # periodic refresh keeps the anchor a *recent good iterate* and
+                # keeps λ in a useful range, which is what gives Halpern its
+                # O(1/k) operator-residual contraction without the rotational
+                # windup of plain GDA — see [[dual-divergence-gda-stability]].
+                #
+                # State is packed as (optax_state, anchor, h). `solve` also
+                # re-anchors (and resets h via a fresh pack) on every outer
+                # restart.
+                def step(carry, _):
+                    i, state, average_state, opt_state, total_weight = carry
+                    opt_state, anchor, h = opt_state
+
+                    g = grad(state)
+                    updates, opt_state = opt_update(g, opt_state, state)
+                    t_state = apply_updates(state, updates)
+                    t_state = SaddleState(
+                        primal=projection_primal(t_state.primal),
+                        dual_ineq=projection_non_negative(t_state.dual_ineq),
+                        dual_eq=t_state.dual_eq,
+                    )
+
+                    # Anchor pull. h is the within-period counter; +2 keeps the
+                    # first pull at λ=1/2.
+                    lam = 1.0 / (h.astype(t_state.primal.dtype) + 2.0)
+                    state = SaddleState(
+                        primal=lam * anchor.primal + (1.0 - lam) * t_state.primal,
+                        dual_ineq=lam * anchor.dual_ineq
+                        + (1.0 - lam) * t_state.dual_ineq,
+                        dual_eq=lam * anchor.dual_eq + (1.0 - lam) * t_state.dual_eq,
+                    )
+                    state = SaddleState(
+                        primal=projection_primal(state.primal),
+                        dual_ineq=projection_non_negative(state.dual_ineq),
+                        dual_eq=state.dual_eq,
+                    )
+
+                    # Periodic restart: every halpern_period iters, re-anchor to
+                    # the current iterate and reset the λ counter. Branch-free so
+                    # the scan stays fused.
+                    h = h + 1
+                    do_restart = h >= halpern_period
+                    h = jnp.where(do_restart, 0, h)
+                    anchor = SaddleState(
+                        primal=jnp.where(do_restart, state.primal, anchor.primal),
+                        dual_ineq=jnp.where(
+                            do_restart, state.dual_ineq, anchor.dual_ineq
+                        ),
+                        dual_eq=jnp.where(
+                            do_restart, state.dual_eq, anchor.dual_eq
+                        ),
+                    )
+                    opt_state = (opt_state, anchor, h)
+
+                    if average:
+                        w = weight_function(i)
+                        total_weight = total_weight + w
+                        average_state = optax.incremental_update(
+                            state, average_state, w / total_weight
+                        )
+
+                    return (i + 1, state, average_state, opt_state, total_weight), None
+
             else:
 
                 def step(carry, _):
@@ -369,6 +449,14 @@ def __sps(
             jnp.asarray(k_init, dtype),
             jnp.asarray(eta_init, dtype),
         )
+    elif halpern:
+        # Pack the Halpern anchor (start-of-run iterate) and within-period
+        # counter h with the optax state.
+        opt_state = (
+            optimiser.init(initial_solution),
+            initial_solution,
+            jnp.asarray(0, jnp.int32),
+        )
     else:
         opt_state = optimiser.init(initial_solution)
 
@@ -424,13 +512,12 @@ def solve(
     log_every=10,
     average=True,
     update_mode="synchronous",
-    per_iterate_k=False,
     per_iterate_k_theta=0.1,
     per_iterate_k_lo=0.1,
     per_iterate_k_hi=10.0,
     k_init=1.0,
     eta_init=1.0,
-    extragradient=False,
+    halpern_period=200,
     scale=None,
     output_opt_state=False,
     scaled_objective=False,
@@ -482,13 +569,37 @@ def solve(
         restart_decay: Sufficient-progress threshold (default 0.2). A restart
             fires early if the KKT merit drops below ``restart_decay`` times its
             value at the last restart.
+        update_mode: Selects the per-iterate stepping scheme. One of:
+            * ``"synchronous"`` (default): simultaneous primal/dual gradient
+              descent-ascent through the user optimiser.
+            * ``"alternating"``: primal step, then a dual step using the
+              post-primal dual gradient (Gauss–Seidel ordering).
+            * ``"per_iterate_k"``: synchronous, but the primal/dual step ratio
+              ``k`` is adapted every iteration from update norms (matvec-free).
+              Tuned by ``per_iterate_k_theta/lo/hi`` and ``k_init``/``eta_init``.
+            * ``"extragradient"``: Korpelevich look-ahead/corrector step with
+              built-in ``k``/``eta`` adaptation. Two gradient evals per iter.
+            * ``"halpern"``: restarted anchoring step — one projected base step
+              ``T(z)`` then a pull toward the anchor ``z_a``:
+              ``z ← λ·z_a + (1−λ)·T(z)`` with ``λ = 1/(h+2)``, where ``h`` is a
+              within-period counter. Every ``halpern_period`` iterations the
+              anchor is refreshed to the current iterate and ``h`` reset to 0.
+              O(1/k) operator-residual contraction without the rotational windup
+              plain GDA suffers; targets the ill-conditioned / dual-divergence
+              regime. (A global, never-refreshed ``λ`` collapses to ~0 within one
+              epoch and Halpern silently degenerates to plain GDA — hence the
+              period.) The anchor also refreshes on every outer restart.
         k_init: Initial value of ``k`` (default 1.0 = symmetric steps, the
-            PC/Ruiz-scaled baseline). Only used when ``per_iterate_k=True`` or
-            ``extragradient=True``.
+            PC/Ruiz-scaled baseline). Only used when
+            ``update_mode in {"per_iterate_k", "extragradient"}``.
         eta_init: Initial value of the step magnitude ``eta`` (default 1.0).
             On restarts, ``eta`` is scaled by ``lr_scale`` to track the
-            magnitude decay. Only used when ``per_iterate_k=True`` or
-            ``extragradient=True``.
+            magnitude decay. Only used when
+            ``update_mode in {"per_iterate_k", "extragradient"}``.
+        halpern_period: Iterations between Halpern anchor refreshes (default
+            200). Smaller = more frequent re-anchoring (stronger, more local
+            contraction); larger = closer to a single long Halpern run. Only
+            used when ``update_mode="halpern"``.
         primal_stop: Opt-in, dual-free termination (default ``False``). When
             ``True``, termination ignores the dual certificate entirely and stops
             on **primal feasibility** (``constraint_bound`` within
@@ -527,22 +638,22 @@ def solve(
     if verbose:
         print("----------------------------------------------")
 
-    if update_mode not in ["synchronous", "alternating"]:
-        raise ValueError("update_mode must be one of ['synchronous', 'alternating']")
-    if per_iterate_k and update_mode != "synchronous":
-        raise ValueError(
-            "per_iterate_k is only implemented for update_mode='synchronous'."
-        )
-    if extragradient and update_mode != "synchronous":
-        raise ValueError(
-            "extragradient is only implemented for update_mode='synchronous'."
-        )
-    if extragradient and per_iterate_k:
-        raise ValueError(
-            "extragradient and per_iterate_k both control per-iterate stepping; "
-            "use extragradient=True to get the look-ahead/corrector step with "
-            "built-in k/eta adaptation."
-        )
+    valid_update_modes = [
+        "synchronous",
+        "alternating",
+        "per_iterate_k",
+        "extragradient",
+        "halpern",
+    ]
+    if update_mode not in valid_update_modes:
+        raise ValueError(f"update_mode must be one of {valid_update_modes}")
+
+    # Derived step-scheme booleans (single source of truth: update_mode). These
+    # name the three synchronous per-iterate schemes that pack extra state into
+    # opt_state and need bespoke restart handling below.
+    per_iterate_k = update_mode == "per_iterate_k"
+    extragradient = update_mode == "extragradient"
+    halpern = update_mode == "halpern"
     if verbose:
         print("====Starting Solve====")
         print("----------------------------------------------")
@@ -810,6 +921,13 @@ def solve(
             jnp.asarray(k_init, _pik_dtype),
             jnp.asarray(eta_init, _pik_dtype),
         )
+    elif halpern:
+        # Pack the Halpern anchor (start-of-run iterate) and period counter h.
+        opt_state = (
+            optimiser.init(initial_solution),
+            initial_solution,
+            jnp.asarray(0, jnp.int32),
+        )
     else:
         opt_state = optimiser.init(initial_solution)
     primal_grad_norm = jnp.inf
@@ -823,8 +941,20 @@ def solve(
     total_weight = 0.0
     is_converged = True
     current_iterations_per_epoch = iterations_per_epoch
-    active_extragradient = extragradient
-    active_per_iterate_k = per_iterate_k
+    # The active step scheme can change at crossover to a polish optimiser, so
+    # track it as a mutable string and derive the per-scheme booleans from it.
+    active_update_mode = update_mode
+
+    def _scheme_flags(mode):
+        return (
+            mode == "per_iterate_k",
+            mode == "extragradient",
+            mode == "halpern",
+        )
+
+    active_per_iterate_k, active_extragradient, active_halpern = _scheme_flags(
+        active_update_mode
+    )
 
     # Rolling window of recent objective values for the opt-in primal_stop rule
     # (oldest first). Seeded with inf so the window is not "full" until enough
@@ -890,16 +1020,21 @@ def solve(
             dual_damping_ineq,
             dual_damping_eq,
             average,
-            update_mode,
-            per_iterate_k=active_per_iterate_k,
+            active_update_mode,
             per_iterate_k_theta=per_iterate_k_theta,
             per_iterate_k_lo=per_iterate_k_lo,
             per_iterate_k_hi=per_iterate_k_hi,
             k_init=k_init,
             eta_init=eta_init,
-            extragradient=active_extragradient,
+            halpern_period=halpern_period,
         )
-        jax.block_until_ready(_precompile_result)
+        # Warm the end-of-epoch metrics fn too, with the exact state the hot
+        # loop will feed it (average vs iterate is a Python-static choice), so
+        # epoch 1 doesn't pay its first-call compile inside the timed loop.
+        _precompile_metrics = compute_epoch_metrics(
+            average_state if average else state
+        )
+        jax.block_until_ready((_precompile_result, _precompile_metrics))
 
     start_time = time.time()
 
@@ -947,14 +1082,13 @@ def solve(
                 dual_damping_ineq,
                 dual_damping_eq,
                 average,
-                update_mode,
-                per_iterate_k=active_per_iterate_k,
+                active_update_mode,
                 per_iterate_k_theta=per_iterate_k_theta,
                 per_iterate_k_lo=per_iterate_k_lo,
                 per_iterate_k_hi=per_iterate_k_hi,
                 k_init=k_init,
                 eta_init=eta_init,
-                extragradient=active_extragradient,
+                halpern_period=halpern_period,
             )
             # __sps increments the (restart-shifted) counter; restore global i.
             i = shifted_i + restart_i_offset
@@ -970,11 +1104,7 @@ def solve(
                 gap_bound_comp,
                 gap_ineq_comp,
                 gap_eq_comp,
-            ) = jax.lax.cond(
-                average,
-                lambda: compute_epoch_metrics(average_state),
-                lambda: compute_epoch_metrics(state),
-            )
+            ) = compute_epoch_metrics(average_state if average else state)
 
             finish_epoch_time = time.time()
             count += 1
@@ -1051,13 +1181,21 @@ def solve(
             ):
                 optimiser = polish_optimiser
                 state = average_state if average else state
-                opt_state = opt_state = (
-                    (optimiser.init(state), 1.0, lr_scale)
-                    if (active_per_iterate_k or active_extragradient)
-                    else optimiser.init(state)
+                if active_per_iterate_k or active_extragradient:
+                    opt_state = (optimiser.init(state), 1.0, lr_scale)
+                elif active_halpern:
+                    # Re-anchor Halpern at the crossover point; reset period h.
+                    opt_state = (
+                        optimiser.init(state),
+                        state,
+                        jnp.asarray(0, jnp.int32),
+                    )
+                else:
+                    opt_state = optimiser.init(state)
+                active_update_mode = update_mode
+                active_per_iterate_k, active_extragradient, active_halpern = (
+                    _scheme_flags(active_update_mode)
                 )
-                active_per_iterate_k = per_iterate_k
-                active_extragradient = extragradient
                 # total_weight = 0.0
                 if verbose:
                     print(f"  → Crossing over to polish optimiser (restarts exhausted)")
@@ -1141,6 +1279,14 @@ def solve(
                             1.0,
                             lr_scale,
                         )
+                    elif active_halpern:
+                        # Re-anchor Halpern at the restart point and reset the
+                        # within-period counter h so λ restarts at 1/2.
+                        opt_state = (
+                            optimiser.init(state),
+                            state,
+                            jnp.asarray(0, jnp.int32),
+                        )
                     else:
                         opt_state = optimiser.init(state)
                     average_state = state
@@ -1166,13 +1312,20 @@ def solve(
                     )
                     if crossover_lr or crossover_merit:
                         optimiser = polish_optimiser
-                        opt_state = (
-                            (optimiser.init(state), opt_state[1], lr_scale)
-                            if (active_per_iterate_k or active_extragradient)
-                            else optimiser.init(state)
+                        if active_per_iterate_k or active_extragradient:
+                            opt_state = (optimiser.init(state), opt_state[1], lr_scale)
+                        elif active_halpern:
+                            opt_state = (
+                                optimiser.init(state),
+                                state,
+                                jnp.asarray(0, jnp.int32),
+                            )
+                        else:
+                            opt_state = optimiser.init(state)
+                        active_update_mode = update_mode
+                        active_per_iterate_k, active_extragradient, active_halpern = (
+                            _scheme_flags(active_update_mode)
                         )
-                        active_per_iterate_k = per_iterate_k
-                        active_extragradient = extragradient
                         current_iterations_per_epoch = iterations_per_epoch_min
                         if verbose:
                             reason = (
