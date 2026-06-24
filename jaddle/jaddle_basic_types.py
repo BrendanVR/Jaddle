@@ -64,36 +64,94 @@ class CP:
         )
 
 
-def _least_norm_dual(A_eq, A_ineq, c, n_eq, n_ineq):
-    """Least-norm dual: min ‖y‖ s.t. Aᵀy ≈ -c (LP stationarity condition).
+def _diagonal_dual(A_eq, A_ineq, c, n_eq, n_ineq):
+    """Diagonal (Jacobi) dual stationarity seed for the LP condition Aᵀy ≈ -c.
 
-    Returns (dual_eq, dual_ineq). ineq duals are clipped to ≥ 0.
-    Works with both dense JAX arrays and BCOO sparse matrices via scipy lsqr.
-    Falls back to zeros on failure.
+    A cheap, solve-free warm start: instead of a full (bound-constrained) least
+    squares, project -c onto each constraint row independently, ignoring the
+    off-diagonal coupling between rows. For row j of A this gives the 1-D
+    least-squares estimate
+
+        y_j = (Aⱼ · (-c)) / ‖Aⱼ‖²   = -(A @ c)_j / rownorm²_j
+
+    so the whole vector is just one matvec ``A @ c`` plus the squared row norms —
+    no iterative solver. Inequality duals are clipped to ≥ 0 for dual
+    feasibility. Crude vs the exact least-norm dual, but it places the duals'
+    signs and magnitudes in the right ballpark, which is what a warm start needs;
+    the solver refines from there.
+
+    Returns (dual_eq, dual_ineq). Works with dense JAX arrays and BCOO sparse
+    matrices (anything supporting ``@`` and elementwise square).
     """
-    import scipy.sparse
-    import scipy.sparse.linalg
+    c = jnp.asarray(c)
 
-    def _to_scipy_csr(mat, n_rows, n_cols):
-        if hasattr(mat, "indices"):  # BCOO
-            mat = mat.sum_duplicates()
-            rows = np.asarray(mat.indices[:, 0])
-            cols = np.asarray(mat.indices[:, 1])
-            data = np.asarray(mat.data)
-            return scipy.sparse.csr_matrix((data, (rows, cols)), shape=(n_rows, n_cols))
-        return scipy.sparse.csr_matrix(np.asarray(mat))
+    def _row_sq_norms(A, n_rows):
+        # Squared row norms ‖Aⱼ‖². For BCOO, square the data and scatter-add by
+        # row index (axis-reductions on sparse `A*A` stay sparse and don't
+        # densify cleanly); for dense, just sum of squares along the columns.
+        if hasattr(A, "indices"):  # BCOO
+            rows = A.indices[:, 0]
+            return jnp.zeros(n_rows, dtype=A.data.dtype).at[rows].add(A.data**2)
+        return jnp.sum(jnp.asarray(A) ** 2, axis=1)
 
-    try:
-        n_vars = int(c.shape[0])
-        A_eq_sp = _to_scipy_csr(A_eq, n_eq, n_vars)
-        A_ineq_sp = _to_scipy_csr(A_ineq, n_ineq, n_vars)
-        A = scipy.sparse.vstack([A_eq_sp, A_ineq_sp], format="csr")
-        rhs = -np.asarray(c)
-        y, *_ = scipy.sparse.linalg.lsqr(A.T, rhs)
-        y = jnp.array(y)
-        return y[:n_eq], jnp.maximum(y[n_eq:], 0.0)
-    except Exception:
-        return jnp.zeros(n_eq), jnp.zeros(n_ineq)
+    def _row_dual(A, n_rows):
+        # (A @ c) is the per-row inner product Aⱼ·c; rownorm²_j = sum_k A_jk².
+        Ac = A @ c
+        row_sq = _row_sq_norms(A, n_rows)
+        return -Ac / (row_sq + 1e-12)
+
+    dual_eq = _row_dual(A_eq, n_eq) if n_eq > 0 else jnp.zeros(0, dtype=c.dtype)
+    dual_ineq = (
+        jnp.maximum(_row_dual(A_ineq, n_ineq), 0.0)
+        if n_ineq > 0
+        else jnp.zeros(0, dtype=c.dtype)
+    )
+    return dual_eq, dual_ineq
+
+
+def _diagonal_primal(A_eq, b_eq, A_ineq, b_ineq, lower, upper, n_vars):
+    """Diagonal (Jacobi) primal feasibility seed for the LP condition Ax ≈ b.
+
+    The transpose-symmetric counterpart of :func:`_diagonal_dual`. Instead of
+    solving the dual stationarity ``Aᵀy ≈ -c`` row-by-row, it solves primal
+    feasibility ``Ax ≈ b`` column-by-column. Taking a single Jacobi step from
+    ``x = 0`` (where the residual ``Ax - b`` is just ``-b``), the 1-D
+    least-squares correction along column ``k`` is
+
+        x_k = (Aₖ · b) / ‖Aₖ‖²   = (Aᵀb)_k / colnorm²_k
+
+    so the whole vector is one transposed matvec ``Aᵀ @ b`` plus the squared
+    column norms — no iterative solver. The equality and inequality blocks act
+    on the same ``x``, so their numerators and denominators are accumulated
+    together. The result is clipped to ``[lower, upper]`` (the primal analogue of
+    the ``≥ 0`` clip on inequality duals) so the seed lands inside the feasible
+    box. Crude vs an exact projection, but it places ``x`` in the right ballpark;
+    the solver refines from there.
+
+    Works with dense JAX arrays and BCOO sparse matrices (anything supporting
+    ``@`` and elementwise square).
+    """
+
+    def _col_sq_norms(A):
+        # Squared column norms ‖Aₖ‖². For BCOO, square the data and scatter-add
+        # by column index (axis 1 of indices); for dense, sum of squares down
+        # the rows.
+        if hasattr(A, "indices"):  # BCOO
+            cols = A.indices[:, 1]
+            return jnp.zeros(n_vars, dtype=A.data.dtype).at[cols].add(A.data**2)
+        return jnp.sum(jnp.asarray(A) ** 2, axis=0)
+
+    numer = jnp.zeros(n_vars)
+    denom = jnp.zeros(n_vars)
+    if A_eq.shape[0] > 0:
+        numer = numer + A_eq.T @ jnp.asarray(b_eq)
+        denom = denom + _col_sq_norms(A_eq)
+    if A_ineq.shape[0] > 0:
+        numer = numer + A_ineq.T @ jnp.asarray(b_ineq)
+        denom = denom + _col_sq_norms(A_ineq)
+
+    x = numer / (denom + 1e-12)
+    return optax.projections.projection_box(x, lower, upper)
 
 
 class LP:
@@ -141,21 +199,6 @@ class LP:
 
     def complementarity_slack(self, x, dual_ineq):
         return (dual_ineq * (self.A_ineq @ x - self.b_ineq)).sum()
-
-    def initial_solution(self):
-        primal = optax.projections.projection_box(
-            jnp.zeros(self.num_variables()),
-            self.lower_bounds,
-            self.upper_bounds,
-        )
-        dual_eq, dual_ineq = _least_norm_dual(
-            jnp.array(self.A_eq),
-            jnp.array(self.A_ineq),
-            jnp.array(self.c),
-            self.num_eq_constraints(),
-            self.num_ineq_constraints(),
-        )
-        return SaddleState(primal=primal, dual_ineq=dual_ineq, dual_eq=dual_eq)
 
 
 class JaddleLP:
@@ -238,19 +281,21 @@ class JaddleLP:
         return (dual_ineq * (self.A_ineq @ x - self.b_ineq)).sum()
 
     def initial_solution(self):
-        # print("---> Computing least-norm dual initial solution...")
-        # print("----------------------------------------------")
-        # primal = optax.projections.projection_box(
-        #     jnp.zeros(self.num_variables()),
-        #     self.lower_bounds,
-        #     self.upper_bounds,
-        # )
-        primal = jnp.zeros(self.num_variables())
-        # n_eq = self.num_eq_constraints()
-        # n_ineq = self.num_ineq_constraints()
-        # dual_eq, dual_ineq = _least_norm_dual(
-        #     self.A_eq, self.A_ineq, self.c, n_eq, n_ineq
-        # )
-        dual_eq = jnp.zeros(self.num_eq_constraints())
-        dual_ineq = jnp.zeros(self.num_ineq_constraints())
+        n_eq = self.num_eq_constraints()
+        n_ineq = self.num_ineq_constraints()
+        primal = _diagonal_primal(
+            self.A_eq,
+            self.b_eq,
+            self.A_ineq,
+            self.b_ineq,
+            self.lower_bounds,
+            self.upper_bounds,
+            self.num_variables(),
+        )
+        dual_eq, dual_ineq = _diagonal_dual(
+            self.A_eq, self.A_ineq, self.c, n_eq, n_ineq
+        )
         return SaddleState(primal=primal, dual_ineq=dual_ineq, dual_eq=dual_eq)
+
+
+# %%

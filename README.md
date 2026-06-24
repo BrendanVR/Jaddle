@@ -7,7 +7,7 @@
 
 Jaddle isn’t here to replace your industrial solver. It’s here to show that primal–dual optimization can be elegant, lightweight, and fun. Built in ~3000 lines of JAX.
 
-Jaddle performs admirably on many hard linear and convex benchmarks, while remaining simple enough for rapid experimentation. Utilizing the basic building blocks that Optax provides, one can specify many complicated variants of primal–dual optimizers all with only 10–15 lines of code.
+Jaddle performs admirably on many hard linear and convex benchmarks, while remaining simple enough for rapid experimentation. Utilizing the basic building blocks that Optax provides, one can specify many complicated variants of primal–dual optimizers all with only 5-10 lines of code.
 
 
 ## ✨ Why Jaddle?
@@ -26,42 +26,13 @@ import optax
 
 optimiser = jo.create_saddle_optimiser(
     optax.optimistic_adam_v2(learning_rate=1e-3, alpha=0.05),
-    dual_optimizer=optax.adadelta(learning_rate=1.0),
-)
-
-```
-
-You can also add static optimizer-side metric preconditioning without changing the LP matrices:
-
-```python
-import jax.numpy as jnp
-
-num_vars = jaddle_lp.num_variables()
-num_eq = jaddle_lp.num_eq_constraints()
-num_ineq = jaddle_lp.num_ineq_constraints()
-
-optimiser = jo.optimistic_adam_metric_saddle(
-    lr_primal=1e-2,
-    lr_dual_ineq=1e-2,
-    lr_dual_eq=1e-2,
-    primal_metric=jnp.ones(num_vars),
-    dual_ineq_metric=jnp.ones(num_ineq),
-    dual_eq_metric=jnp.ones(num_eq),
+    optax.adadelta(learning_rate=1.0),
 )
 ```
 
 ## 📊 Benchmarks
 
-Jaddle has been tested on challenging MIPLIB relaxations.  While not a production solver, it performs competitively with PDLP‑style methods. Here we compare **Jaddle** against **cuPDLP-C** with the appropriate scaling. We also make use of HiGHs' pre-solve functionality. We quote the size of the presolved system and not of the original problem. We also only quote solve time, and not time taken to scale the system (which is done in the same fashion by Jaddle and cuPDLP-C). Running with the above adamdelta_saddle optimiser on a GPU we have the following benchmark results:
-
-| Instance    | Variables | Constraints| cuPDLP-C Runtime (s) | Jaddle Runtime (s) | 
-|-------------|------| ------|-----------|--------|
-| `nug`         | 20446   |   18268  |     1      |   3 |
-| `stp3d`       | 136924  |  97457    |    35      | 9 |        
-| `ns1758913`   |  17684  |  26760 |    39       | 11 |
-| `buildingenergy`   |  154978   |  277594  |    142       | 92 |
-
-The point is not to beat cuPDLP‑C outright, but to show that ~3000 lines of JAX can hang in the same ballpark.
+Jaddle has been tested on challenging MIPLIB relaxations.  While not a production solver, it performs competitively with PDLP‑style methods. 
 
 ## 📦 Installation
 

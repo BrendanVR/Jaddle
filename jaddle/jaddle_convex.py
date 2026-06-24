@@ -25,16 +25,18 @@ def __sps(
     total_weight=0.0,
     average=True,
     update_mode="synchronous",
-    per_iterate_k_theta=0.1,
-    per_iterate_k_lo=0.1,
-    per_iterate_k_hi=10.0,
+    k_scaling=False,
     k_init=1.0,
 ):
-    # The stepping scheme is selected by `update_mode`. These derived booleans
-    # keep the per-scheme branching below readable while the string stays the
+    # The stepping scheme is selected by `update_mode`. This derived boolean
+    # keeps the per-scheme branching below readable while the string stays the
     # single source of truth.
-    per_iterate_k = update_mode == "per_iterate_k"
     extragradient = update_mode == "extragradient"
+    # k-scaling is an orthogonal option (any update_mode): a primal weight k
+    # rescales the primal/dual gradients by (1/k, k) before opt_update, so the
+    # dual/primal step ratio is k**2. When on, k is packed into opt_state and
+    # rebalanced at each restart in `solve` (PDLP-style); constant within an
+    # epoch.
 
     def projection_primal(primal_state):
         return projection_box(primal_state, cp.lower_bounds, cp.upper_bounds)
@@ -78,15 +80,33 @@ def __sps(
             dual_eq=updates.dual_eq,
         )
 
+    def scale_by_k(gradient, k):
+        # Primal weight split: (1/k, k) on (primal, dual) gradients.
+        return SaddleState(
+            primal=gradient.primal / k,
+            dual_ineq=gradient.dual_ineq * k,
+            dual_eq=gradient.dual_eq * k,
+        )
+
+    # When k-scaling is on, k is carried as the last element of opt_state. These
+    # helpers keep the step bodies agnostic to whether k is packed or not.
+    def unpack_k(opt_state):
+        if k_scaling:
+            return opt_state
+        return opt_state, None
+
+    def pack_k(opt_state, k):
+        if k_scaling:
+            return (opt_state, k)
+        return opt_state
+
     cache_key = (
         id(cp),
         id(optimiser),
         id(weight_function),
         bool(average),
         update_mode,
-        float(per_iterate_k_theta),
-        float(per_iterate_k_lo),
-        float(per_iterate_k_hi),
+        bool(k_scaling),
     )
     run_epoch = _CONVEX_RUN_EPOCH_CACHE.get(cache_key)
 
@@ -113,8 +133,12 @@ def __sps(
                     total_weight,
                 ) = carry
 
+                opt_state, k = unpack_k(opt_state)
+
                 if update_mode == "alternating":
                     gradient_start = grad(state)
+                    if k_scaling:
+                        gradient_start = scale_by_k(gradient_start, k)
 
                     primal_updates, _ = opt_update(
                         zero_dual(gradient_start),
@@ -130,6 +154,8 @@ def __sps(
                     )
 
                     gradient_after_primal = grad(state)
+                    if k_scaling:
+                        gradient_after_primal = scale_by_k(gradient_after_primal, k)
                     combined_gradient = SaddleState(
                         primal=gradient_start.primal,
                         dual_ineq=gradient_after_primal.dual_ineq,
@@ -147,55 +173,11 @@ def __sps(
                         dual_ineq=projection_non_negative(state.dual_ineq),
                         dual_eq=state.dual_eq,
                     )
-                elif per_iterate_k:
-                    opt_state, k = opt_state
-
-                    g = grad(state)
-                    updates, opt_state = opt_update(g, opt_state, state)
-
-                    up = updates.primal
-                    ud = jnp.concatenate([updates.dual_eq, updates.dual_ineq])
-                    norm_p = jnp.sqrt(up @ up) + 1e-30
-                    norm_d = jnp.sqrt(ud @ ud) + 1e-30
-                    k_target = jnp.sqrt(norm_p / norm_d)
-                    log_k = per_iterate_k_theta * jnp.log(k_target) + (
-                        1.0 - per_iterate_k_theta
-                    ) * jnp.log(k)
-                    k = jnp.clip(jnp.exp(log_k), per_iterate_k_lo, per_iterate_k_hi)
-
-                    updates = SaddleState(
-                        primal=updates.primal / k,
-                        dual_ineq=updates.dual_ineq * k,
-                        dual_eq=updates.dual_eq * k,
-                    )
-                    state = optax.apply_updates(state, updates)
-                    state = SaddleState(
-                        primal=projection_primal(state.primal),
-                        dual_ineq=projection_non_negative(state.dual_ineq),
-                        dual_eq=state.dual_eq,
-                    )
-                    opt_state = (opt_state, k)
                 elif extragradient:
-                    opt_state, k = opt_state
-
                     # --- Look-ahead gradient ---
                     g = grad(state)
 
-                    up = g.primal
-                    ud = jnp.concatenate([g.dual_eq, g.dual_ineq])
-                    norm_p = jnp.sqrt(up @ up) + 1e-30
-                    norm_d = jnp.sqrt(ud @ ud) + 1e-30
-                    k_target = jnp.sqrt(norm_p / norm_d)
-                    log_k = per_iterate_k_theta * jnp.log(k_target) + (
-                        1.0 - per_iterate_k_theta
-                    ) * jnp.log(k)
-                    k = jnp.clip(jnp.exp(log_k), per_iterate_k_lo, per_iterate_k_hi)
-
-                    scaled_g = SaddleState(
-                        primal=g.primal / k,
-                        dual_ineq=g.dual_ineq * k,
-                        dual_eq=g.dual_eq * k,
-                    )
+                    scaled_g = scale_by_k(g, k) if k_scaling else g
                     la_updates, _ = opt_update(scaled_g, opt_state, state)
                     state_half = optax.apply_updates(state, la_updates)
                     state_half = SaddleState(
@@ -206,11 +188,7 @@ def __sps(
 
                     # Corrector: gradient at look-ahead point, applied from original state
                     g_half = grad(state_half)
-                    scaled_g_half = SaddleState(
-                        primal=g_half.primal / k,
-                        dual_ineq=g_half.dual_ineq * k,
-                        dual_eq=g_half.dual_eq * k,
-                    )
+                    scaled_g_half = scale_by_k(g_half, k) if k_scaling else g_half
                     corr_updates, opt_state = opt_update(
                         scaled_g_half, opt_state, state
                     )
@@ -220,9 +198,10 @@ def __sps(
                         dual_ineq=projection_non_negative(state.dual_ineq),
                         dual_eq=state.dual_eq,
                     )
-                    opt_state = (opt_state, k)
                 else:
                     gradient = grad(state)
+                    if k_scaling:
+                        gradient = scale_by_k(gradient, k)
                     updates, opt_state = opt_update(gradient, opt_state, state)
                     state = optax.apply_updates(state, updates)
                     state = SaddleState(
@@ -230,6 +209,8 @@ def __sps(
                         dual_ineq=projection_non_negative(state.dual_ineq),
                         dual_eq=state.dual_eq,
                     )
+
+                opt_state = pack_k(opt_state, k)
 
                 w = weight_function(i)
                 total_weight = jax.lax.cond(
@@ -274,7 +255,7 @@ def __sps(
 
     if initial_opt_state is not None:
         opt_state = initial_opt_state
-    elif per_iterate_k or extragradient:
+    elif k_scaling:
         dtype = initial_solution.primal.dtype
         opt_state = (
             optimiser.init(initial_solution),
@@ -295,24 +276,25 @@ def __sps(
 
 def solve(
     cp: CP,
-    optimiser,
+    optimiser=None,
     max_epochs=None,
     initial_solution=None,
     initial_opt_state=None,
     iterations_per_epoch=int(1e3),
-    progress_tolerance=1e-2,
-    constraint_tolerance=1e-3,
-    complementarity_tolerance=1e-3,
+    primal_grad_norm_tolerance=1e-2,
+    primal_feasibility_tolerance=1e-3,
+    complementarity_slack_tolerance=1e-3,
     weight_function=lambda _: 1.0,
     verbose=False,
     log_every=10,
-    average=True,
-    update_mode="synchronous",
+    average=False,
+    update_mode="alternating",
     output_opt_state=False,
-    per_iterate_k_theta=0.1,
-    per_iterate_k_lo=0.1,
-    per_iterate_k_hi=10.0,
-    k_init=1.0,
+    k_scaling=True,
+    k_theta=0.5,
+    k_lo=0.1,
+    k_hi=10.0,
+    k_init=None,
     restarts=0,
     epochs_per_restart=10,
     restart_multiplier=1.0,
@@ -326,22 +308,27 @@ def solve(
 
     Args:
         update_mode: Selects the stepping scheme (single source of truth):
-            ``"synchronous"`` (default), ``"alternating"``, ``"per_iterate_k"``,
-            or ``"extragradient"``.
-
-            ``"per_iterate_k"`` adapts the primal/dual step ratio ``k`` every
-            iteration inside the scan, matvec-free. The ratio target is
-            ``sqrt(||u_primal|| / ||u_dual||)``; log-space smoothed by
-            ``per_iterate_k_theta`` and clamped to ``[per_iterate_k_lo,
-            per_iterate_k_hi]``.
-
-            ``"extragradient"`` is Korpelevich extragradient (two-call) with the
-            same per-iterate ``k`` adaptation from look-ahead gradient norms.
-        per_iterate_k_theta: Smoothing coefficient for the log-space k update
-            (default 0.1). Smaller = slower adaptation. Used by the
-            ``"per_iterate_k"`` and ``"extragradient"`` modes.
-        per_iterate_k_lo, per_iterate_k_hi: Clamp band for k (default [0.1, 10]).
-        k_init: Initial value of ``k`` (default 1.0 = symmetric steps).
+            ``"synchronous"`` (default), ``"alternating"``, or
+            ``"extragradient"`` (Korpelevich two-call).
+        k_scaling: Enable primal-weight (k) scaling (default ``False``). When
+            ``True`` — orthogonal to ``update_mode``, so it composes with all
+            three schemes — a primal weight ``k`` rescales the primal/dual
+            gradients by ``(1/k, k)`` before each ``opt_update``, making the
+            dual/primal step ratio ``k**2``. ``k`` is initialised from ``k_init``
+            and rebalanced at each restart (PDLP-style) from primal-vs-dual
+            iterate movement; it is constant within an epoch (not adapted per
+            iteration). Tuned by ``k_theta``/``k_lo``/``k_hi`` and ``k_init``.
+        k_theta: Smoothing coefficient for the log-space primal-weight update at
+            each restart (default 0.5 = geometric mean of the movement-based
+            target and the current weight, matching PDLP). Smaller = slower
+            adaptation. Only used when ``k_scaling=True``.
+        k_lo, k_hi: Clamp band for ``k`` (default [0.1, 10]). Also clamps the
+            ``||c||/||b||`` init. Only used when ``k_scaling=True``.
+        k_init: Initial primal weight ``k``. ``None`` (default) initialises it to
+            the PDLP heuristic ``||c|| / ||b||`` (objective vs RHS norms), where
+            ``c = grad(objective)(0)`` and ``b = -[c_eq(0); c_ineq(0)]``. Pass a
+            float to override (``1.0`` = symmetric steps). Only used when
+            ``k_scaling=True``.
         restarts: Maximum number of warm restarts (default 0 = disabled). Each
             restart resets the optimiser momentum and averaging while keeping the
             current iterate as a warm start. A restart fires when the normalised
@@ -363,6 +350,9 @@ def solve(
             100). Only used when ``iterations_per_epoch_decay < 1``.
     """
 
+    if optimiser is None:
+        optimiser = jo.optimisitic_gd(1 / 2)
+
     if log_every < 1:
         raise ValueError("log_every must be >= 1")
 
@@ -372,17 +362,10 @@ def solve(
     valid_update_modes = [
         "synchronous",
         "alternating",
-        "per_iterate_k",
         "extragradient",
     ]
     if update_mode not in valid_update_modes:
         raise ValueError(f"update_mode must be one of {valid_update_modes}")
-
-    # Derived step-scheme booleans (single source of truth: update_mode). Used
-    # for opt_state packing, restart resets, and logging below; __sps derives
-    # its own copies from update_mode.
-    per_iterate_k = update_mode == "per_iterate_k"
-    extragradient = update_mode == "extragradient"
 
     if verbose:
         print("====Starting Solve====")
@@ -467,9 +450,9 @@ def solve(
         constraint_bound,
     ):
         return (
-            (primal_grad_norm > progress_tolerance)
-            | (complementarity_slack > complementarity_tolerance)
-            | (constraint_bound > constraint_tolerance)
+            (primal_grad_norm > primal_grad_norm_tolerance)
+            | (complementarity_slack > complementarity_slack_tolerance)
+            | (constraint_bound > primal_feasibility_tolerance)
         )
 
     def check_max_epochs(count):
@@ -531,9 +514,7 @@ def solve(
             total_weight,
             average,
             update_mode,
-            per_iterate_k_theta,
-            per_iterate_k_lo,
-            per_iterate_k_hi,
+            k_scaling,
             k_init,
         )
 
@@ -569,12 +550,29 @@ def solve(
     if initial_solution is None:
         initial_solution = cp.initial_solution()
 
+    # PDLP-style primal-weight initialisation. When k-scaling is on and k_init is
+    # left as None we derive it from the objective/RHS norms ||c|| / ||b||, which
+    # puts the primal/dual step ratio in the right order of magnitude before
+    # iteration 1 instead of starting symmetric. For a linear objective
+    # c = grad(obj)(0), and for constraints of the form Ax - b, evaluating at
+    # x = 0 gives -b, so b = -[c_eq(0); c_ineq(0)]. This is generic over
+    # CP/LP/JaddleLP since it only uses the objective/constraint callables.
+    if k_scaling and k_init is None:
+        zero = jnp.zeros_like(initial_solution.primal)
+        c = jax.grad(cp.objective)(zero)
+        b = jnp.concatenate([cp.constraints_eq(zero), cp.constraints_ineq(zero)])
+        norm_c = jnp.linalg.norm(c) + 1e-30
+        norm_b = jnp.linalg.norm(b) + 1e-30
+        k_init = float(jnp.clip(norm_c / norm_b, k_lo, k_hi))
+    elif k_init is None:
+        k_init = 1.0
+
     is_converged = True
     state = initial_solution
     average_state = initial_solution
     if initial_opt_state is not None:
         opt_state = initial_opt_state
-    elif per_iterate_k or extragradient:
+    elif k_scaling:
         dtype = initial_solution.primal.dtype
         opt_state = (
             optimiser.init(initial_solution),
@@ -597,6 +595,9 @@ def solve(
     epochs_since_restart = 0
     current_cycle_cap = float(epochs_per_restart)
     merit_at_last_restart = jnp.inf
+    # Iterate at the last restart (or the start), used to rebalance the primal
+    # weight k from the primal-vs-dual movement over the restart cycle.
+    state_at_last_restart = initial_solution
 
     def kkt_merit(primal_grad_norm, complementarity_slack, constraint_bound):
         # Normalised KKT merit for the restart trigger. Each term is divided by
@@ -633,9 +634,7 @@ def solve(
             total_weight,
             average,
             update_mode,
-            per_iterate_k_theta,
-            per_iterate_k_lo,
-            per_iterate_k_hi,
+            k_scaling,
             k_init,
         )
         _precompile_metrics = compute_epoch_metrics(average_state if average else state)
@@ -675,9 +674,7 @@ def solve(
                 total_weight,
                 average,
                 update_mode,
-                per_iterate_k_theta,
-                per_iterate_k_lo,
-                per_iterate_k_hi,
+                k_scaling,
                 k_init,
             )
             i = shifted_i + restart_i_offset
@@ -705,14 +702,14 @@ def solve(
                     f"|Obj{objective_value:.2e}|"
                     f"|PGN {primal_grad_norm:.2e}|"
                     f"|CS {complementarity_slack:.2e}|"
-                    f"|CB {constraint_bound:.2e}|"
-                    f"|DG {duality_gap:.2e} ({dual_gap_status})|"
+                    f"|PFR {constraint_bound:.2e}|"
+                    f"|RDG {duality_gap/(1 + jnp.abs(objective_value)):.2e} ({dual_gap_status})|"
                     f"|Time {finish_epoch_time - start_epoch_time:.2f}s|"
                 )
                 print("----------------------------------------------")
 
-                if per_iterate_k or extragradient:
-                    print(f"  per-iterate k={float(opt_state[1]):.3f}")
+                if k_scaling:
+                    print(f"  primal weight k={float(opt_state[1]):.3f}")
                     print("----------------------------------------------")
 
             # --- Adaptive restart decision ---
@@ -752,14 +749,32 @@ def solve(
 
                 if sufficient_progress or cycle_exhausted:
                     state = restart_point
-                    if per_iterate_k or extragradient:
-                        opt_state = (
-                            optimiser.init(state),
-                            opt_state[1],
+                    if k_scaling:
+                        # PDLP-style primal-weight rebalance: drive k from the
+                        # primal-vs-dual *movement* over the just-finished cycle
+                        # (distance between iterates), not per-step gradient
+                        # norms. log-space geometric-mean blend with the current
+                        # weight (k_theta), then clamp.
+                        dp = state.primal - state_at_last_restart.primal
+                        dd = jnp.concatenate(
+                            [
+                                state.dual_eq - state_at_last_restart.dual_eq,
+                                state.dual_ineq - state_at_last_restart.dual_ineq,
+                            ]
                         )
+                        move_p = jnp.linalg.norm(dp) + 1e-30
+                        move_d = jnp.linalg.norm(dd) + 1e-30
+                        k_target = move_p / move_d
+                        k_prev = opt_state[1]
+                        log_k = k_theta * jnp.log(k_target) + (1.0 - k_theta) * jnp.log(
+                            k_prev
+                        )
+                        k_new = jnp.clip(jnp.exp(log_k), k_lo, k_hi)
+                        opt_state = (optimiser.init(state), k_new)
                     else:
                         opt_state = optimiser.init(state)
                     average_state = state
+                    state_at_last_restart = state
                     total_weight = 0.0
                     restart_i_offset = i - 1
                     merit_at_last_restart = restart_merit
@@ -777,11 +792,12 @@ def solve(
                             else "cycle-cap"
                         )
                         which = "avg" if restart_used_avg else "iterate"
+                        k_msg = f", k={float(opt_state[1]):.3e}" if k_scaling else ""
                         print(
                             f"Restart {restarts_done}/{restarts} at epoch {count} "
                             f"({reason}, merit={float(restart_merit):.2e} "
                             f"[{which}], next cap={current_cycle_cap:.0f} epochs, "
-                            f"iters/epoch={current_iterations_per_epoch})"
+                            f"iters/epoch={current_iterations_per_epoch}{k_msg})"
                         )
                         print("----------------------------------------------")
 

@@ -11,7 +11,6 @@ from jaddle.jaddle_basic_types import (
 )
 import os
 
-
 # The three supported precision profiles. Aliases map legacy names onto them.
 _PROFILE_ALIASES = {
     "x64": "float64",
@@ -153,3 +152,44 @@ def create_saddle_optimiser(
     )
 
     return optimiser
+
+
+def optimisitic_gd(lr):
+    primal = optax.inject_hyperparams(optax.optimistic_gradient_descent)(
+        learning_rate=lr,
+    )
+    dual = optax.inject_hyperparams(optax.optimistic_gradient_descent)(
+        learning_rate=lr,
+    )
+    return create_saddle_optimiser(
+        primal,
+        dual,
+    )
+
+
+def gd_dual_momentum(lr, momentum=0.3, nesterov=True):
+    primal = optax.inject_hyperparams(optax.sgd)(
+        learning_rate=lr,
+    )
+    dual = optax.inject_hyperparams(optax.sgd)(
+        learning_rate=lr,
+        momentum=momentum,
+        nesterov=nesterov,
+    )
+    return create_saddle_optimiser(
+        primal,
+        dual,
+    )
+
+
+def tail_average(i_max):
+    """Returns a function that computes the tail average of a sequence."""
+
+    def weight_fn(i):
+        return jax.lax.cond(
+            i < i_max,
+            lambda: 1 / i_max,
+            lambda: 1.0,
+        )
+
+    return weight_fn

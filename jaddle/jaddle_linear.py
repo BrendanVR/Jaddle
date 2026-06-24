@@ -37,19 +37,18 @@ def __sps(
     dual_damping_eq=0.0,
     average=True,
     update_mode="synchronous",
-    per_iterate_k_theta=0.1,
-    per_iterate_k_lo=0.1,
-    per_iterate_k_hi=10.0,
+    k_scaling=False,
     k_init=1.0,
-    eta_init=1.0,
-    halpern_period=200,
 ):
-    # The stepping scheme is selected by `update_mode`. These derived booleans
-    # keep the dense per-scheme branching below readable while the string stays
+    # The stepping scheme is selected by `update_mode`. This derived boolean
+    # keeps the dense per-scheme branching below readable while the string stays
     # the single source of truth.
-    per_iterate_k = update_mode == "per_iterate_k"
     extragradient = update_mode == "extragradient"
-    halpern = update_mode == "halpern"
+    # k-scaling is an orthogonal option (any update_mode): a primal weight k
+    # rescales the primal/dual gradients by (1/k, k) before opt_update, so the
+    # dual/primal step ratio is k**2. When on, k is packed into opt_state and
+    # rebalanced at each restart in `solve` (PDLP-style); constant within an
+    # epoch.
 
     def projection_primal(primal_state):
         return projection_box(primal_state, lp.lower_bounds, lp.upper_bounds)
@@ -96,6 +95,26 @@ def __sps(
             dual_eq=updates.dual_eq,
         )
 
+    def scale_by_k(gradient, k):
+        # Primal weight split: (1/k, k) on (primal, dual) gradients.
+        return SaddleState(
+            primal=gradient.primal / k,
+            dual_ineq=gradient.dual_ineq * k,
+            dual_eq=gradient.dual_eq * k,
+        )
+
+    # When k-scaling is on, k is carried as the last element of opt_state. These
+    # helpers keep the step bodies agnostic to whether k is packed or not.
+    def unpack_k(opt_state):
+        if k_scaling:
+            return opt_state
+        return opt_state, None
+
+    def pack_k(opt_state, k):
+        if k_scaling:
+            return (opt_state, k)
+        return opt_state
+
     cache_key = (
         id(lp),
         id(optimiser),
@@ -105,10 +124,7 @@ def __sps(
         float(dual_damping_eq),
         average,
         update_mode,
-        float(per_iterate_k_theta),
-        float(per_iterate_k_lo),
-        float(per_iterate_k_hi),
-        int(halpern_period),
+        bool(k_scaling),
     )
     run_epoch = _LINEAR_RUN_EPOCH_CACHE.get(cache_key)
 
@@ -129,9 +145,12 @@ def __sps(
 
                 def step(carry, _):
                     i, state, average_state, opt_state, total_weight = carry
+                    opt_state, k = unpack_k(opt_state)
 
                     # 1) Primal-only update
                     g0 = grad(state)
+                    if k_scaling:
+                        g0 = scale_by_k(g0, k)
                     primal_updates, _ = opt_update(zero_dual(g0), opt_state, state)
                     state = apply_updates(state, keep_only_primal(primal_updates))
                     state = SaddleState(
@@ -142,6 +161,8 @@ def __sps(
 
                     # 2) Dual-only update (using post-primal dual gradients)
                     g1 = grad(state)
+                    if k_scaling:
+                        g1 = scale_by_k(g1, k)
                     combined_gradient = SaddleState(
                         primal=g0.primal,
                         dual_ineq=g1.dual_ineq,
@@ -156,71 +177,10 @@ def __sps(
                         dual_ineq=projection_non_negative(state.dual_ineq),
                         dual_eq=state.dual_eq,
                     )
+                    opt_state = pack_k(opt_state, k)
 
                     # `average` is a Python-level static, so when False the
                     # incremental_update is dropped from the hot loop entirely.
-                    if average:
-                        w = weight_function(i)
-                        total_weight = total_weight + w
-                        average_state = optax.incremental_update(
-                            state, average_state, w / total_weight
-                        )
-
-                    return (i + 1, state, average_state, opt_state, total_weight), None
-
-            elif per_iterate_k:
-                # Per-iterate primal/dual step-ratio control. The split scales
-                # applied updates by (eta/k, eta*k) for (primal, dual), so the
-                # dual/primal step ratio is k**2. `k` (ratio) and `eta`
-                # (magnitude, set by lr_scale on restarts) are carried alongside
-                # the optax state as (opt_state, k, eta).
-                #
-                #   k_target = sqrt(||u_primal|| / ||u_dual||)   (movement balance)
-                #
-                # log-space smoothed and clamped.
-                def step(carry, _):
-                    i, state, average_state, opt_state, total_weight = carry
-                    opt_state, k, eta = opt_state
-
-                    g = grad(state)
-                    updates, opt_state = opt_update(g, opt_state, state)
-
-                    # --- ratio control (k) ---
-                    # Use raw optimizer update norms (before split and projection).
-                    # A large primal update that gets clipped by box constraints
-                    # correctly signals the dual is under-powered: the primal is
-                    # already at its bound and the dual needs more force to move it.
-                    # Norms taken block-wise to avoid allocating a concatenated
-                    # dual vector every iteration in the innermost scan.
-                    up = updates.primal
-                    norm_p = jnp.sqrt(up @ up) + 1e-30
-                    norm_d = (
-                        jnp.sqrt(
-                            updates.dual_eq @ updates.dual_eq
-                            + updates.dual_ineq @ updates.dual_ineq
-                        )
-                        + 1e-30
-                    )
-                    k_target = jnp.sqrt(norm_p / norm_d)
-                    log_k = per_iterate_k_theta * jnp.log(k_target) + (
-                        1.0 - per_iterate_k_theta
-                    ) * jnp.log(k)
-                    k = jnp.clip(jnp.exp(log_k), per_iterate_k_lo, per_iterate_k_hi)
-
-                    # Apply the (eta/k, eta*k) split to the updates.
-                    updates = SaddleState(
-                        primal=updates.primal * (eta / k),
-                        dual_ineq=updates.dual_ineq * (eta * k),
-                        dual_eq=updates.dual_eq * (eta * k),
-                    )
-                    state = apply_updates(state, updates)
-                    state = SaddleState(
-                        primal=projection_primal(state.primal),
-                        dual_ineq=projection_non_negative(state.dual_ineq),
-                        dual_eq=state.dual_eq,
-                    )
-                    opt_state = (opt_state, k, eta)
-
                     if average:
                         w = weight_function(i)
                         total_weight = total_weight + w
@@ -245,39 +205,23 @@ def __sps(
                 #       opt_state (not la_opt_state) → corr_updates, opt_state
                 #       (committed); state = proj(state + corr_updates).
                 #
-                # The (eta/k, eta*k) split is applied to each gradient before
-                # passing it to opt_update, exactly as in the per_iterate_k path.
-                # k adapts from the look-ahead gradient norms.
+                # When k-scaling is on, a primal weight k rescales each gradient
+                # by (1/k, k) for (primal, dual) before opt_update, so the
+                # dual/primal step ratio is k**2. k is constant within the epoch
+                # — initialised from k_init and rebalanced at each restart in
+                # `solve` (PDLP-style), not adapted per iteration.
                 def step(carry, _):
                     i, state, average_state, opt_state, total_weight = carry
-                    opt_state, k, eta = opt_state
+                    opt_state, k = unpack_k(opt_state)
 
                     # --- Look-ahead gradient ---
                     g = grad(state)
-
-                    # --- per-iterate k (ratio) from look-ahead gradient norms ---
-                    # Block-wise dual norm (no concatenate allocation in-scan).
-                    up = g.primal
-                    norm_p = jnp.sqrt(up @ up) + 1e-30
-                    norm_d = (
-                        jnp.sqrt(g.dual_eq @ g.dual_eq + g.dual_ineq @ g.dual_ineq)
-                        + 1e-30
-                    )
-                    k_target = jnp.sqrt(norm_p / norm_d)
-                    log_k = per_iterate_k_theta * jnp.log(k_target) + (
-                        1.0 - per_iterate_k_theta
-                    ) * jnp.log(k)
-                    k = jnp.clip(jnp.exp(log_k), per_iterate_k_lo, per_iterate_k_hi)
 
                     # Look-ahead: run the user's optimiser on g at state to
                     # get the look-ahead point. la_opt_state is NOT committed —
                     # we discard it and reuse the original opt_state for the
                     # corrector so that momentum/statistics only advance once.
-                    scaled_g = SaddleState(
-                        primal=g.primal * (eta / k),
-                        dual_ineq=g.dual_ineq * (eta * k),
-                        dual_eq=g.dual_eq * (eta * k),
-                    )
+                    scaled_g = scale_by_k(g, k) if k_scaling else g
                     la_updates, _ = opt_update(scaled_g, opt_state, state)
                     state_half = apply_updates(state, la_updates)
                     state_half = SaddleState(
@@ -290,11 +234,7 @@ def __sps(
                     # state_half, but applied from original state (Korpelevich
                     # convention). opt_state IS committed here.
                     g_half = grad(state_half)
-                    scaled_g_half = SaddleState(
-                        primal=g_half.primal * (eta / k),
-                        dual_ineq=g_half.dual_ineq * (eta * k),
-                        dual_eq=g_half.dual_eq * (eta * k),
-                    )
+                    scaled_g_half = scale_by_k(g_half, k) if k_scaling else g_half
                     corr_updates, opt_state = opt_update(
                         scaled_g_half, opt_state, state
                     )
@@ -304,81 +244,7 @@ def __sps(
                         dual_ineq=projection_non_negative(state.dual_ineq),
                         dual_eq=state.dual_eq,
                     )
-                    opt_state = (opt_state, k, eta)
-
-                    if average:
-                        w = weight_function(i)
-                        total_weight = total_weight + w
-                        average_state = optax.incremental_update(
-                            state, average_state, w / total_weight
-                        )
-
-                    return (i + 1, state, average_state, opt_state, total_weight), None
-
-            elif halpern:
-                # Restarted Halpern anchoring. One projected base step gives
-                # T(z_k); the iterate is then pulled back toward the anchor z_a:
-                #
-                #   T(z_k)   = proj(z_k + opt_step(grad(z_k)))
-                #   z_{k+1}  = λ_h · z_a + (1 - λ_h) · T(z_k)   (then re-project)
-                #
-                # with λ_h = 1/(h + 2) decaying the anchor pull over a *within-
-                # period* counter h (NOT the global iteration). Every
-                # `halpern_period` iterations the anchor is refreshed to the
-                # current iterate and h is reset to 0. This is the crucial part:
-                # with a global counter λ collapses to ~0 within one epoch (the
-                # anchor pull dies and Halpern degenerates to plain GDA), and a
-                # stale z_a=0 anchor drags early iterates toward the origin. The
-                # periodic refresh keeps the anchor a *recent good iterate* and
-                # keeps λ in a useful range, which is what gives Halpern its
-                # O(1/k) operator-residual contraction without the rotational
-                # windup of plain GDA — see [[dual-divergence-gda-stability]].
-                #
-                # State is packed as (optax_state, anchor, h). `solve` also
-                # re-anchors (and resets h via a fresh pack) on every outer
-                # restart.
-                def step(carry, _):
-                    i, state, average_state, opt_state, total_weight = carry
-                    opt_state, anchor, h = opt_state
-
-                    g = grad(state)
-                    updates, opt_state = opt_update(g, opt_state, state)
-                    t_state = apply_updates(state, updates)
-                    t_state = SaddleState(
-                        primal=projection_primal(t_state.primal),
-                        dual_ineq=projection_non_negative(t_state.dual_ineq),
-                        dual_eq=t_state.dual_eq,
-                    )
-
-                    # Anchor pull. h is the within-period counter; +2 keeps the
-                    # first pull at λ=1/2.
-                    lam = 1.0 / (h.astype(t_state.primal.dtype) + 2.0)
-                    state = SaddleState(
-                        primal=lam * anchor.primal + (1.0 - lam) * t_state.primal,
-                        dual_ineq=lam * anchor.dual_ineq
-                        + (1.0 - lam) * t_state.dual_ineq,
-                        dual_eq=lam * anchor.dual_eq + (1.0 - lam) * t_state.dual_eq,
-                    )
-                    state = SaddleState(
-                        primal=projection_primal(state.primal),
-                        dual_ineq=projection_non_negative(state.dual_ineq),
-                        dual_eq=state.dual_eq,
-                    )
-
-                    # Periodic restart: every halpern_period iters, re-anchor to
-                    # the current iterate and reset the λ counter. Branch-free so
-                    # the scan stays fused.
-                    h = h + 1
-                    do_restart = h >= halpern_period
-                    h = jnp.where(do_restart, 0, h)
-                    anchor = SaddleState(
-                        primal=jnp.where(do_restart, state.primal, anchor.primal),
-                        dual_ineq=jnp.where(
-                            do_restart, state.dual_ineq, anchor.dual_ineq
-                        ),
-                        dual_eq=jnp.where(do_restart, state.dual_eq, anchor.dual_eq),
-                    )
-                    opt_state = (opt_state, anchor, h)
+                    opt_state = pack_k(opt_state, k)
 
                     if average:
                         w = weight_function(i)
@@ -393,8 +259,11 @@ def __sps(
 
                 def step(carry, _):
                     i, state, average_state, opt_state, total_weight = carry
+                    opt_state, k = unpack_k(opt_state)
 
                     g = grad(state)
+                    if k_scaling:
+                        g = scale_by_k(g, k)
                     updates, opt_state = opt_update(g, opt_state, state)
                     state = apply_updates(state, updates)
                     state = SaddleState(
@@ -402,6 +271,7 @@ def __sps(
                         dual_ineq=projection_non_negative(state.dual_ineq),
                         dual_eq=state.dual_eq,
                     )
+                    opt_state = pack_k(opt_state, k)
 
                     # `average` is a Python-level static, so when False the
                     # incremental_update is dropped from the hot loop entirely.
@@ -439,21 +309,12 @@ def __sps(
 
     if initial_opt_state is not None:
         opt_state = initial_opt_state
-    elif per_iterate_k or extragradient:
-        # Pack the running step-ratio k and magnitude eta alongside the optax state.
+    elif k_scaling:
+        # Pack the primal weight k alongside the optax state.
         dtype = initial_solution.primal.dtype
         opt_state = (
             optimiser.init(initial_solution),
             jnp.asarray(k_init, dtype),
-            jnp.asarray(eta_init, dtype),
-        )
-    elif halpern:
-        # Pack the Halpern anchor (start-of-run iterate) and within-period
-        # counter h with the optax state.
-        opt_state = (
-            optimiser.init(initial_solution),
-            initial_solution,
-            jnp.asarray(0, jnp.int32),
         )
     else:
         opt_state = optimiser.init(initial_solution)
@@ -507,16 +368,16 @@ def solve(
     complementarity_slack_tolerance=None,
     weight_function=lambda _: 1.0,
     verbose=False,
-    log_every=10,
+    log_every=1,
     average=True,
-    update_mode="synchronous",
-    per_iterate_k_theta=0.1,
-    per_iterate_k_lo=0.1,
-    per_iterate_k_hi=10.0,
-    k_init=1.0,
-    eta_init=1.0,
-    halpern_period=200,
-    scale=None,
+    report_best=True,
+    update_mode="extragradient",
+    k_scaling=True,
+    k_theta=0.01,
+    k_lo=1e-3,
+    k_hi=1e3,
+    k_init=None,
+    scale="ruiz+pc",
     output_opt_state=False,
     scaled_objective=False,
     restarts=0,
@@ -528,9 +389,6 @@ def solve(
     primal_stop_obj_tol=1e-4,
     iterations_per_epoch_decay=1.0,
     iterations_per_epoch_min=100,
-    polish_optimiser=None,
-    polish_lr_scale_threshold=1e-2,
-    polish_merit_threshold=None,
     eq_projection_threshold=None,
     precompile=True,
 ):
@@ -572,32 +430,27 @@ def solve(
               descent-ascent through the user optimiser.
             * ``"alternating"``: primal step, then a dual step using the
               post-primal dual gradient (Gauss–Seidel ordering).
-            * ``"per_iterate_k"``: synchronous, but the primal/dual step ratio
-              ``k`` is adapted every iteration from update norms (matvec-free).
-              Tuned by ``per_iterate_k_theta/lo/hi`` and ``k_init``/``eta_init``.
-            * ``"extragradient"``: Korpelevich look-ahead/corrector step with
-              built-in ``k``/``eta`` adaptation. Two gradient evals per iter.
-            * ``"halpern"``: restarted anchoring step — one projected base step
-              ``T(z)`` then a pull toward the anchor ``z_a``:
-              ``z ← λ·z_a + (1−λ)·T(z)`` with ``λ = 1/(h+2)``, where ``h`` is a
-              within-period counter. Every ``halpern_period`` iterations the
-              anchor is refreshed to the current iterate and ``h`` reset to 0.
-              O(1/k) operator-residual contraction without the rotational windup
-              plain GDA suffers; targets the ill-conditioned / dual-divergence
-              regime. (A global, never-refreshed ``λ`` collapses to ~0 within one
-              epoch and Halpern silently degenerates to plain GDA — hence the
-              period.) The anchor also refreshes on every outer restart.
-        k_init: Initial value of ``k`` (default 1.0 = symmetric steps, the
-            PC/Ruiz-scaled baseline). Only used when
-            ``update_mode in {"per_iterate_k", "extragradient"}``.
-        eta_init: Initial value of the step magnitude ``eta`` (default 1.0).
-            On restarts, ``eta`` is scaled by ``lr_scale`` to track the
-            magnitude decay. Only used when
-            ``update_mode in {"per_iterate_k", "extragradient"}``.
-        halpern_period: Iterations between Halpern anchor refreshes (default
-            200). Smaller = more frequent re-anchoring (stronger, more local
-            contraction); larger = closer to a single long Halpern run. Only
-            used when ``update_mode="halpern"``.
+            * ``"extragradient"``: Korpelevich look-ahead/corrector step. Two
+              gradient evals per iter.
+        k_scaling: Enable primal-weight (k) scaling (default ``False``). When
+            ``True`` — orthogonal to ``update_mode``, so it composes with all
+            three schemes — a primal weight ``k`` rescales the primal/dual
+            gradients by ``(1/k, k)`` before each ``opt_update``, making the
+            dual/primal step ratio ``k**2``. ``k`` is initialised from ``k_init``
+            and rebalanced at each restart (PDLP-style) from primal-vs-dual
+            iterate movement; it is constant within an epoch (not adapted per
+            iteration). Tuned by ``k_theta``/``k_lo``/``k_hi`` and ``k_init``.
+        k_init: Initial primal weight ``k``. ``None`` (default) initialises it to
+            the PDLP heuristic ``||c|| / ||b||`` (objective vs RHS norms, in the
+            scaled space the solver iterates in). Pass a float to override
+            (``1.0`` = symmetric steps, the PC/Ruiz-scaled baseline). Only used
+            when ``k_scaling=True``.
+        k_theta: Smoothing coefficient for the log-space primal-weight update at
+            each restart (default 0.5 = geometric mean of the movement-based
+            target and the current weight, matching PDLP). Smaller = slower
+            adaptation. Only used when ``k_scaling=True``.
+        k_lo, k_hi: Clamp band for ``k`` (default [0.1, 10]). Also clamps the
+            ``||c||/||b||`` init. Only used when ``k_scaling=True``.
         primal_stop: Opt-in, dual-free termination (default ``False``). When
             ``True``, termination ignores the dual certificate entirely and stops
             on **primal feasibility** (``constraint_bound`` within
@@ -611,17 +464,6 @@ def solve(
         primal_stop_obj_tol: Relative-change threshold for the objective stall:
             stop when ``|obj_now - obj_{window ago}| / (1 + |obj_now|)`` falls
             below this (default 1e-4). Only used when ``primal_stop=True``.
-        polish_optimiser: Optional optax optimiser to cross over to once the
-            base learning rate has decayed sufficiently. When ``lr_scale`` drops
-            below ``polish_lr_scale_threshold`` on a restart, the main optimiser
-            is replaced by this one and ``lr_scale`` is reset to 1.0 so the
-            polisher's own learning rate is unaffected by the main solver's
-            accumulated decay. The polisher warm-starts from the current restart
-            point and runs for the remainder of the solve budget. Default
-            ``None`` disables crossover.
-        polish_lr_scale_threshold: ``lr_scale`` value below which crossover to
-            ``polish_optimiser`` fires (default 1e-2). Only meaningful when
-            ``polish_optimiser`` is set.
         eq_projection_threshold: When set, after each epoch the unscaled equality
             residual is checked; if it exceeds this value the primal (and average)
             are projected onto the equality manifold ``A_eq x = b_eq`` via the
@@ -629,6 +471,9 @@ def solve(
             disables projection. Only useful when equality feasibility is the
             bottleneck; has no effect when there are no equality constraints.
     """
+
+    if optimiser is None:
+        optimiser = jo.gd_dual_momentum(0.5, momentum=0.5, nesterov=True)
 
     if log_every < 1:
         raise ValueError("log_every must be >= 1")
@@ -639,19 +484,11 @@ def solve(
     valid_update_modes = [
         "synchronous",
         "alternating",
-        "per_iterate_k",
         "extragradient",
-        "halpern",
     ]
     if update_mode not in valid_update_modes:
         raise ValueError(f"update_mode must be one of {valid_update_modes}")
 
-    # Derived step-scheme booleans (single source of truth: update_mode). These
-    # name the three synchronous per-iterate schemes that pack extra state into
-    # opt_state and need bespoke restart handling below.
-    per_iterate_k = update_mode == "per_iterate_k"
-    extragradient = update_mode == "extragradient"
-    halpern = update_mode == "halpern"
     if verbose:
         print("====Starting Solve====")
         print("----------------------------------------------")
@@ -659,6 +496,7 @@ def solve(
     if scale == "ruiz":
         lp, row_scale, col_scale = ruiz_scaling(lp)
 
+        original_lp = lp
         lp = to_jaddle_sparse(lp)
 
         if verbose:
@@ -668,6 +506,7 @@ def solve(
     elif scale == "pc":
         lp, row_scale, col_scale = pc_scaling(lp)
 
+        original_lp = lp
         lp = to_jaddle_sparse(lp)
 
         if verbose:
@@ -683,6 +522,7 @@ def solve(
             col_scale_ruiz * col_scale_pc,
         )
 
+        original_lp = lp
         lp = to_jaddle_sparse(lp)
 
         if verbose:
@@ -929,25 +769,29 @@ def solve(
     def check_max_epochs(count):
         return count >= max_epochs
 
+    # PDLP-style primal-weight initialisation. When k-scaling is on and k_init is
+    # left as None we derive it from the objective/RHS norms ||c|| / ||b|| (in
+    # the scaled space the solver iterates in), which puts the primal/dual step
+    # ratio in the right order of magnitude before iteration 1 instead of
+    # starting symmetric.
+    if k_scaling and k_init is None:
+        norm_c = float(jnp.linalg.norm(lp.c)) + 1e-30
+        norm_b = float(jnp.linalg.norm(lp.b)) + 1e-30
+        k_init = float(np.clip(norm_c / norm_b, k_lo, k_hi))
+    elif k_init is None:
+        k_init = 1.0
+
     i = 1
     state = initial_solution
     average_state = initial_solution
     if initial_opt_state is not None:
         opt_state = initial_opt_state
-    elif per_iterate_k or extragradient:
-        # Pack the per-iterate step-ratio k and magnitude eta with the optax state.
+    elif k_scaling:
+        # Pack the primal weight k with the optax state.
         _pik_dtype = initial_solution.primal.dtype
         opt_state = (
             optimiser.init(initial_solution),
             jnp.asarray(k_init, _pik_dtype),
-            jnp.asarray(eta_init, _pik_dtype),
-        )
-    elif halpern:
-        # Pack the Halpern anchor (start-of-run iterate) and period counter h.
-        opt_state = (
-            optimiser.init(initial_solution),
-            initial_solution,
-            jnp.asarray(0, jnp.int32),
         )
     else:
         opt_state = optimiser.init(initial_solution)
@@ -960,29 +804,18 @@ def solve(
     dual_gap_is_finite = False
     count = 0
     total_weight = 0.0
+    reported_used_avg = average
     is_converged = True
     current_iterations_per_epoch = iterations_per_epoch
-    # The active step scheme can change at crossover to a polish optimiser, so
-    # track it as a mutable string and derive the per-scheme booleans from it.
-    active_update_mode = update_mode
 
-    def _scheme_flags(mode):
-        return (
-            mode == "per_iterate_k",
-            mode == "extragradient",
-            mode == "halpern",
-        )
-
-    active_per_iterate_k, active_extragradient, active_halpern = _scheme_flags(
-        active_update_mode
-    )
+    # Iterate at the last restart (or the start), used to rebalance the primal
+    # weight k from the primal-vs-dual movement over the restart cycle.
+    state_at_last_restart = initial_solution
 
     # Rolling window of recent objective values for the opt-in primal_stop rule
     # (oldest first). Seeded with inf so the window is not "full" until enough
     # real epochs have elapsed.
     obj_window = jnp.full((max(int(primal_stop_window), 1),), jnp.inf)
-
-    lr_scale = 1.0
 
     # Adaptive restart bookkeeping. `restart_i_offset` is subtracted from the
     # global iteration counter `i` before it is handed to the optimiser /
@@ -1041,21 +874,15 @@ def solve(
             dual_damping_ineq,
             dual_damping_eq,
             average,
-            active_update_mode,
-            per_iterate_k_theta=per_iterate_k_theta,
-            per_iterate_k_lo=per_iterate_k_lo,
-            per_iterate_k_hi=per_iterate_k_hi,
+            update_mode,
+            k_scaling=k_scaling,
             k_init=k_init,
-            eta_init=eta_init,
-            halpern_period=halpern_period,
         )
         # Warm the end-of-epoch metrics fn too, with the exact state the hot
         # loop will feed it (average vs iterate is a Python-static choice), so
         # epoch 1 doesn't pay its first-call compile inside the timed loop.
         _precompile_metrics = compute_epoch_metrics(average_state if average else state)
         jax.block_until_ready((_precompile_result, _precompile_metrics))
-
-    start_time = time.time()
 
     def print_epoch_metrics(epoch_time=None):
         dual_gap_status = "finite" if bool(dual_gap_is_finite) else "dual-infeasible"
@@ -1087,6 +914,8 @@ def solve(
             )
         )
 
+    start_time = time.time()
+
     try:
         while not is_done():
             if max_epochs:
@@ -1117,16 +946,46 @@ def solve(
                 dual_damping_ineq,
                 dual_damping_eq,
                 average,
-                active_update_mode,
-                per_iterate_k_theta=per_iterate_k_theta,
-                per_iterate_k_lo=per_iterate_k_lo,
-                per_iterate_k_hi=per_iterate_k_hi,
+                update_mode,
+                k_scaling=k_scaling,
                 k_init=k_init,
-                eta_init=eta_init,
-                halpern_period=halpern_period,
             )
             # __sps increments the (restart-shifted) counter; restore global i.
             i = shifted_i + restart_i_offset
+
+            # JAX dispatch is async: __sps returns futures that may still be in
+            # flight. Force them here so the epoch timer captures the real
+            # compute cost rather than billing the tail to the final
+            # block_until_ready (and thus to total runtime, not any epoch).
+            jax.block_until_ready(state)
+
+            metrics = compute_epoch_metrics(average_state if average else state)
+            # `reported_used_avg` tracks which point the bound metrics describe;
+            # the actual state objects are re-resolved from this flag at use
+            # sites (output, restart) so they stay current after eq-projection.
+            reported_used_avg = average
+
+            # report_best: when averaging is on, the average and the last iterate
+            # are different points and either can be the better solution
+            # (averaging stabilises rotational problems but lags the last iterate
+            # when it is already contracting). Compute the iterate's metrics too
+            # and report/converge on whichever has the lower KKT merit. This costs
+            # a second matvec pair per epoch, so it is opt-in.
+            if report_best and average:
+                state_metrics = compute_epoch_metrics(state)
+                avg_merit = kkt_merit(
+                    metrics[3], metrics[4], metrics[5], metrics[6], metrics[0]
+                )
+                st_merit = kkt_merit(
+                    state_metrics[3],
+                    state_metrics[4],
+                    state_metrics[5],
+                    state_metrics[6],
+                    state_metrics[0],
+                )
+                if bool(st_merit < avg_merit):
+                    metrics = state_metrics
+                    reported_used_avg = False
 
             (
                 objective_value,
@@ -1139,9 +998,8 @@ def solve(
                 gap_bound_comp,
                 gap_ineq_comp,
                 gap_eq_comp,
-            ) = compute_epoch_metrics(average_state if average else state)
+            ) = metrics
 
-            finish_epoch_time = time.time()
             count += 1
 
             # Equality-constraint projection: if the unscaled equality residual
@@ -1180,59 +1038,19 @@ def solve(
                 [obj_window[1:], jnp.reshape(objective_value, (1,))]
             )
 
+            finish_epoch_time = time.time()
+
             if verbose and (count == 1 or count % log_every == 0):
                 print_epoch_metrics(finish_epoch_time - start_epoch_time)
 
-                # Per-iterate k/eta carried in the packed opt_state as
-                # (optax_state, k, eta); surface the values settled on this epoch.
-                if active_per_iterate_k or active_extragradient:
-                    print(
-                        f"  per-iterate k={float(opt_state[1]):.3f}"
-                        f" eta={float(opt_state[2]):.3e}"
-                        f" (τ={float(opt_state[2]) / float(opt_state[1]):.2e},"
-                        f" σ={float(opt_state[2]) * float(opt_state[1]):.2e})"
-                    )
-                    print("----------------------------------------------")
-
             # --- Adaptive restart decision ---
-            if (
-                restarts
-                and restarts_done >= restarts
-                and polish_optimiser is not None
-                and optimiser is not polish_optimiser
-            ):
-                optimiser = polish_optimiser
-                state = average_state if average else state
-                if active_per_iterate_k or active_extragradient:
-                    opt_state = (optimiser.init(state), 1.0, lr_scale)
-                elif active_halpern:
-                    # Re-anchor Halpern at the crossover point; reset period h.
-                    opt_state = (
-                        optimiser.init(state),
-                        state,
-                        jnp.asarray(0, jnp.int32),
-                    )
-                else:
-                    opt_state = optimiser.init(state)
-                active_update_mode = update_mode
-                active_per_iterate_k, active_extragradient, active_halpern = (
-                    _scheme_flags(active_update_mode)
-                )
-                # total_weight = 0.0
-                if verbose:
-                    print(f"  → Crossing over to polish optimiser (restarts exhausted)")
-                    print("----------------------------------------------")
-
-            if (
-                restarts
-                and restarts_done < restarts
-                and optimiser is not polish_optimiser
-            ):
+            if restarts and restarts_done < restarts:
                 epochs_since_restart += 1
 
-                # `merit` is the metric of the point the epoch metrics were
-                # computed on: the average when averaging is on, else the last
-                # iterate. This drives the *trigger*.
+                # `merit` is the metric of the *reported* point: with
+                # report_best it is already the better of {average, iterate};
+                # otherwise it is the average (averaging on) or the last iterate.
+                # This drives the restart *trigger*.
                 merit = kkt_merit(
                     constraint_bound,
                     dual_feasibility_residual,
@@ -1244,23 +1062,32 @@ def solve(
                 # --- Two-point restart candidate (PDLP-style) ---
                 # When averaging is on, the average and the current iterate are
                 # genuinely different points and either can be the better warm
-                # start. Compute the *other* point's merit and restart to
-                # whichever is better, instead of always restarting to the last
-                # iterate (which discarded a frequently-better average).
-                #
-                # The second `compute_epoch_metrics(state)` is a full matvec
-                # pair, paid every epoch when averaging is on. Gate it so it
-                # only runs on epochs where a restart can actually fire: either
-                # the cycle is exhausted (no-progress restart), or the average's
-                # own merit is already near the sufficient-progress threshold so
-                # the better state-point could tip it over. On all other epochs
-                # neither point would trigger, so the extra metrics are wasted.
+                # start, so restart to whichever has the lower merit instead of
+                # always discarding a frequently-better average.
                 cycle_exhausted = epochs_since_restart >= current_cycle_cap
-                restart_point = average_state if average else state
+                # Resolve the restart point from the *current* state/average
+                # variables via the report_best decision flag, not an object
+                # captured before metrics. The equality-projection block above
+                # may have rebound state and average_state to fresh (projected)
+                # iterates; a stale object would warm-start off the equality
+                # manifold.
+                restart_used_avg = reported_used_avg if average else False
+                restart_point = average_state if restart_used_avg else state
                 restart_merit = merit
-                restart_used_avg = average
                 near_threshold = bool(merit <= restart_decay * merit_at_last_restart)
-                if average and (cycle_exhausted or near_threshold):
+                if average and report_best:
+                    # report_best already evaluated both points this epoch and
+                    # `reported_used_avg`/`merit` describe the better of the two —
+                    # reuse them directly, no extra matvec.
+                    pass
+                elif average and (cycle_exhausted or near_threshold):
+                    # report_best is off, so the iterate's metrics were not
+                    # computed yet. The second `compute_epoch_metrics(state)` is a
+                    # full matvec pair; gate it to epochs where a restart can
+                    # actually fire (cycle exhausted, or the average is already
+                    # near the sufficient-progress threshold so the better
+                    # state-point could tip it over). On other epochs neither
+                    # point triggers, so the extra metrics would be wasted.
                     (
                         st_obj,
                         _st_pgn,
@@ -1292,78 +1119,41 @@ def solve(
                     # reset momentum, averaging, weight accumulation and the LR /
                     # weight_function schedule (via the iteration offset).
                     state = restart_point
-                    if active_per_iterate_k or active_extragradient:
-                        # Reset momentum but carry the learned k; apply lr_scale to eta.
-                        opt_state = (
-                            optimiser.init(state),
-                            1.0,
-                            lr_scale,
+                    if k_scaling:
+                        # PDLP-style primal-weight rebalance: drive k from the
+                        # primal-vs-dual *movement* over the just-finished cycle
+                        # (distance between iterates), not per-step gradient
+                        # norms. log-space geometric-mean blend with the current
+                        # weight (k_theta), then clamp. Reset momentum.
+                        dp = state.primal - state_at_last_restart.primal
+                        dd = jnp.concatenate(
+                            [
+                                state.dual_eq - state_at_last_restart.dual_eq,
+                                state.dual_ineq - state_at_last_restart.dual_ineq,
+                            ]
                         )
-                    elif active_halpern:
-                        # Re-anchor Halpern at the restart point and reset the
-                        # within-period counter h so λ restarts at 1/2.
-                        opt_state = (
-                            optimiser.init(state),
-                            state,
-                            jnp.asarray(0, jnp.int32),
+                        move_p = jnp.linalg.norm(dp) + 1e-30
+                        move_d = jnp.linalg.norm(dd) + 1e-30
+                        k_target = move_p / move_d
+                        k_prev = opt_state[1]
+                        log_k = k_theta * jnp.log(k_target) + (1.0 - k_theta) * jnp.log(
+                            k_prev
                         )
+                        k_new = jnp.clip(jnp.exp(log_k), k_lo, k_hi)
+                        opt_state = (optimiser.init(state), k_new)
                     else:
                         opt_state = optimiser.init(state)
                     average_state = state
+                    state_at_last_restart = state
                     # total_weight = 0.0
                     restart_i_offset = i - 1
                     merit_at_last_restart = restart_merit
-                    # Crossover: if lr_scale has decayed below threshold and a
-                    # polishing optimiser was provided, swap to it once. The
-                    # polisher warm-starts from the current restart point and
-                    # runs the rest of the solve budget with lr_scale reset to 1
-                    # (so the polisher's own learning rate is unaffected by the
-                    # main solver's accumulated decay).
-                    crossover_lr = (
-                        polish_optimiser is not None
-                        and optimiser is not polish_optimiser
-                        and lr_scale < polish_lr_scale_threshold
-                    )
-                    crossover_merit = (
-                        polish_optimiser is not None
-                        and optimiser is not polish_optimiser
-                        and polish_merit_threshold is not None
-                        and bool(restart_merit < polish_merit_threshold)
-                    )
-                    if crossover_lr or crossover_merit:
-                        optimiser = polish_optimiser
-                        if active_per_iterate_k or active_extragradient:
-                            opt_state = (optimiser.init(state), opt_state[1], lr_scale)
-                        elif active_halpern:
-                            opt_state = (
-                                optimiser.init(state),
-                                state,
-                                jnp.asarray(0, jnp.int32),
-                            )
-                        else:
-                            opt_state = optimiser.init(state)
-                        active_update_mode = update_mode
-                        active_per_iterate_k, active_extragradient, active_halpern = (
-                            _scheme_flags(active_update_mode)
-                        )
-                        current_iterations_per_epoch = iterations_per_epoch_min
-                        if verbose:
-                            reason = (
-                                f"lr_scale crossed {polish_lr_scale_threshold:.2e}"
-                                if crossover_lr
-                                else f"merit crossed {polish_merit_threshold:.2e}"
-                            )
-                            print(f"  → Crossing over to polish optimiser ({reason})")
                     epochs_since_restart = 0
                     current_cycle_cap *= restart_multiplier
-                    if optimiser is not polish_optimiser:
-                        current_iterations_per_epoch = max(
-                            iterations_per_epoch_min,
-                            int(
-                                current_iterations_per_epoch
-                                * iterations_per_epoch_decay
-                            ),
-                        )
+                    current_iterations_per_epoch = max(
+                        iterations_per_epoch_min,
+                        int(current_iterations_per_epoch * iterations_per_epoch_decay),
+                    )
                     restarts_done += 1
                     if verbose:
                         reason = (
@@ -1372,12 +1162,12 @@ def solve(
                             else "cycle-cap"
                         )
                         which = "avg" if restart_used_avg else "iterate"
+                        k_msg = f", k={float(opt_state[1]):.3e}" if k_scaling else ""
                         print(
                             f"Restart {restarts_done}/{restarts} at epoch {count} "
                             f"({reason}, merit={float(restart_merit):.2e} "
-                            f"[{which}], lr_scale={lr_scale:.3f}, "
-                            f"next cap={current_cycle_cap:.0f} epochs, "
-                            f"iters/epoch={current_iterations_per_epoch})"
+                            f"[{which}], next cap={current_cycle_cap:.0f} epochs, "
+                            f"iters/epoch={current_iterations_per_epoch}{k_msg})"
                         )
                         print("----------------------------------------------")
 
@@ -1388,16 +1178,24 @@ def solve(
         # is_converged False).
         if verbose and is_converged and count > 0:
             print("Convergence criteria met.")
+            if report_best and average:
+                print(
+                    f"Reported point: {'average' if reported_used_avg else 'iterate'}"
+                )
             print("----------------------------------------------")
             print_epoch_metrics()
 
-        if average:
+        if report_best and average:
+            output = average_state if reported_used_avg else state
+        elif average:
             output = average_state
         else:
             output = state
     except KeyboardInterrupt:
         is_converged = False
-        if average:
+        if report_best and average:
+            output = average_state if reported_used_avg else state
+        elif average:
             output = average_state
         else:
             output = state
@@ -1405,7 +1203,9 @@ def solve(
         print("----------------------------------------------")
 
     output = jax.block_until_ready(output)
+
     end_time = time.time()
+
     lp.c = lp.c * c_max
     print(f"Time to solution: {end_time - start_time:.2f} seconds")
     print("----------------------------------------------")
@@ -1539,7 +1339,7 @@ def __convert_to_scipy(jsp_mat: jsp.BCOO) -> sp.csc_matrix:
     return sp.csc_matrix((data, (row, col)), shape=jsp_mat.shape)
 
 
-def ruiz_scaling(lp: LP, max_iter=20, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
+def ruiz_scaling(lp: LP, max_iter=30, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
     """
     Applies Ruiz scaling to an LP in standard form with sparse matrices:
         min c^T x
@@ -1572,17 +1372,31 @@ def ruiz_scaling(lp: LP, max_iter=20, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
     row_scale = np.ones(m + 1)
     col_scale = np.ones(n + 1)
 
-    for _ in range(max_iter):
-        M_cur = sp.diags(row_scale) @ M @ sp.diags(col_scale)
+    # Precompute |M| once and reuse it for every equilibration step. The norms
+    # of D_r @ M @ D_c are obtained by scaling the row/col norms of |M| with the
+    # current scale vectors, so we never rematerialise the scaled matrix.
+    absM = M.copy()
+    absM.data = np.abs(absM.data)
+    absM_csr = absM.tocsr()
+    absM_csc = absM.tocsc()
+    rows = absM_csr.indices  # column index of each nnz, grouped by row
+    cols = absM_csc.indices  # row index of each nnz, grouped by col
 
-        row_norms = np.abs(M_cur).max(axis=1).todense().A.flatten()
+    for _ in range(max_iter):
+        # Row max of D_r @ M @ D_c == row_scale * max over each row of (|M| * col_scale)
+        scaled = absM_csr.data * col_scale[rows]
+        row_norms = np.maximum.reduceat(scaled, absM_csr.indptr[:-1]) * row_scale
+        # reduceat misbehaves on empty rows; guard with indptr deltas
+        empty = np.diff(absM_csr.indptr) == 0
+        row_norms[empty] = 0.0
         row_norms = np.where(row_norms <= threshold, 1.0, row_norms)
         row_s = np.clip(1.0 / np.sqrt(row_norms), clip_bounds[0], clip_bounds[1])
         row_scale *= row_s
 
-        M_cur = sp.diags(row_scale) @ M @ sp.diags(col_scale)
-
-        col_norms = np.abs(M_cur).max(axis=0).todense().A.flatten()
+        scaled = absM_csc.data * row_scale[cols]
+        col_norms = np.maximum.reduceat(scaled, absM_csc.indptr[:-1]) * col_scale
+        empty = np.diff(absM_csc.indptr) == 0
+        col_norms[empty] = 0.0
         col_norms = np.where(col_norms <= threshold, 1.0, col_norms)
         col_s = np.clip(1.0 / np.sqrt(col_norms), clip_bounds[0], clip_bounds[1])
         col_scale *= col_s
@@ -1647,17 +1461,20 @@ def pc_scaling(lp: LP, max_iter=1, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
     row_scale = np.ones(m + 1)
     col_scale = np.ones(n + 1)
 
-    for _ in range(max_iter):
-        M_cur = sp.diags(row_scale) @ M @ sp.diags(col_scale)
+    # Precompute |M| once. L1 row/col norms of D_r @ M @ D_c factor as
+    # row_scale * (|M| @ col_scale) and col_scale * (|M|^T @ row_scale), so we
+    # avoid rematerialising the scaled matrix on every iteration.
+    absM = M.copy()
+    absM.data = np.abs(absM.data)
+    absM_csr = absM.tocsr()
 
-        row_norms = np.abs(M_cur).sum(axis=1).A.flatten()
+    for _ in range(max_iter):
+        row_norms = (absM_csr @ col_scale) * row_scale
         row_norms = np.where(row_norms <= threshold, 1.0, row_norms)
         row_s = np.clip(1.0 / np.sqrt(row_norms), clip_bounds[0], clip_bounds[1])
         row_scale *= row_s
 
-        M_cur = sp.diags(row_scale) @ M @ sp.diags(col_scale)
-
-        col_norms = np.abs(M_cur).sum(axis=0).A.flatten()
+        col_norms = (absM_csr.T @ row_scale) * col_scale
         col_norms = np.where(col_norms <= threshold, 1.0, col_norms)
         col_s = np.clip(1.0 / np.sqrt(col_norms), clip_bounds[0], clip_bounds[1])
         col_scale *= col_s
@@ -1719,6 +1536,201 @@ def project_onto_eq(lp: JaddleLP, primal: jnp.ndarray, tol: 1e-6) -> jnp.ndarray
         print(f"GMRES did not converge (info={info})")
 
     return primal + delta
+
+
+def lsqr_polish(
+    lp: LP,
+    warm: SaddleState,
+    active_tol: float = None,
+    atol: float = 1e-6,
+    damp: float = 1e-6,
+    max_passes: int = 20,
+):
+    """
+    Polish a warm primal by **least squares** on the active constraints — a fast,
+    robust active-set polish that cannot blow up.
+
+    Approximately minimizes ``‖A_active x − b_active‖²``, then clips the result
+    into ``[lb, ub]``, where
+    ``A_active``/``b_active`` are the equalities plus the tight inequalities
+    (each tight ``≤`` row treated as an equality to hit).
+
+    Method: an ACTIVE-SET LOOP around ``lsqr``. Each pass solves the active
+    system ``A_act·x = b_act`` with one ``lsqr`` solve — warm-started from the
+    running iterate (``x0``) and damped (``damp``), i.e. minimizing
+    ``‖A_act·x − b_act‖² + damp²·‖x − x0‖²`` (anchored near the warm point) —
+    then clips into ``[lb, ub]`` and adds any DROPPED inequalities the clipped
+    point now violates, re-solving up to ``max_passes`` times. One Krylov pass
+    per solve — far faster than bound-constrained ``lsq_linear`` (trust-region)
+    on large over-determined active sets (e.g. momentum1 ~11k×5k).
+
+    Trade-offs vs. the bound-constrained solve: the clipped point is NOT the
+    exact bounded optimum, and no exact dual multipliers are produced (warm duals
+    passed through). The loop repairs an *incomplete* active set but NOT
+    infeasibility from the clip pulling ``x`` off the active rows when bounds and
+    constraints conflict. It is a best-effort polish — the caller's keep-better
+    gate discards it if worse. It cannot diverge unboundedly (``damp`` anchors
+    the step; the result is clipped into the box).
+
+    ``active_tol`` defaults to ``None`` ⇒ derived from the warm point's
+    feasibility (``max(1e-6, worst primal residual)``), so the active set tracks
+    how converged the point is. ``atol`` is the ``lsqr`` tolerance; ``damp`` is
+    the Tikhonov damping toward ``x0``; ``max_passes`` caps the add-and-resolve
+    loop.
+
+    Returns a new ``SaddleState`` (polished primal, warm duals). Does not mutate
+    ``warm``.
+    """
+    from scipy.sparse.linalg import lsqr
+
+    x = np.asarray(warm.primal, dtype=np.float64)
+    lb = np.asarray(lp.lower_bounds, dtype=np.float64)
+    ub = np.asarray(lp.upper_bounds, dtype=np.float64)
+    A_eq = lp.A_eq.tocsc().astype(np.float64)
+    A_ineq = lp.A_ineq.tocsc().astype(np.float64)
+    b_eq = np.asarray(lp.b_eq, dtype=np.float64)
+    b_ineq = np.asarray(lp.b_ineq, dtype=np.float64)
+
+    if active_tol is None:
+        # Guard empty constraint blocks: eq_slack/ineq_slack do jnp.max over an
+        # empty array (-> error) when that constraint class is absent.
+        eq_s = float(np.abs(A_eq @ x - b_eq).max()) if A_eq.shape[0] > 0 else 0.0
+        ineq_s = (
+            float(np.maximum(A_ineq @ x - b_ineq, 0.0).max())
+            if A_ineq.shape[0] > 0
+            else 0.0
+        )
+        active_tol = max(1e-6, max(eq_s, ineq_s))
+
+    # Initial active inequalities: those within tolerance of being tight.
+    if A_ineq.shape[0] > 0:
+        ineq_active = np.abs(A_ineq @ x - b_ineq) <= active_tol
+    else:
+        ineq_active = np.zeros(0, dtype=bool)
+
+    # Active-set loop. Each pass: solve the active system A_act·x = b_act with a
+    # single LSQR solve warm-started from the running iterate (x0), clip into the
+    # box, then add any DROPPED inequalities the clipped point now violates and
+    # re-solve, capped at max_passes. (NOTE: this only repairs an INCOMPLETE
+    # active set; it does not
+    # fix infeasibility introduced by the clip pulling x off the active rows when
+    # bounds and constraints conflict -- that is not an active-set error.)
+    #   LSQR with x0 and damp minimizes ‖A_act·x - b_act‖² + damp²·‖x - x0‖²:
+    #   warm-started from the first-order point and anchored near it. One Krylov
+    #   pass per solve -- FAR faster than bound-constrained lsq_linear (trf) on
+    #   large over-determined active sets (e.g. momentum1 ~11k×5k).
+    x_new = x
+    for _pass in range(max_passes):
+        if A_ineq.shape[0] > 0:
+            A_act = sp.vstack([A_eq, A_ineq[ineq_active]], format="csc")
+            b_act = np.concatenate([b_eq, b_ineq[ineq_active]])
+        else:
+            A_act, b_act = A_eq, b_eq
+
+        x_new = lsqr(A_act, b_act, atol=atol, btol=atol, x0=x_new, damp=damp)[0]
+        x_new = np.clip(x_new, lb, ub)
+
+        if A_ineq.shape[0] == 0:
+            break
+        violated = (A_ineq @ x_new - b_ineq) > active_tol
+        newly = violated & ~ineq_active
+        if not newly.any():
+            break
+        ineq_active = ineq_active | newly  # add violated rows, re-solve
+
+    return SaddleState(
+        primal=jnp.asarray(x_new),
+        dual_ineq=warm.dual_ineq,
+        dual_eq=warm.dual_eq,
+    )
+
+
+def vertex_distance_report(lp: LP, sol: SaddleState, tol: float = 1e-6, verbose=True):
+    """
+    Estimate how far a solution is from an LP *vertex* — i.e. whether active-set
+    / simplex polishing is likely to succeed (near a vertex) or diverge (deep in
+    the interior of an optimal face).
+
+    Two complementary, solve-free measures:
+
+    1. **Free-vs-active count** (structural). A vertex has at most ``n_active``
+       basic (interior) variables, the rest pinned at bounds. ``n_interior``
+       well above ``n_active_rows`` ⇒ under-determined / non-vertex face; a huge
+       active-inequality count vs few interior vars ⇒ a fractional point far from
+       any vertex. The ratio ``n_interior / n_active_rows`` near 1 is "near a
+       vertex".
+    2. **Bound distance** (geometric). At a vertex every non-basic variable sits
+       exactly on a bound. ``interior_mass`` (total distance of interior vars to
+       their nearest finite bound) and ``max_interior_dist`` measure directly how
+       far the point is from having a vertex's at-bound structure.
+
+    Returns a dict of the metrics. With ``verbose`` (default) also prints them.
+    """
+    x = np.asarray(sol.primal, dtype=np.float64)
+    lb = np.asarray(lp.lower_bounds, dtype=np.float64)
+    ub = np.asarray(lp.upper_bounds, dtype=np.float64)
+
+    # Distance of each variable to its nearest *finite* bound (inf if free both
+    # ways). Zero ⇒ sitting on a bound (non-basic at a vertex).
+    dist_lo = np.where(np.isfinite(lb), np.abs(x - lb), np.inf)
+    dist_hi = np.where(np.isfinite(ub), np.abs(x - ub), np.inf)
+    dist_bound = np.minimum(dist_lo, dist_hi)
+
+    interior = dist_bound > tol  # strictly off every bound ⇒ candidate basic
+    n_interior = int(interior.sum())
+    finite_dist = dist_bound[np.isfinite(dist_bound)]
+    interior_mass = float(finite_dist[finite_dist > tol].sum())
+    max_interior_dist = float(finite_dist.max()) if finite_dist.size else 0.0
+
+    # Active rows: all equalities + tight inequalities (same classification the
+    # KKT solve uses), to compare against the interior-variable count.
+    n_eq = lp.A_eq.shape[0]
+    if lp.A_ineq.shape[0] > 0:
+        ineq_tight = int(
+            (np.abs(np.asarray(lp.A_ineq @ x) - np.asarray(lp.b_ineq)) <= tol).sum()
+        )
+    else:
+        ineq_tight = 0
+    n_active_rows = n_eq + ineq_tight
+
+    # A vertex needs n_interior basic vars determined by n_active_rows rows; the
+    # ratio (and its sign) says which way the system leans.
+    ratio = n_interior / n_active_rows if n_active_rows > 0 else float("inf")
+
+    metrics = {
+        "n_vars": int(x.shape[0]),
+        "n_interior": n_interior,
+        "n_at_bound": int(x.shape[0]) - n_interior,
+        "n_eq_rows": n_eq,
+        "n_tight_ineq": ineq_tight,
+        "n_active_rows": n_active_rows,
+        "interior_over_active": ratio,
+        "interior_mass": interior_mass,
+        "max_interior_dist": max_interior_dist,
+    }
+
+    if verbose:
+        print("==== Vertex-distance report ====")
+        print(f"  variables        : {metrics['n_vars']}")
+        print(
+            f"  interior / at-bound : {n_interior} / {metrics['n_at_bound']}"
+            f"   (interior = strictly off bounds, tol={tol:g})"
+        )
+        print(
+            f"  active rows      : {n_active_rows}"
+            f"  (eq {n_eq} + tight ineq {ineq_tight})"
+        )
+        print(
+            f"  interior / active : {ratio:.2f}"
+            "   (~1 ⇒ near a vertex; ≫1 ⇒ under-determined face;"
+            " ineq≫interior ⇒ fractional, far from vertex)"
+        )
+        print(
+            f"  bound distance   : mass {interior_mass:.3e},"
+            f" max {max_interior_dist:.3e}   (0 ⇒ on a vertex)"
+        )
+
+    return metrics
 
 
 # %%
