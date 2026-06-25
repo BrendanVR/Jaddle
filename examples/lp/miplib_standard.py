@@ -21,7 +21,7 @@ jo.configure_jax("float64")
 # %% [markdown]
 # ## Load the LP
 # We load a MIPLIB LP from an MPS file using the `highspy` library.
-PROBLEM_NAME = "nug"  # name of MIPLIB problem (without .mps extension)
+PROBLEM_NAME = "momentum1"  # name of MIPLIB problem (without .mps extension)
 highs = hspy.Highs()
 highs.readModel(
     f"/home/brendanvr/python/Jaddle/data/{PROBLEM_NAME}.mps"
@@ -36,7 +36,7 @@ for col in range(highs.numVariables):
 highs.setOptionValue("presolve", "off")
 highs.setOptionValue("primal_feasibility_tolerance", 1e-3)
 highs.setOptionValue("dual_feasibility_tolerance", 1e-3)
-highs.setOptionValue("pdlp_optimality_tolerance", 1e-9)
+highs.setOptionValue("pdlp_optimality_tolerance", 1e-6)
 highs.setOptionValue("solver", "pdlp")
 highs.solve()
 
@@ -53,11 +53,13 @@ jl.lp_summary_statistics(lp)
 solution_jaddle, _ = jl.solve(
     lp,
     verbose=True,
-    k_scale=1e2,
-    k_init=1,
+    k_scale=1e4,
     adaptive_eta=1 / 2,
-    iterations_per_epoch=100,
-    restarts=10,
+    iterations_per_epoch=1000,
+    restarts=50,
+    update_mode="halpern",
+    average=True,
+    dual_feasibility_tolerance=1e-1,
 )
 
 # %%

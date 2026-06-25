@@ -54,8 +54,9 @@ cp = jc.CP(
 solution, _ = jc.solve(
     cp,
     verbose=True,
-    iterations_per_epoch=100,
     primal_feasibility_tolerance=1e-5,
+    update_mode="extragradient",
+    adaptive_eta=1 / 2,
 )
 
 # %%

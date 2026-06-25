@@ -60,6 +60,21 @@ def __sps(
     # line search cannot fix that, so they are excluded.
     adaptive_modes = ("pdhg", "extragradient")
     adaptive_step = adaptive_eta is not None and update_mode in adaptive_modes
+    # Halpern-anchored PDHG (restarted Halpern). The base operator T(z) is the
+    # adaptive PDHG step; each iterate is then anchored back toward z_0 (the
+    # iterate at the start of the current restart cycle):
+    #     z_{k+1} = lambda_k z_0 + (1 - lambda_k) T(z_k),   lambda_k = 1/(k+2),
+    # with the local index k = i - start_iter reset each restart (so lambda_k
+    # restarts from 1/2). The anchor combination is a convex combination of two
+    # feasible iterates, so feasibility is preserved without re-projection.
+    # Halpern always rides the adaptive PDHG step, so it implies adaptive_step
+    # and requires adaptive_eta + k_scaling. The anchor z_0 is carried in the
+    # k-slot alongside (k, eta).
+    halpern = update_mode == "halpern"
+    if halpern:
+        if adaptive_eta is None:
+            raise ValueError("update_mode='halpern' requires adaptive_eta")
+        adaptive_step = True
     if adaptive_step and not k_scaling:
         raise ValueError("adaptive_eta requires k_scaling (primal weight k)")
     # k-scaling is an orthogonal option (any update_mode): a primal weight k
@@ -139,14 +154,19 @@ def __sps(
     # bodies agnostic to the packing.
     def unpack_k(opt_state):
         if k_scaling:
+            if halpern:
+                inner, (k, eta, anchor) = opt_state
+                return inner, k, eta, anchor
             if adaptive_step:
                 inner, (k, eta) = opt_state
                 return inner, k, eta
             return opt_state
         return opt_state, None
 
-    def pack_k(opt_state, k, eta=None):
+    def pack_k(opt_state, k, eta=None, anchor=None):
         if k_scaling:
+            if halpern:
+                return (opt_state, (k, eta, anchor))
             if adaptive_step:
                 return (opt_state, (k, eta))
             return (opt_state, k)
@@ -163,6 +183,7 @@ def __sps(
         update_mode,
         bool(k_scaling),
         adaptive_step,
+        halpern,
     )
     run_epoch = _LINEAR_RUN_EPOCH_CACHE.get(cache_key)
 
@@ -209,7 +230,10 @@ def __sps(
             def make_adaptive_step(trial):
                 def step(carry, _):
                     i, state, average_state, opt_state, total_weight = carry
-                    opt_state, k, eta = unpack_k(opt_state)
+                    if halpern:
+                        opt_state, k, eta, anchor = unpack_k(opt_state)
+                    else:
+                        opt_state, k, eta = unpack_k(opt_state)
                     ip1 = jnp.asarray(i + 1, eta.dtype)
 
                     # Retry: while the trial step exceeds its admissible bound,
@@ -230,7 +254,25 @@ def __sps(
                     eta0, cand, eta_bar = jax.lax.while_loop(
                         cond, body, (eta, cand0, eta_bar0)
                     )
-                    new_state = cand
+
+                    if halpern:
+                        # Halpern anchor: blend T(z_k)=cand back toward z_0.
+                        # lambda_k = 1/(k_local+1) where k_local is the
+                        # restart-shifted iteration index `i` (== i_global -
+                        # restart_i_offset, reset to ~1 each cycle by `solve`), so
+                        # lambda decays as the cycle progresses and re-warms toward
+                        # 1/2 at each restart. The anchor z_0 itself is reset to
+                        # the cycle-start iterate in `solve`. Convex combination of
+                        # two feasible iterates stays feasible — no re-projection.
+                        k_local = jnp.asarray(i, eta.dtype)
+                        lam = 1.0 / (k_local + 1.0)
+                        new_state = jax.tree.map(
+                            lambda z0, tz: lam * z0 + (1.0 - lam) * tz,
+                            anchor,
+                            cand,
+                        )
+                    else:
+                        new_state = cand
 
                     # Advance eta for the next iterate (growth allowed once the
                     # step is accepted). When eta_bar is +inf the step did not move
@@ -243,7 +285,10 @@ def __sps(
                     eta_next = jnp.where(jnp.isfinite(eta_bar), eta_next, eta0)
                     eta_next = jnp.where(jnp.isfinite(eta_next), eta_next, eta0)
                     eta_next = jnp.maximum(eta_next, 1e-12)
-                    opt_state = pack_k(opt_state, k, eta_next)
+                    if halpern:
+                        opt_state = pack_k(opt_state, k, eta_next, anchor)
+                    else:
+                        opt_state = pack_k(opt_state, k, eta_next)
 
                     if average:
                         w = weight_function(i)
@@ -256,9 +301,11 @@ def __sps(
 
                 return step
 
-            if adaptive_step and update_mode == "pdhg":
+            if (adaptive_step and update_mode == "pdhg") or halpern:
                 # PDHG raw step: primal first, then dual reads the EXTRAPOLATED
                 # primal x_bar = 2 x_new - x_old. interaction = dyᵀ A dx (one A·dx).
+                # Halpern uses this same PDHG operator as its base T(z); the anchor
+                # combination is applied in make_adaptive_step.
                 def _trial(eta, state, k):
                     tau = eta / k
                     sigma = eta * k
@@ -609,7 +656,16 @@ def __sps(
         # Pack the primal weight k alongside the optax state. In adaptive_step
         # mode the slot is a (k, eta) pair so the per-iteration step rides along.
         dtype = initial_solution.primal.dtype
-        if adaptive_step:
+        if halpern:
+            # Halpern carries the anchor z_0 (the cycle-start iterate) in the
+            # k-slot. On a bare __sps call the anchor seeds from the incoming
+            # state; across a restart cycle `solve` threads it via opt_state.
+            k_slot = (
+                jnp.asarray(k_init, dtype),
+                jnp.asarray(adaptive_eta, dtype),
+                jax.tree.map(lambda x: x + 0, initial_solution),
+            )
+        elif adaptive_step:
             k_slot = (jnp.asarray(k_init, dtype), jnp.asarray(adaptive_eta, dtype))
         else:
             k_slot = jnp.asarray(k_init, dtype)
@@ -731,6 +787,16 @@ def solve(
               post-primal dual gradient (Gauss–Seidel ordering).
             * ``"extragradient"``: Korpelevich look-ahead/corrector step. Two
               gradient evals per iter.
+            * ``"pdhg"``: Chambolle–Pock PDHG (primal step then dual step on the
+              extrapolated primal x_bar = 2x^{k+1} − x^k).
+            * ``"halpern"``: restarted Halpern-anchored PDHG. Each iterate is the
+              adaptive PDHG step T(z) blended back toward an anchor z_0:
+              ``z_{k+1} = lambda_k z_0 + (1−lambda_k) T(z_k)``, ``lambda_k =
+              1/(k+1)`` (cycle-local k). The anchor z_0 and lambda counter reset
+              to the current iterate at each restart, giving last-iterate
+              acceleration. Implies the ``adaptive_eta`` line search on the inner
+              PDHG operator, so it requires both ``adaptive_eta`` and ``k_scale``;
+              best paired with ``restarts > 0``.
         k_scale: Primal-weight (k) scaling control. ``None`` disables it;
             otherwise a float sets a symmetric clamp band ``[1/k_scale,
             k_scale]`` for ``k`` (default ``10`` → ``[0.1, 10]``). When enabled —
@@ -799,6 +865,7 @@ def solve(
         "alternating",
         "extragradient",
         "pdhg",
+        "halpern",
     ]
     if update_mode not in valid_update_modes:
         raise ValueError(f"update_mode must be one of {valid_update_modes}")
@@ -815,15 +882,24 @@ def solve(
     # on, the optimiser's fixed LR is bypassed in the hot loop and eta drives the
     # step directly via the per-iteration line search. Supported for the saddle
     # stepping schemes synchronous/alternating/pdhg/extragradient.
+    # Halpern-anchored PDHG (restarted Halpern). Rides the adaptive PDHG step, so
+    # it implies adaptive_step and requires adaptive_eta + k_scale. The anchor z_0
+    # is reset to the cycle-start iterate at each restart.
+    halpern = update_mode == "halpern"
     _adaptive_modes = ("pdhg", "extragradient")
-    adaptive_step = adaptive_eta is not None and update_mode in _adaptive_modes
-    if adaptive_eta is not None:
+    adaptive_step = (
+        adaptive_eta is not None and update_mode in _adaptive_modes
+    ) or halpern
+    if halpern and adaptive_eta is None:
+        raise ValueError("update_mode='halpern' requires adaptive_eta")
+    if adaptive_eta is not None and not halpern:
         if update_mode not in _adaptive_modes:
             raise ValueError(
-                f"adaptive_eta is only supported with update_mode in {_adaptive_modes}"
+                f"adaptive_eta is only supported with update_mode in {_adaptive_modes} "
+                "or 'halpern'"
             )
-        if not k_scaling:
-            raise ValueError("adaptive_eta requires k_scale (primal weight k)")
+    if adaptive_step and not k_scaling:
+        raise ValueError("adaptive_eta / halpern requires k_scale (primal weight k)")
 
     if verbose:
         print("====Starting Solve====")
@@ -1173,7 +1249,15 @@ def solve(
         # Pack the primal weight k with the optax state. In adaptive_step mode the
         # k-slot is a (k, eta) pair carrying the per-iteration step size too.
         _pik_dtype = initial_solution.primal.dtype
-        if adaptive_step:
+        if halpern:
+            # Halpern carries the anchor z_0 (cycle-start iterate) in the k-slot,
+            # seeded from the initial solution and reset at each restart below.
+            _k_slot = (
+                jnp.asarray(k_init, _pik_dtype),
+                jnp.asarray(adaptive_eta, _pik_dtype),
+                jax.tree.map(lambda x: x + 0, initial_solution),
+            )
+        elif adaptive_step:
             _k_slot = (
                 jnp.asarray(k_init, _pik_dtype),
                 jnp.asarray(adaptive_eta, _pik_dtype),
@@ -1544,14 +1628,25 @@ def solve(
                         move_p = jnp.linalg.norm(dp) + 1e-30
                         move_d = jnp.linalg.norm(dd) + 1e-30
                         k_target = move_p / move_d
-                        # The k-slot is (k, eta) in adaptive_step mode, plain k
-                        # otherwise. Read k accordingly.
+                        # The k-slot is (k, eta[, anchor]) in adaptive_step mode,
+                        # plain k otherwise. Read k accordingly.
                         k_prev = opt_state[1][0] if adaptive_step else opt_state[1]
                         log_k = k_theta * jnp.log(k_target) + (1.0 - k_theta) * jnp.log(
                             k_prev
                         )
                         k_new = jnp.clip(jnp.exp(log_k), k_lo, k_hi)
-                        if adaptive_step:
+                        if halpern:
+                            # Restarted Halpern: reset eta AND re-anchor z_0 to the
+                            # cycle-start iterate `state`. The lambda counter resets
+                            # via restart_i_offset below. Independent anchor copy —
+                            # `state` is donated to __sps next epoch.
+                            _eta_dtype = state.primal.dtype
+                            k_slot = (
+                                k_new,
+                                jnp.asarray(adaptive_eta, _eta_dtype),
+                                jax.tree.map(lambda x: x + 0, state),
+                            )
+                        elif adaptive_step:
                             # Reset eta to its seed alongside the momentum/LR
                             # schedule reset, so the adaptive rule re-warms from a
                             # known step in the new cycle.
