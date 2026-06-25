@@ -21,7 +21,7 @@ jo.configure_jax("float64")
 # %% [markdown]
 # ## Load the LP
 # We load a MIPLIB LP from an MPS file using the `highspy` library.
-PROBLEM_NAME = "ex9"  # name of MIPLIB problem (without .mps extension)
+PROBLEM_NAME = "nug"  # name of MIPLIB problem (without .mps extension)
 highs = hspy.Highs()
 highs.readModel(
     f"/home/brendanvr/python/Jaddle/data/{PROBLEM_NAME}.mps"
@@ -33,7 +33,7 @@ for col in range(highs.numVariables):
     highs.changeColIntegrality(col, hspy.HighsVarType.kContinuous)
 
 # %%
-highs.setOptionValue("presolve", "on")
+highs.setOptionValue("presolve", "off")
 highs.setOptionValue("primal_feasibility_tolerance", 1e-3)
 highs.setOptionValue("dual_feasibility_tolerance", 1e-3)
 highs.setOptionValue("pdlp_optimality_tolerance", 1e-4)
@@ -43,8 +43,7 @@ highs.solve()
 
 # %% [markdown]
 # We convert the LP to Jaddle's sparse format, before applying the selected scaling strategy.
-highs.presolve()
-highs_lp = highs.getPresolvedLp()
+highs_lp = highs.getLp()
 lp = hh.highs_to_standard_form_sparse(highs_lp)
 
 
@@ -57,16 +56,16 @@ jl.lp_summary_statistics(lp)
 # %% [markdown]
 # ## Stage 1 — crude solve
 # A first-order saddle solve to loose tolerances. Cheap; gets us to ~1e-3.
+
 solve_args = {
     "verbose": True,
     "log_every": 1,
-    "primal_feasibility_tolerance": 1e-3,
-    "dual_feasibility_tolerance": 1e-1,
-    "dual_gap_tolerance": 1e-3,
+    "vertex_bias": 1e-3,
+    "dual_feasibility_tolerance": 1e-2,
+    "dual_gap_tolerance": 1e-2,
 }
 
 solution_crude, _ = jl.solve(lp, **solve_args)
-
 
 # %% [markdown]
 # ## Stage 3 (optional) — least-squares active-set polish
@@ -77,13 +76,11 @@ solution_crude, _ = jl.solve(lp, **solve_args)
 #
 # Polish the *returned* (fully-unscaled) solution against the *same* unscaled
 # ``lp`` — never a scaled iterate.
-
-solution_ls = jl.lsqr_polish(
+solution_polished = jl.polish(
     lp,
     warm=solution_crude,
-    damp=1e-4,
+    damp=1e0,
     atol=1e-12,
-    max_passes=1000,
 )
 
 
@@ -100,7 +97,9 @@ def report(label, sol):
 
 print("\n==== Polish summary ====")
 report("crude   ", solution_crude)
-report("lsqr    ", solution_ls)
+report("polished", solution_polished)
+# %%
 
-
+print(lp.complementarity_slack(solution_crude.primal, solution_crude.dual_ineq))
+print(lp.complementarity_slack(solution_polished.primal, solution_polished.dual_ineq))
 # %%
