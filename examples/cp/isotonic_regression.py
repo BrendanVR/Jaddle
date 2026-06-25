@@ -1,8 +1,7 @@
 # %% [markdown]
 # # Isotonic Regression with Jaddle
-# This example demonstrates how to perform modified isotonic regression using Jaddle.
-# Isotonic regression is a type of regression that fits a non-decreasing function to the data. Here we impose an extra mean constraint
-# on the solution.
+# This example demonstrates how to perform isotonic regression using Jaddle.
+# Isotonic regression is a type of regression that fits a non-decreasing function to the data.
 
 # %%
 import numpy as np
@@ -11,9 +10,7 @@ import matplotlib.pyplot as plt
 import jaddle.jaddle_convex as jc
 import jaddle.jaddle_optimisers as jo
 
-jo.configure_jax("max_speed")
-
-import optax
+jo.configure_jax("float32")
 
 # %% [markdown]
 # ## Generate Synthetic Data
@@ -54,21 +51,12 @@ cp = jc.CP(
 
 # %% [markdown]
 # ## Solve the problem using Jaddle Convex SPS optimizer
-lr = 1 / 2
-k_max = 1e3
-
-optimiser = jo.create_saddle_optimiser(
-    optax.sgd(lr, nesterov=True),
-    optax.sgd(lr, nesterov=True),
-)
-
 solution, _ = jc.solve(
     cp,
-    optimiser=optimiser,
     verbose=True,
-    log_every=1,
+    iterations_per_epoch=100,
+    primal_feasibility_tolerance=1e-5,
 )
-
 
 # %%
 plt.figure(figsize=(10, 6))
@@ -76,13 +64,13 @@ plt.plot(x, y, label="Noisy data", marker="o", linestyle="", alpha=0.2)
 plt.plot(
     x,
     solution.primal,
-    label="Modified isotonic regression solution",
+    label="Isotonic regression solution",
     color="red",
     linewidth=2,
 )
 plt.xlabel("x")
 plt.ylabel("y")
-plt.title("Modified Isotonic Regression using Jaddle")
+plt.title("Isotonic Regression using Jaddle")
 plt.legend()
 plt.show()
 

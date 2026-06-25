@@ -154,7 +154,20 @@ def create_saddle_optimiser(
     return optimiser
 
 
-def optimisitic_gd(lr):
+def gd(lr):
+    primal = optax.inject_hyperparams(optax.sgd)(
+        learning_rate=lr,
+    )
+    dual = optax.inject_hyperparams(optax.sgd)(
+        learning_rate=lr,
+    )
+    return create_saddle_optimiser(
+        primal,
+        dual,
+    )
+
+
+def optimistic_gd(lr):
     primal = optax.inject_hyperparams(optax.optimistic_gradient_descent)(
         learning_rate=lr,
     )

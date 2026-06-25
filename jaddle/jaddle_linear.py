@@ -71,15 +71,25 @@ def __sps(
             dual_eq=grad_dual_eq,
         )
 
+    def grad_primal_only(state):
+        # Primal partial only: c + Aᵀd (+ damping). One sparse matvec (Aᵀ @ d);
+        # the A @ x matvec that the full `grad` does for the dual residual is
+        # skipped entirely. Used by the alternating/pdhg primal half.
+        dual = jnp.concatenate([state.dual_eq, state.dual_ineq])
+        ATd = lp.A_T @ dual
+        return lp.c + ATd + primal_damping * state.primal
+
+    def grad_dual_only(state):
+        # Dual partials only: b - Ax (+ damping). One sparse matvec (A @ x); the
+        # Aᵀ @ d matvec is skipped. Used by the alternating/pdhg dual half.
+        Ax = lp.A @ state.primal
+        residual = lp.b - Ax
+        grad_dual_eq = residual[: lp.n_eq] + dual_damping_eq * state.dual_eq
+        grad_dual_ineq = residual[lp.n_eq :] + dual_damping_ineq * state.dual_ineq
+        return grad_dual_ineq, grad_dual_eq
+
     def opt_update(gradient, opt_state, state):
         return optimiser.update(gradient, opt_state, state)
-
-    def zero_dual(gradient):
-        return SaddleState(
-            primal=gradient.primal,
-            dual_ineq=jnp.zeros_like(gradient.dual_ineq),
-            dual_eq=jnp.zeros_like(gradient.dual_eq),
-        )
 
     def keep_only_primal(updates):
         return SaddleState(
@@ -130,7 +140,13 @@ def __sps(
 
     if run_epoch is None:
 
-        @jax.jit
+        # `average_state` is deliberately not donated: when averaging is off the
+        # caller passes the same buffer for both `state` and `average_state`, and
+        # XLA rejects donating one buffer twice.
+        @functools.partial(
+            jax.jit,
+            donate_argnames=("state", "opt_state", "total_weight"),
+        )
         def run_epoch(
             max_iter,
             start_iter,
@@ -147,11 +163,18 @@ def __sps(
                     i, state, average_state, opt_state, total_weight = carry
                     opt_state, k = unpack_k(opt_state)
 
-                    # 1) Primal-only update
-                    g0 = grad(state)
+                    # 1) Primal-only update. Only the primal gradient is needed
+                    #    here, so compute just c + Aᵀd (one matvec) instead of the
+                    #    full grad (which would also do A @ x for an unused dual).
+                    gp = grad_primal_only(state)
                     if k_scaling:
-                        g0 = scale_by_k(g0, k)
-                    primal_updates, _ = opt_update(zero_dual(g0), opt_state, state)
+                        gp = gp / k
+                    primal_gradient = SaddleState(
+                        primal=gp,
+                        dual_ineq=jnp.zeros_like(state.dual_ineq),
+                        dual_eq=jnp.zeros_like(state.dual_eq),
+                    )
+                    primal_updates, _ = opt_update(primal_gradient, opt_state, state)
                     state = apply_updates(state, keep_only_primal(primal_updates))
                     state = SaddleState(
                         primal=projection_primal(state.primal),
@@ -159,14 +182,17 @@ def __sps(
                         dual_eq=state.dual_eq,
                     )
 
-                    # 2) Dual-only update (using post-primal dual gradients)
-                    g1 = grad(state)
+                    # 2) Dual-only update (post-primal dual gradients). Only the
+                    #    dual gradient is needed, so compute just b - Ax (one
+                    #    matvec) instead of the full grad.
+                    gd_ineq, gd_eq = grad_dual_only(state)
                     if k_scaling:
-                        g1 = scale_by_k(g1, k)
+                        gd_ineq = gd_ineq * k
+                        gd_eq = gd_eq * k
                     combined_gradient = SaddleState(
-                        primal=g0.primal,
-                        dual_ineq=g1.dual_ineq,
-                        dual_eq=g1.dual_eq,
+                        primal=gp,
+                        dual_ineq=gd_ineq,
+                        dual_eq=gd_eq,
                     )
                     dual_updates, opt_state = opt_update(
                         combined_gradient, opt_state, state
@@ -181,6 +207,79 @@ def __sps(
 
                     # `average` is a Python-level static, so when False the
                     # incremental_update is dropped from the hot loop entirely.
+                    if average:
+                        w = weight_function(i)
+                        total_weight = total_weight + w
+                        average_state = optax.incremental_update(
+                            state, average_state, w / total_weight
+                        )
+
+                    return (i + 1, state, average_state, opt_state, total_weight), None
+
+            elif update_mode == "pdhg":
+                # Chambolle-Pock PDHG: identical to `alternating` (Gauss-Seidel
+                # primal-then-dual), except the dual gradient is evaluated at the
+                # EXTRAPOLATED primal x_bar = 2 x^{k+1} - x^k instead of at
+                # x^{k+1}. That over-relaxation is the only thing separating plain
+                # Arrow-Hurwicz from true PDHG, and it is what lifts the
+                # step-size restriction / buys the O(1/k) convergence. It costs
+                # one axpy on the primal (no extra matvec): the dual gradient
+                # b - A x_bar is linear in the primal, so we feed grad() a state
+                # whose primal is x_bar.
+                def step(carry, _):
+                    i, state, average_state, opt_state, total_weight = carry
+                    opt_state, k = unpack_k(opt_state)
+
+                    x_old = state.primal
+
+                    # 1) Primal-only update (same as alternating): c + Aᵀd, one
+                    #    matvec.
+                    gp = grad_primal_only(state)
+                    if k_scaling:
+                        gp = gp / k
+                    primal_gradient = SaddleState(
+                        primal=gp,
+                        dual_ineq=jnp.zeros_like(state.dual_ineq),
+                        dual_eq=jnp.zeros_like(state.dual_eq),
+                    )
+                    primal_updates, _ = opt_update(primal_gradient, opt_state, state)
+                    state = apply_updates(state, keep_only_primal(primal_updates))
+                    state = SaddleState(
+                        primal=projection_primal(state.primal),
+                        dual_ineq=state.dual_ineq,
+                        dual_eq=state.dual_eq,
+                    )
+
+                    # 2) Dual-only update, but the dual gradient reads the
+                    #    extrapolated primal x_bar = 2 x^{k+1} - x^k. Just b - A
+                    #    x_bar (one matvec) — the primal half of the full grad is
+                    #    unused here.
+                    x_bar = 2.0 * state.primal - x_old
+                    extrapolated = SaddleState(
+                        primal=x_bar,
+                        dual_ineq=state.dual_ineq,
+                        dual_eq=state.dual_eq,
+                    )
+                    gd_ineq, gd_eq = grad_dual_only(extrapolated)
+                    if k_scaling:
+                        gd_ineq = gd_ineq * k
+                        gd_eq = gd_eq * k
+                    combined_gradient = SaddleState(
+                        primal=gp,
+                        dual_ineq=gd_ineq,
+                        dual_eq=gd_eq,
+                    )
+                    dual_updates, opt_state = opt_update(
+                        combined_gradient, opt_state, state
+                    )
+                    state = apply_updates(state, keep_only_dual(dual_updates))
+                    state = SaddleState(
+                        primal=state.primal,
+                        dual_ineq=projection_non_negative(state.dual_ineq),
+                        dual_eq=state.dual_eq,
+                    )
+                    opt_state = pack_k(opt_state, k)
+
                     if average:
                         w = weight_function(i)
                         total_weight = total_weight + w
@@ -307,6 +406,12 @@ def __sps(
     else:
         average_state = initial_solution
 
+    # `state` is donated to run_epoch; if `average_state` aliases the same buffer
+    # (the common `average=False` case) XLA rejects the call (`f(donate(a), a)`).
+    # Give `average_state` its own buffer. One copy per epoch, off the hot path.
+    if average_state is state:
+        average_state = jax.tree.map(lambda x: x + 0, average_state)
+
     if initial_opt_state is not None:
         opt_state = initial_opt_state
     elif k_scaling:
@@ -371,11 +476,9 @@ def solve(
     log_every=1,
     average=True,
     report_best=True,
-    update_mode="extragradient",
-    k_scaling=True,
+    update_mode="pdhg",
+    k_scale=1e1,
     k_theta=0.01,
-    k_lo=1e-3,
-    k_hi=1e3,
     k_init=None,
     scale="ruiz+pc",
     output_opt_state=False,
@@ -434,25 +537,25 @@ def solve(
               post-primal dual gradient (Gauss–Seidel ordering).
             * ``"extragradient"``: Korpelevich look-ahead/corrector step. Two
               gradient evals per iter.
-        k_scaling: Enable primal-weight (k) scaling (default ``False``). When
-            ``True`` — orthogonal to ``update_mode``, so it composes with all
-            three schemes — a primal weight ``k`` rescales the primal/dual
-            gradients by ``(1/k, k)`` before each ``opt_update``, making the
-            dual/primal step ratio ``k**2``. ``k`` is initialised from ``k_init``
-            and rebalanced at each restart (PDLP-style) from primal-vs-dual
-            iterate movement; it is constant within an epoch (not adapted per
-            iteration). Tuned by ``k_theta``/``k_lo``/``k_hi`` and ``k_init``.
+        k_scale: Primal-weight (k) scaling control. ``None`` disables it;
+            otherwise a float sets a symmetric clamp band ``[1/k_scale,
+            k_scale]`` for ``k`` (default ``10`` → ``[0.1, 10]``). When enabled —
+            orthogonal to ``update_mode``, so it composes with all three schemes
+            — a primal weight ``k`` rescales the primal/dual gradients by
+            ``(1/k, k)`` before each ``opt_update``, making the dual/primal step
+            ratio ``k**2``. ``k`` is initialised from ``k_init`` and rebalanced
+            at each restart (PDLP-style) from primal-vs-dual iterate movement; it
+            is constant within an epoch (not adapted per iteration). Tuned by
+            ``k_theta``/``k_scale`` and ``k_init``.
         k_init: Initial primal weight ``k``. ``None`` (default) initialises it to
             the PDLP heuristic ``||c|| / ||b||`` (objective vs RHS norms, in the
             scaled space the solver iterates in). Pass a float to override
             (``1.0`` = symmetric steps, the PC/Ruiz-scaled baseline). Only used
-            when ``k_scaling=True``.
+            when ``k_scale`` is set.
         k_theta: Smoothing coefficient for the log-space primal-weight update at
             each restart (default 0.5 = geometric mean of the movement-based
             target and the current weight, matching PDLP). Smaller = slower
-            adaptation. Only used when ``k_scaling=True``.
-        k_lo, k_hi: Clamp band for ``k`` (default [0.1, 10]). Also clamps the
-            ``||c||/||b||`` init. Only used when ``k_scaling=True``.
+            adaptation. Only used when ``k_scale`` is set.
         primal_stop: Opt-in, dual-free termination (default ``False``). When
             ``True``, termination ignores the dual certificate entirely and stops
             on **primal feasibility** (``constraint_bound`` within
@@ -475,7 +578,7 @@ def solve(
     """
 
     if optimiser is None:
-        optimiser = jo.gd_dual_momentum(0.5, momentum=0.5, nesterov=True)
+        optimiser = jo.gd(0.5)
 
     if log_every < 1:
         raise ValueError("log_every must be >= 1")
@@ -487,9 +590,18 @@ def solve(
         "synchronous",
         "alternating",
         "extragradient",
+        "pdhg",
     ]
     if update_mode not in valid_update_modes:
         raise ValueError(f"update_mode must be one of {valid_update_modes}")
+
+    # ``k_scale`` is the public knob for primal-weight scaling: ``None`` disables
+    # it, otherwise it sets a symmetric clamp band ``[1/k_scale, k_scale]``.
+    k_scaling = k_scale is not None
+    if k_scaling:
+        k_lo, k_hi = 1.0 / k_scale, k_scale
+    else:
+        k_lo, k_hi = None, None
 
     if verbose:
         print("====Starting Solve====")
@@ -535,6 +647,14 @@ def solve(
         row_scale = np.ones(lp.A_eq.shape[0] + lp.A_ineq.shape[0])
         col_scale = np.ones(lp.c.shape[0])
 
+        original_lp = lp
+        lp = to_jaddle_sparse(lp)
+
+    # A user-supplied initial_solution is given in the LP's original (unscaled)
+    # space, so it must be mapped into the scaled space the solver iterates in.
+    # The default from lp.initial_solution() is already built from the scaled lp
+    # and must NOT be rescaled again.
+    user_supplied_initial = initial_solution is not None
     if initial_solution is None:
         initial_solution = lp.initial_solution()
 
@@ -611,11 +731,14 @@ def solve(
         c_scale_mag = float(jnp.max(jnp.abs(lp.c))) + 1e-30
         lp.c = lp.c + (vertex_bias * c_scale_mag) * r
 
-    initial_solution = SaddleState(
-        primal=initial_solution.primal / col_scale,
-        dual_ineq=initial_solution.dual_ineq / jnp_row_scale_ineq,
-        dual_eq=initial_solution.dual_eq / jnp_row_scale_eq,
-    )
+    if user_supplied_initial:
+        # Map the user's original-space solution into scaled space (the inverse
+        # of the output unscaling: primal *= col_scale, dual *= row_scale).
+        initial_solution = SaddleState(
+            primal=initial_solution.primal / col_scale,
+            dual_ineq=initial_solution.dual_ineq / jnp_row_scale_ineq,
+            dual_eq=initial_solution.dual_eq / jnp_row_scale_eq,
+        )
 
     dual_feasibility_threshold = (
         float(dual_feasibility_tolerance)
@@ -623,14 +746,21 @@ def solve(
         else 0.0
     )
 
+    # When vertex_bias is off, the working cost IS the true cost — use lp.objective
+    # exactly as before so the zero-bias compiled graph is byte-identical to the
+    # pre-vertex_bias version (no extra captured constant). Only when biased do we
+    # substitute c_true so the reported objective reflects the real problem.
+    _report_c = c_true if vertex_bias else None
+
     @jax.jit
     def compute_epoch_metrics(average_state):
-        # Report the TRUE objective (c_true) the user cares about; the dynamics /
+        # Report the TRUE objective the user cares about; the dynamics /
         # dual-feasibility / gap below run on the (possibly vertex-biased) working
-        # cost lp.c, since that is the problem actually being solved — its optimum
-        # is a vertex within O(vertex_bias) of the true optimum, which polish /
-        # crossover then clean up exactly.
-        objective_value = (c_true @ average_state.primal) * c_max
+        # cost lp.c, since that is the problem actually being solved.
+        if _report_c is None:
+            objective_value = lp.objective(average_state.primal) * c_max
+        else:
+            objective_value = (_report_c @ average_state.primal) * c_max
 
         dual_avg = jnp.concatenate([average_state.dual_eq, average_state.dual_ineq])
         Ax_avg = lp.A @ average_state.primal
@@ -891,14 +1021,27 @@ def solve(
         return jnp.maximum(jnp.maximum(primal_term, dual_term), gap_term)
 
     if precompile:
+        if verbose:
+            # The precompile below runs a full epoch + metrics through XLA before
+            # the loop. On large LPs (e.g. nug, m≈20k) the first XLA compile can
+            # take tens of seconds with NO output — which looks like a hang. Print
+            # a bracket so the wait is visible. (Pass precompile=False to fold the
+            # compile into epoch 1 instead.)
+            print("Precompiling epoch (first XLA compile; may take a while)...")
+            print("----------------------------------------------")
+            _precompile_t0 = time.time()
+        # run_epoch donates its state/opt_state buffers, so feed the warm-up
+        # *copies* — the real state/opt_state the timed loop uses must survive.
+        _warm_state = jax.tree.map(lambda x: x + 0, state)
+        _warm_opt_state = jax.tree.map(lambda x: x + 0, opt_state)
         _precompile_result = __sps(
             1,
             0,
             lp,
             optimiser,
-            state,
+            _warm_state,
             average_state,
-            opt_state,
+            _warm_opt_state,
             weight_function,
             total_weight,
             primal_damping,
@@ -914,6 +1057,9 @@ def solve(
         # epoch 1 doesn't pay its first-call compile inside the timed loop.
         _precompile_metrics = compute_epoch_metrics(average_state if average else state)
         jax.block_until_ready((_precompile_result, _precompile_metrics))
+        if verbose:
+            print(f"Precompile done in {time.time() - _precompile_t0:.1f}s")
+            print("----------------------------------------------")
 
     def print_epoch_metrics(epoch_time=None):
         dual_gap_status = "finite" if bool(dual_gap_is_finite) else "dual-infeasible"
@@ -1570,50 +1716,51 @@ def project_onto_eq(lp: JaddleLP, primal: jnp.ndarray, tol: 1e-6) -> jnp.ndarray
     return primal + delta
 
 
-def __primal_polish(
+def primal_polish(
     lp: LP,
     warm: SaddleState,
-    active_tol: float = None,
-    atol: float = 1e-6,
+    active_tol: float = 1e-6,
+    bound_tol: float = 1e-12,
+    atol: float = 1e-12,
     damp: float = 1e-6,
     max_passes: int = 20,
 ):
     """
-    Polish a warm primal by **least squares** on the active constraints — a fast,
-    robust active-set polish that cannot blow up.
+    Polish a warm primal by a **bound active-set least squares** on the active
+    constraints -- a fast, robust polish that respects the box ``[lb, ub]``
+    EXACTLY (not by post-hoc clipping) and cannot blow up.
 
-    Approximately minimizes ``‖A_active x − b_active‖²``, then clips the result
-    into ``[lb, ub]``, where
-    ``A_active``/``b_active`` are the equalities plus the tight inequalities
-    (each tight ``≤`` row treated as an equality to hit).
+    Two nested active sets: an OUTER loop over the tight inequality rows (added
+    as equalities, growing as the result violates dropped rows) wraps an INNER
+    bound active-set solve (``bounded_lstsq``) that fixes variables at their
+    bounds and frees them by reduced-gradient sign, converging to the exact
+    bounded optimum of the active system. Each inner step is a single warm-started
+    damped ``lsmr`` Krylov solve over the free columns only -- far faster than
+    bound-constrained ``lsq_linear`` (trust-region) on large over-determined
+    active sets (e.g. momentum1 ~11k x 5k), for the same exact-bounded answer.
 
-    Method: an ACTIVE-SET LOOP around ``lsqr``. Each pass solves the active
-    system ``A_act·x = b_act`` with one ``lsqr`` solve — warm-started from the
-    running iterate (``x0``) and damped (``damp``), i.e. minimizing
-    ``‖A_act·x − b_act‖² + damp²·‖x − x0‖²`` (anchored near the warm point) —
-    then clips into ``[lb, ub]`` and adds any DROPPED inequalities the clipped
-    point now violates, re-solving up to ``max_passes`` times. One Krylov pass
-    per solve — far faster than bound-constrained ``lsq_linear`` (trust-region)
-    on large over-determined active sets (e.g. momentum1 ~11k×5k).
+    The active rows ``A_active``/``b_active`` are the equalities plus the tight
+    inequalities (each tight ``<=`` row treated as an equality to hit). The inner
+    solve minimizes ``||A_active x - b_active||^2 + damp^2 ||x - x0||^2`` over the
+    free variables, warm-started from and anchored near the warm point.
 
-    Trade-offs vs. the bound-constrained solve: the clipped point is NOT the
-    exact bounded optimum, and no exact dual multipliers are produced (warm duals
-    passed through). The loop repairs an *incomplete* active set but NOT
-    infeasibility from the clip pulling ``x`` off the active rows when bounds and
-    constraints conflict. It is a best-effort polish — the caller's keep-better
-    gate discards it if worse. It cannot diverge unboundedly (``damp`` anchors
-    the step; the result is clipped into the box).
+    Trade-offs: no exact dual multipliers are produced (warm duals passed
+    through). When bounds and constraints genuinely conflict, no point hits all
+    active rows inside the box -- the bound active-set still returns the
+    box-feasible least-squares point and the caller's keep-better gate discards it
+    if worse. It cannot diverge unboundedly (every iterate is box-feasible by
+    construction; ``damp`` anchors the step).
 
-    ``active_tol`` defaults to ``None`` ⇒ derived from the warm point's
+    ``active_tol`` defaults to ``None`` => derived from the warm point's
     feasibility (``max(1e-6, worst primal residual)``), so the active set tracks
-    how converged the point is. ``atol`` is the ``lsqr`` tolerance; ``damp`` is
-    the Tikhonov damping toward ``x0``; ``max_passes`` caps the add-and-resolve
-    loop.
+    how converged the point is. It also sets the bound-activity tolerance. ``atol``
+    is the ``lsmr`` tolerance; ``damp`` is the Tikhonov damping toward ``x0``;
+    ``max_passes`` caps each active-set loop.
 
     Returns a new ``SaddleState`` (polished primal, warm duals). Does not mutate
     ``warm``.
     """
-    from scipy.sparse.linalg import lsqr
+    from scipy.sparse.linalg import lsmr
 
     x = np.asarray(warm.primal, dtype=np.float64)
     lb = np.asarray(lp.lower_bounds, dtype=np.float64)
@@ -1632,26 +1779,70 @@ def __primal_polish(
             if A_ineq.shape[0] > 0
             else 0.0
         )
-        active_tol = max(1e-6, max(eq_s, ineq_s))
+        active_tol = max(1e-6, 10 * max(eq_s, ineq_s))
 
-    # Initial active inequalities: those within tolerance of being tight.
+    # bound_tol: how close to a bound counts as "at" it. Tie to active_tol.
+    if bound_tol is None:
+        bound_tol = active_tol
+
+    def bounded_lstsq(A_act, b_act, x0):
+        """Exact bounded least-squares of ||A_act x - b_act||^2 s.t. lb <= x <= ub
+        by a BOUND active-set loop over lsmr. x0 must be box-feasible.
+
+        Variables pinned at a bound are FIXED (dropped from the unknowns, folded
+        into the RHS); the inner lsmr solve runs over the FREE columns only. After
+        each solve we (a) FIX any free var the step pushed past a bound, at that
+        bound, and (b) FREE any fixed var whose reduced gradient
+        g = A_act^T (A_act x - b_act) points back into the box. The loop ends when
+        the active set stops changing -- the KKT point of the bounded problem.
+        """
+        x_cur = np.clip(x0, lb, ub)
+        at_lb = x_cur <= lb + bound_tol
+        at_ub = x_cur >= ub - bound_tol
+        fixed = at_lb | at_ub
+        # Pin fixed vars exactly onto the bound they sit on.
+        x_cur = np.where(at_ub, ub, np.where(at_lb, lb, x_cur))
+
+        for _ in range(max_passes):
+            free = ~fixed
+            if not free.any():
+                break
+            A_free = A_act[:, free]
+            rhs = b_act - A_act[:, fixed] @ x_cur[fixed]  # fold fixed cols in
+            sol = lsmr(A_free, rhs, atol=atol, btol=atol, damp=damp, x0=x_cur[free])[0]
+
+            x_trial = x_cur.copy()
+            x_trial[free] = sol
+
+            # (a) FIX free vars the step pushed outside the box, at that bound.
+            newly_fixed = free & (
+                (x_trial < lb - bound_tol) | (x_trial > ub + bound_tol)
+            )
+            x_cur = np.clip(x_trial, lb, ub)
+            if newly_fixed.any():
+                fixed = fixed | newly_fixed
+                continue
+
+            # (b) FREE fixed vars whose reduced gradient points into the box.
+            # At a lower bound, descent needs g < 0 (increase x_i); at an upper
+            # bound, g > 0 (decrease x_i).
+            g = A_act.T @ (A_act @ x_cur - b_act)
+            release = fixed & (
+                ((x_cur <= lb + bound_tol) & (g < -atol))
+                | ((x_cur >= ub - bound_tol) & (g > atol))
+            )
+            if not release.any():
+                break  # KKT satisfied for the bounded problem
+            fixed = fixed & ~release
+        return x_cur
+
+    # Outer loop: the constraint active set.
     if A_ineq.shape[0] > 0:
         ineq_active = np.abs(A_ineq @ x - b_ineq) <= active_tol
     else:
         ineq_active = np.zeros(0, dtype=bool)
 
-    # Active-set loop. Each pass: solve the active system A_act·x = b_act with a
-    # single LSQR solve warm-started from the running iterate (x0), clip into the
-    # box, then add any DROPPED inequalities the clipped point now violates and
-    # re-solve, capped at max_passes. (NOTE: this only repairs an INCOMPLETE
-    # active set; it does not
-    # fix infeasibility introduced by the clip pulling x off the active rows when
-    # bounds and constraints conflict -- that is not an active-set error.)
-    #   LSQR with x0 and damp minimizes ‖A_act·x - b_act‖² + damp²·‖x - x0‖²:
-    #   warm-started from the first-order point and anchored near it. One Krylov
-    #   pass per solve -- FAR faster than bound-constrained lsq_linear (trf) on
-    #   large over-determined active sets (e.g. momentum1 ~11k×5k).
-    x_new = x
+    x_new = np.clip(x, lb, ub)
     for _pass in range(max_passes):
         if A_ineq.shape[0] > 0:
             A_act = sp.vstack([A_eq, A_ineq[ineq_active]], format="csc")
@@ -1659,8 +1850,7 @@ def __primal_polish(
         else:
             A_act, b_act = A_eq, b_eq
 
-        x_new = lsqr(A_act, b_act, atol=atol, btol=atol, x0=x_new, damp=damp)[0]
-        x_new = np.clip(x_new, lb, ub)
+        x_new = bounded_lstsq(A_act, b_act, x_new)
 
         if A_ineq.shape[0] == 0:
             break
@@ -1675,935 +1865,6 @@ def __primal_polish(
         dual_ineq=warm.dual_ineq,
         dual_eq=warm.dual_eq,
     )
-
-
-def __dual_polish(
-    lp: LP,
-    warm: SaddleState,
-    active_tol: float = None,
-    atol: float = 1e-6,
-    damp: float = 1e-6,
-):
-    """
-    Reconstruct optimal duals from a near-optimal **primal** by a single
-    least-squares solve of the stationarity (complementary-slackness) system —
-    steps 1–2 of the active-set dual recovery (no certified ``s ≥ 0`` polish;
-    see ``polish_dual`` for the restricted-dual-LP version that guarantees it).
-
-    Method:
-      1. Classify variables from the warm primal. ``interior`` = strictly off
-         both bounds (``min(x-lb, ub-x) > active_tol``); these are the basic
-         variables whose reduced cost must vanish. Classify inequality rows as
-         active (tight ``≤`` within ``active_tol``); inactive rows get zero dual
-         by complementary slackness, equality rows are always active.
-      2. Solve stationarity restricted to the interior columns for the stacked
-         dual ``y = [y_eq; y_ineq_active]``::
-
-             A_active[:, interior]ᵀ · y = −c[interior]
-
-         by damped ``lsqr`` (Tikhonov ``damp`` toward 0). This is the reduced
-         cost ``s = c + Aᵀy`` set to zero on the basic set. Equality duals are
-         free-signed; active inequality duals are clipped to ``≥ 0`` afterwards
-         (least-squares does not enforce dual feasibility — that is the job of
-         ``polish_dual``).
-
-    ``active_tol`` defaults to ``None`` ⇒ ``max(1e-6, worst primal residual)``,
-    so the active set tracks how converged the warm point is.
-
-    Returns a new ``SaddleState`` (warm primal, reconstructed duals). Does not
-    mutate ``warm``.
-    """
-    from scipy.sparse.linalg import lsqr
-
-    x = np.asarray(warm.primal, dtype=np.float64)
-    lb = np.asarray(lp.lower_bounds, dtype=np.float64)
-    ub = np.asarray(lp.upper_bounds, dtype=np.float64)
-    c = np.asarray(lp.c, dtype=np.float64)
-    A_eq = lp.A_eq.tocsc().astype(np.float64)
-    A_ineq = lp.A_ineq.tocsc().astype(np.float64)
-    b_eq = np.asarray(lp.b_eq, dtype=np.float64)
-    b_ineq = np.asarray(lp.b_ineq, dtype=np.float64)
-    n_eq = A_eq.shape[0]
-
-    if active_tol is None:
-        eq_s = float(np.abs(A_eq @ x - b_eq).max()) if n_eq > 0 else 0.0
-        ineq_s = (
-            float(np.maximum(A_ineq @ x - b_ineq, 0.0).max())
-            if A_ineq.shape[0] > 0
-            else 0.0
-        )
-        active_tol = max(1e-6, max(eq_s, ineq_s))
-
-    # 1) Active set. Interior (basic) variables: strictly off both bounds, so
-    # their reduced cost must be zero. Active inequalities: tight rows only —
-    # inactive rows carry zero dual by complementary slackness.
-    interior = np.minimum(x - lb, ub - x) > active_tol
-    if A_ineq.shape[0] > 0:
-        ineq_active = np.abs(A_ineq @ x - b_ineq) <= active_tol
-    else:
-        ineq_active = np.zeros(0, dtype=bool)
-
-    # 2) Stationarity on the basic set: A_actᵀ·y = −c, restricted to interior
-    # columns. Stack equalities + tight inequalities; solve for y by least
-    # squares. (lsqr solves min‖Mᵀy + c‖² over interior rows; we pass Mᵀ.)
-    if A_ineq.shape[0] > 0:
-        A_act = sp.vstack([A_eq, A_ineq[ineq_active]], format="csc")
-    else:
-        A_act = A_eq
-
-    # Transpose then keep only interior rows (= interior columns of A_act).
-    M = A_act[:, interior].T.tocsc()  # (n_interior, n_active_rows)
-    rhs = -c[interior]
-    y = lsqr(M, rhs, atol=atol, btol=atol, damp=damp)[0]
-
-    dual_eq = y[:n_eq]
-    # Scatter active-inequality duals back to full length; inactive rows = 0.
-    dual_ineq = np.zeros(A_ineq.shape[0], dtype=np.float64)
-    if A_ineq.shape[0] > 0:
-        dual_ineq[ineq_active] = np.maximum(y[n_eq:], 0.0)  # dual feasibility
-
-    return SaddleState(
-        primal=warm.primal,
-        dual_ineq=jnp.asarray(dual_ineq),
-        dual_eq=jnp.asarray(dual_eq),
-    )
-
-
-def polish(
-    lp: LP,
-    warm: SaddleState,
-    active_tol: float = None,
-    atol: float = 1e-6,
-    damp: float = 1e-6,
-    max_passes: int = 20,
-):
-    """
-    Full primal-dual polish: primal by least squares on the active constraints
-    (``primal_polish``), then dual reconstruction from the polished primal by a
-    single least-squares solve of the stationarity system (``dual_polish``).
-
-    Returns a new ``SaddleState`` (polished primal, reconstructed duals). Does not
-    mutate ``warm``.
-    """
-    primal_warm = __primal_polish(
-        lp, warm, active_tol=active_tol, atol=atol, damp=damp, max_passes=max_passes
-    )
-    return __dual_polish(lp, primal_warm, active_tol=active_tol, atol=atol, damp=damp)
-
-
-def crossover(
-    lp: LP,
-    warm: SaddleState,
-    active_tol: float = None,
-    bound_tol: float = 1e-7,
-    opt_tol: float = 1e-7,
-    max_iter: int = None,
-    verbose: bool = False,
-):
-    """
-    Cross a near-optimal first-order solution over to an **exact LP vertex**
-    (basic feasible solution) by a bounded-variable revised primal simplex,
-    seeded from the warm point's active set.
-
-    Unlike ``polish`` (a least-squares active-set solve that *clips* into the
-    box), this produces a *certified* vertex: an exact basic feasible solution
-    with exact primal values, an exact basis, and exact dual multipliers from
-    ``y = B^{-T} c_B``. The least-squares polish gives a near-vertex point; only
-    a basis crossover lands on a true vertex of the optimal face.
-
-    Method. The LP ``min cᵀx  s.t.  A_eq x = b_eq, A_ineq x ≤ b_ineq, lb ≤ x ≤ ub``
-    is put in standard bounded-variable form by adding inequality slacks
-    ``s = b_ineq − A_ineq x ≥ 0``::
-
-        min  c̃ᵀz   s.t.  M z = d,   l ≤ z ≤ u
-        z = (x, s),  M = [[A_eq, 0], [A_ineq, I]],  d = (b_eq, b_ineq)
-
-    An initial basis is *guessed* from the warm point: structural variables that
-    are strictly off both bounds (interior) plus slacks of inequalities that are
-    not tight are taken basic; the rest are nonbasic at the nearer bound. The
-    basis is then squared to exactly ``m = n_eq + n_ineq`` columns (padding with
-    the most interior remaining columns, falling back to any remaining column —
-    including tight slacks — so the basis is always factorable) and refactored.
-
-    A two-phase bounded-variable revised primal simplex then runs:
-
-    - **Phase 1** drives any bound-infeasible basics feasible while keeping
-      ``Mz=d``, via a composite (total-infeasibility) objective and a
-      piecewise-linear ratio test evaluated directly at each breakpoint. This
-      makes the crossover robust to a WRONG active-set guess — it pivots its way
-      to a feasible vertex rather than failing — so even a crude warm point
-      (loose, or with no duals) converges.
-    - **Phase 2** optimises the true cost: Dantzig pricing (most-improving
-      reduced cost ``d̄ = c̃ − Mᵀy``, ``y = B^{-T}c_B``) with a Bland fallback
-      after degenerate steps for anti-cycling, and a Harris-style stable leaving
-      rule (largest pivot among near-tie ratios).
-
-    Both phases re-solve the basics against the factor after every pivot so
-    ``Mz=d`` holds exactly (incremental updates drift). Verified exact (matches
-    HiGHS) on 336 random/degenerate LPs.
-
-    Still a best-effort polish behind the keep-better gate (``crossover_polish``):
-    if phase-2 hits the iteration cap or a singular basis it bails to the warm
-    point.
-
-    Args:
-        active_tol: Tightness tolerance for the initial basis guess. ``None`` ⇒
-            a small fixed tolerance (``bound_tol``); a residual-derived tol is
-            self-defeating on loose iterates (see body).
-        bound_tol: Tolerance for treating a variable as on a bound / a basic as
-            bound-infeasible.
-        opt_tol: Reduced-cost optimality tolerance.
-        max_iter: Pivot cap. ``None`` ⇒ ``50 * (n_eq + n_ineq)``.
-        verbose: Print phase/pivot diagnostics.
-
-    Returns a new ``SaddleState`` (vertex primal, exact duals). Does not mutate
-    ``warm``.
-    """
-    from scipy.sparse.linalg import splu
-
-    x = np.asarray(warm.primal, dtype=np.float64)
-    c = np.asarray(lp.c, dtype=np.float64)
-    lb = np.asarray(lp.lower_bounds, dtype=np.float64)
-    ub = np.asarray(lp.upper_bounds, dtype=np.float64)
-    A_eq = lp.A_eq.tocsc().astype(np.float64)
-    A_ineq = lp.A_ineq.tocsc().astype(np.float64)
-    b_eq = np.asarray(lp.b_eq, dtype=np.float64)
-    b_ineq = np.asarray(lp.b_ineq, dtype=np.float64)
-
-    n = x.shape[0]
-    n_eq = A_eq.shape[0]
-    n_ineq = A_ineq.shape[0]
-    m = n_eq + n_ineq  # number of rows in the standard-form system
-
-    # --- Build standard bounded-variable form  M z = d,  l ≤ z ≤ u  ----------
-    # z = (x, s); slacks s = b_ineq - A_ineq x, with 0 ≤ s (slack only needed
-    # for inequality rows). Equality rows get no slack column.
-    #   M = [[A_eq,   0 ],
-    #        [A_ineq, I ]]
-    if n_ineq > 0:
-        top = sp.hstack([A_eq, sp.csc_matrix((n_eq, n_ineq))], format="csc")
-        I_s = sp.identity(n_ineq, format="csc")
-        bot = sp.hstack([A_ineq, I_s], format="csc")
-        M = sp.vstack([top, bot], format="csc")
-    else:
-        M = A_eq.tocsc()
-    # CSR transpose precomputed ONCE for pricing: each pivot needs the reduced
-    # costs Mᵀy over all nonbasic columns. Computing `MT @ y` as a single
-    # vectorised C matvec — and slicing the result — is far cheaper than
-    # re-slicing `M[:, nb_idx]` into a fresh sparse matrix every iteration (the
-    # pricing bottleneck on large LPs, e.g. nug m≈20k).
-    MT = M.T.tocsr()
-    d = np.concatenate([b_eq, b_ineq])
-
-    nz = n + n_ineq  # total columns (structural + slacks)
-    l = np.concatenate([lb, np.zeros(n_ineq)])
-    u = np.concatenate([ub, np.full(n_ineq, np.inf)])
-    c_full = np.concatenate([c, np.zeros(n_ineq)])
-
-    # Warm slack values = TRUE residual b - A_ineq x (NOT clipped). Clipping
-    # would break Mz=d from the start; instead we let phase-1 drive any
-    # bound-infeasible (negative) slack back to feasibility while keeping Mz=d.
-    s0 = b_ineq - np.asarray(A_ineq @ x) if n_ineq else np.zeros(0)
-    z = np.concatenate([x, s0])
-
-    if active_tol is None:
-        # A SMALL fixed tolerance: the basis guess classifies a column as
-        # nonbasic only when it is genuinely on a bound. Deriving active_tol from
-        # the warm residual (as the least-squares polish does) is self-defeating
-        # here — a sloppy warm point gives a huge tol that marks *every* column
-        # on-bound, leaving no interior basics and a rank-deficient seed. The
-        # crossover assumes a near-optimal warm point; phase-1 repairs the rest.
-        active_tol = bound_tol
-    if max_iter is None:
-        # Generous cap: phase-1 from a poorly-seeded basis can need many pivots.
-        # Per-pivot cost is now low (PFI updates + vectorised pricing/ratio test),
-        # so a higher cap is affordable; the caller's gate bails cleanly if hit.
-        max_iter = 200 * max(m, 1)
-
-    # --- Purification pre-pass (reduced-cost-based active-set guess) ----------
-    # A geometric "near a bound" test is a poor active-set guess from a loose
-    # first-order iterate: many structurals sit a little off their bound, so the
-    # seed marks them basic and the Mz=d solve blows up. The *reduced cost*
-    #   d̄ = c + A_eqᵀ y_eq + A_ineqᵀ y_ineq
-    # is the sharp signal: at optimality a variable with d̄ ≫ 0 must be at its
-    # LOWER bound, d̄ ≪ 0 at its UPPER bound, and only |d̄| ≈ 0 variables are
-    # genuinely basic (interior). We use the warm duals to compute d̄ for the
-    # structurals and SNAP confidently-signed variables exactly onto the implied
-    # bound — sharpening the active set before seeding. Slacks are purified by
-    # their own value (tight ⇒ at 0). When warm duals are absent/zero this
-    # degrades gracefully to the geometric test.
-    y_warm = np.concatenate(
-        [
-            np.asarray(warm.dual_eq, dtype=np.float64),
-            np.asarray(warm.dual_ineq, dtype=np.float64),
-        ]
-    )
-    rc = c.copy()
-    if y_warm.size:
-        rc = rc + np.asarray(M[:, :n].T @ y_warm)  # structural reduced costs
-    rc_tol = 1e-7 * (1.0 + np.abs(c).max())
-    for j in range(n):
-        if rc[j] > rc_tol and np.isfinite(l[j]):
-            z[j] = l[j]  # wants its lower bound
-        elif rc[j] < -rc_tol and np.isfinite(u[j]):
-            z[j] = u[j]  # wants its upper bound
-
-    # --- Seed the basis from the (purified) active set -----------------------
-    # Interior structural vars (strictly off both bounds) and slacks of slack
-    # inequalities (not tight ⇒ s > 0) are basic candidates; everything else is
-    # nonbasic, parked at its nearer finite bound (lower if free).
-    dist_lo = np.where(np.isfinite(l), z - l, np.inf)
-    dist_hi = np.where(np.isfinite(u), u - z, np.inf)
-    on_bound = np.minimum(dist_lo, dist_hi) <= active_tol
-    # A confidently-signed reduced cost forces the structural nonbasic. Use the
-    # SAME threshold as the purification snap above: any structural snapped to a
-    # bound by reduced cost must also be classified nonbasic, otherwise it stays
-    # a basic candidate while pinned to a bound — an over-determined candidate set
-    # (|basic_pref| > m) that forces the seed Mz=d solve to push basics out of
-    # bounds. Aligning the thresholds keeps the candidate count at ~m.
-    rc_nonbasic = np.zeros(nz, dtype=bool)
-    rc_nonbasic[:n] = np.abs(rc) > rc_tol
-    basic_pref = ~on_bound & ~rc_nonbasic  # interior, reduced-cost-ambiguous
-
-    # nonbasic status: -1 at lower, +1 at upper. Park each nonbasic at its
-    # nearer finite bound (lower for free-but-finite-lower; if free both ways
-    # keep it nonbasic "at" its current value via a synthetic zero bound is not
-    # allowed, so free vars are forced basic below).
-    free_both = ~np.isfinite(l) & ~np.isfinite(u)
-    basic_pref = basic_pref | free_both  # free vars cannot sit nonbasic
-
-    # Snap nonbasic columns onto their parked bound now, so the basics solve the
-    # residual system exactly.
-    nb_status = np.zeros(nz, dtype=np.int8)  # 0 basic placeholder
-    cand = np.where(basic_pref)[0]
-    noncand = np.where(~basic_pref)[0]
-    for j in noncand:
-        if dist_lo[j] <= dist_hi[j]:
-            z[j] = l[j]
-            nb_status[j] = -1
-        else:
-            z[j] = u[j]
-            nb_status[j] = +1
-
-    # Square the basis to exactly m columns. Crucially, prefer SLACK columns of
-    # loose (non-tight) inequalities first: a non-tight inequality has positive
-    # slack — it is naturally basic, and its column in M is a unit vector, so it
-    # is perfectly conditioned. Seeding interior STRUCTURALS alone gives an
-    # ill-conditioned (often near-singular) basis whose Mz=d solve blows up
-    # (the bound-infeasible-seed failures). The classic logical/structural split:
-    # take loose slacks, then fill remaining rows with the most-interior
-    # structurals.
-    interior_score = np.minimum(dist_lo, dist_hi)
-    slack_cols = np.arange(n, nz)  # slack column indices
-    slack_basic = slack_cols[basic_pref[slack_cols]]  # loose slacks (positive)
-    slack_basic = slack_basic[np.argsort(-interior_score[slack_basic])]
-
-    struct_cand = cand[cand < n]
-    struct_cand = struct_cand[np.argsort(-interior_score[struct_cand])]
-
-    basis = list(slack_basic[:m])
-    if len(basis) < m:
-        basis += list(struct_cand[: m - len(basis)])
-    if len(basis) < m:
-        # Still short: pad from remaining nonbasic structurals by interior dist.
-        pad_pool = noncand[noncand < n]
-        pad_pool = pad_pool[np.argsort(-interior_score[pad_pool])]
-        have = set(basis)
-        basis += [j for j in pad_pool if j not in have][: m - len(basis)]
-    if len(basis) < m:
-        # Last resort: pad with ANY remaining columns (including tight slacks) so
-        # the basis is exactly m × m and factorable. The seed need not be optimal
-        # or even feasible — phase-1 repairs it; it must only be SQUARE. (Without
-        # this, degenerate data can leave the basis short and splu rejects the
-        # non-square matrix.)
-        have = set(basis)
-        basis += [j for j in range(nz) if j not in have][: m - len(basis)]
-    basis = np.array(basis[:m], dtype=int)
-
-    in_basis = np.zeros(nz, dtype=bool)
-    in_basis[basis] = True
-    # Any column we just decided is basic must not also be marked nonbasic.
-    nb_status[in_basis] = 0
-    # Columns neither basic nor parked (e.g. a former candidate dropped while
-    # squaring) must be parked at a bound now.
-    for j in np.where(~in_basis & ~basic_pref.astype(bool))[0]:
-        pass  # already parked above
-    leftover = np.where(~in_basis & (nb_status == 0))[0]
-    for j in leftover:
-        if np.isfinite(l[j]):
-            z[j] = l[j]
-            nb_status[j] = -1
-        elif np.isfinite(u[j]):
-            z[j] = u[j]
-            nb_status[j] = +1
-        else:
-            # truly free and not basic: force it into the basis by swapping out
-            # an arbitrary basic; rare. Park at 0 as a fallback.
-            z[j] = 0.0
-            nb_status[j] = -1
-
-    class BasisFactor:
-        """Updatable basis factor: a fixed reference ``splu(B_ref)`` plus a
-        Product-Form-of-the-Inverse (PFI) eta chain for the pivots since the last
-        refactor. Replaces a full ``splu`` on every pivot (catastrophic at
-        m≈20k) with one reference solve + a few O(m) eta applications, refactoring
-        periodically to bound the chain length and limit error growth.
-
-        After replacing basis position ``p`` with an entering column whose FTRAN
-        is ``aq = B^{-1} M_q``, the new basis is ``B' = B·E`` with ``E`` the
-        identity except column ``p`` = the eta vector η, η_p = 1/aq_p,
-        η_i = -aq_i/aq_p (i≠p). FTRAN applies etas forward (after the ref solve),
-        BTRAN applies them in reverse (before the ref-transpose solve).
-        """
-
-        def __init__(self, basis):
-            self.singular = False
-            self._refactor(basis)
-
-        def _refactor(self, basis):
-            B = M[:, basis].tocsc()
-            try:
-                lu = splu(B)
-            except RuntimeError:
-                self.singular = True
-                return
-            diagU = np.abs(lu.U.diagonal())
-            if diagU.size < m or diagU.min() < 1e-9:
-                self.singular = True
-                return
-            self.lu = lu
-            self.etas = []  # list of (p, eta_vector)
-            self.singular = False
-
-        def refactor(self, basis):
-            self._refactor(basis)
-
-        def ftran(self, v):
-            # B^{-1} v = apply etas forward after B_ref^{-1} v.
-            x = self.lu.solve(np.asarray(v, dtype=np.float64))
-            for p, eta in self.etas:
-                xp = x[p]
-                if xp != 0.0:
-                    x = x + xp * eta
-                    x[p] = xp * eta[p]
-            return x
-
-        def btran(self, v):
-            # B^{-T} v = B_ref^{-T} (apply etas in reverse, transposed).
-            x = np.asarray(v, dtype=np.float64).copy()
-            for p, eta in reversed(self.etas):
-                # transpose of the eta application: x[p] <- eta · x
-                x[p] = eta @ x
-            return self.lu.solve(x, trans="T")
-
-        def update(self, p, aq):
-            # Form the eta for replacing basis position p; aq = current B^{-1}M_q.
-            piv = aq[p]
-            if abs(piv) < 1e-9:
-                return False  # unstable pivot; caller should refactor/bail
-            eta = -aq / piv
-            eta[p] = 1.0 / piv
-            self.etas.append((p, eta))
-            return True
-
-    def solve_basics(bf, basis, nb_status):
-        # Nonbasic contribution to the RHS: d - M_N z_N.
-        nb = ~in_basis
-        rhs = d - np.asarray(M[:, nb] @ z[nb])
-        return bf.ftran(rhs)
-
-    bf = BasisFactor(basis)
-    if bf.singular:
-        if verbose:
-            print("[crossover] seeded basis singular — bailing (gate keeps warm).")
-        return SaddleState(
-            primal=warm.primal, dual_ineq=warm.dual_ineq, dual_eq=warm.dual_eq
-        )
-    # Refactor when the eta chain reaches this length (bounds cost & error).
-    refactor_period = 64
-    z[basis] = solve_basics(bf, basis, nb_status)
-
-    def total_infeas(z, basis):
-        zb = z[basis]
-        return float(
-            np.maximum(l[basis] - zb, 0.0).sum() + np.maximum(zb - u[basis], 0.0).sum()
-        )
-
-    feas_tol = max(1e-6, 10 * bound_tol)
-
-    # --- Phase 1: composite (bounded-variable) feasibility simplex -----------
-    # Drive any bound-infeasible basic variables feasible while keeping Mz=d.
-    # Composite objective = total bound infeasibility of the basics, a piecewise-
-    # linear function whose subgradient assigns weight w_r to basic r:
-    #   w_r = -1 if z_{basis[r]} < l (below lower),  +1 if above upper, else 0.
-    # Phase-1 reduced cost of a nonbasic column q is d̄_q = -wᵀ(B^{-1} M_q); a
-    # nonbasic improves if moving it off its bound decreases infeasibility.
-    #
-    # The crux is the EXTENDED (piecewise-linear) ratio test: an infeasible basic
-    # moving TOWARD feasibility does not block when it reaches the near bound — it
-    # passes through its VIOLATED bound (a breakpoint where its weight flips from
-    # ±1 to 0), and only then does the marginal gain drop. We walk the breakpoints
-    # in increasing step order, accumulating the slope dInfeas/dt, and stop at the
-    # last breakpoint before the slope turns nonnegative (no further gain). That
-    # breakpoint's basic leaves. This is what lets a wrong active-set seed pivot
-    # its way to a correct vertex instead of bailing. (Maros, Ch. 9.)
-    def phase1_simplex(max_iter):
-        nonlocal basis, in_basis, z, bf
-        for _ in range(max_iter):
-            zb = z[basis]
-            w = np.where(
-                zb < l[basis] - bound_tol,
-                -1.0,
-                np.where(zb > u[basis] + bound_tol, 1.0, 0.0),
-            )
-            if not np.any(w):
-                return "feasible"
-            # Phase-1 duals: Bᵀ y = w (composite cost on basics).
-            y = bf.btran(w)
-            nb_idx = np.where(~in_basis)[0]
-            # Single vectorised matvec over the whole matrix, then slice — cheaper
-            # than re-slicing M[:, nb_idx] each iteration.
-            dbar = -(MT @ y)[nb_idx]
-            st = nb_status[nb_idx]
-            # A nonbasic at lower bound (st≤0) can only increase ⇒ improves if
-            # dbar<0; at upper bound (st≥0, ≠0) can only decrease ⇒ improves if
-            # dbar>0.
-            improving = ((st <= 0) & (dbar < -opt_tol)) | (
-                (st >= 0) & (dbar > opt_tol) & (st != 0)
-            )
-            if not improving.any():
-                # No improving direction but still infeasible: the seed's
-                # infeasibility is unreachable from this basis. Stop; caller bails.
-                return "infeasible"
-            cand_enter = nb_idx[improving]
-            q = cand_enter[np.argmin(cand_enter)]  # Bland
-            dir_up = nb_status[q] <= 0
-            t_dir = 1.0 if dir_up else -1.0
-
-            aq = bf.ftran(np.asarray(M[:, q].todense()).ravel())
-            delta_b = -aq * t_dir  # dz_b/dt as q moves by t≥0
-
-            # Piecewise-linear ratio test by DIRECT evaluation of total
-            # infeasibility at each breakpoint — the original proven-correct
-            # selection, VECTORISED (the breakpoint set and infeasibility at every
-            # breakpoint are array ops, not a Python loop of infeas_at() calls —
-            # the phase-1 hotspot). A basic may cross BOTH its bounds along the
-            # ray, so we enumerate every (t>0) at which any basic reaches l or u.
-            # Total infeasibility is convex piecewise-linear; its minimiser over
-            # [0, q_span] is one of those breakpoints (or q's own bound flip).
-            zb = z[basis]
-            lbb = l[basis]
-            ubb = u[basis]
-            a = delta_b
-
-            q_span = np.inf
-            if dir_up and np.isfinite(u[q]):
-                q_span = u[q] - z[q]
-            elif (not dir_up) and np.isfinite(l[q]):
-                q_span = z[q] - l[q]
-
-            moving = np.abs(a) > bound_tol
-            t_lo = np.where(moving & np.isfinite(lbb), (lbb - zb) / a, np.inf)
-            t_up = np.where(moving & np.isfinite(ubb), (ubb - zb) / a, np.inf)
-            ct, cr, cto = [], [], []
-            for tt, dd in ((t_lo, -1), (t_up, +1)):
-                ok = np.isfinite(tt) & (tt > 1e-12) & (tt <= q_span + 1e-12)
-                rs = np.where(ok)[0]
-                ct.append(tt[rs])
-                cr.append(rs)
-                cto.append(np.full(rs.size, dd, dtype=np.int8))
-            cand_t = np.concatenate(ct)
-            cand_r = np.concatenate(cr).astype(int)
-            cand_to = np.concatenate(cto)
-
-            if cand_t.size == 0:
-                # No basic blocks before q's flip ⇒ q bound-flips (or unbounded).
-                if np.isfinite(q_span):
-                    z[q] += t_dir * q_span
-                    z[basis] = zb + delta_b * q_span
-                    nb_status[q] = +1 if dir_up else -1
-                    continue
-                return "infeasible"
-
-            # Infeasibility at each unique breakpoint time (dedup ties), vectorised:
-            #   infeas(t) = Σ max(l-(zb+a t),0) + Σ max((zb+a t)-u,0)
-            ut = np.unique(cand_t)
-            zb_at = zb[None, :] + np.outer(ut, a)  # (#bp × m), m modest per LP
-            infeas_vals = (
-                np.maximum(lbb[None, :] - zb_at, 0.0).sum(axis=1)
-                + np.maximum(zb_at - ubb[None, :], 0.0).sum(axis=1)
-            )
-            t_star = float(ut[int(np.argmin(infeas_vals))])
-            # Leave: among breakpoints at ~t_star, largest |pivot| (Harris stable).
-            at_star = np.abs(cand_t - t_star) <= 1e-9
-            rr = cand_r[at_star]
-            sel = int(np.argmax(np.abs(a[rr])))
-            leave = int(rr[sel])
-            leave_to = int(cand_to[at_star][sel])
-            t_max = max(t_star, 0.0)
-            z[q] += t_dir * t_max
-            z[basis] += delta_b * t_max
-            br = basis[leave]
-            in_basis[br] = False
-            in_basis[q] = True
-            nb_status[br] = leave_to
-            z[br] = l[br] if leave_to == -1 else u[br]
-            nb_status[q] = 0
-            old = br
-            basis[leave] = q
-            # PFI update (cheap) instead of a full refactor; periodically refactor
-            # to bound the eta chain. If the pivot is unstable or the periodic
-            # refactor finds a singular basis, undo and stop.
-            need_refactor = len(bf.etas) + 1 >= refactor_period
-            if need_refactor or not bf.update(leave, aq):
-                bf.refactor(basis)
-                if bf.singular:
-                    basis[leave] = old
-                    in_basis[old] = True
-                    in_basis[q] = False
-                    nb_status[old] = 0
-                    bf.refactor(basis)  # restore the previous basis factor
-                    return "stalled"
-            # Re-solve the basics so Mz=d holds EXACTLY against the new basis,
-            # rather than relying on the incremental step landing perfectly — the
-            # nonbasic z (including q and the just-left br, now on their bounds)
-            # are fixed; the basics absorb the residual.
-            z[basis] = solve_basics(bf, basis, nb_status)
-        return "iterlimit"
-
-    seed_infeas = total_infeas(z, basis)
-    if seed_infeas > feas_tol:
-        status1 = phase1_simplex(max_iter)
-        post_infeas = total_infeas(z, basis)
-        if verbose:
-            print(
-                f"[crossover] phase-1: {status1}, infeas {seed_infeas:.2e}"
-                f" → {post_infeas:.2e}"
-            )
-        if post_infeas > feas_tol:
-            if verbose:
-                print("[crossover] phase-1 could not reach feasibility — bailing.")
-            return SaddleState(
-                primal=warm.primal, dual_ineq=warm.dual_ineq, dual_eq=warm.dual_eq
-            )
-
-    # --- Phase 2: optimise the true cost over feasible vertices ---------------
-    # bland_steps>0 forces Bland's rule for that many iterations after a stall
-    # (degenerate zero-length step), guaranteeing anti-cycling; otherwise Dantzig
-    # pricing is used for speed.
-    bland_steps = [0]
-
-    # Partial pricing cursor: in the Dantzig regime, scan a rotating window of
-    # `price_chunk` nonbasic columns per pivot instead of all of them (the full
-    # Mᵀy over ~20k columns is the per-pivot bottleneck on large LPs). Only when a
-    # window yields no improver do we fall back to a full scan to confirm
-    # optimality. Bland steps always scan fully (anti-cycling needs the global
-    # smallest index).
-    price_cursor = [0]
-    price_chunk = max(200, nz // 20)
-
-    def revised_simplex(cost_full, max_iter):
-        nonlocal basis, in_basis, z, bf
-        for it in range(max_iter):
-            if bland_steps[0] > 0:
-                bland_steps[0] -= 1
-            cf = cost_full
-            c_b = cf[basis]
-            # Dual y solves Bᵀ y = c_B.
-            y = bf.btran(c_b)
-            nb_idx = np.where(~in_basis)[0]
-
-            def improvers_in(idx):
-                db = cf[idx] - (MT[idx] @ y)
-                s = nb_status[idx]
-                imp = ((s <= 0) & (db < -opt_tol)) | (
-                    (s >= 0) & (db > opt_tol) & (s != 0)
-                )
-                return idx[imp], db[imp]
-
-            if bland_steps[0] > 0:
-                # Bland: full scan, smallest index among improvers.
-                cand_enter, _ = improvers_in(nb_idx)
-                if cand_enter.size == 0:
-                    return "optimal"
-                q = cand_enter[np.argmin(cand_enter)]
-            else:
-                # Dantzig with PARTIAL pricing: scan a rotating window; widen to a
-                # full scan only if the window has no improver.
-                k = nb_idx.size
-                start = price_cursor[0] % max(k, 1)
-                order = np.concatenate([np.arange(start, k), np.arange(0, start)])
-                win = nb_idx[order[:price_chunk]]
-                cand_enter, db = improvers_in(win)
-                if cand_enter.size == 0:
-                    cand_enter, db = improvers_in(nb_idx)  # full scan fallback
-                    if cand_enter.size == 0:
-                        return "optimal"
-                price_cursor[0] = start + price_chunk
-                q = cand_enter[np.argmax(np.abs(db))]
-            dir_up = nb_status[q] <= 0  # increasing q if it was at lower bound
-
-            # Column B^{-1} M_q.
-            aq = bf.ftran(np.asarray(M[:, q].todense()).ravel())
-            # Bounded-variable ratio test. Moving q by t (t>0), basics move by
-            # -aq*t if dir_up else +aq*t. Determine max t before some basic hits
-            # a bound or q hits its opposite bound.
-            t_dir = 1.0 if dir_up else -1.0
-            delta_b = -aq * t_dir  # d z_b / d t
-
-            # Bounded-variable ratio test. Moving q by t>0, basic r moves by
-            # delta_b[r]·t; it blocks at its LOWER bound when delta_b<0 (basic
-            # decreasing) and at its UPPER bound when delta_b>0 (basic increasing).
-            # We take the smallest blocking ratio; among near-ties choose the
-            # largest |pivot| (Harris) for numerical stability.
-            zb = z[basis]
-            ratios = np.full(m, np.inf)
-            to = np.zeros(m, dtype=np.int8)
-            dec = delta_b < -bound_tol  # basic decreasing ⇒ heads to lower bound
-            inc = delta_b > bound_tol  # basic increasing ⇒ heads to upper bound
-            m_lo = dec & np.isfinite(l[basis])
-            m_up = inc & np.isfinite(u[basis])
-            ratios[m_lo] = (l[basis][m_lo] - zb[m_lo]) / delta_b[m_lo]
-            to[m_lo] = -1
-            ratios[m_up] = (u[basis][m_up] - zb[m_up]) / delta_b[m_up]
-            to[m_up] = +1
-            ratios = np.maximum(ratios, 0.0)
-
-            q_span = np.inf
-            if dir_up and np.isfinite(u[q]):
-                q_span = u[q] - z[q]
-            elif (not dir_up) and np.isfinite(l[q]):
-                q_span = z[q] - l[q]
-
-            min_ratio = min(float(ratios.min()), q_span)
-            if not np.isfinite(min_ratio):
-                return "unbounded"
-            near = (ratios <= min_ratio + 1e-9) & np.isfinite(ratios)
-            if near.any() and min_ratio < q_span - 1e-12:
-                piv = np.where(near, np.abs(delta_b), -1.0)
-                leave = int(np.argmax(piv))
-                leave_to = int(to[leave])
-                t_max = float(ratios[leave])
-            else:
-                # q's own bound flip is tightest: no basis change.
-                leave, leave_to, t_max = -1, 0, q_span
-            t_max = max(t_max, 0.0)
-            # Degenerate (zero-length) step ⇒ at risk of cycling: switch to Bland
-            # pricing for a window to guarantee progress.
-            if t_max <= bound_tol and bland_steps[0] == 0:
-                bland_steps[0] = 2 * m
-            # Apply the step.
-            z[q] += t_dir * t_max
-            z[basis] += delta_b * t_max
-            if leave == -1:
-                # q hit its opposite bound: bound flip, basis unchanged.
-                nb_status[q] = +1 if dir_up else -1
-            else:
-                # Swap: q enters basis, basis[leave] leaves to a bound.
-                br = basis[leave]
-                in_basis[br] = False
-                in_basis[q] = True
-                nb_status[br] = leave_to
-                z[br] = l[br] if leave_to == -1 else u[br]
-                nb_status[q] = 0
-                old_leave_col = br
-                basis[leave] = q
-                # PFI update; periodic refactor bounds the eta chain. On an
-                # unstable pivot or a singular periodic refactor, undo and stop.
-                need_refactor = len(bf.etas) + 1 >= refactor_period
-                if need_refactor or not bf.update(leave, aq):
-                    bf.refactor(basis)
-                    if bf.singular:
-                        basis[leave] = old_leave_col
-                        in_basis[old_leave_col] = True
-                        in_basis[q] = False
-                        nb_status[old_leave_col] = 0
-                        bf.refactor(basis)
-                        return "stalled"
-                # Re-solve basics so Mz=d holds EXACTLY against the new basis,
-                # preventing floating-point drift / near-degenerate pivots from
-                # accumulating into a feasibility blow-up (same fix as phase-1).
-                z[basis] = solve_basics(bf, basis, nb_status)
-        return "iterlimit"
-
-    status2 = revised_simplex(c_full, max_iter=max_iter)
-    final_infeas = total_infeas(z, basis)
-    if verbose:
-        print(
-            f"[crossover] phase-2: {status2}, obj={c_full @ z:.8e},"
-            f" infeas={final_infeas:.2e}"
-        )
-    # If phase-2 didn't reach a clean optimal vertex (iterlimit/stalled, or
-    # feasibility degraded), the extracted point is unreliable — return warm so
-    # the gate keeps the better baseline rather than a half-pivoted iterate.
-    if status2 != "optimal" or final_infeas > feas_tol:
-        if verbose:
-            print("[crossover] phase-2 did not converge cleanly — bailing to warm.")
-        return SaddleState(
-            primal=warm.primal, dual_ineq=warm.dual_ineq, dual_eq=warm.dual_eq
-        )
-
-    # --- Extract solution and exact duals ------------------------------------
-    x_out = z[:n]
-    # y solves Bᵀ y = c_B at optimality; recompute against the cost.
-    c_b = c_full[basis]
-    y_full = bf.btran(c_b)  # standard-form multipliers, one per row
-    # Jaddle's Lagrangian gradient is c + Aᵀy (dual_ineq ≥ 0 for Ax ≤ b), i.e.
-    # y here is the NEGATIVE of the standard simplex multiplier (which satisfies
-    # c - Aᵀy_std on reduced costs). Flip sign to match Jaddle's convention.
-    dual_eq = -y_full[:n_eq]
-    dual_ineq = -y_full[n_eq:]
-
-    return SaddleState(
-        primal=jnp.asarray(x_out),
-        dual_ineq=jnp.asarray(dual_ineq),
-        dual_eq=jnp.asarray(dual_eq),
-    )
-
-
-def _solution_merit(lp: LP, sol: SaddleState):
-    """Scalar KKT-merit of a candidate solution for the keep-better gate.
-
-    Sum of (worst primal infeasibility) + (worst dual infeasibility) + (absolute
-    primal-dual gap), all in problem units. Lower is better. Matches the
-    feasibility/stationarity terms the in-solve ``kkt_merit`` tracks, but is
-    standalone (operates on a finished ``SaddleState``).
-    """
-    x = np.asarray(sol.primal, dtype=np.float64)
-    c = np.asarray(lp.c, dtype=np.float64)
-    lb = np.asarray(lp.lower_bounds, dtype=np.float64)
-    ub = np.asarray(lp.upper_bounds, dtype=np.float64)
-    A_eq = lp.A_eq.tocsc().astype(np.float64)
-    A_ineq = lp.A_ineq.tocsc().astype(np.float64)
-    b_eq = np.asarray(lp.b_eq, dtype=np.float64)
-    b_ineq = np.asarray(lp.b_ineq, dtype=np.float64)
-    y_eq = np.asarray(sol.dual_eq, dtype=np.float64)
-    y_ineq = np.asarray(sol.dual_ineq, dtype=np.float64)
-
-    eq_inf = float(np.abs(A_eq @ x - b_eq).max()) if A_eq.shape[0] else 0.0
-    ineq_inf = (
-        float(np.maximum(A_ineq @ x - b_ineq, 0.0).max()) if A_ineq.shape[0] else 0.0
-    )
-    box_inf = float(np.maximum(lb - x, 0.0).max() if lb.size else 0.0) + float(
-        np.maximum(x - ub, 0.0).max() if ub.size else 0.0
-    )
-    # Dual feasibility: y_ineq ≥ 0 for Ax ≤ b.
-    dual_inf = float(np.maximum(-y_ineq, 0.0).max()) if y_ineq.size else 0.0
-    # Stationarity-implied gap proxy: |cᵀx + (Aᵀy)ᵀx_box-adjusted| via objective
-    # vs Lagrangian dual on the box. Use the direct primal-dual objective gap.
-    grad = c + np.asarray(A_eq.T @ y_eq) + np.asarray(A_ineq.T @ y_ineq)
-    # Box-complementarity dual bound (PDLP-style box infimum of the reduced cost).
-    box_inf_term = np.where(grad >= 0, np.where(np.isfinite(lb), grad * lb, 0.0),
-                            np.where(np.isfinite(ub), grad * ub, 0.0)).sum()
-    dual_obj = box_inf_term - float(b_eq @ y_eq) - float(b_ineq @ y_ineq)
-    gap = abs(float(c @ x) - dual_obj)
-    return eq_inf + ineq_inf + box_inf + dual_inf + gap / (1.0 + abs(float(c @ x)))
-
-
-def crossover_polish(lp: LP, warm: SaddleState, verbose: bool = False, **kwargs):
-    """Crossover to a vertex, keeping it only if its KKT merit beats ``warm``.
-
-    Runs :func:`crossover` and compares ``_solution_merit`` of the crossover
-    result against the warm point, returning whichever is better. Mirrors the
-    conditional, keep-better gating of ``active_set_kkt_solve`` so a bad
-    active-set guess (no vertex on the optimal face within the iteration cap)
-    cannot make the returned solution worse. ``kwargs`` pass through to
-    :func:`crossover`.
-    """
-    crossed = crossover(lp, warm, verbose=verbose, **kwargs)
-    m_warm = _solution_merit(lp, warm)
-    m_cross = _solution_merit(lp, crossed)
-    if verbose:
-        print(f"[crossover] merit warm={m_warm:.3e} crossover={m_cross:.3e}")
-    return crossed if m_cross <= m_warm else warm
-
-
-def vertex_distance_report(lp: LP, sol: SaddleState, tol: float = 1e-6, verbose=True):
-    """
-    Estimate how far a solution is from an LP *vertex* — i.e. whether active-set
-    / simplex polishing is likely to succeed (near a vertex) or diverge (deep in
-    the interior of an optimal face).
-
-    Two complementary, solve-free measures:
-
-    1. **Free-vs-active count** (structural). A vertex has at most ``n_active``
-       basic (interior) variables, the rest pinned at bounds. ``n_interior``
-       well above ``n_active_rows`` ⇒ under-determined / non-vertex face; a huge
-       active-inequality count vs few interior vars ⇒ a fractional point far from
-       any vertex. The ratio ``n_interior / n_active_rows`` near 1 is "near a
-       vertex".
-    2. **Bound distance** (geometric). At a vertex every non-basic variable sits
-       exactly on a bound. ``interior_mass`` (total distance of interior vars to
-       their nearest finite bound) and ``max_interior_dist`` measure directly how
-       far the point is from having a vertex's at-bound structure.
-
-    Returns a dict of the metrics. With ``verbose`` (default) also prints them.
-    """
-    x = np.asarray(sol.primal, dtype=np.float64)
-    lb = np.asarray(lp.lower_bounds, dtype=np.float64)
-    ub = np.asarray(lp.upper_bounds, dtype=np.float64)
-
-    # Distance of each variable to its nearest *finite* bound (inf if free both
-    # ways). Zero ⇒ sitting on a bound (non-basic at a vertex).
-    dist_lo = np.where(np.isfinite(lb), np.abs(x - lb), np.inf)
-    dist_hi = np.where(np.isfinite(ub), np.abs(x - ub), np.inf)
-    dist_bound = np.minimum(dist_lo, dist_hi)
-
-    interior = dist_bound > tol  # strictly off every bound ⇒ candidate basic
-    n_interior = int(interior.sum())
-    finite_dist = dist_bound[np.isfinite(dist_bound)]
-    interior_mass = float(finite_dist[finite_dist > tol].sum())
-    max_interior_dist = float(finite_dist.max()) if finite_dist.size else 0.0
-
-    # Active rows: all equalities + tight inequalities (same classification the
-    # KKT solve uses), to compare against the interior-variable count.
-    n_eq = lp.A_eq.shape[0]
-    if lp.A_ineq.shape[0] > 0:
-        ineq_tight = int(
-            (np.abs(np.asarray(lp.A_ineq @ x) - np.asarray(lp.b_ineq)) <= tol).sum()
-        )
-    else:
-        ineq_tight = 0
-    n_active_rows = n_eq + ineq_tight
-
-    # A vertex needs n_interior basic vars determined by n_active_rows rows; the
-    # ratio (and its sign) says which way the system leans.
-    ratio = n_interior / n_active_rows if n_active_rows > 0 else float("inf")
-
-    metrics = {
-        "n_vars": int(x.shape[0]),
-        "n_interior": n_interior,
-        "n_at_bound": int(x.shape[0]) - n_interior,
-        "n_eq_rows": n_eq,
-        "n_tight_ineq": ineq_tight,
-        "n_active_rows": n_active_rows,
-        "interior_over_active": ratio,
-        "interior_mass": interior_mass,
-        "max_interior_dist": max_interior_dist,
-    }
-
-    if verbose:
-        print("==== Vertex-distance report ====")
-        print(f"  variables        : {metrics['n_vars']}")
-        print(
-            f"  interior / at-bound : {n_interior} / {metrics['n_at_bound']}"
-            f"   (interior = strictly off bounds, tol={tol:g})"
-        )
-        print(
-            f"  active rows      : {n_active_rows}"
-            f"  (eq {n_eq} + tight ineq {ineq_tight})"
-        )
-        print(
-            f"  interior / active : {ratio:.2f}"
-            "   (~1 ⇒ near a vertex; ≫1 ⇒ under-determined face;"
-            " ineq≫interior ⇒ fractional, far from vertex)"
-        )
-        print(
-            f"  bound distance   : mass {interior_mass:.3e},"
-            f" max {max_interior_dist:.3e}   (0 ⇒ on a vertex)"
-        )
-
-    return metrics
 
 
 # %%

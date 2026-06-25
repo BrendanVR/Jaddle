@@ -41,30 +41,51 @@ def __sps(
     def projection_primal(primal_state):
         return projection_box(primal_state, cp.lower_bounds, cp.upper_bounds)
 
-    def langrangian(state):
-        return (
-            cp.objective(state.primal)
-            + state.dual_ineq @ cp.constraints_ineq(state.primal)
-            + state.dual_eq @ cp.constraints_eq(state.primal)
-        )
+    # Hand-written saddle gradient of the Lagrangian
+    #   L = obj(x) + d_ineq·g_ineq(x) + d_eq·g_eq(x).
+    # Its structure lets each half be computed independently:
+    #   - dual partials are just the constraint residuals g(x) — a forward eval,
+    #     no autodiff;
+    #   - the primal partial is grad(obj)(x) + J_ineqᵀ·d_ineq + J_eqᵀ·d_eq,
+    #     a single VJP of the constraint map against the duals plus the objective
+    #     gradient.
+    # The negation on the dual partials (descent on x / ascent on the duals) is
+    # folded into the returned dual fields. Splitting `grad` into one-sided
+    # variants lets the alternating/extragradient schemes pay for only the half
+    # they actually consume.
+
+    def constraints(primal):
+        return (cp.constraints_ineq(primal), cp.constraints_eq(primal))
+
+    def grad_primal_only(state):
+        # Primal partial only: grad(obj) + Jᵀ·dual. Skips materialising the
+        # residuals as outputs (the VJP needs them internally but we discard
+        # them).
+        obj_grad = jax.grad(cp.objective)(state.primal)
+        _, vjp_fn = jax.vjp(constraints, state.primal)
+        (jt_dual,) = vjp_fn((state.dual_ineq, state.dual_eq))
+        return obj_grad + jt_dual
+
+    def grad_dual_only(state):
+        # Dual partials only: the (negated) constraint residuals. A plain
+        # forward eval — no objective gradient, no VJP.
+        res_ineq, res_eq = constraints(state.primal)
+        return -res_ineq, -res_eq
 
     def grad(state):
-        gradient = jax.grad(langrangian)(state)
+        # Full saddle gradient. Reuses the residuals produced by the VJP's
+        # forward pass for the dual partials, so it costs one VJP + one obj grad.
+        obj_grad = jax.grad(cp.objective)(state.primal)
+        (res_ineq, res_eq), vjp_fn = jax.vjp(constraints, state.primal)
+        (jt_dual,) = vjp_fn((state.dual_ineq, state.dual_eq))
         return SaddleState(
-            primal=gradient.primal,
-            dual_ineq=-gradient.dual_ineq,
-            dual_eq=-gradient.dual_eq,
+            primal=obj_grad + jt_dual,
+            dual_ineq=-res_ineq,
+            dual_eq=-res_eq,
         )
 
     def opt_update(gradient, opt_state, state):
         return optimiser.update(gradient, opt_state, state)
-
-    def zero_dual(gradient):
-        return SaddleState(
-            primal=gradient.primal,
-            dual_ineq=jnp.zeros_like(gradient.dual_ineq),
-            dual_eq=jnp.zeros_like(gradient.dual_eq),
-        )
 
     def keep_only_primal(updates):
         return SaddleState(
@@ -115,6 +136,14 @@ def __sps(
         @functools.partial(
             jax.jit,
             static_argnames=("max_iter",),
+            # `average_state` is deliberately not donated: when averaging is off
+            # the caller passes the same buffer for both `state` and
+            # `average_state`, and XLA rejects donating one buffer twice.
+            donate_argnames=(
+                "state",
+                "opt_state",
+                "total_weight",
+            ),
         )
         def run_epoch(
             max_iter,
@@ -136,12 +165,21 @@ def __sps(
                 opt_state, k = unpack_k(opt_state)
 
                 if update_mode == "alternating":
-                    gradient_start = grad(state)
+                    # Only the primal half of the start gradient and the dual
+                    # half of the post-primal gradient are ever consumed, so
+                    # compute just those: a VJP+obj-grad for the primal, and a
+                    # plain residual eval for the dual (no VJP, no obj grad).
+                    grad_primal_start = grad_primal_only(state)
                     if k_scaling:
-                        gradient_start = scale_by_k(gradient_start, k)
+                        grad_primal_start = grad_primal_start / k
 
+                    primal_gradient = SaddleState(
+                        primal=grad_primal_start,
+                        dual_ineq=jnp.zeros_like(state.dual_ineq),
+                        dual_eq=jnp.zeros_like(state.dual_eq),
+                    )
                     primal_updates, _ = opt_update(
-                        zero_dual(gradient_start),
+                        primal_gradient,
                         opt_state,
                         state,
                     )
@@ -153,13 +191,14 @@ def __sps(
                         dual_eq=state.dual_eq,
                     )
 
-                    gradient_after_primal = grad(state)
+                    dual_ineq_g, dual_eq_g = grad_dual_only(state)
                     if k_scaling:
-                        gradient_after_primal = scale_by_k(gradient_after_primal, k)
+                        dual_ineq_g = dual_ineq_g * k
+                        dual_eq_g = dual_eq_g * k
                     combined_gradient = SaddleState(
-                        primal=gradient_start.primal,
-                        dual_ineq=gradient_after_primal.dual_ineq,
-                        dual_eq=gradient_after_primal.dual_eq,
+                        primal=grad_primal_start,
+                        dual_ineq=dual_ineq_g,
+                        dual_eq=dual_eq_g,
                     )
                     combined_updates, opt_state = opt_update(
                         combined_gradient,
@@ -212,20 +251,17 @@ def __sps(
 
                 opt_state = pack_k(opt_state, k)
 
-                w = weight_function(i)
-                total_weight = jax.lax.cond(
-                    average,
-                    lambda: total_weight + w,
-                    lambda: total_weight,
-                )
-
-                average_state = jax.lax.cond(
-                    average,
-                    lambda: optax.incremental_update(
+                # `average` is a Python-static bool, so branch on it at trace
+                # time rather than threading a per-step lax.cond (which would
+                # force XLA to evaluate the predicate and the running-mean AXPY
+                # every iteration even when averaging is off — the same class of
+                # issue fixed at the epoch level for the metrics path).
+                if average:
+                    w = weight_function(i)
+                    total_weight = total_weight + w
+                    average_state = optax.incremental_update(
                         state, average_state, w / total_weight
-                    ),
-                    lambda: average_state,
-                )
+                    )
 
                 return (
                     i + 1,
@@ -252,6 +288,14 @@ def __sps(
         average_state = initial_avg_state
     else:
         average_state = initial_solution
+
+    # `state` is donated to run_epoch; if `average_state` aliases the same
+    # buffer (the common `average=False` case, where the caller passes one
+    # buffer for both) XLA rejects the call (`f(donate(a), a)`). Give
+    # `average_state` its own buffer so donation of `state` is safe. The copy is
+    # one-per-epoch, off the hot path.
+    if average_state is state:
+        average_state = jax.tree.map(lambda x: x + 0, average_state)
 
     if initial_opt_state is not None:
         opt_state = initial_opt_state
@@ -286,14 +330,12 @@ def solve(
     complementarity_slack_tolerance=1e-3,
     weight_function=lambda _: 1.0,
     verbose=False,
-    log_every=10,
+    log_every=1,
     average=False,
     update_mode="alternating",
     output_opt_state=False,
-    k_scaling=True,
+    k_scale=10.0,
     k_theta=0.5,
-    k_lo=0.1,
-    k_hi=10.0,
     k_init=None,
     restarts=0,
     epochs_per_restart=10,
@@ -310,25 +352,25 @@ def solve(
         update_mode: Selects the stepping scheme (single source of truth):
             ``"synchronous"`` (default), ``"alternating"``, or
             ``"extragradient"`` (Korpelevich two-call).
-        k_scaling: Enable primal-weight (k) scaling (default ``False``). When
-            ``True`` — orthogonal to ``update_mode``, so it composes with all
-            three schemes — a primal weight ``k`` rescales the primal/dual
-            gradients by ``(1/k, k)`` before each ``opt_update``, making the
-            dual/primal step ratio ``k**2``. ``k`` is initialised from ``k_init``
-            and rebalanced at each restart (PDLP-style) from primal-vs-dual
-            iterate movement; it is constant within an epoch (not adapted per
-            iteration). Tuned by ``k_theta``/``k_lo``/``k_hi`` and ``k_init``.
+        k_scale: Primal-weight (k) scaling control. ``None`` disables it;
+            otherwise a float sets a symmetric clamp band ``[1/k_scale,
+            k_scale]`` for ``k`` (default ``10`` → ``[0.1, 10]``). When enabled —
+            orthogonal to ``update_mode``, so it composes with all three schemes
+            — a primal weight ``k`` rescales the primal/dual gradients by
+            ``(1/k, k)`` before each ``opt_update``, making the dual/primal step
+            ratio ``k**2``. ``k`` is initialised from ``k_init`` and rebalanced
+            at each restart (PDLP-style) from primal-vs-dual iterate movement; it
+            is constant within an epoch (not adapted per iteration). Tuned by
+            ``k_theta``/``k_scale`` and ``k_init``.
         k_theta: Smoothing coefficient for the log-space primal-weight update at
             each restart (default 0.5 = geometric mean of the movement-based
             target and the current weight, matching PDLP). Smaller = slower
-            adaptation. Only used when ``k_scaling=True``.
-        k_lo, k_hi: Clamp band for ``k`` (default [0.1, 10]). Also clamps the
-            ``||c||/||b||`` init. Only used when ``k_scaling=True``.
+            adaptation. Only used when ``k_scale`` is set.
         k_init: Initial primal weight ``k``. ``None`` (default) initialises it to
             the PDLP heuristic ``||c|| / ||b||`` (objective vs RHS norms), where
             ``c = grad(objective)(0)`` and ``b = -[c_eq(0); c_ineq(0)]``. Pass a
             float to override (``1.0`` = symmetric steps). Only used when
-            ``k_scaling=True``.
+            ``k_scale`` is set.
         restarts: Maximum number of warm restarts (default 0 = disabled). Each
             restart resets the optimiser momentum and averaging while keeping the
             current iterate as a warm start. A restart fires when the normalised
@@ -351,7 +393,7 @@ def solve(
     """
 
     if optimiser is None:
-        optimiser = jo.optimisitic_gd(1 / 2)
+        optimiser = jo.gd(1 / 2)
 
     if log_every < 1:
         raise ValueError("log_every must be >= 1")
@@ -366,6 +408,14 @@ def solve(
     ]
     if update_mode not in valid_update_modes:
         raise ValueError(f"update_mode must be one of {valid_update_modes}")
+
+    # ``k_scale`` is the public knob for primal-weight scaling: ``None`` disables
+    # it, otherwise it sets a symmetric clamp band ``[1/k_scale, k_scale]``.
+    k_scaling = k_scale is not None
+    if k_scaling:
+        k_lo, k_hi = 1.0 / k_scale, k_scale
+    else:
+        k_lo, k_hi = None, None
 
     if verbose:
         print("====Starting Solve====")
@@ -622,14 +672,18 @@ def solve(
         # would compile a throwaway length-1 executable and leave the real one
         # to compile cold in epoch 1. (Linear can use max_iter=1 because there
         # it's a traced while_loop bound, not a static scan length.)
+        # run_epoch donates its state/opt_state buffers, so feed the warm-up
+        # *copies* — the real state/opt_state the timed loop uses must survive.
+        _warm_state = jax.tree.map(lambda x: x + 0, state)
+        _warm_opt_state = jax.tree.map(lambda x: x + 0, opt_state)
         _precompile_result = __sps(
             current_iterations_per_epoch,
             i - restart_i_offset,
             cp,
             optimiser,
-            state,
+            _warm_state,
             average_state,
-            opt_state,
+            _warm_opt_state,
             weight_function,
             total_weight,
             average,
@@ -707,10 +761,6 @@ def solve(
                     f"|Time {finish_epoch_time - start_epoch_time:.2f}s|"
                 )
                 print("----------------------------------------------")
-
-                if k_scaling:
-                    print(f"  primal weight k={float(opt_state[1]):.3f}")
-                    print("----------------------------------------------")
 
             # --- Adaptive restart decision ---
             if restarts and restarts_done < restarts:

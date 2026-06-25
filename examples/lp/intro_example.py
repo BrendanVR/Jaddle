@@ -41,21 +41,10 @@ lp = jl.LP(
     lower_bounds=lower_bounds,
     upper_bounds=upper_bounds,
 )
-lp = jl.to_jaddle_sparse(lp)  # Convert to Jaddle sparse format
-
 
 # %% [markdown]
 # ## Solving the LP Problem
-optimiser = jo.create_saddle_optimiser(
-    optax.optimistic_gradient_descent(learning_rate=1e-1),
-    optax.optimistic_gradient_descent(learning_rate=1e-1),
-)
-
-solution, _ = jl.solve(
-    lp,
-    optimiser=optimiser,
-    verbose=True,
-)
+solution, _ = jl.solve(lp, verbose=True, iterations_per_epoch=100)
 # %%
 print(f"x1 = {solution.primal[0]:.4f}, x2 = {solution.primal[1]:.4f}")
 print(f"Optimal objective value: {lp.objective(solution.primal):.4f}")
