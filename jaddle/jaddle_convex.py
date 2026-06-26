@@ -246,9 +246,7 @@ def __sps(
                         yh_eq - state.dual_eq,
                         yh_ineq - state.dual_ineq,
                     )
-                    eta_bar = jnp.where(
-                        dg2 > 0.0, _MT * jnp.sqrt(dz2 / dg2), jnp.inf
-                    )
+                    eta_bar = jnp.where(dg2 > 0.0, _MT * jnp.sqrt(dz2 / dg2), jnp.inf)
                     return cand, eta_bar
 
                 def step(carry, _):
@@ -266,9 +264,7 @@ def __sps(
 
                     def body(c):
                         eta_c, _, eta_bar_c = c
-                        eta_s = jnp.minimum(
-                            (1.0 - ip1 ** (-0.3)) * eta_bar_c, eta_c
-                        )
+                        eta_s = jnp.minimum((1.0 - ip1 ** (-0.3)) * eta_bar_c, eta_c)
                         cand_s, eta_bar_s = _trial(eta_s, state, k)
                         return (eta_s, cand_s, eta_bar_s)
 
@@ -305,19 +301,17 @@ def __sps(
                         total_weight,
                     ), None
 
-                (i, state, average_state, opt_state, total_weight), _ = (
-                    jax.lax.scan(
-                        step,
-                        (
-                            start_iter,
-                            state,
-                            average_state,
-                            opt_state,
-                            total_weight,
-                        ),
-                        None,
-                        length=max_iter,
-                    )
+                (i, state, average_state, opt_state, total_weight), _ = jax.lax.scan(
+                    step,
+                    (
+                        start_iter,
+                        state,
+                        average_state,
+                        opt_state,
+                        total_weight,
+                    ),
+                    None,
+                    length=max_iter,
                 )
                 return i, state, average_state, opt_state, total_weight
 
@@ -627,6 +621,17 @@ def solve(
             + state.dual_eq @ cp.constraints_eq(state.primal)
         )
 
+    def langrangian_with_obj(state):
+        # Returns (lagrangian, objective) as (value, aux) so value_and_grad can
+        # retrieve the objective without an extra forward pass.
+        obj = cp.objective(state.primal)
+        lagrangian = (
+            obj
+            + state.dual_ineq @ cp.constraints_ineq(state.primal)
+            + state.dual_eq @ cp.constraints_eq(state.primal)
+        )
+        return lagrangian, obj
+
     def grad(state):
         gradient = jax.grad(langrangian)(state)
         return SaddleState(
@@ -639,9 +644,15 @@ def solve(
 
     @jax.jit
     def compute_epoch_metrics(average_state):
-        objective_value = cp.objective(average_state.primal)
-
-        gradient = grad(average_state)
+        # value_and_grad with has_aux avoids a second cp.objective forward pass.
+        (_, objective_value), gradient_raw = jax.value_and_grad(
+            langrangian_with_obj, has_aux=True
+        )(average_state)
+        gradient = SaddleState(
+            primal=gradient_raw.primal,
+            dual_ineq=gradient_raw.dual_ineq,
+            dual_eq=gradient_raw.dual_eq,
+        )
 
         grad_primal = gradient.primal
         grad_dual_ineq = gradient.dual_ineq
@@ -806,11 +817,16 @@ def solve(
     # CP/LP/JaddleLP since it only uses the objective/constraint callables.
     if k_scaling and k_init is None:
         zero = jnp.zeros_like(initial_solution.primal)
-        c = jax.grad(cp.objective)(zero)
-        b = jnp.concatenate([cp.constraints_eq(zero), cp.constraints_ineq(zero)])
-        norm_c = jnp.linalg.norm(c) + 1e-30
-        norm_b = jnp.linalg.norm(b) + 1e-30
-        k_init = float(jnp.clip(norm_c / norm_b, k_lo, k_hi))
+        # Fuse into one JIT-compiled call: objective forward+grad and both
+        # constraint evaluations in a single function to reduce dispatch overhead.
+        def _k_init_fn(x):
+            obj, c = jax.value_and_grad(cp.objective)(x)
+            b = jnp.concatenate([cp.constraints_eq(x), cp.constraints_ineq(x)])
+            return c, b
+        c, b = jax.jit(_k_init_fn)(zero)
+        norm_c2 = jnp.vdot(c, c) + 1e-60
+        norm_b2 = jnp.vdot(b, b) + 1e-60
+        k_init = float(jnp.clip(jnp.sqrt(norm_c2 / norm_b2), k_lo, k_hi))
     elif k_init is None:
         k_init = 1.0
 
@@ -948,18 +964,12 @@ def solve(
             count += 1
 
             if verbose and (count == 1 or count % log_every == 0):
-                dual_gap_status = (
-                    "finite"
-                    if bool(dual_gap_is_finite)
-                    else ("unavailable" if not has_dual_bound else "dual-infeasible")
-                )
                 print(
                     f"|Epoch {count}|"
                     f"|Obj{objective_value:.2e}|"
                     f"|PGN {primal_grad_norm:.2e}|"
                     f"|CS {complementarity_slack:.2e}|"
                     f"|PFR {constraint_bound:.2e}|"
-                    f"|RDG {duality_gap/(1 + jnp.abs(objective_value)):.2e} ({dual_gap_status})|"
                     f"|Time {finish_epoch_time - start_epoch_time:.2f}s|"
                 )
                 print("----------------------------------------------")
@@ -1014,9 +1024,10 @@ def solve(
                                 state.dual_ineq - state_at_last_restart.dual_ineq,
                             ]
                         )
-                        move_p = jnp.linalg.norm(dp) + 1e-30
-                        move_d = jnp.linalg.norm(dd) + 1e-30
-                        k_target = move_p / move_d
+                        # Use squared norms to avoid two sqrt ops; ratio is preserved.
+                        move_p2 = jnp.vdot(dp, dp) + 1e-60
+                        move_d2 = jnp.vdot(dd, dd) + 1e-60
+                        k_target = jnp.sqrt(move_p2 / move_d2)
                         # The k-slot is (k, eta) in adaptive_step mode, plain k
                         # otherwise. Read k accordingly.
                         k_prev = opt_state[1][0] if adaptive_step else opt_state[1]

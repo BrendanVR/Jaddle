@@ -121,6 +121,14 @@ def __sps(
         grad_dual_ineq = residual[lp.n_eq :] + dual_damping_ineq * state.dual_ineq
         return grad_dual_ineq, grad_dual_eq
 
+    def grad_dual_only_from_Ax(Ax, state):
+        # Same as grad_dual_only but reuses a pre-computed A @ state.primal,
+        # saving the matvec when Ax is already available at the call site.
+        residual = lp.b - Ax
+        grad_dual_eq = residual[: lp.n_eq] + dual_damping_eq * state.dual_eq
+        grad_dual_ineq = residual[lp.n_eq :] + dual_damping_ineq * state.dual_ineq
+        return grad_dual_ineq, grad_dual_eq
+
     def opt_update(gradient, opt_state, state):
         return optimiser.update(gradient, opt_state, state)
 
@@ -194,15 +202,17 @@ def __sps(
         # XLA rejects donating one buffer twice.
         @functools.partial(
             jax.jit,
+            static_argnames=("max_iter",),
             donate_argnames=("state", "opt_state", "total_weight"),
         )
         def run_epoch(
-            max_iter,
             start_iter,
             state,
             average_state,
             opt_state,
             total_weight=0.0,
+            *,
+            max_iter,
         ):
             apply_updates = optax.apply_updates
 
@@ -223,9 +233,7 @@ def __sps(
                 )
                 # No movement => any step is fine (avoid 0/0); flag with +inf so
                 # the retry loop accepts and the eta-growth branch is suppressed.
-                return jnp.where(
-                    interaction > 0.0, move / (2.0 * interaction), jnp.inf
-                )
+                return jnp.where(interaction > 0.0, move / (2.0 * interaction), jnp.inf)
 
             def make_adaptive_step(trial):
                 def step(carry, _):
@@ -297,7 +305,13 @@ def __sps(
                             new_state, average_state, w / total_weight
                         )
 
-                    return (i + 1, new_state, average_state, opt_state, total_weight), None
+                    return (
+                        i + 1,
+                        new_state,
+                        average_state,
+                        opt_state,
+                        total_weight,
+                    ), None
 
                 return step
 
@@ -311,19 +325,23 @@ def __sps(
                     sigma = eta * k
                     gp = grad_primal_only(state)
                     x_new = projection_primal(state.primal - tau * gp)
-                    x_bar = 2.0 * x_new - state.primal
-                    extrapolated = SaddleState(
-                        primal=x_bar,
-                        dual_ineq=state.dual_ineq,
-                        dual_eq=state.dual_eq,
+                    # A_dx computed once; x_bar = 2*x_new - x_old so
+                    # A @ x_bar = A @ state.primal + 2 * A_dx. Reusing this
+                    # in grad_dual_only_from_Ax avoids a second A @ x matvec.
+                    Ax_old = lp.A @ state.primal
+                    A_dx = lp.A @ x_new - Ax_old
+                    Ax_bar = Ax_old + 2.0 * A_dx
+                    # Dual variables are unchanged from state at this point, so
+                    # state can be passed directly — grad_dual_only_from_Ax only
+                    # reads state.dual_eq / state.dual_ineq.
+                    gd_ineq, gd_eq = grad_dual_only_from_Ax(Ax_bar, state)
+                    dual_ineq = projection_non_negative(
+                        state.dual_ineq - sigma * gd_ineq
                     )
-                    gd_ineq, gd_eq = grad_dual_only(extrapolated)
-                    dual_ineq = projection_non_negative(state.dual_ineq - sigma * gd_ineq)
                     dual_eq = state.dual_eq - sigma * gd_eq
                     cand = SaddleState(
                         primal=x_new, dual_ineq=dual_ineq, dual_eq=dual_eq
                     )
-                    A_dx = lp.A @ (x_new - state.primal)
                     dy = jnp.concatenate(
                         [dual_eq - state.dual_eq, dual_ineq - state.dual_ineq]
                     )
@@ -355,9 +373,13 @@ def __sps(
                     # subtract the optax-convention dual gradient (matches the
                     # non-adaptive extragradient / pdhg sign).
                     xh = projection_primal(state.primal - tau * g.primal)
-                    yh_ineq = projection_non_negative(state.dual_ineq - sigma * g.dual_ineq)
+                    yh_ineq = projection_non_negative(
+                        state.dual_ineq - sigma * g.dual_ineq
+                    )
                     yh_eq = state.dual_eq - sigma * g.dual_eq
-                    state_half = SaddleState(primal=xh, dual_ineq=yh_ineq, dual_eq=yh_eq)
+                    state_half = SaddleState(
+                        primal=xh, dual_ineq=yh_ineq, dual_eq=yh_eq
+                    )
                     g_half = grad(state_half)
                     # Corrector from the ORIGINAL state using the look-ahead grad.
                     x_new = projection_primal(state.primal - tau * g_half.primal)
@@ -368,6 +390,7 @@ def __sps(
                     cand = SaddleState(
                         primal=x_new, dual_ineq=dual_ineq, dual_eq=dual_eq
                     )
+
                     # Local Lipschitz estimate in the k-weighted norm, measured on
                     # the look-ahead displacement (the same z used for g, g_half).
                     def _wnorm2(p, de, di):
@@ -388,9 +411,7 @@ def __sps(
                     # eta_bar = (1/sqrt2) ‖dz‖ / ‖dg‖. No gradient change (dg2 -> 0)
                     # means the step is locally unconstrained: flag with +inf so
                     # the retry accepts and eta-growth is suppressed.
-                    eta_bar = jnp.where(
-                        dg2 > 0.0, _MT * jnp.sqrt(dz2 / dg2), jnp.inf
-                    )
+                    eta_bar = jnp.where(dg2 > 0.0, _MT * jnp.sqrt(dz2 / dg2), jnp.inf)
                     return cand, eta_bar
 
                 step = make_adaptive_step(_trial)
@@ -621,16 +642,16 @@ def __sps(
 
                     return (i + 1, state, average_state, opt_state, total_weight), None
 
-            end_iter = start_iter + max_iter
-
-            def cond(carry):
-                i, *_ = carry
-                return i < end_iter
-
-            i, state, average_state, opt_state, total_weight = jax.lax.while_loop(
-                cond,
-                lambda carry: step(carry, None)[0],
+            # Fixed iteration count per epoch: lax.scan (static `max_iter`) lets
+            # XLA pipeline the loop body better than a while_loop whose only exit
+            # condition is `i < end_iter`. `max_iter` is a static_argname, so a
+            # changing iterations_per_epoch (restart decay) triggers a recompile —
+            # the same tradeoff the convex solver already takes.
+            (i, state, average_state, opt_state, total_weight), _ = jax.lax.scan(
+                step,
                 (start_iter, state, average_state, opt_state, total_weight),
+                None,
+                length=max_iter,
             )
 
             return i, state, average_state, opt_state, total_weight
@@ -674,12 +695,12 @@ def __sps(
         opt_state = optimiser.init(initial_solution)
 
     return run_epoch(
-        max_iter,
         start_iter,
         state,
         average_state,
         opt_state,
         total_weight,
+        max_iter=max_iter,
     )
 
 
@@ -1377,7 +1398,6 @@ def solve(
             print("----------------------------------------------")
 
     def print_epoch_metrics(epoch_time=None):
-        dual_gap_status = "finite" if bool(dual_gap_is_finite) else "dual-infeasible"
         time_str = f"|Time {epoch_time:.2f}s|" if epoch_time is not None else ""
         print(
             f"|Epoch {count}|"
@@ -1386,7 +1406,7 @@ def solve(
             f"|CS {complementarity_slack:.2e}|"
             f"|PFR {constraint_bound:.2e}|"
             f"|DFR {dual_feasibility_residual:.2e}|"
-            f"|RDG {duality_gap / (1.0 + jnp.abs(objective_value)):.2e} ({dual_gap_status})|"
+            f"|RDG {duality_gap / (1.0 + jnp.abs(objective_value)):.2e}|"
             f"{time_str}"
         )
         print("----------------------------------------------")
@@ -1625,9 +1645,10 @@ def solve(
                                 state.dual_ineq - state_at_last_restart.dual_ineq,
                             ]
                         )
-                        move_p = jnp.linalg.norm(dp) + 1e-30
-                        move_d = jnp.linalg.norm(dd) + 1e-30
-                        k_target = move_p / move_d
+                        # Use squared norms to avoid two sqrt ops; ratio is preserved.
+                        move_p2 = jnp.vdot(dp, dp) + 1e-60
+                        move_d2 = jnp.vdot(dd, dd) + 1e-60
+                        k_target = jnp.sqrt(move_p2 / move_d2)
                         # The k-slot is (k, eta[, anchor]) in adaptive_step mode,
                         # plain k otherwise. Read k accordingly.
                         k_prev = opt_state[1][0] if adaptive_step else opt_state[1]

@@ -18,7 +18,7 @@ jo.configure_jax("float32")
 n = 1000
 x = np.linspace(-1, 1, n)
 y = x**3
-y += 0.1 * np.random.randn(n)  # add noise
+y += 0.15 * np.random.randn(n)  # add noise
 
 
 # %% [markdown]
@@ -56,7 +56,8 @@ solution, _ = jc.solve(
     verbose=True,
     primal_feasibility_tolerance=1e-5,
     update_mode="extragradient",
-    adaptive_eta=1 / 2,
+    adaptive_eta=1,
+    iterations_per_epoch=100,
 )
 
 # %%
