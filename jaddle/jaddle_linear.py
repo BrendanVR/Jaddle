@@ -1214,12 +1214,26 @@ def solve(
         grad_dual_ineq_unscaled = grad_dual_ineq / jnp_row_scale_ineq
         grad_dual_eq_unscaled = grad_dual_eq / jnp_row_scale_eq
 
+        # Reduced cost / primal / bounds, all UNSCALED to the original problem
+        # space. grad_primal = c_scaled + A_scaledᵀy carries the col_scale factor
+        # (c_scaled = c_true·col_scale), so r_true = grad_primal / col_scale;
+        # x_true = x_scaled·col_scale and lb/ub_true = lb/ub_scaled·col_scale
+        # (since lb_scaled = lb_true / col_scale). Reporting dual feasibility in
+        # true units makes it consistent with the constraint (PFR) residuals,
+        # which are already unscaled by row_scale; without this the reduced cost
+        # is inflated by up to max(col_scale) on badly-scaled columns (≈5.8x /
+        # 289x spread observed on boeing), making DFR/PGN artificially harsh.
+        reduced_cost_true = grad_primal / col_scale
+        primal_true = average_state.primal * col_scale
+        lower_bounds_true = lp.lower_bounds * col_scale
+        upper_bounds_true = lp.upper_bounds * col_scale
+
         projected_primal = projection_box(
-            average_state.primal - grad_primal,
-            lp.lower_bounds,
-            lp.upper_bounds,
+            primal_true - reduced_cost_true,
+            lower_bounds_true,
+            upper_bounds_true,
         )
-        projected_gradient_residual = average_state.primal - projected_primal
+        projected_gradient_residual = primal_true - projected_primal
         primal_grad_norm = jnp.max(jnp.abs(projected_gradient_residual))
 
         ineq_violations = jnp.maximum(grad_dual_ineq_unscaled, 0.0)
@@ -1234,6 +1248,11 @@ def solve(
 
         constraint_bound = jnp.maximum(max_ineq_violation, max_eq_violation)
 
+        # Scaled-space reduced cost / bounds — used ONLY by the duality-gap
+        # decomposition below, which is built in scaled space and rescaled by
+        # c_max (changing these to true units would mismatch the still-scaled
+        # `average_state.primal` it multiplies; the gap is intentionally left
+        # untouched here). Dual FEASIBILITY uses the true-space versions instead.
         reduced_cost = grad_primal
         lower_bounds = lp.lower_bounds
         upper_bounds = lp.upper_bounds
@@ -1248,32 +1267,60 @@ def solve(
         lower_term = reduced_cost * lower_bounds
         upper_term = reduced_cost * upper_bounds
 
+        # box_infimum = inf over the box of rᵢ·xᵢ — the dual contribution of each
+        # variable's bound. This is only FINITE when the reduced cost has a
+        # dual-feasible sign for the variable's bound class; otherwise the infimum
+        # is genuinely −∞ (the dual bound is unbounded below there) and the gap is
+        # undefined. The old code took the finite bound·r product unconditionally,
+        # which FABRICATED a finite dual bound at dual-infeasible points and
+        # produced a misleading (often negative) duality gap. Guarding with −∞ on
+        # the wrong sign makes duality_gap = +∞ → dual_gap_is_finite = False, so
+        # the convergence test (which already requires a finite gap) correctly
+        # refuses to certify until the dual is feasible. The wrong-sign reduced
+        # cost is still surfaced in DFR. (Sign logic is scale-invariant.)
+        #   has_only_lower ([l, +∞)): dual-feasible iff r ≥ 0; else −∞.
+        #   has_only_upper ((−∞, u]): dual-feasible iff r ≤ 0; else −∞.
+        #   has_no_bounds  (free):    dual-feasible iff r == 0; else −∞.
+        # A small tolerance keeps the sign guards consistent with the DFR
+        # residual (which measures these same wrong-sign magnitudes): a reduced
+        # cost within `_dg_tol` of the feasible side is treated as feasible, so a
+        # point that is dual-feasible-to-tolerance is not spuriously reported as
+        # gap-infinite. (Free variables especially never hit r == 0 exactly.)
+        _dg_tol = jnp.asarray(1e-8, reduced_cost.dtype)
+        neg_inf = jnp.asarray(-jnp.inf, reduced_cost.dtype)
+        lower_only_term = jnp.where(reduced_cost >= -_dg_tol, lower_term, neg_inf)
+        upper_only_term = jnp.where(reduced_cost <= _dg_tol, upper_term, neg_inf)
+        free_term = jnp.where(jnp.abs(reduced_cost) <= _dg_tol, 0.0, neg_inf)
+
         box_infimum = jnp.where(
             has_both_bounds,
             jnp.minimum(lower_term, upper_term),
             jnp.where(
                 has_only_lower,
-                lower_term,
-                jnp.where(has_only_upper, upper_term, 0.0),
+                lower_only_term,
+                jnp.where(has_only_upper, upper_only_term, free_term),
             ),
         )
 
-        # For box-constrained variables the violation is the projected-gradient
-        # magnitude: |x - proj(x - r, lb, ub)|.  For one-sided or free
-        # variables the classical reduced-cost sign rules apply.
+        # Dual feasibility in TRUE units (reduced_cost_true / bounds_true), so it
+        # is consistent with the row-scale-unscaled PFR. For box-constrained
+        # variables the violation is the projected-gradient magnitude
+        # |x - proj(x - r, lb, ub)|; for one-sided or free variables the classical
+        # reduced-cost sign rules apply. (Bound-class masks are scale-invariant —
+        # col_scale > 0 preserves finiteness — so the masks above are reused.)
         proj_box = projection_box(
-            average_state.primal - reduced_cost, lower_bounds, upper_bounds
+            primal_true - reduced_cost_true, lower_bounds_true, upper_bounds_true
         )
         dual_feasibility_violation = jnp.where(
             has_both_bounds,
-            jnp.abs(average_state.primal - proj_box),
+            jnp.abs(primal_true - proj_box),
             jnp.where(
                 has_only_lower,
-                jnp.maximum(-reduced_cost, 0.0),
+                jnp.maximum(-reduced_cost_true, 0.0),
                 jnp.where(
                     has_only_upper,
-                    jnp.maximum(reduced_cost, 0.0),
-                    jnp.abs(reduced_cost),  # has_no_bounds (free variable)
+                    jnp.maximum(reduced_cost_true, 0.0),
+                    jnp.abs(reduced_cost_true),  # has_no_bounds (free variable)
                 ),
             ),
         )
