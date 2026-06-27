@@ -21,6 +21,83 @@ _LINEAR_RUN_EPOCH_CACHE = {}
 
 
 # %%
+def estimate_augmented_spectral_norm(
+    lp: JaddleLP,
+    num_iters: int = 30,
+    seed: int = 0,
+):
+    """Approximate the spectral norm (largest singular value) of the augmented
+    matrix
+
+        M = [[ A,    -b ],
+             [ cᵀ,    0 ]]
+
+    where ``A = [A_eq; A_ineq]`` (m×n), ``b`` is the length-m fused RHS appended
+    as the extra column, and ``c`` the length-n cost appended (transposed) as
+    the extra row. M has shape (m+1)×(n+1). (The signs of the ±b/±c blocks do
+    not affect singular values, so this equals σ_max of [[A, b], [cᵀ, 0]].)
+
+    The estimate is computed by power iteration on the normal operator MᵀM via
+    matvecs only — never forming M, MᵀM, or any dense matrix. M acts on a
+    vector ``[u; s]`` (u length n, scalar s) as
+
+        M [u; s] = [A u - b s ;  cᵀ u],
+
+    and its transpose on ``[p; q]`` (p length m, scalar q) as
+
+        Mᵀ [p; q] = [Aᵀ p + c q ;  -bᵀ p].
+
+    Each iteration applies Mᵀ(M·v) and renormalises; the returned value is
+    sqrt(λ_max(MᵀM)) = σ_max(M). ``num_iters`` power steps are run from a fixed
+    random start (``seed``); 30 is comfortably enough for a tight estimate on
+    LP-scale matrices.
+    """
+    A = lp.A  # (m, n) fused [A_eq; A_ineq], BCOO
+    A_T = lp.A_T  # (n, m) explicit transpose
+    c = lp.c  # (n,)
+    b = lp.b  # (m,)
+
+    def M_matvec(u, s):
+        # M @ [u; s] = [A u - b s; cᵀ u]
+        top = A @ u - b * s
+        bottom = c @ u
+        return top, bottom
+
+    def MT_matvec(p, q):
+        # Mᵀ @ [p; q] = [Aᵀ p + c q; -bᵀ p]
+        top = A_T @ p + c * q
+        bottom = -(b @ p)
+        return top, bottom
+
+    def normal_op(u, s):
+        # MᵀM @ [u; s]
+        p, q = M_matvec(u, s)
+        return MT_matvec(p, q)
+
+    def vnorm(u, s):
+        return jnp.sqrt(u @ u + s * s)
+
+    key = jax.random.PRNGKey(seed)
+    u = jax.random.normal(key, c.shape, dtype=c.dtype)
+    s = jnp.array(1.0, dtype=c.dtype)
+    n = vnorm(u, s)
+    u, s = u / n, s / n
+
+    def body(_, carry):
+        u, s = carry
+        u, s = normal_op(u, s)
+        n = vnorm(u, s)
+        return u / n, s / n
+
+    u, s = jax.lax.fori_loop(0, num_iters, body, (u, s))
+
+    # Rayleigh quotient on MᵀM gives λ_max; σ_max = sqrt(λ_max).
+    Mu, Ms = M_matvec(u, s)
+    lambda_max = Mu @ Mu + Ms * Ms
+    return jnp.sqrt(lambda_max)
+
+
+# %%
 # Solvers for constrained linear optimisation via saddle point formulation
 def __sps(
     max_iter,
@@ -647,9 +724,27 @@ def __sps(
             # condition is `i < end_iter`. `max_iter` is a static_argname, so a
             # changing iterations_per_epoch (restart decay) triggers a recompile —
             # the same tradeoff the convex solver already takes.
+            #
+            # scan requires the carry's output dtypes to match its input dtypes
+            # exactly. optax's inject_hyperparams carries an `is_initial_step`
+            # flag that is int at init but bool after the first update; some
+            # optimisers (e.g. optimistic_gradient_descent) thus drift the carry
+            # dtype on iteration 1, which scan rejects (while_loop tolerated it).
+            # Cast each step's output carry back to the input carry's dtypes so
+            # the loop is type-stable regardless of the user optimiser.
+            init_carry = (start_iter, state, average_state, opt_state, total_weight)
+            _carry_dtypes = jax.tree.map(lambda x: jnp.asarray(x).dtype, init_carry)
+
+            def step_typed(carry, _):
+                new_carry, y = step(carry, _)
+                new_carry = jax.tree.map(
+                    lambda v, dt: v.astype(dt), new_carry, _carry_dtypes
+                )
+                return new_carry, y
+
             (i, state, average_state, opt_state, total_weight), _ = jax.lax.scan(
-                step,
-                (start_iter, state, average_state, opt_state, total_weight),
+                step_typed,
+                init_carry,
                 None,
                 length=max_iter,
             )
@@ -693,6 +788,18 @@ def __sps(
         opt_state = (optimiser.init(initial_solution), k_slot)
     else:
         opt_state = optimiser.init(initial_solution)
+
+    # run_epoch DONATES `state` and `opt_state`. The caller's restart path may
+    # hand us a `state`/`opt_state` pair that shares buffers: `state =
+    # restart_point` aliases the live `average_state`, and `optimiser.init(state)`
+    # / inject_hyperparams reuse buffers tied to that same `state` (e.g. the
+    # scalar learning-rate float64[]). Donating two args that alias one buffer
+    # double-frees it, so the next epoch reads a deleted buffer. Break any such
+    # aliasing with an independent copy of each donated tree — one cheap pass per
+    # epoch, off the per-iteration hot path. (XLA elides the copy when there is
+    # nothing to alias.)
+    state = jax.tree.map(lambda x: x + 0, state)
+    opt_state = jax.tree.map(lambda x: x + 0, opt_state)
 
     return run_epoch(
         start_iter,
@@ -748,16 +855,17 @@ def solve(
     report_best=True,
     update_mode="pdhg",
     k_scale=None,
-    k_theta=0.01,
+    k_theta=0.5,
     k_init=None,
     adaptive_eta=None,
     scale="ruiz+pc",
     output_opt_state=False,
-    scaled_objective=False,
+    scaled_objective=True,
     restarts=0,
     epochs_per_restart=10,
     restart_multiplier=1.0,
     restart_decay=0.2,
+    necessary_decay=0.8,
     primal_stop=False,
     primal_stop_window=5,
     primal_stop_obj_tol=1e-4,
@@ -798,9 +906,14 @@ def solve(
             (default 10). Subsequent cycle caps grow by ``restart_multiplier``.
         restart_multiplier: Geometric growth factor for cycle-length caps
             (default 1.0 = fixed length, 2.0 = doubling).
-        restart_decay: Sufficient-progress threshold (default 0.2). A restart
-            fires early if the KKT merit drops below ``restart_decay`` times its
-            value at the last restart.
+        restart_decay: Sufficient-progress threshold (default 0.2; cuPDLP
+            β_sufficient). A restart fires when the KKT merit drops below
+            ``restart_decay`` times its value at the last restart.
+        necessary_decay: Necessary-decay threshold for the cuPDLP "stalling"
+            restart condition (default 0.8; cuPDLP β_necessary). A restart also
+            fires when the merit has decayed below ``necessary_decay`` times its
+            cycle-start value AND has risen versus the previous epoch (rotational
+            turnaround). Must be > ``restart_decay`` to be meaningful.
         update_mode: Selects the per-iterate stepping scheme. One of:
             * ``"synchronous"`` (default): simultaneous primal/dual gradient
               descent-ascent through the user optimiser.
@@ -947,7 +1060,11 @@ def solve(
             print("----------------------------------------------")
 
     elif scale == "ruiz+pc":
-        lp, row_scale_ruiz, col_scale_ruiz = ruiz_scaling(lp)
+        # A-only Ruiz (PDLP-style): equilibrate the constraint operator alone, not
+        # the augmented [[A,b],[c,0]]. The augmented form under-scales constraint
+        # rows on badly-scaled problems (boeing), freezing the dual/complementarity
+        # residuals. PC then applies its single Pock-Chambolle finishing pass.
+        lp, row_scale_ruiz, col_scale_ruiz = ruiz_scaling(lp, augmented=False)
         lp, row_scale_pc, col_scale_pc = pc_scaling(lp)
 
         row_scale, col_scale = (
@@ -968,6 +1085,11 @@ def solve(
 
         original_lp = lp
         lp = to_jaddle_sparse(lp)
+
+    if adaptive_eta == 0.0:
+        adaptive_eta = 1 / estimate_augmented_spectral_norm(lp)
+        print(f"Adaptive step size seed set to 1/||A||_2 = {adaptive_eta:.3e}")
+        print("----------------------------------------------")
 
     # A user-supplied initial_solution is given in the LP's original (unscaled)
     # space, so it must be mapped into the scaled space the solver iterates in.
@@ -1322,6 +1444,9 @@ def solve(
     epochs_since_restart = 0
     current_cycle_cap = float(epochs_per_restart)
     merit_at_last_restart = jnp.inf
+    # Previous epoch's restart merit, for cuPDLP condition (ii) (stalling: merit
+    # rising again after necessary decay). inf until the first epoch sets it.
+    prev_epoch_merit = jnp.inf
 
     # Normalisation constants for the restart merit (PDLP-style). Each KKT
     # residual is divided by 1 + its natural scale so the three terms are
@@ -1397,8 +1522,26 @@ def solve(
             print(f"Precompile done in {time.time() - _precompile_t0:.1f}s")
             print("----------------------------------------------")
 
-    def print_epoch_metrics(epoch_time=None):
+    def _read_k_eta(opt_state):
+        # Surface the live primal weight k and adaptive step eta from the
+        # opt_state k-slot for the epoch trace. Layout: (inner, k) for plain
+        # k-scaling, (inner, (k, eta[, anchor])) once adaptive_step/halpern adds
+        # the step (and anchor) to the slot. Returns (k, eta) with eta None when
+        # there is no adaptive step to report.
+        if not k_scaling:
+            return None, None
+        slot = opt_state[1]
+        if isinstance(slot, tuple):
+            return float(slot[0]), float(slot[1])
+        return float(slot), None
+
+    def print_epoch_metrics(epoch_time=None, k_val=None, eta_val=None):
         time_str = f"|Time {epoch_time:.2f}s|" if epoch_time is not None else ""
+        ke_str = ""
+        if k_val is not None:
+            ke_str += f"|k {k_val:.2e}|"
+        if eta_val is not None:
+            ke_str += f"|eta {eta_val:.2e}|"
         print(
             f"|Epoch {count}|"
             f"|Obj{objective_value:.2e}|"
@@ -1407,6 +1550,7 @@ def solve(
             f"|PFR {constraint_bound:.2e}|"
             f"|DFR {dual_feasibility_residual:.2e}|"
             f"|RDG {duality_gap / (1.0 + jnp.abs(objective_value)):.2e}|"
+            f"{ke_str}"
             f"{time_str}"
         )
         print("----------------------------------------------")
@@ -1554,7 +1698,12 @@ def solve(
             finish_epoch_time = time.time()
 
             if verbose and (count == 1 or count % log_every == 0):
-                print_epoch_metrics(finish_epoch_time - start_epoch_time)
+                _k_trace, _eta_trace = _read_k_eta(opt_state)
+                print_epoch_metrics(
+                    finish_epoch_time - start_epoch_time,
+                    k_val=_k_trace,
+                    eta_val=_eta_trace,
+                )
 
             # --- Adaptive restart decision ---
             if restarts and restarts_done < restarts:
@@ -1627,7 +1776,20 @@ def solve(
                     restart_merit <= restart_decay * merit_at_last_restart
                 )
 
-                if sufficient_progress or cycle_exhausted:
+                # cuPDLP.jl condition (ii) — "necessary decay + stalling": restart
+                # once the merit has decayed to <= necessary_decay (0.8) of its
+                # cycle-start value AND has started rising again vs the previous
+                # epoch (the rotational-stall turnaround). Catches the oscillating
+                # feasibility tail that the absolute sufficient-decay test (0.2x)
+                # misses. `restart_decay` keeps driving the (i) sufficient trigger;
+                # `necessary_decay` is the looser (ii) threshold.
+                stalling_restart = bool(
+                    jnp.isfinite(prev_epoch_merit)
+                    and restart_merit <= necessary_decay * merit_at_last_restart
+                    and restart_merit > prev_epoch_merit
+                )
+
+                if sufficient_progress or stalling_restart or cycle_exhausted:
                     # Warm-start restart from the better of {average, iterate};
                     # reset momentum, averaging, weight accumulation and the LR /
                     # weight_function schedule (via the iteration offset).
@@ -1668,11 +1830,15 @@ def solve(
                                 jax.tree.map(lambda x: x + 0, state),
                             )
                         elif adaptive_step:
-                            # Reset eta to its seed alongside the momentum/LR
-                            # schedule reset, so the adaptive rule re-warms from a
-                            # known step in the new cycle.
-                            _eta_dtype = state.primal.dtype
-                            k_slot = (k_new, jnp.asarray(adaptive_eta, _eta_dtype))
+                            # Carry the learned step size across the restart.
+                            # The adaptive rule grows eta ~100-250x above its
+                            # 1/||A|| seed over a cycle; re-seeding here forced
+                            # the rule to re-climb from scratch after every
+                            # restart (a stretch of tiny, conservative steps).
+                            # PDLP convention resets averaging/momentum at a
+                            # restart but keeps the step size, so carry the live
+                            # eta from the current opt_state instead of reseeding.
+                            k_slot = (k_new, opt_state[1][1])
                         else:
                             k_slot = k_new
                         opt_state = (optimiser.init(state), k_slot)
@@ -1687,6 +1853,8 @@ def solve(
                     # total_weight = 0.0
                     restart_i_offset = i - 1
                     merit_at_last_restart = restart_merit
+                    # New cycle: no previous-epoch merit yet for condition (ii).
+                    prev_epoch_merit = jnp.inf
                     epochs_since_restart = 0
                     current_cycle_cap *= restart_multiplier
                     current_iterations_per_epoch = max(
@@ -1695,11 +1863,12 @@ def solve(
                     )
                     restarts_done += 1
                     if verbose:
-                        reason = (
-                            "sufficient-progress"
-                            if sufficient_progress
-                            else "cycle-cap"
-                        )
+                        if sufficient_progress:
+                            reason = "sufficient-progress"
+                        elif stalling_restart:
+                            reason = "stalling"
+                        else:
+                            reason = "cycle-cap"
                         which = "avg" if restart_used_avg else "iterate"
                         if k_scaling:
                             _k_show = opt_state[1][0] if adaptive_step else opt_state[1]
@@ -1713,6 +1882,10 @@ def solve(
                             f"iters/epoch={current_iterations_per_epoch}{k_msg})"
                         )
                         print("----------------------------------------------")
+                else:
+                    # No restart this epoch: record the merit so the next epoch's
+                    # condition (ii) can detect a turnaround (merit rising again).
+                    prev_epoch_merit = restart_merit
 
         # The while-loop exits the iteration *after* the converging epoch, so its
         # metrics were computed but only printed if it landed on a log_every
@@ -1883,7 +2056,9 @@ def __convert_to_scipy(jsp_mat: jsp.BCOO) -> sp.csc_matrix:
     return sp.csc_matrix((data, (row, col)), shape=jsp_mat.shape)
 
 
-def ruiz_scaling(lp: LP, max_iter=30, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
+def ruiz_scaling(
+    lp: LP, max_iter=30, threshold=1e-8, clip_bounds=(1e-6, 1e6), augmented=False
+):
     """
     Applies Ruiz scaling to an LP in standard form with sparse matrices:
         min c^T x
@@ -1892,8 +2067,15 @@ def ruiz_scaling(lp: LP, max_iter=30, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
              lower_bounds <= x <= upper_bounds
     Returns scaled LP, row_scaling (length m), col_scaling (length n).
 
-    Scaling is derived from the augmented matrix [[A, b], [c^T, 0]] so that
-    both cost and constraint information drive the equilibration.
+    ``augmented`` selects what is equilibrated:
+      * ``False`` (default, PDLP-style): equilibrate ``A`` alone — the operator
+        that defines the saddle dynamics — and let ``b``/``c`` ride the resulting
+        row/col scales. The augmented variant lets the appended ``b`` column and
+        ``c`` row absorb scaling, which under-equilibrates the constraint ROWS on
+        badly-scaled problems (observed on `boeing`: cols hit [1,1] but rows
+        retained a 130x spread, freezing complementarity / dual feasibility).
+      * ``True``: equilibrate the augmented ``[[A, b], [c^T, 0]]`` so cost and RHS
+        information also drive the equilibration (the previous default).
     """
 
     A_eq = lp.A_eq
@@ -1905,16 +2087,24 @@ def ruiz_scaling(lp: LP, max_iter=30, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
     lower_bounds = lp.lower_bounds.copy()
     upper_bounds = lp.upper_bounds.copy()
 
-    c_norm = np.max(np.abs(c)) or 1.0
+    if augmented:
+        c_norm = np.max(np.abs(c)) or 1.0
+        # Build [[A, b], [c^T/c_norm, 0]] as a sparse (m+1) x (n+1) matrix
+        b_col = sp.csc_matrix(b.reshape(-1, 1))
+        c_row = sp.csc_matrix((c / c_norm).reshape(1, -1))
+        zero = sp.csc_matrix((1, 1))
+        M = sp.bmat([[A, b_col], [c_row, zero]]).tocsc()
+    else:
+        # A-only: equilibrate the constraint operator itself. row_scale/col_scale
+        # are length m/n, so the dr/dc slicing below (which drops the augmented
+        # row/col) is a no-op — handled by basing m,n on A's true shape.
+        M = A.tocsc()
 
-    # Build [[A, b], [c^T/c_norm, 0]] as a sparse (m+1) x (n+1) matrix
-    b_col = sp.csc_matrix(b.reshape(-1, 1))
-    c_row = sp.csc_matrix((c / c_norm).reshape(1, -1))
-    zero = sp.csc_matrix((1, 1))
-    M = sp.bmat([[A, b_col], [c_row, zero]]).tocsc()
-
-    row_scale = np.ones(m + 1)
-    col_scale = np.ones(n + 1)
+    # Scale vectors sized to M (augmented: m+1/n+1; A-only: m/n). The dr/dc
+    # slices below take the first m/n entries — the LP's true dimensions — which
+    # drops the augmented row/col when present and is a no-op otherwise.
+    row_scale = np.ones(M.shape[0])
+    col_scale = np.ones(M.shape[1])
 
     # Precompute |M| once and reuse it for every equilibration step. The norms
     # of D_r @ M @ D_c are obtained by scaling the row/col norms of |M| with the
