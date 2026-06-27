@@ -117,7 +117,6 @@ def __sps(
     k_scaling=False,
     k_init=1.0,
     adaptive_eta=None,
-    reflection_gamma=0.0,
 ):
     # The stepping scheme is selected by `update_mode`. This derived boolean
     # keeps the dense per-scheme branching below readable while the string stays
@@ -270,7 +269,6 @@ def __sps(
         bool(k_scaling),
         adaptive_step,
         halpern,
-        float(reflection_gamma),
     )
     run_epoch = _LINEAR_RUN_EPOCH_CACHE.get(cache_key)
 
@@ -343,39 +341,20 @@ def __sps(
                     )
 
                     if halpern:
-                        # Reflected Halpern (cuPDLPx):
-                        #   z_{k+1} = (1/(k+2)) z0
-                        #           + ((k+1)/(k+2)) [ (1+γ) T(z_k) − γ z_k ]
-                        # The reflected operator R = (1+γ)·cand − γ·z_k (γ∈[0,1])
-                        # extrapolates BEYOND the PDHG step T(z_k)=cand — a longer
-                        # step than vanilla Halpern, which accelerates last-iterate
-                        # / infeasibility-detection convergence (the dual-side
-                        # bottleneck). γ=0 recovers vanilla Halpern. The anchor z0
-                        # is the cycle-start iterate; lambda = 1/(k+2) decays over
-                        # the cycle and re-warms at each restart.
-                        #
-                        # Reflection can leave the feasible box (it overshoots), so
-                        # unlike the γ=0 convex blend we MUST re-project the result.
+                        # Halpern anchor: blend T(z_k)=cand back toward z_0.
+                        # lambda_k = 1/(k_local+1) where k_local is the
+                        # restart-shifted iteration index `i` (== i_global -
+                        # restart_i_offset, reset to ~1 each cycle by `solve`), so
+                        # lambda decays as the cycle progresses and re-warms toward
+                        # 1/2 at each restart. The anchor z_0 itself is reset to
+                        # the cycle-start iterate in `solve`. Convex combination of
+                        # two feasible iterates stays feasible — no re-projection.
                         k_local = jnp.asarray(i, eta.dtype)
-                        lam = 1.0 / (k_local + 2.0)
-                        g = jnp.asarray(reflection_gamma, eta.dtype)
-                        reflected = jax.tree.map(
-                            lambda tz, zk: (1.0 + g) * tz - g * zk,
-                            cand,
-                            state,
-                        )
-                        blended = jax.tree.map(
-                            lambda z0, r: lam * z0 + (1.0 - lam) * r,
+                        lam = 1.0 / (k_local + 1.0)
+                        new_state = jax.tree.map(
+                            lambda z0, tz: lam * z0 + (1.0 - lam) * tz,
                             anchor,
-                            reflected,
-                        )
-                        # Re-project onto the feasible set (box on primal, ≥0 on
-                        # inequality dual). For γ=0 this is a no-op on an already
-                        # feasible convex blend; for γ>0 it is required.
-                        new_state = SaddleState(
-                            primal=projection_primal(blended.primal),
-                            dual_ineq=projection_non_negative(blended.dual_ineq),
-                            dual_eq=blended.dual_eq,
+                            cand,
                         )
                     else:
                         new_state = cand
@@ -879,13 +858,6 @@ def solve(
     k_theta=0.5,
     k_init=None,
     adaptive_eta=None,
-    reflection_gamma=0.0,
-    # PID primal-weight gains. Default 0 = the legacy one-shot log-blend (gain
-    # k_theta = K_P), which is also the best-behaved in practice: nonzero ki/kd
-    # tend to wind up / oscillate across restart discontinuities and destabilised
-    # the only problem they were meant to help (boeing). Opt-in, use with care.
-    pid_ki=0.0,
-    pid_kd=0.0,
     scale="ruiz+pc",
     output_opt_state=False,
     scaled_objective=True,
@@ -1545,15 +1517,6 @@ def solve(
     # rising again after necessary decay). inf until the first epoch sets it.
     prev_epoch_merit = jnp.inf
 
-    # PID primal-weight controller state (cuPDLPx). The k rebalance at each restart
-    # drives log k toward log(k_target) where k_target = ‖Δx‖/‖Δy‖ over the cycle;
-    # the integral term accumulates past imbalance and the derivative term damps
-    # oscillation (k was seen swinging 5→25 on boeing, starving the dual). With
-    # pid_ki=pid_kd=0 the controller reduces exactly to the legacy one-shot blend
-    # (gain k_theta = K_P). e = log(k_target) − log(k_prev).
-    pid_e_integral = 0.0
-    pid_e_prev = 0.0
-
     # Normalisation constants for the restart merit (PDLP-style). Each KKT
     # residual is divided by 1 + its natural scale so the three terms are
     # comparable across very differently-scaled problems and the merit reflects
@@ -1626,7 +1589,6 @@ def solve(
             k_scaling=k_scaling,
             k_init=k_init,
             adaptive_eta=adaptive_eta,
-            reflection_gamma=reflection_gamma,
         )
         # Warm the end-of-epoch metrics fn too, with the exact state the hot
         # loop will feed it (average vs iterate is a Python-static choice), so
@@ -1721,7 +1683,6 @@ def solve(
                 k_scaling=k_scaling,
                 k_init=k_init,
                 adaptive_eta=adaptive_eta,
-                reflection_gamma=reflection_gamma,
             )
             # __sps increments the (restart-shifted) counter; restore global i.
             i = shifted_i + restart_i_offset
@@ -1930,19 +1891,9 @@ def solve(
                         # The k-slot is (k, eta[, anchor]) in adaptive_step mode,
                         # plain k otherwise. Read k accordingly.
                         k_prev = opt_state[1][0] if adaptive_step else opt_state[1]
-                        # PID controller on the log-imbalance error e = log(k_target)
-                        # − log(k_prev). The proportional gain is k_theta (so
-                        # pid_ki=pid_kd=0 reproduces the legacy one-shot blend
-                        # exactly); the integral term corrects sustained primal/dual
-                        # imbalance and the derivative term damps the k oscillation.
-                        e = jnp.log(k_target) - jnp.log(k_prev)
-                        pid_e_integral = pid_e_integral + e
-                        log_k = jnp.log(k_prev) + (
-                            k_theta * e
-                            + pid_ki * pid_e_integral
-                            + pid_kd * (e - pid_e_prev)
+                        log_k = k_theta * jnp.log(k_target) + (1.0 - k_theta) * jnp.log(
+                            k_prev
                         )
-                        pid_e_prev = e
                         k_new = jnp.clip(jnp.exp(log_k), k_lo, k_hi)
                         if halpern:
                             # Restarted Halpern: reset eta AND re-anchor z_0 to the
