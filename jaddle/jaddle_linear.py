@@ -117,6 +117,7 @@ def __sps(
     k_scaling=False,
     k_init=1.0,
     adaptive_eta=None,
+    reflection_gamma=0.0,
 ):
     # The stepping scheme is selected by `update_mode`. This derived boolean
     # keeps the dense per-scheme branching below readable while the string stays
@@ -269,6 +270,7 @@ def __sps(
         bool(k_scaling),
         adaptive_step,
         halpern,
+        float(reflection_gamma),
     )
     run_epoch = _LINEAR_RUN_EPOCH_CACHE.get(cache_key)
 
@@ -341,20 +343,39 @@ def __sps(
                     )
 
                     if halpern:
-                        # Halpern anchor: blend T(z_k)=cand back toward z_0.
-                        # lambda_k = 1/(k_local+1) where k_local is the
-                        # restart-shifted iteration index `i` (== i_global -
-                        # restart_i_offset, reset to ~1 each cycle by `solve`), so
-                        # lambda decays as the cycle progresses and re-warms toward
-                        # 1/2 at each restart. The anchor z_0 itself is reset to
-                        # the cycle-start iterate in `solve`. Convex combination of
-                        # two feasible iterates stays feasible — no re-projection.
+                        # Reflected Halpern (cuPDLPx):
+                        #   z_{k+1} = (1/(k+2)) z0
+                        #           + ((k+1)/(k+2)) [ (1+γ) T(z_k) − γ z_k ]
+                        # The reflected operator R = (1+γ)·cand − γ·z_k (γ∈[0,1])
+                        # extrapolates BEYOND the PDHG step T(z_k)=cand — a longer
+                        # step than vanilla Halpern, which accelerates last-iterate
+                        # / infeasibility-detection convergence (the dual-side
+                        # bottleneck). γ=0 recovers vanilla Halpern. The anchor z0
+                        # is the cycle-start iterate; lambda = 1/(k+2) decays over
+                        # the cycle and re-warms at each restart.
+                        #
+                        # Reflection can leave the feasible box (it overshoots), so
+                        # unlike the γ=0 convex blend we MUST re-project the result.
                         k_local = jnp.asarray(i, eta.dtype)
-                        lam = 1.0 / (k_local + 1.0)
-                        new_state = jax.tree.map(
-                            lambda z0, tz: lam * z0 + (1.0 - lam) * tz,
-                            anchor,
+                        lam = 1.0 / (k_local + 2.0)
+                        g = jnp.asarray(reflection_gamma, eta.dtype)
+                        reflected = jax.tree.map(
+                            lambda tz, zk: (1.0 + g) * tz - g * zk,
                             cand,
+                            state,
+                        )
+                        blended = jax.tree.map(
+                            lambda z0, r: lam * z0 + (1.0 - lam) * r,
+                            anchor,
+                            reflected,
+                        )
+                        # Re-project onto the feasible set (box on primal, ≥0 on
+                        # inequality dual). For γ=0 this is a no-op on an already
+                        # feasible convex blend; for γ>0 it is required.
+                        new_state = SaddleState(
+                            primal=projection_primal(blended.primal),
+                            dual_ineq=projection_non_negative(blended.dual_ineq),
+                            dual_eq=blended.dual_eq,
                         )
                     else:
                         new_state = cand
@@ -858,6 +879,13 @@ def solve(
     k_theta=0.5,
     k_init=None,
     adaptive_eta=None,
+    reflection_gamma=0.0,
+    # PID primal-weight gains. Default 0 = the legacy one-shot log-blend (gain
+    # k_theta = K_P), which is also the best-behaved in practice: nonzero ki/kd
+    # tend to wind up / oscillate across restart discontinuities and destabilised
+    # the only problem they were meant to help (boeing). Opt-in, use with care.
+    pid_ki=0.0,
+    pid_kd=0.0,
     scale="ruiz+pc",
     output_opt_state=False,
     scaled_objective=True,
@@ -1281,16 +1309,28 @@ def solve(
         #   has_only_lower ([l, +∞)): dual-feasible iff r ≥ 0; else −∞.
         #   has_only_upper ((−∞, u]): dual-feasible iff r ≤ 0; else −∞.
         #   has_no_bounds  (free):    dual-feasible iff r == 0; else −∞.
-        # A small tolerance keeps the sign guards consistent with the DFR
-        # residual (which measures these same wrong-sign magnitudes): a reduced
-        # cost within `_dg_tol` of the feasible side is treated as feasible, so a
-        # point that is dual-feasible-to-tolerance is not spuriously reported as
-        # gap-infinite. (Free variables especially never hit r == 0 exactly.)
-        _dg_tol = jnp.asarray(1e-8, reduced_cost.dtype)
+        # The sign guard must be CONSISTENT with how dual feasibility is TESTED in
+        # `converged`: a RELATIVE residual, wrong-sign reduced cost ÷ (1+‖c‖)
+        # against `dual_feasibility_tolerance`. So a wrong-sign reduced cost is
+        # tolerated up to `tol·(1+‖c‖)` in absolute true units. Without matching
+        # this, a point that is dual-feasible-to-tolerance (DFR_rel passes) is
+        # spuriously reported as gap-infinite and never certifies a PDLP-optimal
+        # point (boeing: DFR_rel 5.4e-4 < 1e-3 but the gap was +∞). Beyond that
+        # band the term is −∞ (genuine dual infeasibility → gap undefined).
+        # `c_norm` is defined below in `solve`, resolved at call time via closure.
+        _dg_tol = jnp.asarray(
+            dual_feasibility_threshold * (1.0 + c_norm), reduced_cost_true.dtype
+        )
         neg_inf = jnp.asarray(-jnp.inf, reduced_cost.dtype)
-        lower_only_term = jnp.where(reduced_cost >= -_dg_tol, lower_term, neg_inf)
-        upper_only_term = jnp.where(reduced_cost <= _dg_tol, upper_term, neg_inf)
-        free_term = jnp.where(jnp.abs(reduced_cost) <= _dg_tol, 0.0, neg_inf)
+        lower_only_term = jnp.where(
+            reduced_cost_true >= -_dg_tol, lower_term, neg_inf
+        )
+        upper_only_term = jnp.where(
+            reduced_cost_true <= _dg_tol, upper_term, neg_inf
+        )
+        free_term = jnp.where(
+            jnp.abs(reduced_cost_true) <= _dg_tol, 0.0, neg_inf
+        )
 
         box_infimum = jnp.where(
             has_both_bounds,
@@ -1378,9 +1418,19 @@ def solve(
         # convention so benchmark comparisons are apples-to-apples. The same
         # (1 + |obj|) normalisation is used for `complementarity_slack` above.
         relative_duality_gap = jnp.abs(duality_gap) / (1.0 + jnp.abs(objective_value))
+        # Primal/dual feasibility are tested RELATIVELY, normalised by (1+‖b‖) and
+        # (1+‖c‖) — PDLP/HiGHS's relative-residual stopping convention, and the
+        # same normalisation the restart `kkt_merit` already uses. The absolute
+        # residuals are misleadingly large on problems with big ‖b‖/‖c‖ (boeing:
+        # ‖b‖≈2952, ‖c‖≈43), so an absolute test never certified points that were
+        # PDLP-optimal (e.g. PFR_abs 2.5e-3 but PFR_rel 8.6e-7; DFR_abs 2.4e-2 but
+        # DFR_rel 5.4e-4 — both well inside 1e-3 relative). `b_norm`/`c_norm` are
+        # defined below in `solve` and resolved at call time via the closure.
+        relative_primal_residual = constraint_bound / (1.0 + b_norm)
+        relative_dual_residual = dual_feasibility_residual / (1.0 + c_norm)
         standard = (
-            (constraint_bound <= primal_feasibility_tolerance)
-            & (dual_feasibility_residual <= dual_feasibility_threshold)
+            (relative_primal_residual <= primal_feasibility_tolerance)
+            & (relative_dual_residual <= dual_feasibility_threshold)
             & dual_gap_is_finite
             & (relative_duality_gap <= dual_gap_tolerance)
         )
@@ -1495,13 +1545,30 @@ def solve(
     # rising again after necessary decay). inf until the first epoch sets it.
     prev_epoch_merit = jnp.inf
 
+    # PID primal-weight controller state (cuPDLPx). The k rebalance at each restart
+    # drives log k toward log(k_target) where k_target = ‖Δx‖/‖Δy‖ over the cycle;
+    # the integral term accumulates past imbalance and the derivative term damps
+    # oscillation (k was seen swinging 5→25 on boeing, starving the dual). With
+    # pid_ki=pid_kd=0 the controller reduces exactly to the legacy one-shot blend
+    # (gain k_theta = K_P). e = log(k_target) − log(k_prev).
+    pid_e_integral = 0.0
+    pid_e_prev = 0.0
+
     # Normalisation constants for the restart merit (PDLP-style). Each KKT
     # residual is divided by 1 + its natural scale so the three terms are
     # comparable across very differently-scaled problems and the merit reflects
-    # *relative* progress, not absolute units. Computed in the scaled space the
-    # solver iterates in; `c_max` puts the objective back in true units.
-    b_norm = float(jnp.max(jnp.abs(lp.b))) if lp.b.size else 0.0
-    c_norm = float(jnp.max(jnp.abs(lp.c))) if lp.c.size else 0.0
+    # *relative* progress, not absolute units. These MUST be in TRUE (original)
+    # units, because the residuals they normalise are reported in true units
+    # (constraint_bound is row-scale-unscaled; the reduced cost is /col_scale):
+    # b_true = b_scaled / row_scale, c_true = c_scaled / col_scale. Using the
+    # scaled-space norms here was a unit mismatch — on boeing it made the relative
+    # convergence test and the gap sign-guard band wrong (true ‖c‖≈43 vs scaled
+    # ‖c‖≈0.8), so the gap read +∞ at a point whose true relative gap was ~2e-3.
+    _row_scale_all = jnp.concatenate([jnp_row_scale_eq, jnp_row_scale_ineq])
+    b_norm = (
+        float(jnp.max(jnp.abs(lp.b / _row_scale_all))) if lp.b.size else 0.0
+    )
+    c_norm = float(jnp.max(jnp.abs(lp.c / col_scale))) if lp.c.size else 0.0
 
     def kkt_merit(
         constraint_bound,
@@ -1559,6 +1626,7 @@ def solve(
             k_scaling=k_scaling,
             k_init=k_init,
             adaptive_eta=adaptive_eta,
+            reflection_gamma=reflection_gamma,
         )
         # Warm the end-of-epoch metrics fn too, with the exact state the hot
         # loop will feed it (average vs iterate is a Python-static choice), so
@@ -1653,6 +1721,7 @@ def solve(
                 k_scaling=k_scaling,
                 k_init=k_init,
                 adaptive_eta=adaptive_eta,
+                reflection_gamma=reflection_gamma,
             )
             # __sps increments the (restart-shifted) counter; restore global i.
             i = shifted_i + restart_i_offset
@@ -1861,9 +1930,19 @@ def solve(
                         # The k-slot is (k, eta[, anchor]) in adaptive_step mode,
                         # plain k otherwise. Read k accordingly.
                         k_prev = opt_state[1][0] if adaptive_step else opt_state[1]
-                        log_k = k_theta * jnp.log(k_target) + (1.0 - k_theta) * jnp.log(
-                            k_prev
+                        # PID controller on the log-imbalance error e = log(k_target)
+                        # − log(k_prev). The proportional gain is k_theta (so
+                        # pid_ki=pid_kd=0 reproduces the legacy one-shot blend
+                        # exactly); the integral term corrects sustained primal/dual
+                        # imbalance and the derivative term damps the k oscillation.
+                        e = jnp.log(k_target) - jnp.log(k_prev)
+                        pid_e_integral = pid_e_integral + e
+                        log_k = jnp.log(k_prev) + (
+                            k_theta * e
+                            + pid_ki * pid_e_integral
+                            + pid_kd * (e - pid_e_prev)
                         )
+                        pid_e_prev = e
                         k_new = jnp.clip(jnp.exp(log_k), k_lo, k_hi)
                         if halpern:
                             # Restarted Halpern: reset eta AND re-anchor z_0 to the
@@ -1897,7 +1976,16 @@ def solve(
                     # copy — otherwise it aliases the donated buffer and reads as
                     # deleted at the next restart's k-rebalance (line ~1534).
                     state_at_last_restart = jax.tree.map(lambda x: x + 0, state)
-                    # total_weight = 0.0
+                    # Reset the averaging accumulator alongside `average_state`.
+                    # The running mean is avg += (w/total_weight)·(new − avg); if
+                    # total_weight keeps the prior cycles' accumulated weight while
+                    # average_state is re-seeded to the cycle-start point, the
+                    # post-restart ratio w/total_weight is far too small and the new
+                    # cycle's average stays frozen near the restart point. This made
+                    # 5×1000 (restarts fire on epoch boundaries) diverge from 1×5000
+                    # (fewer restarts) — same total iters, different result. Resetting
+                    # restores epoch-granularity invariance of the averaging.
+                    total_weight = 0.0
                     restart_i_offset = i - 1
                     merit_at_last_restart = restart_merit
                     # New cycle: no previous-epoch merit yet for condition (ii).
