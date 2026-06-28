@@ -40,7 +40,7 @@ def constraints_eq(y_pred):
 lower_bounds = -jnp.ones(n)
 upper_bounds = jnp.ones(n)
 
-cp = jc.CP(
+cp = jc.JaddleCP(
     num_variables=n,
     objective=objective,
     constraints_eq=constraints_eq,
@@ -57,7 +57,7 @@ solution, _ = jc.solve(
     primal_feasibility_tolerance=1e-5,
     update_mode="extragradient",
     adaptive_eta=1,
-    iterations_per_epoch=100,
+    iterations_per_epoch=1000,
 )
 
 # %%

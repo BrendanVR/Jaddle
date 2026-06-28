@@ -6,7 +6,7 @@ import optax
 import functools
 from typing import NamedTuple
 import time
-from jaddle.jaddle_basic_types import CP, SaddleState
+from jaddle.jaddle_basic_types import JaddleCP, SaddleState
 import jaddle.jaddle_optimisers as jo
 import numpy as np
 
@@ -16,7 +16,7 @@ _CONVEX_RUN_EPOCH_CACHE = {}
 def __sps(
     max_iter,
     start_iter,
-    cp: CP,
+    cp: JaddleCP,
     optimiser,
     initial_solution,
     initial_avg_state=None,
@@ -482,7 +482,7 @@ def __sps(
 
 
 def solve(
-    cp: CP,
+    cp: JaddleCP,
     optimiser=None,
     max_epochs=None,
     initial_solution=None,
@@ -814,15 +814,17 @@ def solve(
     # iteration 1 instead of starting symmetric. For a linear objective
     # c = grad(obj)(0), and for constraints of the form Ax - b, evaluating at
     # x = 0 gives -b, so b = -[c_eq(0); c_ineq(0)]. This is generic over
-    # CP/LP/JaddleLP since it only uses the objective/constraint callables.
+    # JaddleCP/LP/JaddleLP since it only uses the objective/constraint callables.
     if k_scaling and k_init is None:
         zero = jnp.zeros_like(initial_solution.primal)
+
         # Fuse into one JIT-compiled call: objective forward+grad and both
         # constraint evaluations in a single function to reduce dispatch overhead.
         def _k_init_fn(x):
             obj, c = jax.value_and_grad(cp.objective)(x)
             b = jnp.concatenate([cp.constraints_eq(x), cp.constraints_ineq(x)])
             return c, b
+
         c, b = jax.jit(_k_init_fn)(zero)
         norm_c2 = jnp.vdot(c, c) + 1e-60
         norm_b2 = jnp.vdot(b, b) + 1e-60

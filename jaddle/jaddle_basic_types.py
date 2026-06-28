@@ -16,7 +16,7 @@ class SaddleState(NamedTuple):
     dual_eq: jnp.ndarray
 
 
-class CP:
+class JaddleCP:
     def __init__(
         self,
         num_variables,
@@ -253,6 +253,43 @@ class JaddleLP:
         self.A_T = A_T_bcoo
         self.b = jnp.concatenate([b_eq, b_ineq])
 
+    @classmethod
+    def from_scipy(cls, c, A_eq, b_eq, A_ineq, b_ineq, lower_bounds, upper_bounds):
+        """Build a ``JaddleLP`` directly from scipy sparse blocks + numpy vectors.
+
+        Mirrors ``jaddle_linear.to_jaddle_sparse``: resolves the active precision
+        profile (float64 under x64, else float32; float16 lives only in JAX since
+        scipy cannot hold it), converts each constraint block to a sorted,
+        deduplicated BCOO, and casts the data array to the profile dtype. This is
+        the JAX-native entry point — callers (e.g. ``highs_to_standard_form_sparse``)
+        no longer route through a scipy ``LP``.
+        """
+        import jax.experimental.sparse as _jsp
+        from jaddle.jaddle_optimisers import jaddle_dtype
+
+        float_dtype = jaddle_dtype()
+        if float_dtype == jnp.float64 and not jax.config.jax_enable_x64:
+            float_dtype = jnp.float32
+        np_float = np.float64 if float_dtype == jnp.float64 else np.float32
+
+        def _to_bcoo(A):
+            A = A.astype(np_float).sorted_indices()
+            A.sum_duplicates()
+            bcoo = _jsp.BCOO.from_scipy_sparse(A.tocoo()).sort_indices()
+            return _jsp.BCOO(
+                (bcoo.data.astype(float_dtype), bcoo.indices), shape=bcoo.shape
+            )
+
+        return cls(
+            jnp.asarray(c, dtype=float_dtype),
+            _to_bcoo(A_eq),
+            jnp.asarray(b_eq, dtype=float_dtype),
+            _to_bcoo(A_ineq),
+            jnp.asarray(b_ineq, dtype=float_dtype),
+            jnp.asarray(lower_bounds, dtype=float_dtype),
+            jnp.asarray(upper_bounds, dtype=float_dtype),
+        )
+
     def objective(self, x):
         return self.c @ x
 
@@ -296,6 +333,36 @@ class JaddleLP:
             self.A_eq, self.A_ineq, self.c, n_eq, n_ineq
         )
         return SaddleState(primal=primal, dual_ineq=dual_ineq, dual_eq=dual_eq)
+
+    def to_scipy(self) -> "LP":
+        """Materialise a scipy-backed ``LP`` (CSC matrices, numpy vectors).
+
+        ``JaddleLP`` is the device-side representation the saddle solver iterates
+        on; the scaling, primal/dual polish, crossover and eq-projection LU stages
+        run host-side on scipy sparse (sparse direct solve, ``lsmr``, boolean
+        row-slicing — none of which JAX provides). Those stages call this to get
+        the scipy view they need; the solver never does.
+        """
+        import scipy.sparse as sp
+
+        def _to_csc(bcoo):
+            data = np.asarray(bcoo.data)
+            idx = np.asarray(bcoo.indices)
+            return sp.csc_matrix(
+                (data, (idx[:, 0], idx[:, 1])),
+                shape=bcoo.shape,
+                dtype=np.float64,
+            )
+
+        return LP(
+            np.asarray(self.c, dtype=np.float64),
+            _to_csc(self.A_eq),
+            np.asarray(self.b_eq, dtype=np.float64),
+            _to_csc(self.A_ineq),
+            np.asarray(self.b_ineq, dtype=np.float64),
+            np.asarray(self.lower_bounds, dtype=np.float64),
+            np.asarray(self.upper_bounds, dtype=np.float64),
+        )
 
 
 # %%
