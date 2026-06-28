@@ -919,6 +919,7 @@ def solve(
     eq_projection_threshold=None,
     vertex_bias=0.0,
     vertex_bias_seed=0,
+    reference_objective=None,
 ):
     """
     Solve a linear program via saddle-point optimisation.
@@ -927,7 +928,8 @@ def solve(
     RELATIVELY (PDLP/HiGHS convention): primal feasibility
     (``primal_feasibility_tolerance``, normalised by 1+‖b‖), dual feasibility
     (``dual_feasibility_tolerance``, normalised by 1+‖c‖), and a finite duality
-    gap within ``dual_gap_tolerance`` (normalised by 1+|obj|).
+    gap within ``dual_gap_tolerance`` (normalised by 1+|primal_obj|+|dual_obj|,
+    the PDLP/cuPDLP convention, so RDG is directly comparable to PDLP).
 
     Adaptive restarts (PDLP-style) accelerate ill-conditioned problems. A
     restart resets the optimiser momentum/averaging while keeping the current
@@ -1024,6 +1026,16 @@ def solve(
             precomputed factorisation of ``A_eq A_eq^T``. Default ``None``
             disables projection. Only useful when equality feasibility is the
             bottleneck; has no effect when there are no equality constraints.
+        reference_objective: True optimal objective value ``z*`` from a reference
+            solver, in the ORIGINAL problem's units. Purely diagnostic: when
+            supplied and ``verbose=True``, each epoch also logs the true relative
+            objective error ``|cᵀx − z*| / (1 + |z*|)`` (``OBJERR``) alongside the
+            reported relative duality gap (``RDG``). The gap is gated by the dual
+            (it is a complementarity sum that carries the dual's lag), so the
+            primal typically reaches optimality well before the gap closes;
+            comparing ``OBJERR`` against ``RDG`` quantifies how much of the gap is
+            dual lag versus genuine primal suboptimality. Does not affect
+            termination — convergence still uses the full LP certificate.
     """
 
     if optimiser is None:
@@ -1289,14 +1301,18 @@ def solve(
         projected_gradient_residual = primal_true - projected_primal
         primal_grad_norm = jnp.max(jnp.abs(projected_gradient_residual))
 
+        # initial=0.0 gives the reduction an identity so problems with no
+        # inequality (or no equality) constraints — i.e. a zero-size
+        # violations array — report 0 violation instead of raising.
         ineq_violations = jnp.maximum(grad_dual_ineq_unscaled, 0.0)
-        max_ineq_violation = jnp.max(ineq_violations)
+        max_ineq_violation = jnp.max(ineq_violations, initial=0.0)
 
         eq_violations = jnp.abs(grad_dual_eq_unscaled)
-        max_eq_violation = jnp.max(eq_violations)
+        max_eq_violation = jnp.max(eq_violations, initial=0.0)
 
         complementarity_slack = jnp.max(
-            jnp.abs(average_state.dual_ineq * grad_dual_ineq_unscaled)
+            jnp.abs(average_state.dual_ineq * grad_dual_ineq_unscaled),
+            initial=0.0,
         ) / (1.0 + jnp.abs(objective_value))
 
         constraint_bound = jnp.maximum(max_ineq_violation, max_eq_violation)
@@ -1417,6 +1433,32 @@ def solve(
             gap_eq_comp,
         )
 
+    def relative_gap(duality_gap, objective_value):
+        # PDLP/cuPDLP relative duality gap: |primal_obj − dual_obj| normalised by
+        # (1 + |primal_obj| + |dual_obj|). The numerator IS `duality_gap` (built
+        # as the unit-consistent complementarity decomposition in
+        # compute_epoch_metrics — equal to primal_obj − dual_obj at a dual-feasible
+        # point), and the dual objective is recovered exactly and unit-consistently
+        # as `dual_obj = primal_obj − duality_gap` rather than recomputing bᵀy +
+        # Σbox_infimum (which would risk the scaled/true unit mismatch the
+        # decomposition exists to avoid). Adding |dual_obj| to the denominator
+        # matches PDLP's convention so RDG magnitudes are directly comparable to
+        # PDLP/HiGHS-PDLP certificates; it only enlarges the denominator, so it
+        # slightly loosens the effective `dual_gap_tolerance` versus the old
+        # (1+|obj|)-only normalisation.
+        # At dual-infeasible points the gap is +inf (box_infimum sign-guarded to
+        # −inf), making dual_bound = −inf and the raw ratio inf/inf = nan. Report
+        # +inf there instead — the gap is undefined/unbounded, not nan — so the
+        # log and any |gap|-based comparison read sensibly. Convergence still gates
+        # on the separate `dual_gap_is_finite` flag regardless.
+        dual_bound = objective_value - duality_gap
+        return jnp.where(
+            jnp.isfinite(duality_gap),
+            jnp.abs(duality_gap)
+            / (1.0 + jnp.abs(objective_value) + jnp.abs(dual_bound)),
+            jnp.inf,
+        )
+
     def converged(
         constraint_bound,
         dual_feasibility_residual,
@@ -1428,16 +1470,17 @@ def solve(
         #   * primal feasibility: constraint_bound within tolerance
         #   * dual feasibility: reduced-cost residual within tolerance
         #   * a finite, small duality gap
-        # All three are tested RELATIVELY: the gap by (1+|objective_value|), and
-        # primal/dual feasibility by (1+‖b‖)/(1+‖c‖) — PDLP/HiGHS's relative-
-        # residual stopping convention, and the same normalisation the restart
-        # `kkt_merit` uses. The absolute residuals are misleadingly large on
-        # problems with big ‖b‖/‖c‖ (boeing: ‖b‖≈2952, ‖c‖≈43), so an absolute
-        # test never certified points that were PDLP-optimal (e.g. PFR_abs 2.5e-3
-        # but PFR_rel 8.6e-7; DFR_abs 2.4e-2 but DFR_rel 5.4e-4 — both well inside
-        # 1e-3 relative). `b_norm`/`c_norm` are defined below in `solve` and
-        # resolved at call time via the closure.
-        relative_duality_gap = jnp.abs(duality_gap) / (1.0 + jnp.abs(objective_value))
+        # All three are tested RELATIVELY: the gap by the PDLP normalisation
+        # (1+|primal_obj|+|dual_obj|) via `relative_gap`, and primal/dual
+        # feasibility by (1+‖b‖)/(1+‖c‖) — PDLP/HiGHS's relative-residual stopping
+        # convention, and the same normalisation the restart `kkt_merit` uses. The
+        # absolute residuals are misleadingly large on problems with big ‖b‖/‖c‖
+        # (boeing: ‖b‖≈2952, ‖c‖≈43), so an absolute test never certified points
+        # that were PDLP-optimal (e.g. PFR_abs 2.5e-3 but PFR_rel 8.6e-7; DFR_abs
+        # 2.4e-2 but DFR_rel 5.4e-4 — both well inside 1e-3 relative). `b_norm`/
+        # `c_norm` are defined below in `solve` and resolved at call time via the
+        # closure.
+        relative_duality_gap = relative_gap(duality_gap, objective_value)
         relative_primal_residual = constraint_bound / (1.0 + b_norm)
         relative_dual_residual = dual_feasibility_residual / (1.0 + c_norm)
         return (
@@ -1574,7 +1617,7 @@ def solve(
         # off most.
         gap_term = jnp.where(
             dual_gap_is_finite,
-            jnp.abs(duality_gap) / (1.0 + jnp.abs(objective_value)),
+            relative_gap(duality_gap, objective_value),
             jnp.inf,
         )
         primal_term = constraint_bound / (1.0 + b_norm)
@@ -1607,12 +1650,23 @@ def solve(
         # RDG is already relative (÷(1+|obj|)).
         relative_pfr = constraint_bound / (1.0 + b_norm)
         relative_dfr = dual_feasibility_residual / (1.0 + c_norm)
+        # OBJERR: true relative objective error vs a supplied reference optimum.
+        # The duality gap (RDG) is a complementarity sum gated by the dual, so it
+        # lags the primal; OBJERR isolates genuine primal suboptimality, and the
+        # OBJERR≪RDG gap is the dual-lag artifact. Diagnostic only.
+        objerr_str = ""
+        if reference_objective is not None:
+            obj_err = abs(objective_value - reference_objective) / (
+                1.0 + abs(reference_objective)
+            )
+            objerr_str = f"|OBJERR {obj_err:.2e}|"
         print(
             f"|Epoch {count}|"
             f"|Obj{objective_value:.2e}|"
             f"|PFR {relative_pfr:.2e}|"
             f"|DFR {relative_dfr:.2e}|"
-            f"|RDG {duality_gap / (1.0 + jnp.abs(objective_value)):.2e}|"
+            f"|RDG {relative_gap(duality_gap, objective_value):.2e}|"
+            f"{objerr_str}"
             f"{ke_str}"
             f"{time_str}"
         )
