@@ -5,14 +5,13 @@
 
 ## 🚀 Introduction
 
-Jaddle isn’t here to replace your industrial solver. It’s here to show that primal–dual optimization can be elegant, lightweight, and fun. Built in ~3000 lines of JAX.
+Jaddle isn’t here to replace your industrial solver. It’s here to show that primal–dual optimization can be elegant, lightweight, and fun. Built in ~4000 lines of JAX.
 
 Jaddle performs admirably on many hard linear and convex benchmarks, while remaining simple enough for rapid experimentation. Utilizing the basic building blocks that Optax provides, one can specify many complicated variants of primal–dual optimizers all with only 5-10 lines of code.
 
 
 ## ✨ Why Jaddle?
 
-- 🪶 Minimalist: (~3000 lines of code)
 - 🧩 Modular: built on JAX + Optax primitives
 - 🤸‍♀️ Flexible: swap optimizers in ~10 lines
 - 🚀 Portable: CPU / GPU / TPU
