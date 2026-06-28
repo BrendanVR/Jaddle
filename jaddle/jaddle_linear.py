@@ -908,6 +908,7 @@ def solve(
     adaptive_eta=None,
     scale="ruiz+pc",
     output_opt_state=False,
+    return_timing=False,
     scaled_objective=False,
     restarts=0,
     epochs_per_restart=10,
@@ -2083,10 +2084,18 @@ def solve(
             dual_eq=output.dual_eq * c_max,
         )
 
+    # The internal solve time (epoch loop, incl. first-epoch XLA compile but
+    # NOT the scaling / spectral-norm / sparse-setup phase before start_time).
+    # This is the fair like-for-like figure against a baseline solver's own
+    # run() timer, which also excludes problem setup.
+    solve_seconds = end_time - start_time
+
+    result = (output, is_converged)
     if output_opt_state:
-        return output, is_converged, opt_state
-    else:
-        return output, is_converged
+        result = result + (opt_state,)
+    if return_timing:
+        result = result + (solve_seconds,)
+    return result
 
 
 # %%
