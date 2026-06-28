@@ -33,7 +33,7 @@ import jaddle.jaddle_optimisers as jo
 import jaddle.jaddle_linear as jl
 import jaddle.highs_helpers as hh
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DATA_DIR = os.path.join(REPO_ROOT, "data")
 
 
@@ -75,11 +75,17 @@ def parse_args():
     return p.parse_args()
 
 
-def load_relaxed_lp(path, tol):
-    """Load an MPS file via HiGHS, relax integrality, run HiGHS-PDLP as the
-    baseline, and convert to Jaddle's sparse standard form.
+def load_relaxed_lp(path):
+    """Load an MPS file via HiGHS, relax integrality, solve to optimality with
+    HiGHS's exact solver to obtain a trusted reference objective, and convert to
+    Jaddle's sparse standard form.
 
-    Returns (jaddle_lp, highs_objective, highs_seconds, highs_status).
+    HiGHS is used here only as an objective *oracle* (ground-truth optimum), not
+    as a speed competitor -- a same-class PDLP-vs-PDHG timing race is misleading
+    because the two stop on different relative-gap criteria. The exact optimum is
+    an unambiguous answer key for Jaddle's objective gap.
+
+    Returns (jaddle_lp, opt_obj, highs_status).
     """
     highs = hspy.Highs()
     highs.setOptionValue("output_flag", False)
@@ -89,24 +95,17 @@ def load_relaxed_lp(path, tol):
     for col in range(highs.numVariables):
         highs.changeColIntegrality(col, hspy.HighsVarType.kContinuous)
 
-    # HiGHS-PDLP baseline (same first-order-method class as Jaddle).
-    highs.setOptionValue("presolve", "off")
-    highs.setOptionValue("solver", "pdlp")
-    highs.setOptionValue("primal_feasibility_tolerance", tol)
-    highs.setOptionValue("dual_feasibility_tolerance", tol)
-    highs.setOptionValue("pdlp_optimality_tolerance", tol)
-
-    t0 = time.perf_counter()
+    # Solve to optimality with HiGHS's default exact solver (simplex/IPM) to get
+    # the ground-truth objective. Default tolerances; no PDLP.
     highs.run()
-    highs_seconds = time.perf_counter() - t0
 
     info = highs.getInfo()
-    highs_obj = info.objective_function_value
+    opt_obj = info.objective_function_value
     highs_status = highs.modelStatusToString(highs.getModelStatus())
 
     highs_lp = highs.getLp()
     jaddle_lp = hh.highs_to_standard_form_sparse(highs_lp)
-    return jaddle_lp, highs_obj, highs_seconds, highs_status
+    return jaddle_lp, opt_obj, highs_status
 
 
 def run_jaddle(jaddle_lp, tol, max_epochs):
@@ -150,9 +149,10 @@ def run_jaddle(jaddle_lp, tol, max_epochs):
     }
 
 
-def rel_obj_gap(jaddle_obj, ref_obj):
-    """Relative objective gap |jaddle - ref| / (1 + |ref|), PDLP convention."""
-    return abs(jaddle_obj - ref_obj) / (1.0 + abs(ref_obj))
+def rel_obj_gap(jaddle_obj, opt_obj):
+    """Relative gap to the exact optimum |jaddle - opt| / (1 + |opt|),
+    PDLP-convention normalisation."""
+    return abs(jaddle_obj - opt_obj) / (1.0 + abs(opt_obj))
 
 
 def discover_instances(args):
@@ -188,24 +188,21 @@ def main():
         print(f"=== {name} ({size_mb:.1f} MB) ===")
         row = {"problem": name, "size_mb": round(size_mb, 1)}
         try:
-            jaddle_lp, highs_obj, highs_sec, highs_status = load_relaxed_lp(
-                path, args.tol
-            )
+            jaddle_lp, opt_obj, highs_status = load_relaxed_lp(path)
             row.update(
                 {
                     "n_vars": int(jaddle_lp.num_variables()),
                     "n_cons": int(jaddle_lp.num_constraints()),
-                    "highs_obj": highs_obj,
-                    "highs_seconds": highs_sec,
+                    "opt_obj": opt_obj,
                     "highs_status": highs_status,
                 }
             )
             jres = run_jaddle(jaddle_lp, args.tol, args.max_epochs)
             row.update(jres)
-            row["rel_obj_gap"] = rel_obj_gap(jres["jaddle_obj"], highs_obj)
+            row["rel_obj_gap"] = rel_obj_gap(jres["jaddle_obj"], opt_obj)
             row["error"] = ""
             print(
-                f"  HiGHS-PDLP: obj={highs_obj:.6g} ({highs_sec:.2f}s)  |  "
+                f"  optimum (HiGHS exact): {opt_obj:.6g}  |  "
                 f"Jaddle: obj={jres['jaddle_obj']:.6g} "
                 f"(solve={jres['jaddle_solve_seconds']:.2f}s, "
                 f"wall={jres['jaddle_wall_seconds']:.2f}s, "
@@ -228,8 +225,7 @@ CSV_FIELDS = [
     "size_mb",
     "n_vars",
     "n_cons",
-    "highs_obj",
-    "highs_seconds",
+    "opt_obj",
     "highs_status",
     "jaddle_obj",
     "jaddle_converged",
@@ -262,29 +258,24 @@ def _fmt(x, spec="{:.4g}"):
 def print_markdown(rows):
     print("\n## Benchmark Results\n")
     print(
-        "_Times are solve-only (iterate loop incl. first-epoch XLA compile), "
-        "excluding problem setup/scaling, to match HiGHS-PDLP's run() timer. "
-        "See `jaddle_wall_seconds` in the CSV for full call time._\n"
+        "_Optimum is HiGHS's exact solver (simplex/IPM) solved to optimality, "
+        "used as a ground-truth objective oracle. Jaddle time is solve-only "
+        "(iterate loop incl. first-epoch XLA compile, excl. setup/scaling); see "
+        "`jaddle_wall_seconds` in the CSV for full call time._\n"
     )
     print(
-        "| Problem | Vars | Cons | HiGHS-PDLP obj | HiGHS (s) | "
-        "Jaddle obj | Jaddle solve (s) | Converged | Rel. obj gap |"
+        "| Problem | Vars | Cons | Optimum | "
+        "Jaddle obj | Jaddle solve (s) | Converged | Rel. gap to opt |"
     )
-    print(
-        "|---|---:|---:|---:|---:|---:|---:|:---:|---:|"
-    )
+    print("|---|---:|---:|---:|---:|---:|:---:|---:|")
     for r in rows:
         if r.get("error"):
-            print(
-                f"| {r['problem']} | — | — | — | — | — | — | "
-                f"⚠️ error | — |"
-            )
+            print(f"| {r['problem']} | — | — | — | — | — | ⚠️ error | — |")
             continue
         conv = "✅" if r.get("jaddle_converged") else "❌"
         print(
             f"| {r['problem']} | {_fmt(r.get('n_vars'), '{:d}')} | "
-            f"{_fmt(r.get('n_cons'), '{:d}')} | {_fmt(r.get('highs_obj'))} | "
-            f"{_fmt(r.get('highs_seconds'), '{:.2f}')} | "
+            f"{_fmt(r.get('n_cons'), '{:d}')} | {_fmt(r.get('opt_obj'))} | "
             f"{_fmt(r.get('jaddle_obj'))} | "
             f"{_fmt(r.get('jaddle_solve_seconds'), '{:.2f}')} | {conv} | "
             f"{_fmt(r.get('rel_obj_gap'), '{:.2e}')} |"
