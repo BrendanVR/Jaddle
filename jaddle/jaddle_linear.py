@@ -237,21 +237,34 @@ def __sps(
     # per-iteration step size eta rides alongside the primal weight k; otherwise
     # it is just k (or absent when k_scaling is off). These helpers keep the step
     # bodies agnostic to the packing.
+    # Adaptive PDHG carries A @ x_old in the k-slot so the step can reuse last
+    # iteration's A @ x_new instead of recomputing it — a 3->2 matvec cut per
+    # iteration. The slot is (k, eta, Ax). Only plain adaptive pdhg qualifies:
+    # halpern's anchor blend changes the primal after the matvec (so the carried
+    # Ax wouldn't match next iter's x_old), and extragradient is a different
+    # operator with no A @ x_old to reuse. Both keep their existing slots.
+    carry_Ax = adaptive_step and update_mode == "pdhg" and not halpern
+
     def unpack_k(opt_state):
         if k_scaling:
             if halpern:
                 inner, (k, eta, anchor) = opt_state
                 return inner, k, eta, anchor
+            if carry_Ax:
+                inner, (k, eta, Ax) = opt_state
+                return inner, k, eta, Ax
             if adaptive_step:
                 inner, (k, eta) = opt_state
                 return inner, k, eta
             return opt_state
         return opt_state, None
 
-    def pack_k(opt_state, k, eta=None, anchor=None):
+    def pack_k(opt_state, k, eta=None, anchor=None, Ax=None):
         if k_scaling:
             if halpern:
                 return (opt_state, (k, eta, anchor))
+            if carry_Ax:
+                return (opt_state, (k, eta, Ax))
             if adaptive_step:
                 return (opt_state, (k, eta))
             return (opt_state, k)
@@ -313,31 +326,42 @@ def __sps(
                 return jnp.where(interaction > 0.0, move / (2.0 * interaction), jnp.inf)
 
             def make_adaptive_step(trial):
+                # `trial(eta, state, k, Ax_old)` returns (cand, eta_bar, Ax_new):
+                # Ax_old = A @ state.primal (carried, not recomputed); Ax_new =
+                # A @ cand.primal (carried forward to the next iteration). When the
+                # path doesn't carry Ax (halpern), Ax_old/Ax_new are None.
                 def step(carry, _):
                     i, state, average_state, opt_state, total_weight = carry
                     if halpern:
                         opt_state, k, eta, anchor = unpack_k(opt_state)
+                        Ax_old = None
+                    elif carry_Ax:
+                        opt_state, k, eta, Ax_old = unpack_k(opt_state)
                     else:
+                        # extragradient: adaptive but doesn't carry Ax.
                         opt_state, k, eta = unpack_k(opt_state)
+                        Ax_old = None
                     ip1 = jnp.asarray(i + 1, eta.dtype)
 
                     # Retry: while the trial step exceeds its admissible bound,
                     # shrink eta to just under eta_bar and re-trial. The
                     # (1-(i+1)^-0.3) factor < 1 guarantees strict decrease, so the
-                    # loop terminates. Carry (eta, cand, eta_bar).
+                    # loop terminates. Carry (eta, cand, eta_bar, Ax_new). Ax_old is
+                    # eta-invariant (it depends on `state`, fixed across retries),
+                    # so it is closed over, not carried.
                     def cond(c):
-                        eta_c, _, eta_bar_c = c
+                        eta_c, _, eta_bar_c, _ = c
                         return eta_c > eta_bar_c
 
                     def body(c):
-                        eta_c, _, eta_bar_c = c
+                        eta_c, _, eta_bar_c, _ = c
                         eta_s = jnp.minimum((1.0 - ip1 ** (-0.3)) * eta_bar_c, eta_c)
-                        cand_s, eta_bar_s = trial(eta_s, state, k)
-                        return (eta_s, cand_s, eta_bar_s)
+                        cand_s, eta_bar_s, Ax_new_s = trial(eta_s, state, k, Ax_old)
+                        return (eta_s, cand_s, eta_bar_s, Ax_new_s)
 
-                    cand0, eta_bar0 = trial(eta, state, k)
-                    eta0, cand, eta_bar = jax.lax.while_loop(
-                        cond, body, (eta, cand0, eta_bar0)
+                    cand0, eta_bar0, Ax_new0 = trial(eta, state, k, Ax_old)
+                    eta0, cand, eta_bar, Ax_new = jax.lax.while_loop(
+                        cond, body, (eta, cand0, eta_bar0, Ax_new0)
                     )
 
                     if halpern:
@@ -371,9 +395,11 @@ def __sps(
                     eta_next = jnp.where(jnp.isfinite(eta_next), eta_next, eta0)
                     eta_next = jnp.maximum(eta_next, 1e-12)
                     if halpern:
-                        opt_state = pack_k(opt_state, k, eta_next, anchor)
+                        opt_state = pack_k(opt_state, k, eta_next, anchor=anchor)
                     else:
-                        opt_state = pack_k(opt_state, k, eta_next)
+                        # Carry A @ new_state.primal (== Ax_new, since new_state ==
+                        # cand on the pdhg path) for the next iteration's Ax_old.
+                        opt_state = pack_k(opt_state, k, eta_next, Ax=Ax_new)
 
                     if average:
                         w = weight_function(i)
@@ -397,16 +423,22 @@ def __sps(
                 # primal x_bar = 2 x_new - x_old. interaction = dyᵀ A dx (one A·dx).
                 # Halpern uses this same PDHG operator as its base T(z); the anchor
                 # combination is applied in make_adaptive_step.
-                def _trial(eta, state, k):
+                def _trial(eta, state, k, Ax_old):
                     tau = eta / k
                     sigma = eta * k
                     gp = grad_primal_only(state)
                     x_new = projection_primal(state.primal - tau * gp)
-                    # A_dx computed once; x_bar = 2*x_new - x_old so
-                    # A @ x_bar = A @ state.primal + 2 * A_dx. Reusing this
-                    # in grad_dual_only_from_Ax avoids a second A @ x matvec.
-                    Ax_old = lp.A @ state.primal
-                    A_dx = lp.A @ x_new - Ax_old
+                    # Ax_old = A @ state.primal is carried from the previous
+                    # iteration (== last iter's A @ x_new), saving one matvec. Only
+                    # Ax_new = A @ x_new is computed here. A_dx = Ax_new - Ax_old;
+                    # x_bar = 2*x_new - x_old so A @ x_bar = Ax_old + 2 * A_dx.
+                    # Halpern shares this operator but can't carry Ax (its anchor
+                    # blend changes the primal post-matvec), so Ax_old is None and
+                    # recomputed — the 3-matvec path, unchanged from before.
+                    if Ax_old is None:
+                        Ax_old = lp.A @ state.primal
+                    Ax_new = lp.A @ x_new
+                    A_dx = Ax_new - Ax_old
                     Ax_bar = Ax_old + 2.0 * A_dx
                     # Dual variables are unchanged from state at this point, so
                     # state can be passed directly — grad_dual_only_from_Ax only
@@ -423,7 +455,7 @@ def __sps(
                         [dual_eq - state.dual_eq, dual_ineq - state.dual_ineq]
                     )
                     interaction = jnp.abs(jnp.vdot(dy, A_dx))
-                    return cand, _descent_bound(state, cand, k, interaction)
+                    return cand, _descent_bound(state, cand, k, interaction), Ax_new
 
                 step = make_adaptive_step(_trial)
 
@@ -442,7 +474,9 @@ def __sps(
                 # (Korpelevich convention).
                 _MT = 1.0 / jnp.sqrt(2.0)
 
-                def _trial(eta, state, k):
+                def _trial(eta, state, k, Ax_old):
+                    # Extragradient doesn't carry Ax (its line search is matvec-free
+                    # and it isn't the default path); Ax_old is None, Ax_new is None.
                     tau = eta / k
                     sigma = eta * k
                     g = grad(state)
@@ -489,7 +523,7 @@ def __sps(
                     # means the step is locally unconstrained: flag with +inf so
                     # the retry accepts and eta-growth is suppressed.
                     eta_bar = jnp.where(dg2 > 0.0, _MT * jnp.sqrt(dz2 / dg2), jnp.inf)
-                    return cand, eta_bar
+                    return cand, eta_bar, None
 
                 step = make_adaptive_step(_trial)
 
@@ -732,6 +766,15 @@ def __sps(
             # dtype on iteration 1, which scan rejects (while_loop tolerated it).
             # Cast each step's output carry back to the input carry's dtypes so
             # the loop is type-stable regardless of the user optimiser.
+            # Adaptive PDHG carries A @ x in the k-slot to save a matvec per
+            # iteration. The slot enters as (k, eta) from `solve` (which never sees
+            # Ax); seed Ax = A @ x_old here (one matvec/epoch — negligible) and
+            # strip it from the returned opt_state so the caller's contract is
+            # unchanged.
+            if carry_Ax:
+                inner, (k0, eta0) = opt_state
+                opt_state = (inner, (k0, eta0, lp.A @ state.primal))
+
             init_carry = (start_iter, state, average_state, opt_state, total_weight)
             _carry_dtypes = jax.tree.map(lambda x: jnp.asarray(x).dtype, init_carry)
 
@@ -748,6 +791,10 @@ def __sps(
                 None,
                 length=max_iter,
             )
+
+            if carry_Ax:
+                inner, (k0, eta0, _Ax) = opt_state
+                opt_state = (inner, (k0, eta0))
 
             return i, state, average_state, opt_state, total_weight
 
@@ -870,7 +917,6 @@ def solve(
     iterations_per_epoch_decay=1.0,
     iterations_per_epoch_min=100,
     eq_projection_threshold=None,
-    precompile=True,
     vertex_bias=0.0,
     vertex_bias_seed=0,
 ):
@@ -1535,48 +1581,6 @@ def solve(
         dual_term = dual_feasibility_residual / (1.0 + c_norm)
         return jnp.maximum(jnp.maximum(primal_term, dual_term), gap_term)
 
-    if precompile:
-        if verbose:
-            # The precompile below runs a full epoch + metrics through XLA before
-            # the loop. On large LPs (e.g. nug, m≈20k) the first XLA compile can
-            # take tens of seconds with NO output — which looks like a hang. Print
-            # a bracket so the wait is visible. (Pass precompile=False to fold the
-            # compile into epoch 1 instead.)
-            print("Precompiling epoch (first XLA compile; may take a while)...")
-            print("----------------------------------------------")
-            _precompile_t0 = time.time()
-        # run_epoch donates its state/opt_state buffers, so feed the warm-up
-        # *copies* — the real state/opt_state the timed loop uses must survive.
-        _warm_state = jax.tree.map(lambda x: x + 0, state)
-        _warm_opt_state = jax.tree.map(lambda x: x + 0, opt_state)
-        _precompile_result = __sps(
-            1,
-            0,
-            lp,
-            optimiser,
-            _warm_state,
-            average_state,
-            _warm_opt_state,
-            weight_function,
-            total_weight,
-            primal_damping,
-            dual_damping_ineq,
-            dual_damping_eq,
-            average,
-            update_mode,
-            k_scaling=k_scaling,
-            k_init=k_init,
-            adaptive_eta=adaptive_eta,
-        )
-        # Warm the end-of-epoch metrics fn too, with the exact state the hot
-        # loop will feed it (average vs iterate is a Python-static choice), so
-        # epoch 1 doesn't pay its first-call compile inside the timed loop.
-        _precompile_metrics = compute_epoch_metrics(average_state if average else state)
-        jax.block_until_ready((_precompile_result, _precompile_metrics))
-        if verbose:
-            print(f"Precompile done in {time.time() - _precompile_t0:.1f}s")
-            print("----------------------------------------------")
-
     def _read_k_eta(opt_state):
         # Surface the live primal weight k and adaptive step eta from the
         # opt_state k-slot for the epoch trace. Layout: (inner, k) for plain
@@ -1665,7 +1669,18 @@ def solve(
                 adaptive_eta=adaptive_eta,
             )
             # __sps increments the (restart-shifted) counter; restore global i.
-            i = shifted_i + restart_i_offset
+            # `shifted_i` comes back as a JAX array (it is the scan-carried loop
+            # index). Coerce to a Python int so the `start_iter` argument fed to
+            # __sps next epoch (i - restart_i_offset) stays a Python int. Otherwise
+            # it flips int -> ArrayImpl after epoch 1, and since start_iter is a
+            # traced (non-static) argument that type change retraces run_epoch —
+            # a second ~0.6s XLA compile billed to epoch 2.
+            i = int(shifted_i) + restart_i_offset
+            # Same flip for total_weight: it returns as a float64 JAX array but
+            # enters epoch 1 as a weak-typed Python float. Coerce back to a Python
+            # float so its type is stable across epochs — otherwise the weak->strong
+            # change retraces run_epoch a second time, billed to epoch 2.
+            total_weight = float(total_weight)
 
             # JAX dispatch is async: __sps returns futures that may still be in
             # flight. Force them here so the epoch timer captures the real
