@@ -892,8 +892,11 @@ def solve(
         # it's a traced while_loop bound, not a static scan length.)
         # run_epoch donates its state/opt_state buffers, so feed the warm-up
         # *copies* — the real state/opt_state the timed loop uses must survive.
-        _warm_state = jax.tree.map(lambda x: x + 0, state)
-        _warm_opt_state = jax.tree.map(lambda x: x + 0, opt_state)
+        # Use jnp.copy (not `x + 0`): adding 0 promotes boolean leaves such as
+        # optax adadelta's `is_initial_step` from bool to int32, which then
+        # mismatches the scan carry's bool output and raises a dtype TypeError.
+        _warm_state = jax.tree.map(jnp.copy, state)
+        _warm_opt_state = jax.tree.map(jnp.copy, opt_state)
         _precompile_result = __sps(
             current_iterations_per_epoch,
             i - restart_i_offset,

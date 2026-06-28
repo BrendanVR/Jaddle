@@ -846,7 +846,10 @@ def __sps(
     # epoch, off the per-iteration hot path. (XLA elides the copy when there is
     # nothing to alias.)
     state = jax.tree.map(lambda x: x + 0, state)
-    opt_state = jax.tree.map(lambda x: x + 0, opt_state)
+    # jnp.copy (not `x + 0`) for opt_state: `+ 0` promotes boolean leaves such
+    # as optax adadelta's `is_initial_step` from bool to int32, breaking the
+    # scan/while carry dtype match.
+    opt_state = jax.tree.map(jnp.copy, opt_state)
 
     return run_epoch(
         start_iter,
