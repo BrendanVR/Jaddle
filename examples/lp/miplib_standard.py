@@ -9,85 +9,57 @@ import os
 # Suppress INFO and WARNING logs from XLA/JAX
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
-import jax
-import jax.numpy as jnp
-
-# jax.config.update(
-#     "jax_platform_name", "cpu"
-# )  # Using CPU for this example, as the problem is not large and we want to avoid GPU overhead
-# jax.config.update(
-#     "jax_enable_x64", True
-# )  # Use 64-bit precision for better numerical stability
-
-jax.config.update("eager_constant_folding", True)
-jax.config.update("jax_bcoo_cusparse_lowering", True)
-
+import highspy as hspy
+import jaddle.jaddle_optimisers as jo
 import jaddle.jaddle_linear as jl
 import jaddle.highs_helpers as hh
-import jaddle.jaddle_optimisers as jo
-import highspy as hspy
-import optax
+import jax.numpy as jnp
 
 # %%
-PROBLEM_NAME = "stp3d"
-jax_mode = "max_speed"
-gpu = "y"
-float_precision = "y"
-scale = "ruiz+pc"
-
-if jax_mode in ["balanced", "safe", "max_speed"]:
-    jo.configure_jax(jax_mode)
-else:
-    print("Invalid JAX mode. Using default precision.")
-
-if gpu == "y":
-    jax.config.update("jax_platform_name", "gpu")
-else:
-    jax.config.update("jax_platform_name", "cpu")
-
-if float_precision == "y":
-    jax.config.update("jax_enable_x64", False)
-else:
-    jax.config.update("jax_enable_x64", True)
+jo.configure_jax("float64")
 
 # %% [markdown]
 # ## Load the LP
 # We load a MIPLIB LP from an MPS file using the `highspy` library.
+PROBLEM_NAME = "app1-2"  # name of MIPLIB problem (without .mps extension)
 highs = hspy.Highs()
 highs.readModel(
     f"/home/brendanvr/python/Jaddle/data/{PROBLEM_NAME}.mps"
 )  # path to MPS file
 
+# %%
+# Relax integrality
+for col in range(highs.numVariables):
+    highs.changeColIntegrality(col, hspy.HighsVarType.kContinuous)
+
+# %%
+highs.setOptionValue("presolve", "off")
+highs.setOptionValue("primal_feasibility_tolerance", 1e-3)
+highs.setOptionValue("dual_feasibility_tolerance", 1e-3)
+highs.setOptionValue("pdlp_optimality_tolerance", 1e-5)
+highs.setOptionValue("solver", "pdlp")
+highs.solve()
+
 
 # %% [markdown]
 # We convert the LP to Jaddle's sparse format, before applying the selected scaling strategy.
 highs_lp = highs.getLp()
-jaddle_lp = jl.to_jaddle_sparse(hh.highs_to_standard_form_sparse(highs_lp))
+lp = hh.highs_to_standard_form_sparse(highs_lp)
 
 # %% [markdown]
 # ## Solve the presolved LP using Jaddle's saddle point solver
-jl.lp_summary_statistics(jaddle_lp)
-
-
-learning_rate = optax.exponential_decay(
-    init_value=1e-2, transition_steps=1000, decay_rate=0.9,
-)
-
-optimiser =jo.create_saddle_optimiser(optax.optimistic_adam_v2(learning_rate=learning_rate,alpha=0.01))
-solution, _ = jl.solve(
-    lp=jaddle_lp,
-    optimiser=optimiser, 
+print("Problem:", PROBLEM_NAME)
+jl.lp_summary_statistics(lp)
+solution_jaddle, _ = jl.solve(
+    lp,
     verbose=True,
-    log_every=1,
-    scale=scale,
-    update_mode="alternating",
-    average="polyak",
-    weight_function=lambda k: jax.lax.cond(k < 1000, lambda: 1e-12, lambda: 1.0)
+    k_scale=1e2,
+    adaptive_eta=1,
+    iterations_per_epoch=1000,
+    restarts=50,
+    epochs_per_restart=1,
+    restart_multiplier=2,
+    update_mode="pdhg",
 )
-
-# %%
-print(f"Primal Equality Residual: {jaddle_lp.eq_slack(solution.primal)}")
-print(f"Primal Inequality Residual: {jaddle_lp.ineq_slack(solution.primal)}")
-print("----------------------------------------------")
 
 # %%

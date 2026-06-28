@@ -1,22 +1,24 @@
 # %% [markdown]
 # # Isotonic Regression with Jaddle
-# This example demonstrates how to perform modified isotonic regression using Jaddle.
-# Isotonic regression is a type of regression that fits a non-decreasing function to the data. Here we impose an extra mean constraint
-# on the solution.
+# This example demonstrates how to perform isotonic regression using Jaddle.
+# Isotonic regression is a type of regression that fits a non-decreasing function to the data.
 
 # %%
 import numpy as np
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import jaddle.jaddle_convex as jc
+import jaddle.jaddle_optimisers as jo
+
+jo.configure_jax("float32")
 
 # %% [markdown]
 # ## Generate Synthetic Data
 # We will create synthetic data that follows a cubic relationship with some added noise.
-n = 500
+n = 1000
 x = np.linspace(-1, 1, n)
 y = x**3
-y += 0.1 * np.random.randn(n)  # add noise
+y += 0.15 * np.random.randn(n)  # add noise
 
 
 # %% [markdown]
@@ -32,13 +34,13 @@ def constraints_ineq(y_pred):
 
 
 def constraints_eq(y_pred):
-    return jnp.array([y_pred.mean() - 0.1])  # mean of y_pred should be 0.1
+    return jnp.zeros(0)  # No equality constraints in this example
 
 
-lower_bounds = -jnp.inf * jnp.ones(n)
-upper_bounds = jnp.inf * jnp.ones(n)
+lower_bounds = -jnp.ones(n)
+upper_bounds = jnp.ones(n)
 
-cp = jc.CP(
+cp = jc.JaddleCP(
     num_variables=n,
     objective=objective,
     constraints_eq=constraints_eq,
@@ -49,7 +51,14 @@ cp = jc.CP(
 
 # %% [markdown]
 # ## Solve the problem using Jaddle Convex SPS optimizer
-solution = jc.solve(cp)
+solution, _ = jc.solve(
+    cp,
+    verbose=True,
+    primal_feasibility_tolerance=1e-5,
+    update_mode="extragradient",
+    adaptive_eta=1,
+    iterations_per_epoch=1000,
+)
 
 # %%
 plt.figure(figsize=(10, 6))
@@ -57,13 +66,13 @@ plt.plot(x, y, label="Noisy data", marker="o", linestyle="", alpha=0.2)
 plt.plot(
     x,
     solution.primal,
-    label="Modified isotonic regression solution",
+    label="Isotonic regression solution",
     color="red",
     linewidth=2,
 )
 plt.xlabel("x")
 plt.ylabel("y")
-plt.title("Modified Isotonic Regression using Jaddle")
+plt.title("Isotonic Regression using Jaddle")
 plt.legend()
 plt.show()
 
@@ -71,9 +80,7 @@ plt.show()
 # Verify that the solution satisfies the constraints
 y_pred = solution.primal
 ineq_violations = constraints_ineq(y_pred)
-eq_violations = constraints_eq(y_pred)
 print("Max Inequality Constraint Violation (should be <= 0):", cp.ineq_slack(y_pred))
-print("Max Equality Constraint Violation (should be == 0):", cp.eq_slack(y_pred))
 print("Optimal Objective Value:", objective(y_pred))
 
 # %%
