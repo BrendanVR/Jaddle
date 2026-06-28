@@ -1,7 +1,7 @@
 # %% [markdown]
 # # Solve a Scaled LP using Jaddle Saddle Point Optimisation
 # This example demonstrates how to load and solve a MIPLIB linear program (LP) using saddle point optimisation methods implemented in Jaddle.
-# We will use the `highspy` library to load a MIPLIB LP from an MPS file.
+# We will use the `highspy` library to load a MIPLIB LP from an MPS file. We do not ship the MPS files with Jaddle, but they can be downloaded from the [MIPLIB website](https://miplib.zib.de/).
 
 # %%
 import os
@@ -22,10 +22,9 @@ jo.configure_jax("float64")
 # ## Load the LP
 # We load a MIPLIB LP from an MPS file using the `highspy` library.
 PROBLEM_NAME = "app1-2"  # name of MIPLIB problem (without .mps extension)
+PATH_TO_MPS = f"/home/brendanvr/python/Jaddle/data/{PROBLEM_NAME}.mps"  # The path to the MPS file. You will need to download the MPS file from the MIPLIB website and change this path.
 highs = hspy.Highs()
-highs.readModel(
-    f"/home/brendanvr/python/Jaddle/data/{PROBLEM_NAME}.mps"
-)  # path to MPS file
+highs.readModel(PATH_TO_MPS)  # path to MPS file
 
 # %%
 # Relax integrality
@@ -55,11 +54,6 @@ solution_jaddle, _ = jl.solve(
     verbose=True,
     k_scale=1e2,
     adaptive_eta=1,
-    iterations_per_epoch=1000,
-    restarts=50,
-    epochs_per_restart=1,
-    restart_multiplier=2,
-    update_mode="pdhg",
 )
 
 # %%
