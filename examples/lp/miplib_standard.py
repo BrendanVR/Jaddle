@@ -22,7 +22,11 @@ jo.configure_jax("float64")
 # ## Load the LP
 # We load a MIPLIB LP from an MPS file using the `highspy` library.
 PROBLEM_NAME = "app1-2"  # name of MIPLIB problem (without .mps extension)
-PATH_TO_MPS = f"/home/brendanvr/python/Jaddle/data/{PROBLEM_NAME}.mps"  # The path to the MPS file. You will need to download the MPS file from the MIPLIB website and change this path.
+# Download the MPS file from the MIPLIB website (https://miplib.zib.de/) and
+# place it in the `data/` directory at the repo root, or override PATH_TO_MPS.
+PATH_TO_MPS = os.path.join(
+    os.path.dirname(__file__), "..", "..", "data", f"{PROBLEM_NAME}.mps"
+)
 highs = hspy.Highs()
 highs.readModel(PATH_TO_MPS)  # path to MPS file
 

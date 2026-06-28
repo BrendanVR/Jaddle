@@ -11,6 +11,9 @@ setup(
         "scipy",
         "highspy",
     ],
+    extras_require={
+        "examples": ["scikit-learn"],
+    },
     author="Brendan van Rooyen",
     description="A JAX-based saddle solver for linear and convex programs",
     license="MIT",
