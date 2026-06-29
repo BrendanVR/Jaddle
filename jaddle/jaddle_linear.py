@@ -1362,9 +1362,15 @@ def solve(
         # spuriously reported as gap-infinite and never certifies a PDLP-optimal
         # point (boeing: DFR_rel 5.4e-4 < 1e-3 but the gap was +∞). Beyond that
         # band the term is −∞ (genuine dual infeasibility → gap undefined).
-        # `c_norm` is defined below in `solve`, resolved at call time via closure.
+        # The band uses `c_norm_robust` (median-based, NOT the ∞-norm) so big-M /
+        # penalty cost coefficients can't inflate it and fabricate a finite gap at
+        # a dual-infeasible point — see the c_norm_robust definition in `solve` for
+        # the binkar10_1 failure this guards against. On well-scaled problems
+        # c_norm_robust == c_norm, so boeing is unchanged. Both are defined below
+        # in `solve` and resolved at call time via closure.
         _dg_tol = jnp.asarray(
-            dual_feasibility_threshold * (1.0 + c_norm), reduced_cost_true.dtype
+            dual_feasibility_threshold * (1.0 + c_norm_robust),
+            reduced_cost_true.dtype,
         )
         neg_inf = jnp.asarray(-jnp.inf, reduced_cost.dtype)
         lower_only_term = jnp.where(reduced_cost_true >= -_dg_tol, lower_term, neg_inf)
@@ -1603,6 +1609,36 @@ def solve(
     _row_scale_all = jnp.concatenate([jnp_row_scale_eq, jnp_row_scale_ineq])
     b_norm = float(jnp.max(jnp.abs(lp.b / _row_scale_all))) if lp.b.size else 0.0
     c_norm = float(jnp.max(jnp.abs(lp.c / col_scale))) if lp.c.size else 0.0
+
+    # Robust cost norm for the gap's dual-feasibility SIGN-GUARD band only. The
+    # band `_dg_tol = tol·(1+norm)` decides whether a wrong-sign reduced cost is
+    # tolerated (term finite) or genuinely dual-infeasible (term −∞ → gap +∞).
+    # Keying it to the ∞-norm `c_norm` breaks on big-M / penalty problems where a
+    # handful of huge cost coefficients dominate: binkar10_1 has 90 entries of 1e6
+    # against a median |c|≈25, so c_norm=1e6 inflated the band to ~1000 and a point
+    # with reduced costs as negative as −61 was treated as dual-feasible, making
+    # `duality_gap` finite and tiny (RDG 5e-4) at a point a TRUE 14% above optimum
+    # (gap ≈ 1031). The certificate then falsely fired. A median-based norm tracks
+    # the problem's NATURAL cost scale (unpolluted by big-M), so the band stays
+    # tight enough to reject big-M wrong-sign mass while still matching c_norm on
+    # well-scaled problems (boeing: median≈∞-norm≈43, band unchanged → its genuine
+    # near-feasible dual, needing ~0.024 slack, still certifies). The *reported*
+    # DFR residual test below keeps the PDLP ∞-norm convention; only the gap
+    # finiteness guard uses this robust norm. `min(c_norm, …)` ensures we never
+    # LOOSEN relative to the ∞-norm — only tighten when big-M pollution is present.
+    if lp.c.size:
+        _c_true = jnp.abs(lp.c / col_scale)
+        _c_nonzero = _c_true[_c_true > 0]
+        if _c_nonzero.size:
+            _c_median = float(jnp.median(_c_nonzero))
+            # 1e3·median is a generous multiple of the natural scale — wide enough
+            # to never clip a genuine reduced cost, narrow enough that big-M
+            # coefficients (≫1e3× the median) cannot inflate the band.
+            c_norm_robust = min(c_norm, max(_c_median * 1e3, 1.0))
+        else:
+            c_norm_robust = c_norm
+    else:
+        c_norm_robust = 0.0
 
     def kkt_merit(
         constraint_bound,

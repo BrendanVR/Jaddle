@@ -85,10 +85,11 @@ def load_relaxed_lp(path):
     because the two stop on different relative-gap criteria. The exact optimum is
     an unambiguous answer key for Jaddle's objective gap.
 
-    Returns (jaddle_lp, opt_obj, highs_status).
+    Returns (jaddle_lp, opt_obj, highs_status, offset), where `offset` is the
+    presolved model's constant objective offset (add it to jaddle's c^T x to
+    compare against the full-problem `opt_obj`).
     """
     highs = hspy.Highs()
-    highs.setOptionValue("output_flag", False)
     highs.readModel(path)
 
     # Relax integrality so we solve the LP relaxation.
@@ -97,15 +98,25 @@ def load_relaxed_lp(path):
 
     # Solve to optimality with HiGHS's default exact solver (simplex/IPM) to get
     # the ground-truth objective. Default tolerances; no PDLP.
+    highs.setOptionValue("output_flag", "false")
     highs.run()
 
     info = highs.getInfo()
     opt_obj = info.objective_function_value
     highs_status = highs.modelStatusToString(highs.getModelStatus())
 
-    highs_lp = highs.getLp()
+    highs.presolve()
+    highs_lp = highs.getPresolvedLp()
     jaddle_lp = hh.highs_to_standard_form_sparse(highs_lp)
-    return jaddle_lp, opt_obj, highs_status
+    # Presolve folds eliminated variables' cost contributions into a constant
+    # objective offset that lives OUTSIDE the reduced `c` vector. The converter
+    # (highs_to_standard_form_sparse) reads only col_cost_, so jaddle's objective
+    # is c^T x on the reduced problem; HiGHS reports c^T x + offset_. We carry the
+    # offset out so the reported objective is comparable to the full-problem
+    # optimum `opt_obj`. The offset is a pure constant — it shifts the objective
+    # but not the argmin, so it stays a reporting concern and never enters solve().
+    offset = float(highs_lp.offset_)
+    return jaddle_lp, opt_obj, highs_status, offset
 
 
 def run_jaddle(jaddle_lp, tol, max_epochs):
@@ -122,7 +133,8 @@ def run_jaddle(jaddle_lp, tol, max_epochs):
     t0 = time.perf_counter()
     solution, converged, solve_seconds = jl.solve(
         jaddle_lp,
-        verbose=False,
+        verbose=True,
+        log_every=10,
         primal_feasibility_tolerance=tol,
         dual_feasibility_tolerance=tol,
         dual_gap_tolerance=tol,
@@ -130,7 +142,7 @@ def run_jaddle(jaddle_lp, tol, max_epochs):
         k_scale=1e2,
         adaptive_eta=1,
         iterations_per_epoch=1000,
-        restarts=0,
+        restarts=10,
         max_epochs=max_epochs,
         return_timing=True,
     )
@@ -172,7 +184,7 @@ def discover_instances(args):
 
 def main():
     args = parse_args()
-    jo.configure_jax("max_speed")
+    jo.configure_jax("float64")
 
     instances = discover_instances(args)
     if not instances:
@@ -188,7 +200,28 @@ def main():
         print(f"=== {name} ({size_mb:.1f} MB) ===")
         row = {"problem": name, "size_mb": round(size_mb, 1)}
         try:
-            jaddle_lp, opt_obj, highs_status = load_relaxed_lp(path)
+            jaddle_lp, opt_obj, highs_status, offset = load_relaxed_lp(path)
+
+            if jaddle_lp.A_eq.shape[0] == 0:
+                import jax.experimental.sparse as jsp
+                import jax.numpy as jnp
+
+                jaddle_lp.A_eq = jsp.BCOO(
+                    (jnp.zeros((1,)), jnp.array([[0, 0]])),
+                    shape=(1, jaddle_lp.num_variables()),
+                )
+                jaddle_lp.b_eq = jnp.zeros(1)
+
+            if jaddle_lp.A_ineq.shape[0] == 0:
+                import jax.experimental.sparse as jsp
+                import jax.numpy as jnp
+
+                jaddle_lp.A_ineq = jsp.BCOO(
+                    (jnp.zeros((1,)), jnp.array([[0, 0]])),
+                    shape=(1, jaddle_lp.num_variables()),
+                )
+                jaddle_lp.b_ineq = jnp.zeros(1)
+
             row.update(
                 {
                     "n_vars": int(jaddle_lp.num_variables()),
@@ -198,7 +231,11 @@ def main():
                 }
             )
             jres = run_jaddle(jaddle_lp, args.tol, args.max_epochs)
+            # jaddle solves the presolved reduced problem (objective = c^T x);
+            # add the presolve offset to compare against the full-problem opt_obj.
+            jres["jaddle_obj"] += offset
             row.update(jres)
+            row["offset"] = offset
             row["rel_obj_gap"] = rel_obj_gap(jres["jaddle_obj"], opt_obj)
             row["error"] = ""
             print(
@@ -226,6 +263,7 @@ CSV_FIELDS = [
     "n_vars",
     "n_cons",
     "opt_obj",
+    "offset",
     "highs_status",
     "jaddle_obj",
     "jaddle_converged",
@@ -284,3 +322,5 @@ def print_markdown(rows):
 
 if __name__ == "__main__":
     main()
+
+# %%
