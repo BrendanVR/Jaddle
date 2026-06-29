@@ -33,6 +33,8 @@ import jaddle.jaddle_optimisers as jo
 import jaddle.jaddle_linear as jl
 import jaddle.highs_helpers as hh
 
+from scan_bigm import is_bigm_cost
+
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DATA_DIR = os.path.join(REPO_ROOT, "data")
 
@@ -56,6 +58,13 @@ def parse_args():
         "instances can OOM or run for very long). Set 0 to disable.",
     )
     p.add_argument(
+        "--min-mb",
+        type=float,
+        default=0.0,
+        help="Skip .mps files smaller than this many MB (default 0; raise to "
+        "target larger LPs only).",
+    )
+    p.add_argument(
         "--tol",
         type=float,
         default=1e-3,
@@ -72,10 +81,25 @@ def parse_args():
         default=os.path.join(REPO_ROOT, "benchmark_results.csv"),
         help="Path to write CSV results.",
     )
+    p.add_argument(
+        "--skip-highs",
+        action="store_true",
+        help="Skip the HiGHS reference solve and report NaN for the optimum "
+        "(and rel_obj_gap). Useful for very large LPs where the exact solve is "
+        "prohibitively slow; jaddle still runs and its objective is reported.",
+    )
+    p.add_argument(
+        "--skip-bigm",
+        action="store_true",
+        help="Skip instances with a big-M / penalty COST structure (wide "
+        "dynamic range in the objective coefficients, e.g. glass4, binkar10_1). "
+        "These stall the saddle-point solver at a feasible-but-suboptimal point "
+        "and waste the epoch budget. See benchmarks/scan_bigm.py.",
+    )
     return p.parse_args()
 
 
-def load_relaxed_lp(path):
+def load_relaxed_lp(path, skip_highs=False):
     """Load an MPS file via HiGHS, relax integrality, solve to optimality with
     HiGHS's exact solver to obtain a trusted reference objective, and convert to
     Jaddle's sparse standard form.
@@ -84,6 +108,11 @@ def load_relaxed_lp(path):
     as a speed competitor -- a same-class PDLP-vs-PDHG timing race is misleading
     because the two stop on different relative-gap criteria. The exact optimum is
     an unambiguous answer key for Jaddle's objective gap.
+
+    When ``skip_highs`` is True the reference solve is skipped entirely (the
+    exact solve can be prohibitively slow on very large LPs); ``opt_obj`` is
+    returned as NaN and ``highs_status`` as "skipped". The presolve + conversion
+    still run, since jaddle solves the presolved LP and needs its offset.
 
     Returns (jaddle_lp, opt_obj, highs_status, offset), where `offset` is the
     presolved model's constant objective offset (add it to jaddle's c^T x to
@@ -96,14 +125,19 @@ def load_relaxed_lp(path):
     for col in range(highs.numVariables):
         highs.changeColIntegrality(col, hspy.HighsVarType.kContinuous)
 
-    # Solve to optimality with HiGHS's default exact solver (simplex/IPM) to get
-    # the ground-truth objective. Default tolerances; no PDLP.
     highs.setOptionValue("output_flag", "false")
-    highs.run()
+    if skip_highs:
+        opt_obj = float("nan")
+        highs_status = "skipped"
+    else:
+        # Solve to optimality with HiGHS's default exact solver (simplex/IPM) to
+        # get the ground-truth objective. Default tolerances; no PDLP.
+        highs.setOptionValue("solver", "simplex")
+        highs.run()
 
-    info = highs.getInfo()
-    opt_obj = info.objective_function_value
-    highs_status = highs.modelStatusToString(highs.getModelStatus())
+        info = highs.getInfo()
+        opt_obj = info.objective_function_value
+        highs_status = highs.modelStatusToString(highs.getModelStatus())
 
     highs.presolve()
     highs_lp = highs.getPresolvedLp()
@@ -139,12 +173,16 @@ def run_jaddle(jaddle_lp, tol, max_epochs):
         dual_feasibility_tolerance=tol,
         dual_gap_tolerance=tol,
         update_mode="pdhg",
-        k_scale=1e2,
-        adaptive_eta=1,
+        k_scale=1e3,
+        k_theta=0.3,
+        k_update_per_epoch=True,
+        adaptive_eta=0.0,
         iterations_per_epoch=1000,
-        restarts=10,
         max_epochs=max_epochs,
         return_timing=True,
+        primal_stop=False,
+        primal_stop_obj_tol=1e-4,
+        primal_stop_window=50,
     )
     wall_seconds = time.perf_counter() - t0
 
@@ -178,6 +216,12 @@ def discover_instances(args):
         if args.max_mb and size_mb > args.max_mb:
             print(f"  skip {name} ({size_mb:.0f} MB > --max-mb {args.max_mb:.0f})")
             continue
+        if args.min_mb and size_mb < args.min_mb:
+            print(f"  skip {name} ({size_mb:.1f} MB < --min-mb {args.min_mb:.1f})")
+            continue
+        if args.skip_bigm and is_bigm_cost(path):
+            print(f"  skip {name} (big-M cost structure; --skip-bigm)")
+            continue
         instances.append((name, path, size_mb))
     return instances
 
@@ -200,7 +244,9 @@ def main():
         print(f"=== {name} ({size_mb:.1f} MB) ===")
         row = {"problem": name, "size_mb": round(size_mb, 1)}
         try:
-            jaddle_lp, opt_obj, highs_status, offset = load_relaxed_lp(path)
+            jaddle_lp, opt_obj, highs_status, offset = load_relaxed_lp(
+                path, skip_highs=args.skip_highs
+            )
 
             if jaddle_lp.A_eq.shape[0] == 0:
                 import jax.experimental.sparse as jsp

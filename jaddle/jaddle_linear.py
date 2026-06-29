@@ -905,6 +905,7 @@ def solve(
     k_scale=None,
     k_theta=0.5,
     k_init=None,
+    k_update_per_epoch=True,
     adaptive_eta=None,
     scale="ruiz+pc",
     output_opt_state=False,
@@ -993,6 +994,17 @@ def solve(
             scaled space the solver iterates in). Pass a float to override
             (``1.0`` = symmetric steps, the PC/Ruiz-scaled baseline). Only used
             when ``k_scale`` is set.
+        k_update_per_epoch: When ``True`` (default), the primal weight ``k`` is
+            rebalanced at every epoch boundary (not only at restarts) using the
+            primal-vs-dual iterate movement over the just-finished epoch — same
+            log-space geometric-mean blend (``k_theta``) and ``[1/k_scale,
+            k_scale]`` clamp as the restart rebalance. Unlike a restart it does
+            NOT reset momentum/averaging or (for halpern) re-anchor ``z_0`` / reset
+            ``eta``; only the ``k`` component of the optimiser state changes, so
+            the gradient reweighting tracks the local primal/dual progress within a
+            restart cycle. Active only for ``update_mode`` in
+            ``{"pdhg", "extragradient", "halpern"}`` with ``k_scale`` set. Set
+            ``False`` to keep the prior behaviour (k frozen between restarts).
         adaptive_eta: Enables a cuPDLP-style per-iteration adaptive step size with
             a line search. ``None`` (default) keeps the optimiser's fixed learning
             rate. A float seeds a single scalar base step ``eta`` that drives the
@@ -1508,7 +1520,15 @@ def solve(
         # `primal_stop_window` epochs below `primal_stop_obj_tol`. `obj_window`
         # holds the most recent objective values (oldest first). The duality gap
         # and dual residuals are still computed but do NOT gate here.
-        feasible = constraint_bound <= primal_feasibility_tolerance
+        #
+        # Primal feasibility is tested RELATIVELY — constraint_bound / (1+‖b‖) —
+        # to match `converged()` and the printed PFR. The raw absolute
+        # `constraint_bound` is misleadingly large on big-‖b‖ problems (e.g. big-M
+        # relaxations): an absolute `constraint_bound <= tol` test never fires even
+        # when the relative PFR is deep inside tolerance, so primal_stop ran to
+        # max_epochs while reporting a feasible-looking PFR.
+        relative_primal_residual = constraint_bound / (1.0 + b_norm)
+        feasible = relative_primal_residual <= primal_feasibility_tolerance
         oldest = obj_window[0]
         newest = obj_window[-1]
         rel_change = jnp.abs(newest - oldest) / (1.0 + jnp.abs(newest))
@@ -1577,6 +1597,18 @@ def solve(
     # to (freed by) __sps each epoch, so sharing it would read as deleted at the
     # first restart's k-rebalance.
     state_at_last_restart = jax.tree.map(lambda x: x + 0, initial_solution)
+
+    # Per-epoch primal-weight rebalance (k_update_per_epoch): reference iterate at
+    # the end of the previous epoch, used to drive k from the primal-vs-dual
+    # movement over the just-finished epoch. Independent copy for the same
+    # buffer-donation reason as state_at_last_restart. Only the three contractive
+    # schemes that can carry a meaningful k qualify.
+    k_per_epoch = (
+        k_scaling
+        and k_update_per_epoch
+        and update_mode in ("pdhg", "extragradient", "halpern")
+    )
+    state_at_last_epoch = jax.tree.map(lambda x: x + 0, initial_solution)
 
     # Rolling window of recent objective values for the opt-in primal_stop rule
     # (oldest first). Seeded with inf so the window is not "full" until enough
@@ -1714,7 +1746,15 @@ def solve(
 
     def is_done():
         if primal_stop:
-            return bool(converged_primal(constraint_bound, obj_window))
+            return bool(converged_primal(constraint_bound, obj_window)) or bool(
+                converged(
+                    constraint_bound,
+                    dual_feasibility_residual,
+                    duality_gap,
+                    dual_gap_is_finite,
+                    objective_value,
+                )
+            )
         return bool(
             converged(
                 constraint_bound,
@@ -1724,6 +1764,25 @@ def solve(
                 objective_value,
             )
         )
+
+    # PDLP-style primal-weight rebalance from the primal-vs-dual *movement*
+    # between two iterates (distance, not per-step gradient norms). Shared by the
+    # restart rebalance and the per-epoch rebalance: log-space geometric-mean
+    # blend of the movement-ratio target with the current weight (k_theta), then
+    # clamp to [k_lo, k_hi]. Squared norms avoid two sqrts; the ratio is preserved.
+    def _rebalance_k(new_state, ref_state, k_prev):
+        dp = new_state.primal - ref_state.primal
+        dd = jnp.concatenate(
+            [
+                new_state.dual_eq - ref_state.dual_eq,
+                new_state.dual_ineq - ref_state.dual_ineq,
+            ]
+        )
+        move_p2 = jnp.vdot(dp, dp) + 1e-60
+        move_d2 = jnp.vdot(dd, dd) + 1e-60
+        k_target = jnp.sqrt(move_p2 / move_d2)
+        log_k = k_theta * jnp.log(k_target) + (1.0 - k_theta) * jnp.log(k_prev)
+        return jnp.clip(jnp.exp(log_k), k_lo, k_hi)
 
     start_time = time.time()
 
@@ -1872,6 +1931,7 @@ def solve(
                 )
 
             # --- Adaptive restart decision ---
+            restarted_this_epoch = False
             if restarts and restarts_done < restarts:
                 epochs_since_restart += 1
 
@@ -1956,6 +2016,7 @@ def solve(
                 )
 
                 if sufficient_progress or stalling_restart or cycle_exhausted:
+                    restarted_this_epoch = True
                     # Warm-start restart from the better of {average, iterate};
                     # reset momentum, averaging, weight accumulation and the LR /
                     # weight_function schedule (via the iteration offset).
@@ -1966,24 +2027,10 @@ def solve(
                         # (distance between iterates), not per-step gradient
                         # norms. log-space geometric-mean blend with the current
                         # weight (k_theta), then clamp. Reset momentum.
-                        dp = state.primal - state_at_last_restart.primal
-                        dd = jnp.concatenate(
-                            [
-                                state.dual_eq - state_at_last_restart.dual_eq,
-                                state.dual_ineq - state_at_last_restart.dual_ineq,
-                            ]
-                        )
-                        # Use squared norms to avoid two sqrt ops; ratio is preserved.
-                        move_p2 = jnp.vdot(dp, dp) + 1e-60
-                        move_d2 = jnp.vdot(dd, dd) + 1e-60
-                        k_target = jnp.sqrt(move_p2 / move_d2)
                         # The k-slot is (k, eta[, anchor]) in adaptive_step mode,
                         # plain k otherwise. Read k accordingly.
                         k_prev = opt_state[1][0] if adaptive_step else opt_state[1]
-                        log_k = k_theta * jnp.log(k_target) + (1.0 - k_theta) * jnp.log(
-                            k_prev
-                        )
-                        k_new = jnp.clip(jnp.exp(log_k), k_lo, k_hi)
+                        k_new = _rebalance_k(state, state_at_last_restart, k_prev)
                         if halpern:
                             # Restarted Halpern: reset eta AND re-anchor z_0 to the
                             # cycle-start iterate `state`. The lambda counter resets
@@ -2061,6 +2108,28 @@ def solve(
                     # No restart this epoch: record the merit so the next epoch's
                     # condition (ii) can detect a turnaround (merit rising again).
                     prev_epoch_merit = restart_merit
+
+            # Per-epoch primal-weight rebalance. A restart already rebalanced k
+            # (and reset momentum/anchor/eta), so only adjust k on epochs where no
+            # restart fired. Unlike the restart path this leaves the optimiser
+            # state, averaging, halpern anchor and adaptive eta untouched — it only
+            # rewrites the k component of the k-slot, tracking primal/dual progress
+            # within the current restart cycle.
+            if k_per_epoch and not restarted_this_epoch:
+                k_prev = opt_state[1][0] if adaptive_step else opt_state[1]
+                k_new = _rebalance_k(state, state_at_last_epoch, k_prev)
+                if adaptive_step or halpern:
+                    # k-slot is (k, eta) for adaptive pdhg/extragradient and
+                    # (k, eta, anchor) for halpern; rewrite only the k leaf.
+                    opt_state = (opt_state[0], (k_new, *opt_state[1][1:]))
+                else:
+                    opt_state = (opt_state[0], k_new)
+                if verbose and (count == 1 or count % log_every == 0):
+                    print(f"k (per-epoch) -> {float(k_new):.3e}")
+            if k_per_epoch:
+                # Reference for next epoch's movement. Independent copy: `state` is
+                # donated to (freed by) __sps next epoch.
+                state_at_last_epoch = jax.tree.map(lambda x: x + 0, state)
 
         # The while-loop exits the iteration *after* the converging epoch, so its
         # metrics were computed but only printed if it landed on a log_every

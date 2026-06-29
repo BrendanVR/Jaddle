@@ -31,23 +31,29 @@ optimiser = jo.create_saddle_optimiser(
 
 ## 📊 Benchmarks
 
-Jaddle has been tested on challenging MIPLIB relaxations.  While not a production solver, it performs competitively with PDLP‑style methods. Benchmark using my laptops NVIDIA GeForce RT 5070 Ti GPU. Optimum is HiGHS's exact solver (simplex/IPM) solved to optimality, used as a ground-truth objective oracle. Jaddle time is solve-only (iterate loop incl. first-epoch XLA compile, excl. setup/scaling). Crucially it includes XLA compile time, roughly 0.8 seconds of overhead.
+Jaddle has been tested on challenging MIPLIB relaxations. While not a production solver, it performs competitively with PDLP‑style methods. Here we benchmark MIPLIB problems between 30 and 50mb in size using my laptop's NVIDIA GeForce RT 5070 Ti GPU. We make use of Jaddles in-built PDHG solver, with 10 rounds of Ruiz scaling followed by 1 round of PC scaling. Jaddle time is solve-only. Crucially it includes XLA compile time, roughly 0.8 seconds of overhead. cuPDLP-c also failed to converge in 2 minutes on proteindesign121hz512p9 and radiationm40-10-02.
 
-| Problem | Vars | Cons | Optimum | Jaddle obj | Jaddle solve (s) | Converged | Rel. gap to opt |
-|---|---:|---:|---:|---:|---:|:---:|---:|
-| acc-tight5 | 1339 | 3052 | 0 | 0 | 1.05 | ✅ | 0.00e+00 |
-| adlittle | 97 | 56 | 2.255e+05 | 2.255e+05 | 1.01 | ✅ | 1.82e-04 |
-| app1-2 | 26871 | 53467 | -264.6 | -264.6 | 4.15 | ✅ | 2.83e-05 |
-| boeing | 384 | 440 | -335.2 | -335.2 | 4.32 | ✅ | 1.23e-04 |
-| csched010 | 1758 | 351 | 332.4 | 332.9 | 18.63 | ✅ | 1.54e-03 |
-| ex9 | 10404 | 40962 | 81 | 81 | 1.07 | ✅ | 6.93e-16 |
-| lectsched-4-obj | 7901 | 14163 | 0 | 0 | 1.13 | ✅ | 0.00e+00 |
-| lotsize | 2985 | 1920 | 3.484e+05 | 3.485e+05 | 1.22 | ✅ | 1.92e-04 |
-| momentum1 | 5174 | 42680 | 7.279e+04 | 7.279e+04 | 3.22 | ✅ | 6.94e-05 |
-| n9-3 | 7644 | 2364 | 7890 | 7890 | 1.28 | ✅ | 2.18e-08 |
-| net12 | 14115 | 14021 | 17.25 | 17.23 | 1.33 | ✅ | 1.23e-03 |
-| nug | 20448 | 19728 | 214 | 214 | 1.14 | ✅ | 7.10e-07 |
-| sing2 | 31630 | 28891 | 1.715e+07 | 1.689e+07 | 3.86 | ✅ | 1.49e-02 |
+| Problem | Vars | Cons | Jaddle obj | Jaddle solve (s) | Converged |
+|---|---:|---:|---:|---:|:---:|
+| buildingenergy | 145237 | 267853  | 3.325e+04 | 59.86 | ✅  |
+| eilA101-2 | 65832 | 101  | 803.2 | 16.46 | ✅  |
+| ex10 | 15895 | 62931  | 100 | 3.17 | ✅  |
+| map10 | 26617 | 49895  | -602.2 | 49.26 | ✅  |
+| map16715-04 | 26617 | 49895  | -296.3 | 58.51 | ✅  |
+| n3div36 | 22120 | 4454  | 1.144e+05 | 19.57 | ✅  |
+| neos-3555904-turama | 22233 | 67836  | -41.45 | 3.38 | ✅  |
+| neos-5049753-cuanza | 242736 | 313956  | 464 | 4.63 | ✅  |
+| neos-848589 | 550539 | 1484  | 0 | 96.23 | ✅  |
+| netdiversion | 129174 | 99787  | 230.8 | 13.93 | ✅  |
+| physiciansched3-3 | 23572 | 85819  | 2.427e+06 | 63.52 | ✅ |
+| proteindesign121hz512p9 | 159067 | 224  | 0 | 79.56 | ❌  |
+| radiationm40-10-02 | 42613 | 44087  | 0 | 42.42 | ❌  |
+| rd-rplusc-21 | 543 | 54182  | 100 | 14.02 | ✅  |
+| sorrell3 | 1024 | 169163  | -512 | 8.13 | ✅  |
+| thor50dday | 53130 | 231  | 4174 | 3.37 | ✅  |
+| triptim1 | 24010 | 14593  | 22.86 | 10.62 | ✅  |
+| uccase12 | 40327 | 92414  | 1.151e+04 | 6.25 | ✅  |
+| uccase9 | 21361 | 32295  | 1.082e+04 | 9.66 | ✅  |
 
 ## 📦 Installation
 
