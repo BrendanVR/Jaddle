@@ -134,22 +134,23 @@ def load_relaxed_lp(path, skip_highs=False):
     for col in range(highs.numVariables):
         highs.changeColIntegrality(col, hspy.HighsVarType.kContinuous)
 
+    highs.setOptionValue("output_flag", "false")
+    highs.setOptionValue("solver", "simplex")
+
     if skip_highs:
         opt_obj = float("nan")
         highs_status = "skipped"
     else:
         # Solve to optimality with HiGHS's default exact solver (simplex/IPM) to
         # get the ground-truth objective. Default tolerances; no PDLP.
-        highs.setOptionValue("output_flag", "false")
-        highs.setOptionValue("solver", "pdlp")
         highs.run()
 
         info = highs.getInfo()
         opt_obj = info.objective_function_value
         highs_status = highs.modelStatusToString(highs.getModelStatus())
 
-    # highs.presolve()
-    highs_lp = highs.getLp()
+    highs.presolve()
+    highs_lp = highs.getPresolvedLp()
     jaddle_lp = hh.highs_to_standard_form_sparse(highs_lp)
     # Presolve folds eliminated variables' cost contributions into a constant
     # objective offset that lives OUTSIDE the reduced `c` vector. The converter
@@ -174,7 +175,7 @@ def run_jaddle(jaddle_lp, tol, max_epochs):
         scaling and setup, for transparency.
     """
     t0 = time.perf_counter()
-    solution, converged, solve_seconds = jl.solve(
+    solution, converged, stop_reason, solve_seconds = jl.solve(
         jaddle_lp,
         verbose=True,
         primal_feasibility_tolerance=tol,
@@ -184,11 +185,10 @@ def run_jaddle(jaddle_lp, tol, max_epochs):
         k_scale=1e2,
         k_theta=0.001,
         adaptive_eta=0.0,
-        iterations_per_epoch=1000,
+        iterations_per_epoch=2000,
         max_epochs=max_epochs,
+        output_stop_reason=True,
         return_timing=True,
-        primal_stop=True,
-        primal_stop_obj_tol=1e-5,
     )
     wall_seconds = time.perf_counter() - t0
 
@@ -198,6 +198,11 @@ def run_jaddle(jaddle_lp, tol, max_epochs):
     return {
         "jaddle_obj": obj,
         "jaddle_converged": bool(converged),
+        # "certificate" = full LP optimality cert met; "primal_stall" = the
+        # primal_stop heuristic fired (feasible but not certified optimal, so the
+        # objective may be suboptimal even though converged=True); "max_epochs" =
+        # budget exhausted. Disambiguates the two ways converged can be True.
+        "jaddle_stop_reason": stop_reason,
         "jaddle_solve_seconds": solve_seconds,
         "jaddle_wall_seconds": wall_seconds,
         "jaddle_eq_res": eq_res,
@@ -322,6 +327,7 @@ CSV_FIELDS = [
     "highs_status",
     "jaddle_obj",
     "jaddle_converged",
+    "jaddle_stop_reason",
     "jaddle_solve_seconds",
     "jaddle_wall_seconds",
     "jaddle_eq_res",
@@ -358,12 +364,12 @@ def print_markdown(rows):
     )
     print(
         "| Problem | Vars | Cons | Optimum | "
-        "Jaddle obj | Jaddle solve (s) | Converged | Rel. gap to opt |"
+        "Jaddle obj | Jaddle solve (s) | Converged | Stop | Rel. gap to opt |"
     )
-    print("|---|---:|---:|---:|---:|---:|:---:|---:|")
+    print("|---|---:|---:|---:|---:|---:|:---:|:---:|---:|")
     for r in rows:
         if r.get("error"):
-            print(f"| {r['problem']} | — | — | — | — | — | ⚠️ error | — |")
+            print(f"| {r['problem']} | — | — | — | — | — | ⚠️ error | — | — |")
             continue
         conv = "✅" if r.get("jaddle_converged") else "❌"
         print(
@@ -371,6 +377,7 @@ def print_markdown(rows):
             f"{_fmt(r.get('n_cons'), '{:d}')} | {_fmt(r.get('opt_obj'))} | "
             f"{_fmt(r.get('jaddle_obj'))} | "
             f"{_fmt(r.get('jaddle_solve_seconds'), '{:.2f}')} | {conv} | "
+            f"{r.get('jaddle_stop_reason') or '—'} | "
             f"{_fmt(r.get('rel_obj_gap'), '{:.2e}')} |"
         )
 

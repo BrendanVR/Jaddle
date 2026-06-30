@@ -909,6 +909,7 @@ def solve(
     adaptive_eta=None,
     scale="ruiz+pc",
     output_opt_state=False,
+    output_stop_reason=False,
     return_timing=False,
     scaled_objective=False,
     restarts=0,
@@ -919,6 +920,7 @@ def solve(
     primal_stop=False,
     primal_stop_window=5,
     primal_stop_obj_tol=1e-4,
+    halpern_reanchor_per_epoch=False,
     iterations_per_epoch_decay=1.0,
     iterations_per_epoch_min=100,
     eq_projection_threshold=None,
@@ -1036,6 +1038,28 @@ def solve(
         primal_stop_obj_tol: Relative-change threshold for the objective stall:
             stop when ``|obj_now - obj_{window ago}| / (1 + |obj_now|)`` falls
             below this (default 1e-4). Only used when ``primal_stop=True``.
+        output_stop_reason: Opt-in (default ``False``). When ``True``, append a
+            string ``stop_reason`` to the return tuple recording *why* the solve
+            terminated: ``"certificate"`` (the full LP optimality certificate was
+            met), ``"primal_stall"`` (the ``primal_stop`` heuristic fired — the
+            primal stalled at a feasible but not certified-optimal point), or
+            ``"max_epochs"`` (epoch budget exhausted). Lets a caller distinguish a
+            certified-optimal stop from a heuristic early stop, since both return
+            ``is_converged=True``. Appended before ``solve_seconds`` (if
+            ``return_timing``) and after ``opt_state`` (if ``output_opt_state``).
+        halpern_reanchor_per_epoch: Opt-in (default ``False``, ``"halpern"`` only).
+            When ``True``, re-anchor ``z_0`` to the current iterate and reset the
+            ``lambda_k = 1/(k+1)`` counter at **every** epoch boundary, not only at
+            restarts — i.e. each epoch starts a fresh Halpern cycle. This re-warms
+            ``lambda`` toward 1/2 each epoch (strong pull to the cycle-start point)
+            instead of letting it decay across the whole restart cycle. Note an
+            epoch is a fixed iteration chunk, not a progress-driven boundary, so
+            this re-anchors on a schedule rather than on convergence; it can help
+            on rotation-limited problems but discards the long-horizon anchor that
+            gives Halpern its last-iterate acceleration. Both ``eta`` and ``k`` are
+            left to their usual per-epoch handling. No effect unless
+            ``update_mode="halpern"``. On an epoch where a real restart fires, the
+            restart's own re-anchor takes precedence (no double re-anchor).
         eq_projection_threshold: When set, after each epoch the unscaled equality
             residual is checked; if it exceeds this value the primal (and average)
             are projected onto the equality manifold ``A_eq x = b_eq`` via the
@@ -1487,6 +1511,9 @@ def solve(
         duality_gap,
         dual_gap_is_finite,
         objective_value,
+        gap_bound_comp,
+        gap_ineq_comp,
+        gap_eq_comp,
     ):
         # Standard LP optimality certificate — all three conditions must hold:
         #   * primal feasibility: constraint_bound within tolerance
@@ -1505,11 +1532,33 @@ def solve(
         relative_duality_gap = relative_gap(duality_gap, objective_value)
         relative_primal_residual = constraint_bound / (1.0 + b_norm)
         relative_dual_residual = dual_feasibility_residual / (1.0 + c_norm)
+
+        # No-cancellation guard. `duality_gap` is the SIGNED sum of three
+        # complementarity terms (bound, inequality, equality coupling). At a true
+        # KKT point each term is ~0, so the sum is ~0 honestly. But on degenerate
+        # problems with large dual multipliers the equality-coupling term
+        # `y_eqᵀ(b−A_eq x)` can be large and negative — (large y)·(small residual)
+        # — and CANCEL a large positive bound-complementarity term, making the
+        # signed sum tiny while the point is nowhere near complementary. qap10
+        # (QAP assignment relaxation) certified ~1.4–2.4% suboptimal this way:
+        # gap_bound≈+5.2, gap_eq≈−5.2, sum≈0.04 → RDG 6.5e-5, yet the recovered
+        # dual_obj sat BELOW the true optimum (weak-duality violation). Requiring
+        # the sum of the |component|s (not their signed sum) to be small closes
+        # this: cancellation can shrink the signed sum but not the absolute sum.
+        # Normalised by the same PDLP denominator so the band matches the RDG test.
+        dual_bound = objective_value - duality_gap
+        gap_denom = 1.0 + jnp.abs(objective_value) + jnp.abs(dual_bound)
+        relative_gap_abs = (
+            jnp.abs(gap_bound_comp)
+            + jnp.abs(gap_ineq_comp)
+            + jnp.abs(gap_eq_comp)
+        ) / gap_denom
         return (
             (relative_primal_residual <= primal_feasibility_tolerance)
             & (relative_dual_residual <= dual_feasibility_threshold)
             & dual_gap_is_finite
             & (relative_duality_gap <= dual_gap_tolerance)
+            & (relative_gap_abs <= dual_gap_tolerance)
         )
 
     def converged_primal(constraint_bound, obj_window):
@@ -1585,10 +1634,20 @@ def solve(
     objective_value = jnp.inf
     duality_gap = jnp.inf
     dual_gap_is_finite = False
+    # Gap components (bound / inequality / equality complementarity). Seeded to inf
+    # so the no-cancellation guard in converged() can't fire before the first epoch
+    # has computed real metrics (inf gives relative_gap_abs = nan ≤ tol → False).
+    gap_bound_comp = jnp.inf
+    gap_ineq_comp = jnp.inf
+    gap_eq_comp = jnp.inf
     count = 0
     total_weight = 0.0
     reported_used_avg = average
     is_converged = True
+    # Why the loop terminated. Defaults to the budget-exhausted case; is_done()
+    # overwrites it with the test that actually fired ("certificate" or
+    # "primal_stall"), and the max_epochs break path leaves it as "max_epochs".
+    stop_reason = "max_epochs"
     current_iterations_per_epoch = iterations_per_epoch
 
     # Iterate at the last restart (or the start), used to rebalance the primal
@@ -1745,25 +1804,29 @@ def solve(
         print("----------------------------------------------")
 
     def is_done():
-        if primal_stop:
-            return bool(converged_primal(constraint_bound, obj_window)) or bool(
-                converged(
-                    constraint_bound,
-                    dual_feasibility_residual,
-                    duality_gap,
-                    dual_gap_is_finite,
-                    objective_value,
-                )
-            )
-        return bool(
+        nonlocal stop_reason
+        certificate_met = bool(
             converged(
                 constraint_bound,
                 dual_feasibility_residual,
                 duality_gap,
                 dual_gap_is_finite,
                 objective_value,
+                gap_bound_comp,
+                gap_ineq_comp,
+                gap_eq_comp,
             )
         )
+        # Check the certificate first: when both the full certificate and the
+        # primal-stall heuristic would fire on the same epoch, attribute the stop
+        # to the certificate — it is the stronger (truly optimal) reason.
+        if certificate_met:
+            stop_reason = "certificate"
+            return True
+        if primal_stop and bool(converged_primal(constraint_bound, obj_window)):
+            stop_reason = "primal_stall"
+            return True
+        return False
 
     # PDLP-style primal-weight rebalance from the primal-vs-dual *movement*
     # between two iterates (distance, not per-step gradient norms). Shared by the
@@ -2144,6 +2207,29 @@ def solve(
                 # donated to (freed by) __sps next epoch.
                 state_at_last_epoch = jax.tree.map(lambda x: x + 0, state)
 
+            # Optional per-epoch Halpern re-anchor: start a fresh Halpern cycle at
+            # every epoch boundary instead of only at restarts. Mirrors the
+            # restart re-anchor (anchor z_0 := current iterate, lambda counter
+            # reset via restart_i_offset so lambda re-warms toward 1/2), but
+            # leaves eta and k to their usual per-epoch handling. Skipped when a
+            # real restart already fired this epoch — the restart's re-anchor
+            # (above) takes precedence, so we don't re-anchor twice.
+            if halpern and halpern_reanchor_per_epoch and not restarted_this_epoch:
+                # k-slot is (k, eta, anchor); rewrite only the anchor leaf with an
+                # independent copy (state is donated to __sps next epoch).
+                opt_state = (
+                    opt_state[0],
+                    (
+                        opt_state[1][0],
+                        opt_state[1][1],
+                        jax.tree.map(lambda x: x + 0, state),
+                    ),
+                )
+                # Reset the cycle-local index so lambda_k = 1/(k_local+1) re-warms
+                # toward 1/2 next epoch; without this lambda would stay ~0 and the
+                # fresh anchor would carry no weight (a silent no-op).
+                restart_i_offset = i - 1
+
         # The while-loop exits the iteration *after* the converging epoch, so its
         # metrics were computed but only printed if it landed on a log_every
         # boundary. Print the final converged epoch's criteria here (skip when we
@@ -2166,6 +2252,7 @@ def solve(
             output = state
     except KeyboardInterrupt:
         is_converged = False
+        stop_reason = "interrupted"
         if report_best and average:
             output = average_state if reported_used_avg else state
         elif average:
@@ -2211,6 +2298,8 @@ def solve(
     result = (output, is_converged)
     if output_opt_state:
         result = result + (opt_state,)
+    if output_stop_reason:
+        result = result + (stop_reason,)
     if return_timing:
         result = result + (solve_seconds,)
     return result
