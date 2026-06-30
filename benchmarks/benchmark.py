@@ -33,7 +33,7 @@ import jaddle.jaddle_optimisers as jo
 import jaddle.jaddle_linear as jl
 import jaddle.highs_helpers as hh
 
-from scan_bigm import is_bigm_cost
+from scan_bigm import is_bigm_cost, is_bigm_matrix
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DATA_DIR = os.path.join(REPO_ROOT, "data")
@@ -96,6 +96,15 @@ def parse_args():
         "These stall the saddle-point solver at a feasible-but-suboptimal point "
         "and waste the epoch budget. See benchmarks/scan_bigm.py.",
     )
+    p.add_argument(
+        "--skip-bigm-matrix",
+        action="store_true",
+        help="Skip instances with a big-M / penalty MATRIX structure (rows where "
+        "one coefficient dwarfs its rowmates, e.g. sp150x300d, neos-3754480-"
+        "nidda). Like cost big-M but constraint-side: Ruiz scaling cannot flatten "
+        "the within-row skew, so the saddle solver stalls on a primal-feasibility "
+        "plateau. See benchmarks/scan_bigm.py.",
+    )
     return p.parse_args()
 
 
@@ -125,22 +134,22 @@ def load_relaxed_lp(path, skip_highs=False):
     for col in range(highs.numVariables):
         highs.changeColIntegrality(col, hspy.HighsVarType.kContinuous)
 
-    highs.setOptionValue("output_flag", "false")
     if skip_highs:
         opt_obj = float("nan")
         highs_status = "skipped"
     else:
         # Solve to optimality with HiGHS's default exact solver (simplex/IPM) to
         # get the ground-truth objective. Default tolerances; no PDLP.
-        highs.setOptionValue("solver", "simplex")
+        highs.setOptionValue("output_flag", "false")
+        highs.setOptionValue("solver", "pdlp")
         highs.run()
 
         info = highs.getInfo()
         opt_obj = info.objective_function_value
         highs_status = highs.modelStatusToString(highs.getModelStatus())
 
-    highs.presolve()
-    highs_lp = highs.getPresolvedLp()
+    # highs.presolve()
+    highs_lp = highs.getLp()
     jaddle_lp = hh.highs_to_standard_form_sparse(highs_lp)
     # Presolve folds eliminated variables' cost contributions into a constant
     # objective offset that lives OUTSIDE the reduced `c` vector. The converter
@@ -168,21 +177,18 @@ def run_jaddle(jaddle_lp, tol, max_epochs):
     solution, converged, solve_seconds = jl.solve(
         jaddle_lp,
         verbose=True,
-        log_every=10,
         primal_feasibility_tolerance=tol,
         dual_feasibility_tolerance=tol,
         dual_gap_tolerance=tol,
         update_mode="pdhg",
-        k_scale=1e3,
-        k_theta=0.3,
-        k_update_per_epoch=True,
+        k_scale=1e2,
+        k_theta=0.001,
         adaptive_eta=0.0,
         iterations_per_epoch=1000,
         max_epochs=max_epochs,
         return_timing=True,
-        primal_stop=False,
-        primal_stop_obj_tol=1e-4,
-        primal_stop_window=50,
+        primal_stop=True,
+        primal_stop_obj_tol=1e-5,
     )
     wall_seconds = time.perf_counter() - t0
 
@@ -221,6 +227,9 @@ def discover_instances(args):
             continue
         if args.skip_bigm and is_bigm_cost(path):
             print(f"  skip {name} (big-M cost structure; --skip-bigm)")
+            continue
+        if args.skip_bigm_matrix and is_bigm_matrix(path):
+            print(f"  skip {name} (big-M matrix structure; --skip-bigm-matrix)")
             continue
         instances.append((name, path, size_mb))
     return instances

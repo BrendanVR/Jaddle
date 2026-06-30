@@ -1992,13 +1992,27 @@ def solve(
                         restart_merit = state_merit
                         restart_used_avg = False
 
+                # A non-finite merit carries no progress signal — it just means
+                # the iterate is dual-infeasible so the duality gap (hence the KKT
+                # merit) is +∞ (see the box-infimum sign guard). Without this gate
+                # the progress tests below degenerate to `inf <= restart_decay*inf`
+                # → True, firing a restart EVERY epoch and exhausting the restart
+                # budget in the first few epochs (e.g. neos-3754480-nidda: 10/10
+                # restarts in 10 epochs, all on merit=inf), leaving none for the
+                # feasibility tail where they actually help. Only the length-based
+                # `cycle_exhausted` path may fire on an inf merit.
+                merit_is_finite = bool(jnp.isfinite(restart_merit))
+
                 # Seed the baseline on the first finite merit so the
                 # sufficient-progress test has something real to compare against
-                # (avoids a spurious restart against the initial inf baseline).
-                if not jnp.isfinite(merit_at_last_restart):
+                # (avoids a spurious restart against the initial inf baseline). Only
+                # seed from a FINITE merit, so a dual-infeasible early run leaves the
+                # baseline inf until a real value appears rather than locking it to
+                # inf.
+                if not jnp.isfinite(merit_at_last_restart) and merit_is_finite:
                     merit_at_last_restart = restart_merit
 
-                sufficient_progress = bool(
+                sufficient_progress = merit_is_finite and bool(
                     restart_merit <= restart_decay * merit_at_last_restart
                 )
 
@@ -2009,10 +2023,11 @@ def solve(
                 # feasibility tail that the absolute sufficient-decay test (0.2x)
                 # misses. `restart_decay` keeps driving the (i) sufficient trigger;
                 # `necessary_decay` is the looser (ii) threshold.
-                stalling_restart = bool(
-                    jnp.isfinite(prev_epoch_merit)
-                    and restart_merit <= necessary_decay * merit_at_last_restart
-                    and restart_merit > prev_epoch_merit
+                stalling_restart = (
+                    merit_is_finite
+                    and bool(jnp.isfinite(prev_epoch_merit))
+                    and bool(restart_merit <= necessary_decay * merit_at_last_restart)
+                    and bool(restart_merit > prev_epoch_merit)
                 )
 
                 if sufficient_progress or stalling_restart or cycle_exhausted:
@@ -2124,8 +2139,6 @@ def solve(
                     opt_state = (opt_state[0], (k_new, *opt_state[1][1:]))
                 else:
                     opt_state = (opt_state[0], k_new)
-                if verbose and (count == 1 or count % log_every == 0):
-                    print(f"k (per-epoch) -> {float(k_new):.3e}")
             if k_per_epoch:
                 # Reference for next epoch's movement. Independent copy: `state` is
                 # donated to (freed by) __sps next epoch.
