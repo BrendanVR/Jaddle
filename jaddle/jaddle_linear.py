@@ -1078,6 +1078,18 @@ def solve(
             termination — convergence still uses the full LP certificate.
     """
 
+    if lp.A_ineq.shape[0] == 0:
+        lp.A_ineq = jsp.BCOO.fromdense(
+            jnp.zeros((1, lp.A_eq.shape[1]), dtype=lp.A_eq.dtype)
+        )
+        lp.b_ineq = jnp.zeros((1,), dtype=lp.b_eq.dtype)
+
+    if lp.A_eq.shape[0] == 0:
+        lp.A_eq = jsp.BCOO.fromdense(
+            jnp.zeros((1, lp.A_ineq.shape[1]), dtype=lp.A_ineq.dtype)
+        )
+        lp.b_eq = jnp.zeros((1,), dtype=lp.b_ineq.dtype)
+
     if optimiser is None:
         optimiser = jo.gd(0.5)
 
@@ -1549,9 +1561,7 @@ def solve(
         dual_bound = objective_value - duality_gap
         gap_denom = 1.0 + jnp.abs(objective_value) + jnp.abs(dual_bound)
         relative_gap_abs = (
-            jnp.abs(gap_bound_comp)
-            + jnp.abs(gap_ineq_comp)
-            + jnp.abs(gap_eq_comp)
+            jnp.abs(gap_bound_comp) + jnp.abs(gap_ineq_comp) + jnp.abs(gap_eq_comp)
         ) / gap_denom
         return (
             (relative_primal_residual <= primal_feasibility_tolerance)
