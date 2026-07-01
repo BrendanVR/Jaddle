@@ -496,7 +496,6 @@ def solve(
     log_every=1,
     average=False,
     update_mode="alternating",
-    output_opt_state=False,
     k_scale=10.0,
     k_theta=0.5,
     k_init=None,
@@ -568,6 +567,17 @@ def solve(
             more time checking convergence.
         iterations_per_epoch_min: Floor for the decayed epoch length (default
             100). Only used when ``iterations_per_epoch_decay < 1``.
+
+    Returns:
+        dict: The solution together with diagnostics. Keys:
+            * ``"solution"``: the ``SaddleState`` (primal/dual iterate).
+            * ``"converged"``: ``bool``, whether the solve met the convergence
+              criteria (``False`` if the epoch budget was exhausted or the solve
+              was interrupted).
+            * ``"opt_state"``: the final optimiser state, for warm-starting a
+              subsequent solve via ``initial_opt_state``.
+            * ``"solve_seconds"``: ``float`` wall time of the epoch loop (incl. the
+              first-epoch XLA compile but not the setup phase before it).
     """
 
     if optimiser is None:
@@ -1108,10 +1118,12 @@ def solve(
     print(f"Objective: {cp.objective(output.primal):.5e}")
     print("----------------------------------------------")
 
-    if output_opt_state:
-        return output, is_converged, opt_state
-    else:
-        return output, is_converged
+    return {
+        "solution": output,
+        "converged": is_converged,
+        "opt_state": opt_state,
+        "solve_seconds": end_time - start_time,
+    }
 
 
 # %%

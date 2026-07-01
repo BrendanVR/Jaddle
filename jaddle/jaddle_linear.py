@@ -908,9 +908,6 @@ def solve(
     k_update_per_epoch=True,
     adaptive_eta=None,
     scale="ruiz+pc",
-    output_opt_state=False,
-    output_stop_reason=False,
-    return_timing=False,
     scaled_objective=False,
     restarts=0,
     epochs_per_restart=10,
@@ -1038,15 +1035,6 @@ def solve(
         primal_stop_obj_tol: Relative-change threshold for the objective stall:
             stop when ``|obj_now - obj_{window ago}| / (1 + |obj_now|)`` falls
             below this (default 1e-4). Only used when ``primal_stop=True``.
-        output_stop_reason: Opt-in (default ``False``). When ``True``, append a
-            string ``stop_reason`` to the return tuple recording *why* the solve
-            terminated: ``"certificate"`` (the full LP optimality certificate was
-            met), ``"primal_stall"`` (the ``primal_stop`` heuristic fired — the
-            primal stalled at a feasible but not certified-optimal point), or
-            ``"max_epochs"`` (epoch budget exhausted). Lets a caller distinguish a
-            certified-optimal stop from a heuristic early stop, since both return
-            ``is_converged=True``. Appended before ``solve_seconds`` (if
-            ``return_timing``) and after ``opt_state`` (if ``output_opt_state``).
         halpern_reanchor_per_epoch: Opt-in (default ``False``, ``"halpern"`` only).
             When ``True``, re-anchor ``z_0`` to the current iterate and reset the
             ``lambda_k = 1/(k+1)`` counter at **every** epoch boundary, not only at
@@ -1076,6 +1064,29 @@ def solve(
             comparing ``OBJERR`` against ``RDG`` quantifies how much of the gap is
             dual lag versus genuine primal suboptimality. Does not affect
             termination — convergence still uses the full LP certificate.
+
+    Returns:
+        dict: The solution together with diagnostics. Keys:
+            * ``"solution"``: the ``SaddleState`` (primal/dual iterate), unscaled
+              back to the original problem's units.
+            * ``"converged"``: ``bool``, whether the solve terminated by meeting
+              the LP optimality certificate or a ``primal_stop`` heuristic stop
+              (see ``"stop_reason"`` to disambiguate).
+            * ``"opt_state"``: the final optimiser state, for warm-starting a
+              subsequent solve via ``initial_opt_state``.
+            * ``"stop_reason"``: ``str`` recording *why* the solve terminated:
+              ``"certificate"`` (full LP optimality certificate met),
+              ``"primal_stall"`` (the ``primal_stop`` heuristic fired — feasible
+              but not certified optimal, so the objective may be suboptimal even
+              though ``"converged"`` is ``True``), ``"max_epochs"`` (epoch budget
+              exhausted), or ``"interrupted"`` (KeyboardInterrupt).
+            * ``"solve_seconds"``: ``float`` wall time of the epoch loop (incl. the
+              first-epoch XLA compile but not the scaling / sparse-setup phase).
+            * ``"corrected_seconds"``: ``float`` steady-state runtime with the
+              one-off first-epoch XLA compile amortised out:
+              ``n * (solve_seconds - first_epoch_seconds) / (n - 1)`` where ``n``
+              is the epoch count. Falls back to ``solve_seconds`` when it can't be
+              formed (fewer than two epochs).
     """
 
     if lp.A_ineq.shape[0] == 0:
@@ -1651,6 +1662,10 @@ def solve(
     gap_ineq_comp = jnp.inf
     gap_eq_comp = jnp.inf
     count = 0
+    # Wall time of the very first epoch (which pays the one-off XLA compile).
+    # Captured so callers can form a "corrected" steady-state runtime that
+    # amortises out the compile: n_epochs * (solve - first) / (n_epochs - 1).
+    first_epoch_seconds = None
     total_weight = 0.0
     reported_used_avg = average
     is_converged = True
@@ -1995,6 +2010,9 @@ def solve(
 
             finish_epoch_time = time.time()
 
+            if count == 1:
+                first_epoch_seconds = finish_epoch_time - start_epoch_time
+
             if verbose and (count == 1 or count % log_every == 0):
                 _k_trace, _eta_trace = _read_k_eta(opt_state)
                 print_epoch_metrics(
@@ -2305,14 +2323,25 @@ def solve(
     # run() timer, which also excludes problem setup.
     solve_seconds = end_time - start_time
 
-    result = (output, is_converged)
-    if output_opt_state:
-        result = result + (opt_state,)
-    if output_stop_reason:
-        result = result + (stop_reason,)
-    if return_timing:
-        result = result + (solve_seconds,)
-    return result
+    # "Corrected" (steady-state) runtime: amortise the one-off first-epoch XLA
+    # compile out of the total. Extrapolates what the solve would have cost had
+    # every epoch run at the warm per-epoch rate:
+    #     n * (solve - first_epoch) / (n - 1)
+    # Falls back to the raw solve time when it can't be formed (fewer than two
+    # epochs, or the first-epoch time was never captured).
+    if first_epoch_seconds is not None and count > 1:
+        corrected_seconds = count * (solve_seconds - first_epoch_seconds) / (count - 1)
+    else:
+        corrected_seconds = solve_seconds
+
+    return {
+        "solution": output,
+        "converged": is_converged,
+        "opt_state": opt_state,
+        "stop_reason": stop_reason,
+        "solve_seconds": solve_seconds,
+        "corrected_seconds": corrected_seconds,
+    }
 
 
 # %%

@@ -195,32 +195,47 @@ def load_relaxed_lp(path, highs_solver="simplex"):
 def run_jaddle(jaddle_lp, tol, max_epochs):
     """Solve with Jaddle's saddle-point solver. Returns a dict of metrics.
 
-    Two times are reported:
+    Three times are reported:
       * ``jaddle_solve_seconds`` -- the solver's internal iterate-loop time
         (incl. first-epoch XLA compile, excl. scaling/sparse setup). This is
         the like-for-like figure against HiGHS-PDLP's own ``run()`` timer,
         which likewise excludes problem setup. Use this in the headline table.
+      * ``jaddle_corrected_seconds`` -- the same solve-loop time with the one-off
+        first-epoch XLA compile amortised out:
+        ``n_epochs * (solve - first_epoch) / (n_epochs - 1)``. Estimates the
+        steady-state runtime had every epoch run at the warm per-epoch rate.
       * ``jaddle_wall_seconds`` -- the full ``jl.solve()`` call including
         scaling and setup, for transparency.
     """
 
     t0 = time.perf_counter()
-    solution, converged, stop_reason, solve_seconds = jl.solve(
+    result = jl.solve(
         jaddle_lp,
         verbose=True,
+        log_every=20,
         primal_feasibility_tolerance=tol,
         dual_feasibility_tolerance=tol,
         dual_gap_tolerance=tol,
         update_mode="pdhg",
+        halpern_reanchor_per_epoch=True,
+        average=False,
+        report_best=False,
         k_scale=1e2,
         k_theta=0.001,
         adaptive_eta=0.0,
-        iterations_per_epoch=256,
+        iterations_per_epoch=5000,
         max_epochs=max_epochs,
-        output_stop_reason=True,
-        return_timing=True,
+        restarts=100,
+        epochs_per_restart=1,
+        restart_multiplier=5,
     )
     wall_seconds = time.perf_counter() - t0
+
+    solution = result["solution"]
+    converged = result["converged"]
+    stop_reason = result["stop_reason"]
+    solve_seconds = result["solve_seconds"]
+    corrected_seconds = result["corrected_seconds"]
 
     obj = float(jaddle_lp.objective(solution.primal))
     eq_res = float(jaddle_lp.eq_slack(solution.primal))
@@ -234,6 +249,10 @@ def run_jaddle(jaddle_lp, tol, max_epochs):
         # budget exhausted. Disambiguates the two ways converged can be True.
         "jaddle_stop_reason": stop_reason,
         "jaddle_solve_seconds": solve_seconds,
+        # Steady-state solve time with the first-epoch XLA compile amortised out:
+        # n_epochs * (solve - first_epoch) / (n_epochs - 1). Falls back to
+        # solve_seconds when there are fewer than two epochs.
+        "jaddle_corrected_seconds": corrected_seconds,
         "jaddle_wall_seconds": wall_seconds,
         "jaddle_eq_res": eq_res,
         "jaddle_ineq_res": ineq_res,
@@ -313,13 +332,16 @@ def main():
             row["rel_obj_gap"] = rel_obj_gap(jres["jaddle_obj"], opt_obj)
             row["error"] = ""
             highs_time_str = (
-                "skipped" if args.highs_solver == "none" else f"solve={highs_seconds:.2f}s"
+                "skipped"
+                if args.highs_solver == "none"
+                else f"solve={highs_seconds:.2f}s"
             )
             print(
                 f"  optimum (HiGHS {args.highs_solver}): {opt_obj:.6g} "
                 f"({highs_time_str})  |  "
                 f"Jaddle: obj={jres['jaddle_obj']:.6g} "
                 f"(solve={jres['jaddle_solve_seconds']:.2f}s, "
+                f"corrected={jres['jaddle_corrected_seconds']:.2f}s, "
                 f"wall={jres['jaddle_wall_seconds']:.2f}s, "
                 f"converged={jres['jaddle_converged']}, "
                 f"rel_gap={row['rel_obj_gap']:.2e})"
@@ -348,6 +370,7 @@ CSV_FIELDS = [
     "jaddle_converged",
     "jaddle_stop_reason",
     "jaddle_solve_seconds",
+    "jaddle_corrected_seconds",
     "jaddle_wall_seconds",
     "jaddle_eq_res",
     "jaddle_ineq_res",
@@ -386,18 +409,21 @@ def print_markdown(rows, highs_solver="simplex"):
             "objective oracle."
         )
     print(
-        f"_{oracle} Jaddle time is solve-only (iterate loop incl. first-epoch "
-        "XLA compile, excl. setup/scaling); see `jaddle_wall_seconds` in the CSV "
-        "for full call time._\n"
+        f"_{oracle} Jaddle solve time is solve-only (iterate loop incl. "
+        "first-epoch XLA compile, excl. setup/scaling); corrected time amortises "
+        "the one-off first-epoch compile out "
+        "(`n·(solve−first)/(n−1)`); see `jaddle_wall_seconds` in the CSV for full "
+        "call time._\n"
     )
     print(
         "| Problem | Vars | Cons | Optimum | HiGHS solve (s) | "
-        "Jaddle obj | Jaddle solve (s) | Converged | Stop | Rel. gap to opt |"
+        "Jaddle obj | Jaddle solve (s) | Jaddle corrected (s) | "
+        "Converged | Stop | Rel. gap to opt |"
     )
-    print("|---|---:|---:|---:|---:|---:|---:|:---:|:---:|---:|")
+    print("|---|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|---:|")
     for r in rows:
         if r.get("error"):
-            print(f"| {r['problem']} | — | — | — | — | — | — | ⚠️ error | — | — |")
+            print(f"| {r['problem']} | — | — | — | — | — | — | — | ⚠️ error | — | — |")
             continue
         conv = "✅" if r.get("jaddle_converged") else "❌"
         print(
@@ -405,7 +431,8 @@ def print_markdown(rows, highs_solver="simplex"):
             f"{_fmt(r.get('n_cons'), '{:d}')} | {_fmt(r.get('opt_obj'))} | "
             f"{_fmt(r.get('highs_solve_seconds'), '{:.2f}')} | "
             f"{_fmt(r.get('jaddle_obj'))} | "
-            f"{_fmt(r.get('jaddle_solve_seconds'), '{:.2f}')} | {conv} | "
+            f"{_fmt(r.get('jaddle_solve_seconds'), '{:.2f}')} | "
+            f"{_fmt(r.get('jaddle_corrected_seconds'), '{:.2f}')} | {conv} | "
             f"{r.get('jaddle_stop_reason') or '—'} | "
             f"{_fmt(r.get('rel_obj_gap'), '{:.2e}')} |"
         )

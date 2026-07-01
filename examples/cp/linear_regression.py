@@ -77,12 +77,12 @@ optimiser = jo.create_saddle_optimiser(
 
 # %%
 # Solve the problem using Jaddle Convex SPS optimizer
-solution, _ = jc.solve(
+solution = jc.solve(
     cp,
     optimiser=optimiser,
     verbose=True,
     k_scale=None,
-)
+)["solution"]
 
 # %%
 y_pred = jnp.dot(X_jax, solution.primal)

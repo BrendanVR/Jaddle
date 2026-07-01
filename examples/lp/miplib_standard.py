@@ -53,11 +53,11 @@ lp = hh.highs_to_standard_form_sparse(highs_lp)
 # ## Solve the presolved LP using Jaddle's saddle point solver
 print("Problem:", PROBLEM_NAME)
 jl.lp_summary_statistics(lp)
-solution_jaddle, _ = jl.solve(
+solution_jaddle = jl.solve(
     lp,
     verbose=True,
     k_scale=1e2,
     adaptive_eta=1,
-)
+)["solution"]
 
 # %%
