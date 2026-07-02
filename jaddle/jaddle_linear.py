@@ -239,17 +239,24 @@ def __sps(
     # bodies agnostic to the packing.
     # Adaptive PDHG carries A @ x_old in the k-slot so the step can reuse last
     # iteration's A @ x_new instead of recomputing it — a 3->2 matvec cut per
-    # iteration. The slot is (k, eta, Ax). Only plain adaptive pdhg qualifies:
-    # halpern's anchor blend changes the primal after the matvec (so the carried
-    # Ax wouldn't match next iter's x_old), and extragradient is a different
-    # operator with no A @ x_old to reuse. Both keep their existing slots.
+    # iteration. Plain adaptive pdhg carries (k, eta, Ax). Halpern's anchor
+    # blend changes the primal after the matvec, so the carried Ax_new alone
+    # wouldn't match next iter's x_old — but A is linear, so the blended
+    # iterate's matvec is one axpy away:
+    #     A @ (lam z_0 + (1-lam) cand) = lam (A @ z_0) + (1-lam) Ax_new.
+    # The anchor z_0 is constant within an epoch (restarts / re-anchors only
+    # fire at epoch boundaries in `solve`), so A @ z_0 is loop-invariant.
+    # Halpern therefore carries (k, eta, anchor, Ax_anchor, Ax_state) with
+    # Ax_anchor = A @ anchor.primal and Ax_state = A @ state.primal — the same
+    # 3->2 matvec cut. Extragradient is a different operator with no A @ x_old
+    # to reuse and keeps its (k, eta) slot.
     carry_Ax = adaptive_step and update_mode == "pdhg" and not halpern
 
     def unpack_k(opt_state):
         if k_scaling:
             if halpern:
-                inner, (k, eta, anchor) = opt_state
-                return inner, k, eta, anchor
+                inner, (k, eta, anchor, Ax_anchor, Ax_state) = opt_state
+                return inner, k, eta, anchor, Ax_anchor, Ax_state
             if carry_Ax:
                 inner, (k, eta, Ax) = opt_state
                 return inner, k, eta, Ax
@@ -259,10 +266,10 @@ def __sps(
             return opt_state
         return opt_state, None
 
-    def pack_k(opt_state, k, eta=None, anchor=None, Ax=None):
+    def pack_k(opt_state, k, eta=None, anchor=None, Ax=None, Ax_anchor=None):
         if k_scaling:
             if halpern:
-                return (opt_state, (k, eta, anchor))
+                return (opt_state, (k, eta, anchor, Ax_anchor, Ax))
             if carry_Ax:
                 return (opt_state, (k, eta, Ax))
             if adaptive_step:
@@ -328,13 +335,15 @@ def __sps(
             def make_adaptive_step(trial):
                 # `trial(eta, state, k, Ax_old)` returns (cand, eta_bar, Ax_new):
                 # Ax_old = A @ state.primal (carried, not recomputed); Ax_new =
-                # A @ cand.primal (carried forward to the next iteration). When the
-                # path doesn't carry Ax (halpern), Ax_old/Ax_new are None.
+                # A @ cand.primal (carried forward to the next iteration — for
+                # halpern, blended with Ax_anchor first). When the path doesn't
+                # carry Ax (extragradient), Ax_old/Ax_new are None.
                 def step(carry, _):
                     i, state, average_state, opt_state, total_weight = carry
                     if halpern:
-                        opt_state, k, eta, anchor = unpack_k(opt_state)
-                        Ax_old = None
+                        opt_state, k, eta, anchor, Ax_anchor, Ax_old = unpack_k(
+                            opt_state
+                        )
                     elif carry_Ax:
                         opt_state, k, eta, Ax_old = unpack_k(opt_state)
                     else:
@@ -380,6 +389,10 @@ def __sps(
                             anchor,
                             cand,
                         )
+                        # Advance the matvec carry through the blend by linearity
+                        # of A: A @ new_primal = lam Ax_anchor + (1-lam) Ax_new.
+                        # One axpy replaces next iteration's A @ state.primal.
+                        Ax_state_next = lam * Ax_anchor + (1.0 - lam) * Ax_new
                     else:
                         new_state = cand
 
@@ -395,7 +408,14 @@ def __sps(
                     eta_next = jnp.where(jnp.isfinite(eta_next), eta_next, eta0)
                     eta_next = jnp.maximum(eta_next, 1e-12)
                     if halpern:
-                        opt_state = pack_k(opt_state, k, eta_next, anchor=anchor)
+                        opt_state = pack_k(
+                            opt_state,
+                            k,
+                            eta_next,
+                            anchor=anchor,
+                            Ax=Ax_state_next,
+                            Ax_anchor=Ax_anchor,
+                        )
                     else:
                         # Carry A @ new_state.primal (== Ax_new, since new_state ==
                         # cand on the pdhg path) for the next iteration's Ax_old.
@@ -429,12 +449,11 @@ def __sps(
                     gp = grad_primal_only(state)
                     x_new = projection_primal(state.primal - tau * gp)
                     # Ax_old = A @ state.primal is carried from the previous
-                    # iteration (== last iter's A @ x_new), saving one matvec. Only
-                    # Ax_new = A @ x_new is computed here. A_dx = Ax_new - Ax_old;
-                    # x_bar = 2*x_new - x_old so A @ x_bar = Ax_old + 2 * A_dx.
-                    # Halpern shares this operator but can't carry Ax (its anchor
-                    # blend changes the primal post-matvec), so Ax_old is None and
-                    # recomputed — the 3-matvec path, unchanged from before.
+                    # iteration (pdhg: last iter's A @ x_new; halpern: the
+                    # anchor-blended lam·Ax_anchor + (1-lam)·Ax_new), saving one
+                    # matvec. Only Ax_new = A @ x_new is computed here.
+                    # A_dx = Ax_new - Ax_old; x_bar = 2*x_new - x_old so
+                    # A @ x_bar = Ax_old + 2 * A_dx.
                     if Ax_old is None:
                         Ax_old = lp.A @ state.primal
                     Ax_new = lp.A @ x_new
@@ -770,10 +789,25 @@ def __sps(
             # iteration. The slot enters as (k, eta) from `solve` (which never sees
             # Ax); seed Ax = A @ x_old here (one matvec/epoch — negligible) and
             # strip it from the returned opt_state so the caller's contract is
-            # unchanged.
+            # unchanged. Halpern's caller-facing slot is (k, eta, anchor); seed
+            # Ax_anchor = A @ anchor.primal and Ax_state = A @ state.primal the
+            # same way (two matvecs/epoch). Re-seeding every epoch also resets any
+            # rounding drift the blended carry accumulated within the prior epoch.
             if carry_Ax:
                 inner, (k0, eta0) = opt_state
                 opt_state = (inner, (k0, eta0, lp.A @ state.primal))
+            if halpern:
+                inner, (k0, eta0, anchor0) = opt_state
+                opt_state = (
+                    inner,
+                    (
+                        k0,
+                        eta0,
+                        anchor0,
+                        lp.A @ anchor0.primal,
+                        lp.A @ state.primal,
+                    ),
+                )
 
             init_carry = (start_iter, state, average_state, opt_state, total_weight)
             _carry_dtypes = jax.tree.map(lambda x: jnp.asarray(x).dtype, init_carry)
@@ -795,6 +829,9 @@ def __sps(
             if carry_Ax:
                 inner, (k0, eta0, _Ax) = opt_state
                 opt_state = (inner, (k0, eta0))
+            if halpern:
+                inner, (k0, eta0, anchor0, _AxA, _AxS) = opt_state
+                opt_state = (inner, (k0, eta0, anchor0))
 
             return i, state, average_state, opt_state, total_weight
 
