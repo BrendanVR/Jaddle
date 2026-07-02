@@ -31,29 +31,24 @@ optimiser = jo.create_saddle_optimiser(
 
 ## 📊 Benchmarks
 
-Jaddle has been tested on challenging MIPLIB relaxations. While not a production solver, it performs competitively with PDLP‑style methods. Here we benchmark MIPLIB problems between 30 and 50mb in size using my laptop's NVIDIA GeForce RT 5070 Ti GPU. We make use of Jaddles in-built PDHG solver, with 10 rounds of Ruiz scaling followed by 1 round of PC scaling. Jaddle time is solve-only. Crucially it includes XLA compile time, roughly 0.8 seconds of overhead. cuPDLP-c also failed to converge in 2 minutes on proteindesign121hz512p9 and radiationm40-10-02.
+Jaddle has been tested on challenging MIPLIB relaxations. While not a production solver, it performs competitively with PDLP‑style methods. Here we benchmark MIPLIB problems between 30 and 50mb in size using my laptop's NVIDIA GeForce RT 5070 Ti GPU. We make use of Jaddles in-built PDHG solver, with 10 rounds of Ruiz scaling followed by 1 round of PC scaling. Jaddle solve (s) is solve-only.
 
 | Problem | Vars | Cons | Jaddle obj | Jaddle solve (s) | Converged |
 |---|---:|---:|---:|---:|:---:|
-| buildingenergy | 145237 | 267853  | 3.325e+04 | 59.86 | ✅  |
-| eilA101-2 | 65832 | 101  | 803.2 | 16.46 | ✅  |
-| ex10 | 15895 | 62931  | 100 | 3.17 | ✅  |
-| map10 | 26617 | 49895  | -602.2 | 49.26 | ✅  |
-| map16715-04 | 26617 | 49895  | -296.3 | 58.51 | ✅  |
-| n3div36 | 22120 | 4454  | 1.144e+05 | 19.57 | ✅  |
-| neos-3555904-turama | 22233 | 67836  | -41.45 | 3.38 | ✅  |
-| neos-5049753-cuanza | 242736 | 313956  | 464 | 4.63 | ✅  |
-| neos-848589 | 550539 | 1484  | 0 | 96.23 | ✅  |
-| netdiversion | 129174 | 99787  | 230.8 | 13.93 | ✅  |
-| physiciansched3-3 | 23572 | 85819  | 2.427e+06 | 63.52 | ✅ |
-| proteindesign121hz512p9 | 159067 | 224  | 0 | 79.56 | ❌  |
-| radiationm40-10-02 | 42613 | 44087  | 0 | 42.42 | ❌  |
-| rd-rplusc-21 | 543 | 54182  | 100 | 14.02 | ✅  |
-| sorrell3 | 1024 | 169163  | -512 | 8.13 | ✅  |
-| thor50dday | 53130 | 231  | 4174 | 3.37 | ✅  |
-| triptim1 | 24010 | 14593  | 22.86 | 10.62 | ✅  |
-| uccase12 | 40327 | 92414  | 1.151e+04 | 6.25 | ✅  |
-| uccase9 | 21361 | 32295  | 1.082e+04 | 9.66 | ✅  |
+| eilA101-2 | 65832 | 100 | 803.4 | 22.06 | ✅ |
+| ex10 | 15895 | 62931 | 100 | 3.04 | ✅ |
+| map10 | 26617 | 49894 | -602.2 | 57.75 | ✅ |
+| map16715-04 | 26617 | 49894 | -296.3 | 67.80 | ✅ |
+| n3div36 | 22120 | 4453 | 1.143e+05 | 22.69 | ✅ |
+| neos-3555904-turama | 22233 | 67836 | -41.45 | 2.94 | ✅ |
+| neos-5049753-cuanza | 242736 | 313956 | 464 | 4.54 | ✅ |
+| physiciansched3-3 | 23572 | 85819 | 2.432e+06 | 69.45 | ✅ |
+| sorrell3 | 1024 | 169162 | -512 | 7.83 | ✅ |
+| thor50dday | 53130 | 230 | 4174 | 3.31 | ✅ |
+| triptim1 | 24010 | 14593 | 22.86 | 14.46 | ✅ |
+| uccase12 | 40327 | 92414 | 1.151e+04 | 6.28 | ✅ |
+| uccase9 | 21361 | 32295 | 1.082e+04 | 26.05 | ✅ |
+
 
 ## 📦 Installation
 
