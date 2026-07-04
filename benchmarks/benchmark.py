@@ -172,8 +172,8 @@ def load_relaxed_lp(path, highs_solver="simplex"):
         opt_obj = info.objective_function_value
         highs_status = highs.modelStatusToString(highs.getModelStatus())
 
-    highs.presolve()
-    highs_lp = highs.getPresolvedLp()
+    # highs.presolve()
+    highs_lp = highs.getLp()
     jaddle_lp = hh.highs_to_standard_form_sparse(highs_lp)
 
     if jaddle_lp.A_ineq.shape == (0, 0) and jaddle_lp.A_eq.shape == (0, 0):
@@ -216,17 +216,14 @@ def run_jaddle(jaddle_lp, tol, max_epochs):
         dual_feasibility_tolerance=tol,
         dual_gap_tolerance=tol,
         update_mode="pdhg",
-        halpern_reanchor_per_epoch=True,
-        iterations_per_epoch=256,
-        k_scale=1e3,
-        k_theta=1e-3,
+        iterations_per_epoch=10000,
+        average=True,
+        k_scale=1e5,
+        k_theta=1e-1,
         adaptive_eta=0.0,
         max_epochs=max_epochs,
-        restarts=100,
-        restart_decay=0.9,
-        epochs_per_restart=10,
-        restart_multiplier=1.2,
-        vertex_bias=1e-3,
+        restarts=10,
+        feasibility_polish=True,
     )
     wall_seconds = time.perf_counter() - t0
 

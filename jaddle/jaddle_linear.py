@@ -97,6 +97,38 @@ def estimate_augmented_spectral_norm(
     return jnp.sqrt(lambda_max)
 
 
+def estimate_augmented_inf_norm(lp: JaddleLP):
+    """Compute the exact ∞-norm (max absolute row sum) of the augmented matrix
+
+        M = [[ A,    -b ],
+             [ cᵀ,    0 ]]
+
+    where ``A = [A_eq; A_ineq]`` (m×n), ``b`` is the length-m fused RHS and ``c``
+    the length-n cost. This is PDLP's step-size seed convention (Algorithm 1,
+    line 2: ``η ← 1/‖·‖∞``), but on the augmented system rather than on ``A``
+    alone — the ±b/±c signs do not affect absolute row sums so this equals
+    ‖[[A, b], [cᵀ, 0]]‖∞.
+
+    The ∞-norm is the largest ℓ₁ row norm. Row ``i`` of the top block is
+    ``[A_i, -b_i]`` with absolute sum ``Σ_j |A_ij| + |b_i|``; the single bottom
+    row is ``[cᵀ, 0]`` with absolute sum ``Σ_j |c_j|``. Per-row absolute sums of
+    ``A`` are obtained with one matvec ``|A| · 1`` (no dense matrix formed, no
+    power iteration), so this is a single O(nnz) pass and depends only on the
+    matrix data, not a random seed.
+    """
+    A = lp.A  # (m, n) fused [A_eq; A_ineq], BCOO
+    b = lp.b  # (m,)
+    c = lp.c  # (n,)
+
+    # Absolute row sums of A via one matvec against the all-ones vector.
+    abs_A = jsp.BCOO((jnp.abs(A.data), A.indices), shape=A.shape)
+    ones_n = jnp.ones(A.shape[1], dtype=c.dtype)
+    top_row_sums = abs_A @ ones_n + jnp.abs(b)  # rows [A_i, -b_i]
+    bottom_row_sum = jnp.sum(jnp.abs(c))  # row [cᵀ, 0]
+
+    return jnp.maximum(jnp.max(top_row_sums, initial=0.0), bottom_row_sum)
+
+
 # %%
 # Solvers for constrained linear optimisation via saddle point formulation
 def __sps(
@@ -117,7 +149,34 @@ def __sps(
     k_scaling=False,
     k_init=1.0,
     adaptive_eta=None,
+    gate=None,
 ):
+    # Per-iteration convergence gate. `gate` is None (disabled) or the tuple
+    # (row_scale_all, b_norm, gate_tol, col_scale, c_norm, dfr_tol): a cheap
+    # trigger checked every iteration inside the scan. When the CURRENT iterate is
+    # BOTH primal-feasible (relative PFR < gate_tol) AND dual-feasible (relative
+    # DFR < dfr_tol) the carried converged_flag latches True and the remaining
+    # scan steps become no-ops (state frozen). It is only a trigger to return
+    # early to the host — the host still runs the full 3-part certificate on the
+    # average iterate — so it can never cause a false stop, only an earlier host
+    # check. Wired for synchronous (whose `grad` computes A @ x and the reduced
+    # cost) and pdhg (which carries both); halpern and extragradient thread the
+    # flag through inertly (never latch — see the step bodies for why).
+    gate_enabled = gate is not None
+    if gate_enabled:
+        (
+            gate_row_scale_all,
+            gate_b_norm,
+            gate_tol,
+            gate_col_scale,
+            gate_c_norm,
+            gate_dfr_tol,
+            gate_c_max,
+            gate_c_norm_robust,
+            gate_gap_tol,
+            gate_report_c,
+        ) = gate
+
     # The stepping scheme is selected by `update_mode`. This derived boolean
     # keeps the dense per-scheme branching below readable while the string stays
     # the single source of truth.
@@ -163,11 +222,12 @@ def __sps(
     def projection_primal(primal_state):
         return projection_box(primal_state, lp.lower_bounds, lp.upper_bounds)
 
-    def grad(state):
+    def grad(state, return_Ax=False):
         # Fused matvecs: 2 sparse ops (A @ x, Aᵀ @ y) instead of 4. The
         # controllers below act on post-optimiser update norms, not on A·dx, so
         # there is nothing to gain from returning Ax — keep the single matvec
-        # pair and return only the gradient.
+        # pair and return only the gradient. `return_Ax` exposes the already-
+        # computed A @ x for the per-iteration convergence gate (no extra matvec).
         dual = jnp.concatenate([state.dual_eq, state.dual_ineq])
         Ax = lp.A @ state.primal  # shape: (n_eq + n_ineq,)
         ATd = lp.A_T @ dual  # shape: (n_vars,)
@@ -175,11 +235,14 @@ def __sps(
         residual = lp.b - Ax
         grad_dual_eq = residual[: lp.n_eq] + dual_damping_eq * state.dual_eq
         grad_dual_ineq = residual[lp.n_eq :] + dual_damping_ineq * state.dual_ineq
-        return SaddleState(
+        g = SaddleState(
             primal=grad_primal,
             dual_ineq=grad_dual_ineq,
             dual_eq=grad_dual_eq,
         )
+        if return_Ax:
+            return g, Ax
+        return g
 
     def grad_primal_only(state):
         # Primal partial only: c + Aᵀd (+ damping). One sparse matvec (Aᵀ @ d);
@@ -205,6 +268,120 @@ def __sps(
         grad_dual_eq = residual[: lp.n_eq] + dual_damping_eq * state.dual_eq
         grad_dual_ineq = residual[lp.n_eq :] + dual_damping_ineq * state.dual_ineq
         return grad_dual_ineq, grad_dual_eq
+
+    def gate_tripped(Ax, reduced_cost, state):
+        # Cheap per-iteration convergence trigger evaluating the SAME 3-part LP
+        # certificate the host `converged()` uses (relative PFR, DFR, and the
+        # sign-guarded duality-gap RDG), but on the CURRENT iterate, reusing
+        # Ax = A @ x and reduced_cost = c + Aᵀy the step already computes (no
+        # extra matvec). All three are required: a primal+dual-feasible iterate
+        # whose duality gap is still open must NOT freeze, or restart-driven modes
+        # get trapped (ns1830653). It is a trigger only — the host re-runs the
+        # full certificate on the AVERAGE iterate, so the gate can never cause a
+        # false stop, only an earlier host check. This mirrors compute_epoch_
+        # metrics; keep the two in sync. Returns a scalar bool; only meaningful
+        # when gate_enabled.
+        primal = state.primal
+        dual = jnp.concatenate([state.dual_eq, state.dual_ineq])
+
+        # ---- PFR: constraint violation unscaled by row_scale to true units,
+        # max over eq (|·|) and ineq (positive part) rows, ÷ (1 + ‖b‖). ----
+        Ax_minus_b = Ax - lp.b
+        grad_dual_eq = Ax_minus_b[: lp.n_eq]
+        grad_dual_ineq = Ax_minus_b[lp.n_eq :]
+        violations_unscaled = Ax_minus_b / gate_row_scale_all
+        eq_viol = jnp.abs(violations_unscaled[: lp.n_eq])
+        ineq_viol = jnp.maximum(violations_unscaled[lp.n_eq :], 0.0)
+        pfr = jnp.maximum(
+            jnp.max(eq_viol, initial=0.0), jnp.max(ineq_viol, initial=0.0)
+        ) / (1.0 + gate_b_norm)
+
+        # ---- DFR: projected-gradient / reduced-cost dual-feasibility residual in
+        # true units. reduced_cost = c_scaled + A_scaledᵀy carries col_scale, so
+        # r_true = r/col_scale; x_true = x·col_scale, bounds_true = b·col_scale. --
+        reduced_cost_true = reduced_cost / gate_col_scale
+        primal_true = primal * gate_col_scale
+        lb_true = lp.lower_bounds * gate_col_scale
+        ub_true = lp.upper_bounds * gate_col_scale
+        finite_lower = jnp.isfinite(lb_true)
+        finite_upper = jnp.isfinite(ub_true)
+        has_both = finite_lower & finite_upper
+        has_only_lower = finite_lower & (~finite_upper)
+        has_only_upper = (~finite_lower) & finite_upper
+        proj = projection_box(primal_true - reduced_cost_true, lb_true, ub_true)
+        dual_viol = jnp.where(
+            has_both,
+            jnp.abs(primal_true - proj),
+            jnp.where(
+                has_only_lower,
+                jnp.maximum(-reduced_cost_true, 0.0),
+                jnp.where(
+                    has_only_upper,
+                    jnp.maximum(reduced_cost_true, 0.0),
+                    jnp.abs(reduced_cost_true),  # free variable
+                ),
+            ),
+        )
+        dfr = jnp.max(dual_viol, initial=0.0) / (1.0 + gate_c_norm)
+
+        # ---- Duality gap: the three-way complementarity decomposition, in scaled
+        # space then ·c_max, exactly as compute_epoch_metrics builds it. The
+        # box_infimum is sign-guarded to −∞ on wrong-sign reduced costs (band
+        # tol·(1+‖c‖_robust)) so the gap is +∞ (undefined) at dual-infeasible
+        # points rather than fabricated finite. reduced_cost / bounds here are the
+        # SCALED versions (the decomposition multiplies the scaled primal). ----
+        objective_value = (
+            lp.objective(primal) if gate_report_c is None else gate_report_c @ primal
+        ) * gate_c_max
+        lb_s = lp.lower_bounds
+        ub_s = lp.upper_bounds
+        lower_term = reduced_cost * lb_s
+        upper_term = reduced_cost * ub_s
+        _dg_band = gate_dfr_tol * (1.0 + gate_c_norm_robust)
+        neg_inf = jnp.asarray(-jnp.inf, reduced_cost.dtype)
+        lower_only = jnp.where(reduced_cost_true >= -_dg_band, lower_term, neg_inf)
+        upper_only = jnp.where(reduced_cost_true <= _dg_band, upper_term, neg_inf)
+        free_term = jnp.where(jnp.abs(reduced_cost_true) <= _dg_band, 0.0, neg_inf)
+        box_infimum = jnp.where(
+            has_both,
+            jnp.minimum(lower_term, upper_term),
+            jnp.where(
+                has_only_lower,
+                lower_only,
+                jnp.where(has_only_upper, upper_only, free_term),
+            ),
+        )
+        gap_bound = (reduced_cost @ primal - jnp.sum(box_infimum)) * gate_c_max
+        gap_ineq = -(state.dual_ineq @ grad_dual_ineq) * gate_c_max
+        gap_eq = -(state.dual_eq @ grad_dual_eq) * gate_c_max
+        duality_gap = gap_bound + gap_ineq + gap_eq
+        gap_finite = jnp.isfinite(duality_gap)
+        dual_bound = objective_value - duality_gap
+        rdg = jnp.abs(duality_gap) / (
+            1.0 + jnp.abs(objective_value) + jnp.abs(dual_bound)
+        )
+        # No-cancellation guard (matches converged()): the summed magnitudes of
+        # the three gap components must also be within tolerance, so a gap that is
+        # small only through sign cancellation doesn't falsely trip.
+        rdg_abs = (jnp.abs(gap_bound) + jnp.abs(gap_ineq) + jnp.abs(gap_eq)) / (
+            1.0 + jnp.abs(objective_value) + jnp.abs(dual_bound)
+        )
+
+        return (
+            (pfr < gate_tol)
+            & (dfr < gate_dfr_tol)
+            & gap_finite
+            & (rdg < gate_gap_tol)
+            & (rdg_abs < gate_gap_tol)
+        )
+
+    def freeze_leaf(converged_flag, old, new):
+        # No-op tail: once converged_flag latches, keep the pre-step value so the
+        # remaining iterations don't move the iterate/average/opt-state. Work is
+        # computed unconditionally (jnp.where, not lax.cond) to stay type-stable
+        # under scan; the matvec on the frozen tail is not saved — correctness /
+        # convergence control is the goal, not tail-matvec savings.
+        return jax.tree.map(lambda o, n: jnp.where(converged_flag, o, n), old, new)
 
     def opt_update(gradient, opt_state, state):
         return optimiser.update(gradient, opt_state, state)
@@ -289,6 +466,7 @@ def __sps(
         bool(k_scaling),
         adaptive_step,
         halpern,
+        gate_enabled,
     )
     run_epoch = _LINEAR_RUN_EPOCH_CACHE.get(cache_key)
 
@@ -355,23 +533,41 @@ def __sps(
                     # Retry: while the trial step exceeds its admissible bound,
                     # shrink eta to just under eta_bar and re-trial. The
                     # (1-(i+1)^-0.3) factor < 1 guarantees strict decrease, so the
-                    # loop terminates. Carry (eta, cand, eta_bar, Ax_new). Ax_old is
-                    # eta-invariant (it depends on `state`, fixed across retries),
-                    # so it is closed over, not carried.
+                    # loop terminates. Carry (eta, cand, eta_bar, Ax_new). Ax_old
+                    # and the reduced cost rc = c + Aᵀy are eta-invariant (they
+                    # depend on `state`, fixed across retries), so rc is captured
+                    # from the first trial (not recomputed) and Ax_old is closed
+                    # over. `trial` returns rc so the gate reuses the Aᵀy the trial
+                    # already forms — no extra matvec.
                     def cond(c):
-                        eta_c, _, eta_bar_c, _ = c
+                        eta_c, _, eta_bar_c, _, _ = c
                         return eta_c > eta_bar_c
 
                     def body(c):
-                        eta_c, _, eta_bar_c, _ = c
+                        eta_c, _, eta_bar_c, _, rc_c = c
                         eta_s = jnp.minimum((1.0 - ip1 ** (-0.3)) * eta_bar_c, eta_c)
-                        cand_s, eta_bar_s, Ax_new_s = trial(eta_s, state, k, Ax_old)
-                        return (eta_s, cand_s, eta_bar_s, Ax_new_s)
+                        cand_s, eta_bar_s, Ax_new_s, _ = trial(eta_s, state, k, Ax_old)
+                        return (eta_s, cand_s, eta_bar_s, Ax_new_s, rc_c)
 
-                    cand0, eta_bar0, Ax_new0 = trial(eta, state, k, Ax_old)
-                    eta0, cand, eta_bar, Ax_new = jax.lax.while_loop(
-                        cond, body, (eta, cand0, eta_bar0, Ax_new0)
+                    cand0, eta_bar0, Ax_new0, rc0 = trial(eta, state, k, Ax_old)
+                    eta0, cand, eta_bar, Ax_new, _ = jax.lax.while_loop(
+                        cond, body, (eta, cand0, eta_bar0, Ax_new0, rc0)
                     )
+
+                    # Gate on the CURRENT iterate. pdhg carries Ax_old =
+                    # A @ state.primal and exposes rc0 = c + Aᵀy at `state`, so
+                    # both the PFR and DFR conditions are free. Halpern is excluded
+                    # even though it carries Ax: its convergence is driven by the
+                    # anchor schedule (z_{k+1}=lam·z_0+(1-lam)·T(z_k)) and per-epoch
+                    # reanchoring, so freezing the tail mid-cycle discards anchor
+                    # progress and COSTS epochs (a KKT-residual trip doesn't imply
+                    # the anchor average has settled). Extragradient carries no Ax
+                    # (Ax_old is None) so it never gates either. Trigger-only, same
+                    # as the synchronous path — the host runs the full certificate.
+                    if gate_enabled and Ax_old is not None and not halpern:
+                        gate_bool = gate_tripped(Ax_old, rc0, state)
+                    else:
+                        gate_bool = False
 
                     if halpern:
                         # Halpern anchor: blend T(z_k)=cand back toward z_0.
@@ -428,13 +624,16 @@ def __sps(
                             new_state, average_state, w / total_weight
                         )
 
+                    # gate_bool (computed above from Ax_old) is the per-step trip;
+                    # the wrapper OR-latches it into converged_flag. Paths without
+                    # a carried Ax (extragradient) emit False.
                     return (
                         i + 1,
                         new_state,
                         average_state,
                         opt_state,
                         total_weight,
-                    ), None
+                    ), gate_bool
 
                 return step
 
@@ -474,7 +673,9 @@ def __sps(
                         [dual_eq - state.dual_eq, dual_ineq - state.dual_ineq]
                     )
                     interaction = jnp.abs(jnp.vdot(dy, A_dx))
-                    return cand, _descent_bound(state, cand, k, interaction), Ax_new
+                    # gp = c + Aᵀd (+ damping) is the reduced cost at `state`;
+                    # returned so the gate's DFR test reuses it (no extra matvec).
+                    return cand, _descent_bound(state, cand, k, interaction), Ax_new, gp
 
                 step = make_adaptive_step(_trial)
 
@@ -542,7 +743,10 @@ def __sps(
                     # means the step is locally unconstrained: flag with +inf so
                     # the retry accepts and eta-growth is suppressed.
                     eta_bar = jnp.where(dg2 > 0.0, _MT * jnp.sqrt(dz2 / dg2), jnp.inf)
-                    return cand, eta_bar, None
+                    # 4th value = reduced cost at `state` (g.primal), for tuple-
+                    # arity parity with the pdhg trial. Unused here: extragradient
+                    # carries no Ax so its step never gates.
+                    return cand, eta_bar, None, g.primal
 
                 step = make_adaptive_step(_trial)
 
@@ -603,7 +807,7 @@ def __sps(
                             state, average_state, w / total_weight
                         )
 
-                    return (i + 1, state, average_state, opt_state, total_weight), None
+                    return (i + 1, state, average_state, opt_state, total_weight), False
 
             elif update_mode == "pdhg":
                 # Chambolle-Pock PDHG: identical to `alternating` (Gauss-Seidel
@@ -676,7 +880,7 @@ def __sps(
                             state, average_state, w / total_weight
                         )
 
-                    return (i + 1, state, average_state, opt_state, total_weight), None
+                    return (i + 1, state, average_state, opt_state, total_weight), False
 
             elif extragradient:
                 # Extragradient (Korpelevich) using jo.extragradient's two-call
@@ -741,7 +945,7 @@ def __sps(
                             state, average_state, w / total_weight
                         )
 
-                    return (i + 1, state, average_state, opt_state, total_weight), None
+                    return (i + 1, state, average_state, opt_state, total_weight), False
 
             else:
 
@@ -749,7 +953,18 @@ def __sps(
                     i, state, average_state, opt_state, total_weight = carry
                     opt_state, k = unpack_k(opt_state)
 
-                    g = grad(state)
+                    # `grad` already forms Ax = A @ state.primal; reuse it for the
+                    # per-iteration primal-feasibility gate (no extra matvec). The
+                    # gate reads the CURRENT (pre-update) iterate — the host
+                    # re-check on the average is authoritative, so an early/late
+                    # trip is harmless.
+                    if gate_enabled:
+                        g, Ax = grad(state, return_Ax=True)
+                        # g.primal = c + Aᵀy + damping is the reduced cost.
+                        gate_bool = gate_tripped(Ax, g.primal, state)
+                    else:
+                        g = grad(state)
+                        gate_bool = False
                     if k_scaling:
                         g = scale_by_k(g, k)
                     updates, opt_state = opt_update(g, opt_state, state)
@@ -770,7 +985,13 @@ def __sps(
                             state, average_state, w / total_weight
                         )
 
-                    return (i + 1, state, average_state, opt_state, total_weight), None
+                    return (
+                        i + 1,
+                        state,
+                        average_state,
+                        opt_state,
+                        total_weight,
+                    ), gate_bool
 
             # Fixed iteration count per epoch: lax.scan (static `max_iter`) lets
             # XLA pipeline the loop body better than a while_loop whose only exit
@@ -809,22 +1030,44 @@ def __sps(
                     ),
                 )
 
-            init_carry = (start_iter, state, average_state, opt_state, total_weight)
-            _carry_dtypes = jax.tree.map(lambda x: jnp.asarray(x).dtype, init_carry)
+            step_carry = (start_iter, state, average_state, opt_state, total_weight)
+            _carry_dtypes = jax.tree.map(lambda x: jnp.asarray(x).dtype, step_carry)
+
+            # The scan carry adds a latching converged_flag as its 6th element.
+            # The inner `step` variants stay 5-tuple functions; `step_typed`
+            # unpacks the flag, runs the step, OR-latches the step's gate output,
+            # and — once latched — freezes state/average/opt/total_weight to the
+            # pre-step values so the remaining iterations are no-ops (the loop
+            # index still advances so `i` reflects the true iteration count). `i`
+            # is intentionally NOT frozen so a converged epoch still reports where
+            # it stopped. converged_flag rides as a scalar bool; seed it False.
+            converged_flag0 = jnp.asarray(False)
+            init_carry = (*step_carry, converged_flag0)
 
             def step_typed(carry, _):
-                new_carry, y = step(carry, _)
-                new_carry = jax.tree.map(
-                    lambda v, dt: v.astype(dt), new_carry, _carry_dtypes
+                *inner_carry, converged_flag = carry
+                new_inner, gate_bool = step(tuple(inner_carry), _)
+                new_inner = jax.tree.map(
+                    lambda v, dt: v.astype(dt), new_inner, _carry_dtypes
                 )
-                return new_carry, y
+                # Freeze everything except the loop index once converged. The
+                # index (element 0) always advances; elements 1.. freeze.
+                i_new = new_inner[0]
+                frozen_tail = freeze_leaf(
+                    converged_flag, tuple(inner_carry[1:]), tuple(new_inner[1:])
+                )
+                new_flag = jnp.logical_or(
+                    converged_flag, jnp.asarray(gate_bool, converged_flag.dtype)
+                )
+                return (i_new, *frozen_tail, new_flag), None
 
-            (i, state, average_state, opt_state, total_weight), _ = jax.lax.scan(
+            scan_out, _ = jax.lax.scan(
                 step_typed,
                 init_carry,
                 None,
                 length=max_iter,
             )
+            i, state, average_state, opt_state, total_weight, converged_flag = scan_out
 
             if carry_Ax:
                 inner, (k0, eta0, _Ax) = opt_state
@@ -833,7 +1076,7 @@ def __sps(
                 inner, (k0, eta0, anchor0, _AxA, _AxS) = opt_state
                 opt_state = (inner, (k0, eta0, anchor0))
 
-            return i, state, average_state, opt_state, total_weight
+            return i, state, average_state, opt_state, total_weight, converged_flag
 
         _LINEAR_RUN_EPOCH_CACHE[cache_key] = run_epoch
 
@@ -961,6 +1204,16 @@ def solve(
     vertex_bias=0.0,
     vertex_bias_seed=0,
     reference_objective=None,
+    per_iter_gate=True,
+    gate_tol=None,
+    feasibility_polish=False,
+    polish_gap_slack=10.0,
+    polish_residual_slack=10.0,
+    polish_stall_window=10,
+    polish_stall_ratio=0.5,
+    polish_max_epochs=20,
+    polish_max_attempts=2,
+    polish_cooldown=10,
 ):
     """
     Solve a linear program via saddle-point optimisation.
@@ -986,8 +1239,21 @@ def solve(
             while keeping the current iterate as a warm start. The LR schedule /
             ``weight_function`` iteration counter also restarts from its initial
             value.
-        epochs_per_restart: Length cap (in epochs) of the first restart cycle
-            (default 10). Subsequent cycle caps grow by ``restart_multiplier``.
+        epochs_per_restart: Length cap of the first restart cycle, expressed in
+            epochs AT THE DEFAULT ``iterations_per_epoch`` (default 10) but
+            internally converted to and tracked in ITERATIONS
+            (``epochs_per_restart * iterations_per_epoch``), so the cycle-cap
+            restart fires at the same point in the optimisation trajectory
+            regardless of ``iterations_per_epoch``. This matters because a
+            restart is destructive (it wipes PDHG momentum/averaging via
+            ``optimiser.init``): tying the cap to a raw epoch count made the
+            restart cadence an accident of how the iteration budget was chopped
+            into epochs — e.g. on momentum1, ``iterations_per_epoch=1000``
+            triggered a cap-exhaustion restart at 10,000 iterations while still
+            dual-infeasible, wiping out a trajectory that would otherwise have
+            converged smoothly, while ``iterations_per_epoch=10000`` reached
+            full convergence in under 100,000 iterations before the same cap
+            ever fired. Subsequent cycle caps grow by ``restart_multiplier``.
         restart_multiplier: Geometric growth factor for cycle-length caps
             (default 1.0 = fixed length, 2.0 = doubling).
         restart_decay: Sufficient-progress threshold (default 0.2; cuPDLP
@@ -1101,6 +1367,73 @@ def solve(
             comparing ``OBJERR`` against ``RDG`` quantifies how much of the gap is
             dual lag versus genuine primal suboptimality. Does not affect
             termination — convergence still uses the full LP certificate.
+        per_iter_gate: When ``True`` (default), a cheap primal-feasibility TRIGGER
+            is evaluated every iteration inside the scan, reusing the ``A @ x``
+            the step already computes (no extra matvec). Once the current
+            iterate's relative primal residual drops below ``gate_tol`` the flag
+            latches and the remaining iterations of the epoch become no-ops
+            (state/average frozen), so the epoch returns a converged iterate to
+            the host instead of drifting past it. It is only a trigger: the host
+            still runs the full 3-part certificate on the average iterate, so the
+            gate can only cause an earlier host check, never a false stop. Active
+            for ``synchronous`` and ``pdhg`` (both have ``A @ x`` and the reduced
+            cost already in hand). ``halpern`` is excluded — its anchor schedule
+            makes an early freeze counterproductive — and ``extragradient`` has no
+            carried ``A @ x``, so neither is gated. The trip requires BOTH primal
+            and dual feasibility (relative PFR and DFR), matching the certificate,
+            so it can't fire on a primal-feasible-but-dual-lagging iterate.
+        gate_tol: Threshold for the per-iteration gate's relative primal residual.
+            Defaults to ``primal_feasibility_tolerance`` (the same threshold the
+            certificate's PFR test uses).
+        feasibility_polish: PDLP-style feasibility polishing (the "feasibility
+            polishing" phase of the PDLP deployment paper). Saddle solves are
+            frequently FEASIBILITY-tail-limited: the duality gap and one residual
+            converge quickly while the other residual crawls down a sublinear
+            tail. When one side of the certificate is the lone blocker, the main
+            loop pauses and solves that side's far easier feasibility problem
+            with a nested ``solve()``, warm-started from the current point:
+            * primal polish — the original constraints with ``c = 0`` (the
+              optimal dual is 0, so PDHG contracts fast), started at ``(x, 0)``;
+            * dual polish — the homogenised problem with ``b = 0`` and every
+              finite bound moved to 0 (bound classes, and hence the dual sign
+              conditions, are preserved; the optimal primal is 0), started at
+              ``(0, y)``.
+            Polishing targets the FINISHING regime only — the lagging residual
+            must already be within ``polish_residual_slack`` of tolerance.
+            Deep plateaus (mzzv11's PFR~1e-1 wall) are out of scope: from
+            there the warm start drags the trap into the sub-problem, and a
+            cold-started feasible point is objective-agnostic so its
+            recombined duality gap explodes (both measured; see the trigger
+            and ``_attempt_polish`` comments).
+            The polished side is recombined with the untouched other side and the
+            FULL certificate is re-evaluated on the combination: certified →
+            terminate; KKT merit improved → warm-start the main loop from it
+            (restart-style reset, not counted against the ``restarts`` budget);
+            otherwise the candidate is discarded. A sub-solve that exhausts its
+            budget before certifying doubles the side's budget for the next
+            attempt.
+            A polish attempt can therefore never make the returned point worse.
+            Each attempt is a nested solve on the modified LP and pays its own
+            scaling + XLA compile (the epoch-fn cache is keyed on the LP object).
+        polish_gap_slack: Gap condition (necessary): polishing fires only once
+            ``RDG <= polish_gap_slack * dual_gap_tolerance`` (the gap is
+            essentially there; feasibility is the blocker). Default 10.
+        polish_residual_slack: Finishing-regime condition (necessary): the
+            lagging residual must satisfy ``residual <= polish_residual_slack *
+            its_tolerance``, so attempts are not burned warm-starting from deep
+            plateaus the sub-solve inherits. Default 10.
+        polish_stall_window / polish_stall_ratio: Stall condition (necessary):
+            the lagging residual has improved by less than a factor
+            ``1/polish_stall_ratio`` over the last ``polish_stall_window``
+            epochs. A residual still making progress converges cheaper by
+            letting the main loop run (an eager gap-only trigger COST epochs on
+            neos-1593097). Defaults 10 / 0.5 (less than 2x in 10 epochs).
+        polish_max_epochs: Epoch budget of a side's first polish attempt; doubles
+            after any attempt whose sub-solve ran out of budget. Default 20.
+        polish_max_attempts: Maximum attempts per side. Default 2.
+        polish_cooldown: Minimum epochs between attempts — and, since the counter
+            starts at epoch 0, the earliest epoch a first attempt can fire.
+            Default 10.
 
     Returns:
         dict: The solution together with diagnostics. Keys:
@@ -1124,6 +1457,10 @@ def solve(
               ``n * (solve_seconds - first_epoch_seconds) / (n - 1)`` where ``n``
               is the epoch count. Falls back to ``solve_seconds`` when it can't be
               formed (fewer than two epochs).
+            * ``"epochs"``: ``int``, number of epochs run.
+            * ``"polish"``: feasibility-polishing diagnostics —
+              ``{"primal_attempts", "dual_attempts", "adopted"}`` (all 0 when
+              ``feasibility_polish`` is off).
     """
 
     if lp.A_ineq.shape[0] == 0:
@@ -1200,6 +1537,12 @@ def solve(
     if isinstance(lp, JaddleLP):
         lp = lp.to_scipy()
 
+    # Feasibility polishing builds its sub-problems (c=0 / homogenised b=0) from
+    # the ORIGINAL (unscaled) problem, so keep a reference before scaling rebinds
+    # `lp`. The scaling functions construct a new LP (they never mutate their
+    # input), so sharing the constraint-matrix references is safe.
+    _polish_base_lp = lp if feasibility_polish else None
+
     if scale == "ruiz":
         lp, row_scale, col_scale = ruiz_scaling(lp)
 
@@ -1251,6 +1594,10 @@ def solve(
         original_lp = lp
         lp = to_jaddle_sparse(lp)
 
+    # Polish sub-solves re-derive the step-size seed on their own scaled
+    # operator, so keep the caller's sentinel (0.0 = derive) before it is
+    # resolved for the main problem below.
+    _orig_adaptive_eta = adaptive_eta
     if adaptive_eta == 0.0:
         adaptive_eta = 1 / estimate_augmented_spectral_norm(lp)
         print(f"Adaptive step size seed set to 1/||A||_2 = {adaptive_eta:.3e}")
@@ -1705,6 +2052,10 @@ def solve(
     first_epoch_seconds = None
     total_weight = 0.0
     reported_used_avg = average
+    # Whether the per-iteration primal-feasibility gate latched during the most
+    # recent epoch. Diagnostic (surfaced in verbose logging); does not affect
+    # stopping — the certificate below decides that.
+    epoch_gate_tripped = False
     is_converged = True
     # Why the loop terminated. Defaults to the budget-exhausted case; is_done()
     # overwrites it with the test that actually fired ("certificate" or
@@ -1743,11 +2094,43 @@ def solve(
     restarts_done = 0
     restart_i_offset = 0
     epochs_since_restart = 0
-    current_cycle_cap = float(epochs_per_restart)
+    # The cycle-exhaustion cap is tracked in ITERATIONS, not epochs, so that
+    # `cycle_exhausted` fires at the same point in the optimisation trajectory
+    # regardless of `iterations_per_epoch`. A restart is a destructive reset
+    # (optimiser.init(state) wipes PDHG momentum/averaging), so its cadence must
+    # not depend on how the same iteration budget happens to be chopped into
+    # epochs. Seed the cap in iterations from the epoch-count knob so the
+    # default (epochs_per_restart=10) means the same thing it always has at the
+    # default iterations_per_epoch; iterations_since_restart accumulates the
+    # ACTUAL per-epoch iteration count, so it stays correct even under
+    # iterations_per_epoch_decay.
+    iterations_since_restart = 0
+    current_cycle_cap_iters = float(epochs_per_restart) * float(iterations_per_epoch)
     merit_at_last_restart = jnp.inf
+    # Previous epoch's RELATIVE (tolerance-comparable) primal/dual residuals.
+    # Used only to gate the cycle-cap restart while the merit is non-finite
+    # (dual-infeasible): see the `still_improving` guard below. inf until the
+    # first epoch sets it, so the guard can't fire before there is a real
+    # comparison point.
+    prev_relative_pfr = jnp.inf
+    prev_relative_dfr = jnp.inf
     # Previous epoch's restart merit, for cuPDLP condition (ii) (stalling: merit
     # rising again after necessary decay). inf until the first epoch sets it.
     prev_epoch_merit = jnp.inf
+
+    # Feasibility-polish bookkeeping. Attempt counters and epoch budgets are per
+    # side; the relative-residual windows drive the stall trigger; seeding
+    # `last_polish_epoch` at 0 makes `polish_cooldown` double as the earliest
+    # epoch a first attempt can fire.
+    polish_attempts = {"primal": 0, "dual": 0}
+    polish_budget = {
+        "primal": int(polish_max_epochs),
+        "dual": int(polish_max_epochs),
+    }
+    last_polish_epoch = 0
+    polish_adopted = 0
+    pfr_window = []
+    dfr_window = []
 
     # Normalisation constants for the restart merit (PDLP-style). Each KKT
     # residual is divided by 1 + its natural scale so the three terms are
@@ -1762,6 +2145,12 @@ def solve(
     _row_scale_all = jnp.concatenate([jnp_row_scale_eq, jnp_row_scale_ineq])
     b_norm = float(jnp.max(jnp.abs(lp.b / _row_scale_all))) if lp.b.size else 0.0
     c_norm = float(jnp.max(jnp.abs(lp.c / col_scale))) if lp.c.size else 0.0
+
+    # Per-iteration gate PFR tolerance. Defaults to the primal-feasibility
+    # tolerance — the same threshold the certificate's PFR test uses. The full
+    # `_gate` config tuple is assembled below, once `c_norm_robust` (needed for
+    # the gate's gap sign-guard, matching the host certificate) is available.
+    _gate_tol = gate_tol if gate_tol is not None else primal_feasibility_tolerance
 
     # Robust cost norm for the gap's dual-feasibility SIGN-GUARD band only. The
     # band `_dg_tol = tol·(1+norm)` decides whether a wrong-sign reduced cost is
@@ -1792,6 +2181,36 @@ def solve(
             c_norm_robust = c_norm
     else:
         c_norm_robust = 0.0
+
+    # Per-iteration convergence gate config passed to __sps. The gate is a cheap
+    # TRIGGER checked every iteration inside the scan; the host still runs the
+    # full 3-part certificate (converged()) on the average iterate, so the gate
+    # can only cause an earlier host check, never a false stop. It evaluates the
+    # SAME three conditions the host certificate does (relative PFR, DFR, and the
+    # sign-guarded duality-gap RDG) on the CURRENT iterate, reusing the A@x and
+    # reduced cost the step already computes — no extra matvec. Requiring the gap
+    # too (not just PFR+DFR) is essential: a primal+dual-feasible-but-gap-open
+    # iterate must NOT freeze, or restart-driven modes get trapped (ns1830653:
+    # PFR+DFR-only froze the tail every epoch and never closed the gap). The
+    # tuple carries every scaled-space constant the three tests need. Wired for
+    # synchronous and pdhg (both expose A@x and the reduced cost); halpern and
+    # extragradient thread the flag inertly (see the step bodies).
+    _gate = (
+        (
+            _row_scale_all,
+            b_norm,
+            _gate_tol,
+            col_scale,
+            c_norm,
+            dual_feasibility_threshold,
+            c_max,
+            c_norm_robust,
+            float(dual_gap_tolerance),
+            _report_c,
+        )
+        if per_iter_gate
+        else None
+    )
 
     def kkt_merit(
         constraint_bound,
@@ -1853,6 +2272,7 @@ def solve(
                 1.0 + abs(reference_objective)
             )
             objerr_str = f"|OBJERR {obj_err:.2e}|"
+        gate_str = "|gate|" if epoch_gate_tripped else ""
         print(
             f"|Epoch {count}|"
             f"|Obj{objective_value:.2e}|"
@@ -1860,6 +2280,7 @@ def solve(
             f"|DFR {relative_dfr:.2e}|"
             f"|RDG {relative_gap(duality_gap, objective_value):.2e}|"
             f"{objerr_str}"
+            f"{gate_str}"
             f"{ke_str}"
             f"{time_str}"
         )
@@ -1909,6 +2330,113 @@ def solve(
         log_k = k_theta * jnp.log(k_target) + (1.0 - k_theta) * jnp.log(k_prev)
         return jnp.clip(jnp.exp(log_k), k_lo, k_hi)
 
+    def _attempt_polish(side):
+        # One feasibility-polish attempt (see the docstring): a nested solve() on
+        # the side's feasibility problem, built from the ORIGINAL (unscaled)
+        # data and warm-started from the currently-reported point. Returns the
+        # recombined candidate — polished side + untouched other side — mapped
+        # into the MAIN solve's scaled space; the caller certifies/adopts it.
+        seed = average_state if (average and reported_used_avg) else state
+        base = _polish_base_lp
+        if side == "primal":
+            # Pure feasibility: min 0 subject to the original constraints. The
+            # optimal dual is 0, so the dual is warm-started there.
+            sub_lp = LP(
+                np.zeros_like(base.c),
+                base.A_eq,
+                base.b_eq,
+                base.A_ineq,
+                base.b_ineq,
+                base.lower_bounds,
+                base.upper_bounds,
+            )
+            init = SaddleState(
+                primal=seed.primal * col_scale,
+                dual_ineq=jnp.zeros_like(seed.dual_ineq),
+                dual_eq=jnp.zeros_like(seed.dual_eq),
+            )
+        else:
+            # Homogenised dual-feasibility problem: b = 0 and every finite bound
+            # moved to 0. Bound CLASSES are preserved, so the dual sign
+            # conditions match the original problem; the optimal primal is 0
+            # and the primal is warm-started there.
+            sub_lp = LP(
+                base.c,
+                base.A_eq,
+                np.zeros_like(base.b_eq),
+                base.A_ineq,
+                np.zeros_like(base.b_ineq),
+                np.where(np.isfinite(base.lower_bounds), 0.0, -np.inf),
+                np.where(np.isfinite(base.upper_bounds), 0.0, np.inf),
+            )
+            init = SaddleState(
+                primal=jnp.zeros_like(seed.primal),
+                dual_ineq=seed.dual_ineq * jnp_row_scale_ineq * c_max,
+                dual_eq=seed.dual_eq * jnp_row_scale_eq * c_max,
+            )
+        # Warm-started from the trigger point — valid because the trigger
+        # additionally requires the lagging residual to already be within
+        # polish_residual_slack of tolerance (the FINISHING regime). Do NOT
+        # loosen that gate and lean on this warm start for deep plateaus: from
+        # mzzv11's PFR~1e-1 plateau the warm-started feasibility problem did
+        # not converge in 60 epochs (the trap rides in with the iterate) while
+        # a cold start certified in 2 — but the cold point is objective-
+        # agnostic, so its recombined gap explodes and the candidate is
+        # useless. Escaping deep plateaus needs a different tool.
+        sub = solve(
+            sub_lp,
+            optimiser=optimiser,
+            max_epochs=polish_budget[side],
+            initial_solution=init,
+            iterations_per_epoch=iterations_per_epoch,
+            primal_feasibility_tolerance=primal_feasibility_tolerance,
+            dual_feasibility_tolerance=dual_feasibility_tolerance,
+            dual_gap_tolerance=dual_gap_tolerance,
+            weight_function=weight_function,
+            verbose=verbose,
+            log_every=log_every,
+            average=average,
+            report_best=report_best,
+            update_mode=update_mode,
+            k_scale=k_scale,
+            k_theta=k_theta,
+            # k_init is left to the ||c||/||b|| derivation ON PURPOSE: it
+            # degenerates in exactly the right direction on the polish problems
+            # (c=0 → k_lo: no objective force on the primal; b=0 → k_hi,
+            # symmetrically). Seeding the main solve's learned k instead left
+            # mzzv11's 2-epoch feasibility problem unconverged at 20 epochs.
+            adaptive_eta=_orig_adaptive_eta,
+            scale=scale,
+            # c=0 on the primal side would make the objective scale max|c| = 0;
+            # both sides run with the unscaled cost.
+            scaled_objective=False,
+            restarts=restarts,
+            epochs_per_restart=epochs_per_restart,
+            restart_multiplier=restart_multiplier,
+            restart_decay=restart_decay,
+            necessary_decay=necessary_decay,
+            per_iter_gate=per_iter_gate,
+            feasibility_polish=False,
+        )
+        if sub["stop_reason"] == "interrupted":
+            # The nested solve caught the Ctrl-C; re-raise so the main solve's
+            # interrupt path (return the current best point) still runs.
+            raise KeyboardInterrupt
+        sol = sub["solution"]  # original units
+        if side == "primal":
+            cand = SaddleState(
+                primal=sol.primal / col_scale,
+                dual_ineq=seed.dual_ineq + 0,
+                dual_eq=seed.dual_eq + 0,
+            )
+        else:
+            cand = SaddleState(
+                primal=seed.primal + 0,
+                dual_ineq=sol.dual_ineq / (jnp_row_scale_ineq * c_max),
+                dual_eq=sol.dual_eq / (jnp_row_scale_eq * c_max),
+            )
+        return cand, bool(sub["converged"])
+
     start_time = time.time()
 
     try:
@@ -1927,6 +2455,7 @@ def solve(
                 average_state,
                 opt_state,
                 total_weight,
+                epoch_converged_flag,
             ) = __sps(
                 current_iterations_per_epoch,
                 i - restart_i_offset,
@@ -1945,6 +2474,7 @@ def solve(
                 k_scaling=k_scaling,
                 k_init=k_init,
                 adaptive_eta=adaptive_eta,
+                gate=_gate,
             )
             # __sps increments the (restart-shifted) counter; restore global i.
             # `shifted_i` comes back as a JAX array (it is the scan-carried loop
@@ -1954,6 +2484,10 @@ def solve(
             # traced (non-static) argument that type change retraces run_epoch —
             # a second ~0.6s XLA compile billed to epoch 2.
             i = int(shifted_i) + restart_i_offset
+            # Whether the per-iteration primal-feasibility gate latched this
+            # epoch (state frozen for the tail). Informational only — the host
+            # still runs the full certificate below and that decides stopping.
+            epoch_gate_tripped = bool(epoch_converged_flag)
             # Same flip for total_weight: it returns as a float64 JAX array but
             # enters epoch 1 as a weak-typed Python float. Coerce back to a Python
             # float so its type is stable across epochs — otherwise the weak->strong
@@ -2062,6 +2596,7 @@ def solve(
             restarted_this_epoch = False
             if restarts and restarts_done < restarts:
                 epochs_since_restart += 1
+                iterations_since_restart += current_iterations_per_epoch
 
                 # `merit` is the metric of the *reported* point: with
                 # report_best it is already the better of {average, iterate};
@@ -2080,7 +2615,7 @@ def solve(
                 # genuinely different points and either can be the better warm
                 # start, so restart to whichever has the lower merit instead of
                 # always discarding a frequently-better average.
-                cycle_exhausted = epochs_since_restart >= current_cycle_cap
+                cycle_exhausted = iterations_since_restart >= current_cycle_cap_iters
                 # Resolve the restart point from the *current* state/average
                 # variables via the report_best decision flag, not an object
                 # captured before metrics. The equality-projection block above
@@ -2130,6 +2665,31 @@ def solve(
                 # feasibility tail where they actually help. Only the length-based
                 # `cycle_exhausted` path may fire on an inf merit.
                 merit_is_finite = bool(jnp.isfinite(restart_merit))
+
+                # `cycle_exhausted` is the one trigger allowed to fire on a
+                # non-finite merit (see above) — it's the safety valve that keeps
+                # a permanently dual-infeasible run restarting at all. But while
+                # still dual-infeasible, BOTH raw feasibility residuals monotone-
+                # decreasing epoch-over-epoch means the run is mid-flight on a
+                # perfectly good trajectory, not stuck — restarting there only
+                # destroys momentum for no gain (momentum1: an
+                # iterations_per_epoch=1000 run hit merit=inf cycle-exhaustion at
+                # 10,000 iterations while PFR/DFR were still improving every
+                # epoch; the optimiser.init() reset wiped the trajectory and it
+                # never recovered, while iterations_per_epoch=10000 reached full
+                # convergence before the same cap fired). Only suppress the
+                # exhaustion path this way — sufficient_progress/stalling_restart
+                # already require merit_is_finite and are unaffected.
+                relative_pfr = float(constraint_bound) / (1.0 + b_norm)
+                relative_dfr = float(dual_feasibility_residual) / (1.0 + c_norm)
+                still_improving = (not merit_is_finite) and (
+                    relative_pfr < prev_relative_pfr
+                    and relative_dfr < prev_relative_dfr
+                )
+                if cycle_exhausted and not merit_is_finite and still_improving:
+                    cycle_exhausted = False
+                prev_relative_pfr = relative_pfr
+                prev_relative_dfr = relative_dfr
 
                 # Seed the baseline on the first finite merit so the
                 # sufficient-progress test has something real to compare against
@@ -2221,7 +2781,8 @@ def solve(
                     # New cycle: no previous-epoch merit yet for condition (ii).
                     prev_epoch_merit = jnp.inf
                     epochs_since_restart = 0
-                    current_cycle_cap *= restart_multiplier
+                    iterations_since_restart = 0
+                    current_cycle_cap_iters *= restart_multiplier
                     current_iterations_per_epoch = max(
                         iterations_per_epoch_min,
                         int(current_iterations_per_epoch * iterations_per_epoch_decay),
@@ -2243,7 +2804,7 @@ def solve(
                         print(
                             f"Restart {restarts_done}/{restarts} at epoch {count} "
                             f"({reason}, merit={float(restart_merit):.2e} "
-                            f"[{which}], next cap={current_cycle_cap:.0f} epochs, "
+                            f"[{which}], next cap={current_cycle_cap_iters:.0f} iters, "
                             f"iters/epoch={current_iterations_per_epoch}{k_msg})"
                         )
                         print("----------------------------------------------")
@@ -2294,6 +2855,214 @@ def solve(
                 # toward 1/2 next epoch; without this lambda would stay ~0 and the
                 # fresh anchor would carry no weight (a silent no-op).
                 restart_i_offset = i - 1
+
+            # --- Feasibility polishing (PDLP-style) ---
+            # When one side of the certificate is the lone blocker, solve that
+            # side's far easier feasibility problem and recombine (see the
+            # docstring). Checked after the restart decision so a restarting
+            # epoch is left alone.
+            if feasibility_polish and not restarted_this_epoch:
+                rel_pfr = float(constraint_bound) / (1.0 + b_norm)
+                rel_dfr = float(dual_feasibility_residual) / (1.0 + c_norm)
+                rdg = float(relative_gap(duality_gap, objective_value))
+                pfr_window.append(rel_pfr)
+                dfr_window.append(rel_dfr)
+                if len(pfr_window) > int(polish_stall_window):
+                    pfr_window.pop(0)
+                    dfr_window.pop(0)
+                gap_ok = bool(dual_gap_is_finite) and rdg <= polish_gap_slack * float(
+                    dual_gap_tolerance
+                )
+                window_full = len(pfr_window) == int(polish_stall_window)
+                pfr_stalled = window_full and rel_pfr > polish_stall_ratio * (
+                    pfr_window[0]
+                )
+                dfr_stalled = window_full and rel_dfr > polish_stall_ratio * (
+                    dfr_window[0]
+                )
+
+                # All conditions are NECESSARY. Near-tolerance (finishing
+                # regime): the sub-solve is warm-started from the current
+                # point, and from a deep plateau the warm start drags the trap
+                # into the sub-problem (see _attempt_polish). Stalled: a
+                # residual still improving will get there cheaper by letting
+                # the main loop run (measured: an eager gap-only trigger COST
+                # epochs on neos-1593097). gap_ok: a stalled residual with a
+                # wide-open gap is not a finishing case.
+                side = None
+                if (
+                    primal_feasibility_tolerance
+                    < rel_pfr
+                    <= polish_residual_slack * primal_feasibility_tolerance
+                    and rel_dfr <= dual_feasibility_threshold
+                    and gap_ok
+                    and pfr_stalled
+                ):
+                    side = "primal"
+                elif (
+                    dual_feasibility_threshold
+                    < rel_dfr
+                    <= polish_residual_slack * dual_feasibility_threshold
+                    and rel_pfr <= primal_feasibility_tolerance
+                    and gap_ok
+                    and dfr_stalled
+                ):
+                    side = "dual"
+
+                if (
+                    side is not None
+                    and polish_attempts[side] < polish_max_attempts
+                    and count - last_polish_epoch >= polish_cooldown
+                ):
+                    if verbose:
+                        print(
+                            f"→ Feasibility polish ({side}), budget "
+                            f"{polish_budget[side]} epochs (PFR {rel_pfr:.2e}, "
+                            f"DFR {rel_dfr:.2e}, RDG {rdg:.2e})"
+                        )
+                        print("----------------------------------------------")
+                    polish_attempts[side] += 1
+                    last_polish_epoch = count
+                    cand, sub_converged = _attempt_polish(side)
+                    if not sub_converged:
+                        # The sub-solve ran out of budget before certifying its
+                        # feasibility problem; give the next attempt more room
+                        # regardless of whether the partial result is adopted.
+                        polish_budget[side] *= 2
+
+                    # Adoption compares TOLERANCE-NORMALISED certificate
+                    # distance (>1 = blocking), NOT the raw KKT merit: the raw
+                    # max() is often pinned by a residual that is already
+                    # within its (perhaps loose) tolerance, so a candidate that
+                    # fixes the actual blocker would compare equal and be
+                    # spuriously discarded.
+                    def _cert_distance(obj, cb, dfr, dg, dgf, gb, gi, ge):
+                        rp = (cb / (1.0 + b_norm)) / primal_feasibility_tolerance
+                        rd = (dfr / (1.0 + c_norm)) / max(
+                            dual_feasibility_threshold, 1e-30
+                        )
+                        if bool(dgf):
+                            rg = float(relative_gap(dg, obj)) / dual_gap_tolerance
+                            gap_denom = 1.0 + abs(float(obj)) + abs(float(obj - dg))
+                            rga = (
+                                (abs(float(gb)) + abs(float(gi)) + abs(float(ge)))
+                                / gap_denom
+                                / dual_gap_tolerance
+                            )
+                        else:
+                            rg = rga = np.inf
+                        return max(float(rp), float(rd), rg, rga)
+
+                    cand_metrics = compute_epoch_metrics(cand)
+                    cand_merit = _cert_distance(
+                        cand_metrics[0],
+                        cand_metrics[3],
+                        cand_metrics[4],
+                        cand_metrics[5],
+                        cand_metrics[6],
+                        cand_metrics[7],
+                        cand_metrics[8],
+                        cand_metrics[9],
+                    )
+                    cur_merit = _cert_distance(
+                        objective_value,
+                        constraint_bound,
+                        dual_feasibility_residual,
+                        duality_gap,
+                        dual_gap_is_finite,
+                        gap_bound_comp,
+                        gap_ineq_comp,
+                        gap_eq_comp,
+                    )
+                    cand_certified = bool(
+                        converged(
+                            cand_metrics[3],
+                            cand_metrics[4],
+                            cand_metrics[5],
+                            cand_metrics[6],
+                            cand_metrics[0],
+                            cand_metrics[7],
+                            cand_metrics[8],
+                            cand_metrics[9],
+                        )
+                    )
+                    if cand_certified or cand_merit < cur_merit:
+                        # Adopt. Certified → the loop exits at the next is_done()
+                        # (the certificate reads the metric variables rebound
+                        # here). Merely merit-improving → warm-start the main
+                        # loop from the combination with a restart-style reset:
+                        # momentum/averaging cleared, k and eta carried, LR
+                        # schedule re-zeroed. Not counted against `restarts`.
+                        polish_adopted += 1
+                        (
+                            objective_value,
+                            primal_grad_norm,
+                            complementarity_slack,
+                            constraint_bound,
+                            dual_feasibility_residual,
+                            duality_gap,
+                            dual_gap_is_finite,
+                            gap_bound_comp,
+                            gap_ineq_comp,
+                            gap_eq_comp,
+                        ) = cand_metrics
+                        state = cand
+                        average_state = cand
+                        reported_used_avg = average
+                        if k_scaling:
+                            k_slot = opt_state[1]
+                            if halpern:
+                                # Re-anchor Halpern at the adopted point
+                                # (independent copy; `state` is donated next
+                                # epoch).
+                                k_slot = (
+                                    k_slot[0],
+                                    k_slot[1],
+                                    jax.tree.map(lambda x: x + 0, cand),
+                                )
+                            opt_state = (optimiser.init(cand), k_slot)
+                        else:
+                            opt_state = optimiser.init(cand)
+                        total_weight = 0.0
+                        restart_i_offset = i - 1
+                        state_at_last_restart = jax.tree.map(lambda x: x + 0, cand)
+                        state_at_last_epoch = jax.tree.map(lambda x: x + 0, cand)
+                        # The restart controller's baseline is in raw KKT-merit
+                        # units, not the tolerance-normalised cert distance used
+                        # for the adoption decision above.
+                        merit_at_last_restart = kkt_merit(
+                            cand_metrics[3],
+                            cand_metrics[4],
+                            cand_metrics[5],
+                            cand_metrics[6],
+                            cand_metrics[0],
+                        )
+                        prev_epoch_merit = jnp.inf
+                        epochs_since_restart = 0
+                        iterations_since_restart = 0
+                        pfr_window.clear()
+                        dfr_window.clear()
+                        if verbose:
+                            outcome = (
+                                "certified" if cand_certified else "merit improved"
+                            )
+                            print(
+                                f"→ Polish adopted ({outcome}: "
+                                f"{float(cand_merit):.2e} vs {float(cur_merit):.2e})"
+                            )
+                            print("----------------------------------------------")
+                    else:
+                        # Discarded. Budget already doubled above if the
+                        # sub-solve ran out of room; a converged-but-still-worse
+                        # candidate means the recombination is the problem, and
+                        # more sub-epochs would not change it.
+                        if verbose:
+                            print(
+                                f"→ Polish discarded (merit {float(cand_merit):.2e}"
+                                f" vs {float(cur_merit):.2e}; sub-solve "
+                                f"{'converged' if sub_converged else 'unconverged'})"
+                            )
+                            print("----------------------------------------------")
 
         # The while-loop exits the iteration *after* the converging epoch, so its
         # metrics were computed but only printed if it landed on a log_every
@@ -2378,6 +3147,12 @@ def solve(
         "stop_reason": stop_reason,
         "solve_seconds": solve_seconds,
         "corrected_seconds": corrected_seconds,
+        "epochs": count,
+        "polish": {
+            "primal_attempts": polish_attempts["primal"],
+            "dual_attempts": polish_attempts["dual"],
+            "adopted": polish_adopted,
+        },
     }
 
 
@@ -2631,7 +3406,7 @@ def ruiz_scaling(
     return __apply_scaling(lp, A, b, dr, dc)
 
 
-def pc_scaling(lp: LP, max_iter=1, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
+def pc_scaling(lp: LP, max_iter=10, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
     """
     Applies PC scaling to an LP in standard form with sparse matrices:
         min c^T x
@@ -2659,7 +3434,7 @@ def pc_scaling(lp: LP, max_iter=1, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
         n_rows,
         n_cols,
         max_iter,
-        False,  # L1 (Pock-Chambolle) via segment_sum
+        True,
         clip_bounds,
         threshold,
     )
