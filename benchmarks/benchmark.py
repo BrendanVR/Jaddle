@@ -32,7 +32,9 @@ import highspy as hspy
 import jaddle.jaddle_optimisers as jo
 import jaddle.jaddle_linear as jl
 import jaddle.highs_helpers as hh
+from jaddle.jaddle_basic_types import JaddleLP, SaddleState
 
+import jax
 import jax.numpy as jnp
 import jax.experimental.sparse as jsp
 
@@ -112,6 +114,19 @@ def parse_args():
         "plateau. See benchmarks/scan_bigm.py.",
     )
     p.add_argument(
+        "--highs-verbose",
+        action="store_true",
+        help="Enable HiGHS's own solve logging (output_flag=true), instead of "
+        "the default silent reference solve.",
+    )
+    p.add_argument(
+        "--highs-kkt-tolerance",
+        type=float,
+        default=None,
+        help="KKT tolerance passed to HiGHS's reference solve (default: same "
+        "value as --tol).",
+    )
+    p.add_argument(
         "--skip-bigm-column",
         action="store_true",
         help="Skip instances with a big-M / penalty COLUMN structure (a dense "
@@ -124,7 +139,13 @@ def parse_args():
     return p.parse_args()
 
 
-def load_relaxed_lp(path, highs_solver="simplex"):
+def load_relaxed_lp(
+    path,
+    highs_solver="simplex",
+    tol=1e-3,
+    highs_verbose=False,
+    highs_kkt_tolerance=None,
+):
     """Load an MPS file via HiGHS, relax integrality, solve for a trusted
     reference objective with the requested HiGHS solver, and convert to Jaddle's
     sparse standard form.
@@ -141,6 +162,9 @@ def load_relaxed_lp(path, highs_solver="simplex"):
     and ``highs_status`` as "skipped". The presolve + conversion still run, since
     jaddle solves the presolved LP and needs its offset.
 
+    ``highs_verbose`` enables HiGHS's own solve logging. ``highs_kkt_tolerance``
+    overrides the KKT tolerance passed to HiGHS (defaults to ``tol``).
+
     Returns (jaddle_lp, opt_obj, highs_status, highs_seconds, offset), where
     `highs_seconds` is the wall time of the HiGHS reference solve (NaN when
     skipped) and `offset` is the presolved model's constant objective offset (add
@@ -153,7 +177,7 @@ def load_relaxed_lp(path, highs_solver="simplex"):
     for col in range(highs.numVariables):
         highs.changeColIntegrality(col, hspy.HighsVarType.kContinuous)
 
-    highs.setOptionValue("output_flag", "false")
+    highs.setOptionValue("output_flag", "true" if highs_verbose else "false")
 
     if highs_solver == "none":
         opt_obj = float("nan")
@@ -163,6 +187,8 @@ def load_relaxed_lp(path, highs_solver="simplex"):
         # Solve for the ground-truth objective with the requested HiGHS solver.
         # Default tolerances. Time only the run() call (excl. read/relax), the
         # like-for-like counterpart to jaddle's solve-only timer.
+        kkt_tol = tol if highs_kkt_tolerance is None else highs_kkt_tolerance
+        highs.setOptionValue("kkt_tolerance", kkt_tol)
         highs.setOptionValue("solver", highs_solver)
         t0 = time.perf_counter()
         highs.run()
@@ -172,8 +198,8 @@ def load_relaxed_lp(path, highs_solver="simplex"):
         opt_obj = info.objective_function_value
         highs_status = highs.modelStatusToString(highs.getModelStatus())
 
-    # highs.presolve()
-    highs_lp = highs.getLp()
+    highs.presolve()
+    highs_lp = highs.getPresolvedLp()
     jaddle_lp = hh.highs_to_standard_form_sparse(highs_lp)
 
     if jaddle_lp.A_ineq.shape == (0, 0) and jaddle_lp.A_eq.shape == (0, 0):
@@ -208,24 +234,49 @@ def run_jaddle(jaddle_lp, tol, max_epochs):
         scaling and setup, for transparency.
     """
 
+    jl.lp_summary_statistics(jaddle_lp)
+
     t0 = time.perf_counter()
     result = jl.solve(
         jaddle_lp,
         verbose=True,
+        log_every=50,
         primal_feasibility_tolerance=tol,
         dual_feasibility_tolerance=tol,
         dual_gap_tolerance=tol,
         update_mode="pdhg",
-        iterations_per_epoch=10000,
-        average=True,
-        k_scale=1e5,
-        k_theta=1e-1,
+        iterations_per_epoch=128,
+        # halpern_reanchor_per_epoch=True,
+        restarts=100,
+        epochs_per_restart=1e6,
+        k_scale=1e2,
+        k_theta=0.01,
         adaptive_eta=0.0,
         max_epochs=max_epochs,
-        restarts=10,
-        feasibility_polish=True,
+        scaled_objective=True,
+        scaled_rhs=True,
     )
     wall_seconds = time.perf_counter() - t0
+
+    jaddle_lp_feasible = JaddleLP(
+        c=jnp.zeros_like(jaddle_lp.c),
+        A_ineq=jaddle_lp.A_ineq,
+        b_ineq=jaddle_lp.b_ineq,
+        A_eq=jaddle_lp.A_eq,
+        b_eq=jaddle_lp.b_eq,
+        lower_bounds=jaddle_lp.lower_bounds,
+        upper_bounds=jaddle_lp.upper_bounds,
+    )
+
+    tol = 1e-7
+
+    initial_solution = SaddleState(
+        primal=result["solution"].primal,
+        dual_ineq=jnp.zeros_like(result["solution"].dual_ineq),
+        dual_eq=jnp.zeros_like(result["solution"].dual_eq),
+    )
+
+    result = jl.primal_polish(jaddle_lp, warm_start=initial_solution, tol=tol)
 
     solution = result["solution"]
     converged = result["converged"]
@@ -307,7 +358,11 @@ def main():
         row = {"problem": name, "size_mb": round(size_mb, 1)}
         try:
             jaddle_lp, opt_obj, highs_status, highs_seconds, offset = load_relaxed_lp(
-                path, highs_solver=args.highs_solver
+                path,
+                highs_solver=args.highs_solver,
+                tol=args.tol,
+                highs_verbose=args.highs_verbose,
+                highs_kkt_tolerance=args.highs_kkt_tolerance,
             )
 
             row.update(
