@@ -965,7 +965,7 @@ def set_saddle_lrs(opt_state, primal_lr, dual_lr):
 
 
 def solve(
-    lp: "JaddleLP | LP",
+    lp: JaddleLP,
     optimiser=None,
     max_epochs=None,
     initial_solution=None,
@@ -988,7 +988,7 @@ def solve(
     k_init=None,
     k_update_per_epoch=True,
     adaptive_eta=0.0,
-    scale="ruiz+pc",
+    scale=True,
     scaled_objective=True,
     scaled_rhs=True,
     restarts=0,
@@ -1186,16 +1186,14 @@ def solve(
     """
 
     if lp.A_ineq.shape[0] == 0:
-        lp.A_ineq = jsp.BCOO.fromdense(
-            jnp.zeros((1, lp.A_eq.shape[1]), dtype=lp.A_eq.dtype)
-        )
-        lp.b_ineq = jnp.zeros((1,), dtype=lp.b_eq.dtype)
+        lp.A_ineq = sp.coo_matrix(jnp.zeros((1, lp.A_eq.shape[1]), dtype=lp.A_eq.dtype))
+        lp.b_ineq = np.zeros((1,), dtype=lp.b_eq.dtype)
 
     if lp.A_eq.shape[0] == 0:
-        lp.A_eq = jsp.BCOO.fromdense(
+        lp.A_eq = sp.coo_matrix(
             jnp.zeros((1, lp.A_ineq.shape[1]), dtype=lp.A_ineq.dtype)
         )
-        lp.b_eq = jnp.zeros((1,), dtype=lp.b_ineq.dtype)
+        lp.b_eq = np.zeros((1,), dtype=lp.b_ineq.dtype)
 
     if optimiser is None:
         optimiser = jo.gd(0.5)
@@ -1259,71 +1257,7 @@ def solve(
     if isinstance(lp, JaddleLP):
         lp = lp.to_scipy()
 
-    # Global objective/RHS normalisation runs BEFORE Ruiz+PC, not after: Ruiz+PC
-    # equilibrates the augmented [[A,b],[c,0]] matrix (or A alone), so a wildly
-    # out-of-scale c or b distorts the equilibration itself, not just later
-    # reporting. Normalising first gives Ruiz+PC a better-conditioned matrix to
-    # equilibrate.
-    if scaled_objective:
-        c_max = np.max(np.abs(lp.c))
-        c_max = c_max if c_max > 0 else 1.0
-        lp = LP(
-            lp.c / c_max,
-            lp.A_eq,
-            lp.b_eq,
-            lp.A_ineq,
-            lp.b_ineq,
-            lp.lower_bounds,
-            lp.upper_bounds,
-        )
-        if verbose:
-            print(f"Applied global objective scaling (||c||_inf = {c_max:.3e}).")
-            print("----------------------------------------------")
-    else:
-        c_max = 1.0
-
-    if scaled_rhs:
-        # Rescale every row (both A's row and b's entry) by the SAME global
-        # scalar ||b||_inf. Dividing a whole row of Ax=b by a nonzero constant
-        # doesn't change its feasible set, so this is free — unlike scaling b
-        # alone, which would change the constraint. Folded into row_scale below
-        # (not a separate c_max-style constant) so every existing true-units
-        # unscaling site (b_norm, constraint_bound, the final dual output
-        # rescale) picks it up automatically with no further threading.
-        b = np.concatenate([lp.b_eq, lp.b_ineq])
-        b_max = np.max(np.abs(b)) if b.size else 1.0
-        b_max = b_max if b_max > 0 else 1.0
-        lp = LP(
-            lp.c,
-            lp.A_eq / b_max,
-            lp.b_eq / b_max,
-            lp.A_ineq / b_max,
-            lp.b_ineq / b_max,
-            lp.lower_bounds,
-            lp.upper_bounds,
-        )
-        if verbose:
-            print(f"Applied global RHS scaling (||b||_inf = {b_max:.3e}).")
-            print("----------------------------------------------")
-
-    else:
-        b_max = 1.0
-
-    if scale == "ruiz":
-        lp, row_scale, col_scale = ruiz_scaling(lp)
-
-        if verbose:
-            print("Applied Ruiz scaling to the LP.")
-            print("----------------------------------------------")
-
-    elif scale == "pc":
-        lp, row_scale, col_scale = pc_scaling(lp)
-
-        if verbose:
-            print("Applied PC scaling to the LP.")
-            print("----------------------------------------------")
-
-    elif scale == "ruiz+pc":
+    if scale:
         # Augmented Ruiz: equilibrate [[A,b],[c,0]] so cost and RHS information also
         # drive the equilibration. Conditions the constraint (esp. equality) block
         # better on cost/RHS-dominated problems (momentum1: A-only Ruiz froze the
@@ -1332,12 +1266,8 @@ def solve(
         # not the default — it broke both momentum1 and boeing once the relative
         # convergence test + true-units norm fixes were in place. PC then applies
         # its single Pock-Chambolle finishing pass.
-        lp, row_scale_ruiz, col_scale_ruiz = ruiz_scaling(lp)
-        lp, row_scale_pc, col_scale_pc = pc_scaling(lp)
-
-        row_scale, col_scale = (
-            row_scale_ruiz * row_scale_pc,
-            col_scale_ruiz * col_scale_pc,
+        lp, row_scale, col_scale, c_max = scale_problem(
+            lp, scaled_objective=scaled_objective, scaled_rhs=scaled_rhs
         )
 
         if verbose:
@@ -1347,12 +1277,8 @@ def solve(
     else:
         row_scale = np.ones(lp.A_eq.shape[0] + lp.A_ineq.shape[0])
         col_scale = np.ones(lp.c.shape[0])
-
-    if scaled_rhs:
-        row_scale = row_scale / b_max
-
-    original_lp = lp
-    lp = to_jaddle_sparse(lp)
+        c_max = 1.0
+        lp = to_jaddle_sparse(lp)
 
     if adaptive_eta == 0.0:
         adaptive_eta = 1 / estimate_augmented_spectral_norm(lp)
@@ -1848,7 +1774,6 @@ def solve(
     # Previous epoch's restart merit, for cuPDLP condition (ii) (stalling: merit
     # rising again after necessary decay). inf until the first epoch sets it.
     prev_epoch_merit = jnp.inf
-
 
     # Normalisation constants for the restart merit (PDLP-style). Each KKT
     # residual is divided by 1 + its natural scale so the three terms are
@@ -2449,7 +2374,7 @@ def solve(
         print(f"Objective: {float((c_true * c_max) @ output.primal):.5e}")
         print("----------------------------------------------")
 
-    if scale in ["ruiz", "pc", "ruiz+pc"]:
+    if scale:
         output = SaddleState(
             primal=output.primal * col_scale,
             dual_ineq=output.dual_ineq * jnp_row_scale_ineq,
@@ -2741,7 +2666,9 @@ def ruiz_scaling(
     return __apply_scaling(lp, A, b, dr, dc)
 
 
-def pc_scaling(lp: LP, max_iter=10, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
+def pc_scaling(
+    lp: LP, max_iter=10, threshold=1e-8, clip_bounds=(1e-6, 1e6), augmented=True
+):
     """
     Applies PC scaling to an LP in standard form with sparse matrices:
         min c^T x
@@ -2757,9 +2684,9 @@ def pc_scaling(lp: LP, max_iter=10, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
     # Build |M| once in scipy, then equilibrate in JAX. The L1 row/col norms of
     # D_r M D_c factor as row_scale * (|M| @ col_scale) and col_scale *
     # (|M|^T @ row_scale) — i.e. segment_sum over the nnz — so the scaled matrix
-    # is never rematerialised. PC always uses the augmented [[A,b],[c,0]].
+    # is never rematerialised.
     absdata, row_idx, col_idx, n_rows, n_cols, A, b, m, n = __build_scaling_coo(
-        lp, augmented=True
+        lp, augmented=augmented
     )
 
     row_scale, col_scale = __equilibrate_jax(
@@ -2769,7 +2696,7 @@ def pc_scaling(lp: LP, max_iter=10, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
         n_rows,
         n_cols,
         max_iter,
-        True,
+        False,  # L1 (PC) via segment_sum
         clip_bounds,
         threshold,
     )
@@ -2779,7 +2706,96 @@ def pc_scaling(lp: LP, max_iter=10, threshold=1e-8, clip_bounds=(1e-6, 1e6)):
     return __apply_scaling(lp, A, b, dr, dc)
 
 
-def project_onto_eq(lp: JaddleLP, primal: jnp.ndarray, tol: 1e-6) -> jnp.ndarray:
+def scale_problem(
+    lp: LP,
+    ruiz_iter=10,
+    pc_iter=1,
+    threshold=1e-8,
+    clip_bounds=(1e-6, 1e6),
+    augmented=True,
+    scaled_objective=False,
+    scaled_rhs=False,
+):
+    """
+    Applies Ruiz+PC scaling to an LP in standard form with sparse matrices:
+        min c^T x
+        s.t. A_eq x = b_eq
+             A_ineq x <= b_ineq
+             lower_bounds <= x <= upper_bounds
+    Returns scaled LP, row_scaling (length m), col_scaling (length n).
+
+    Scaling is derived from the augmented matrix [[A, b], [c^T, 0]] so that
+    both cost and constraint information drive the equilibration.
+    """
+
+    if scaled_objective:
+        c_max = np.max(np.abs(lp.c))
+        c_max = c_max if c_max > 0 else 1.0
+        lp = LP(
+            lp.c / c_max,
+            lp.A_eq,
+            lp.b_eq,
+            lp.A_ineq,
+            lp.b_ineq,
+            lp.lower_bounds,
+            lp.upper_bounds,
+        )
+    else:
+        c_max = 1.0
+
+    if scaled_rhs:
+        # Rescale every row (both A's row and b's entry) by the SAME global
+        # scalar ||b||_inf. Dividing a whole row of Ax=b by a nonzero constant
+        # doesn't change its feasible set, so this is free — unlike scaling b
+        # alone, which would change the constraint. Folded into row_scale below
+        # (not a separate c_max-style constant) so every existing true-units
+        # unscaling site (b_norm, constraint_bound, the final dual output
+        # rescale) picks it up automatically with no further threading.
+        b = np.concatenate([lp.b_eq, lp.b_ineq])
+        b_max = np.max(np.abs(b)) if b.size else 1.0
+        b_max = b_max if b_max > 0 else 1.0
+        lp = LP(
+            lp.c,
+            lp.A_eq / b_max,
+            lp.b_eq / b_max,
+            lp.A_ineq / b_max,
+            lp.b_ineq / b_max,
+            lp.lower_bounds,
+            lp.upper_bounds,
+        )
+
+    else:
+        b_max = 1.0
+
+    # First apply Ruiz scaling to equilibrate the rows/cols of A.
+    lp_scaled, dr_ruiz, dc_ruiz = ruiz_scaling(
+        lp,
+        max_iter=ruiz_iter,
+        threshold=threshold,
+        clip_bounds=clip_bounds,
+        augmented=augmented,
+    )
+
+    # Then apply PC scaling to equilibrate the rows/cols of the augmented matrix [[A,b],[c^T,0]].
+    lp_scaled_final, dr_pc, dc_pc = pc_scaling(
+        lp_scaled,
+        max_iter=pc_iter,
+        threshold=threshold,
+        clip_bounds=clip_bounds,
+        augmented=augmented,
+    )
+
+    # Combine the row and column scalings from both methods.
+    dr_combined = dr_ruiz * dr_pc
+    dc_combined = dc_ruiz * dc_pc
+
+    if scaled_rhs:
+        dr_combined = dr_combined / b_max
+
+    return to_jaddle_sparse(lp_scaled_final), dr_combined, dc_combined, c_max
+
+
+def project_onto_eq(lp: JaddleLP, primal: jnp.ndarray, tol=1e-6) -> jnp.ndarray:
     """
     Projects a primal solution onto the equality constraints using JAX GMRES.
 
@@ -2811,12 +2827,458 @@ def project_onto_eq(lp: JaddleLP, primal: jnp.ndarray, tol: 1e-6) -> jnp.ndarray
     return primal + delta
 
 
+def lp_to_dual(lp: JaddleLP) -> JaddleLP:
+    """
+    Builds the true dual LP of ``lp``, adapted to THIS codebase's dual sign
+    convention.
+
+    The paper's (Applegate et al., arXiv:2501.07018) (2)/(3a) primal update is
+    ``x' = proj_X(x - τ(c - Aᵀy))``, i.e. its dual stationarity is
+    ``c - Aᵀy = r``. This codebase's primal update (`grad_primal` in
+    `solve`'s `grad`/`grad_primal_only`, ~line 205/220) is instead
+    ``x' = proj_X(x - τ(c + Aᵀy))`` — the OPPOSITE sign on the ``Aᵀy`` term,
+    so its stationarity condition is ``c + Aᵀy = r``, i.e. this codebase's
+    ``dual_eq``/``dual_ineq`` are the negative of the paper's ``y``. Using
+    ``Aᵀy + r = c`` verbatim would silently solve for the paper's ``y``, which
+    has the wrong sign relative to every other dual quantity this codebase
+    produces (`solve()`'s own `dual_eq`/`dual_ineq`, `compute_epoch_metrics`'s
+    reduced cost, etc.) — the resulting `dual_eq`/`dual_ineq` would fail
+    `evaluate_lp_certificate`'s feasibility check despite solving *a* valid LP.
+
+        maximize_{y, r}  b_eqᵀy_eq + b_ineqᵀy_ineq + Σ box_infimum(r; l, u)
+        subject to:      Aᵀy - r = -c,  y ∈ Y,  r ∈ R
+
+    which is exactly `evaluate_lp_certificate`'s own dual-objective/duality-gap
+    decomposition (jaddle_linear.py ~2943), so a (dual_eq, dual_ineq, r) that
+    solves this dual LP to optimality is a genuine LP dual solution, not just a
+    feasible point of Eq (7).
+
+    ``box_infimum(r; l, u)`` is ``min(r·l, r·u)`` when x has two finite bounds
+    (r free there — see below), ``r·l``/``r·u`` when only one bound is finite,
+    and 0 when x is free. The two-sided case makes the objective PIECEWISE
+    LINEAR in a free r, which a plain JaddleLP (linear c) can't represent
+    directly. Fix: split each two-sided column's r into ``r = r_plus - r_minus``
+    with ``r_plus, r_minus ≥ 0`` — then ``min(r·l, r·u) = l·r_plus - u·r_minus``
+    exactly (maximizing pushes whichever of r_plus/r_minus is slack to 0, which
+    is the same thing the min() would have picked). Columns with only one
+    finite bound (or none) keep a single ``r`` entry as before.
+
+    The dual LP's primal variable is the stacked
+    ``z = [y_eq; y_ineq; r_rest; r_plus; r_minus]`` — ``r_rest`` holds one
+    entry per column that is NOT two-sided-bounded (free/lower-only/upper-only,
+    same bounds rule as before), ``r_plus``/``r_minus`` hold one entry each per
+    two-sided-bounded column. `solve()`'s own primal update IS the y/r update
+    of the dual LP — no vestigial x, no vestigial objective coupling.
+
+    ``y ∈ Y``: y_eq is free (equality rows dualize with no sign restriction),
+    y_ineq ≥ 0 (matching this codebase's `A_ineq x ≤ b_ineq` convention) —
+    encoded as bounds on the y-block of z, not as inequality rows.
+
+    ``r ∈ R``: the per-variable normal-cone sign pattern implied by each
+    original variable's bounds on x (same rule as `compute_epoch_metrics`'s
+    dual-feasibility check): two-sided variables admit any sign, split into
+    r_plus, r_minus ≥ 0; lower-only need r ≥ 0; upper-only need r ≤ 0; free
+    variables need r = 0 — encoded as bounds on the r-block of z.
+
+    The single equality block ``Aᵀy - r = -c`` (n rows, one per original
+    variable, with the two-sided columns' ``-r`` split into ``-r_plus + r_minus``)
+    is exactly this codebase's dual-feasibility constraint; there are no
+    inequality rows since all sign structure now lives in the bounds on z.
+    """
+    m = lp.A_eq.shape[0] + lp.A_ineq.shape[0]
+    n = lp.c.shape[0]
+
+    lower_bounds_np = np.asarray(lp.lower_bounds)
+    upper_bounds_np = np.asarray(lp.upper_bounds)
+    finite_lower_np = np.isfinite(lower_bounds_np)
+    finite_upper_np = np.isfinite(upper_bounds_np)
+    has_both_bounds_np = finite_lower_np & finite_upper_np
+    has_only_lower_np = finite_lower_np & (~finite_upper_np)
+    has_only_upper_np = (~finite_lower_np) & finite_upper_np
+
+    two_sided_idx = np.flatnonzero(has_both_bounds_np)
+    rest_idx = np.flatnonzero(~has_both_bounds_np)
+    n_rest = rest_idx.shape[0]
+    n_two_sided = two_sided_idx.shape[0]
+
+    # z = [y_eq; y_ineq; r_rest; r_plus; r_minus]
+    rest_offset = m
+    plus_offset = m + n_rest
+    minus_offset = m + n_rest + n_two_sided
+    z_size = m + n_rest + 2 * n_two_sided
+
+    # [A_eq^T | A_ineq^T] acting on [y_eq; y_ineq], padded into the full
+    # (n, z_size) constraint block.
+    A_T_block = lp.A_T  # (n, m), rows = original variables, cols = [eq; ineq] duals
+    index_dtype = A_T_block.indices.dtype
+    AT_padded = jsp.BCOO((A_T_block.data, A_T_block.indices), shape=(n, z_size))
+
+    # -r_rest on the rest columns' own rows.
+    rest_rows = jnp.asarray(rest_idx, dtype=index_dtype)
+    rest_cols = jnp.arange(n_rest, dtype=index_dtype) + rest_offset
+    rest_data = -jnp.ones(n_rest, dtype=lp.c.dtype)
+
+    # -r_plus + r_minus on the two-sided columns' own rows.
+    two_sided_rows = jnp.asarray(two_sided_idx, dtype=index_dtype)
+    plus_cols = jnp.arange(n_two_sided, dtype=index_dtype) + plus_offset
+    minus_cols = jnp.arange(n_two_sided, dtype=index_dtype) + minus_offset
+
+    r_rows = jnp.concatenate([rest_rows, two_sided_rows, two_sided_rows])
+    r_cols = jnp.concatenate([rest_cols, plus_cols, minus_cols])
+    r_data = jnp.concatenate(
+        [
+            rest_data,
+            -jnp.ones(n_two_sided, dtype=lp.c.dtype),
+            jnp.ones(n_two_sided, dtype=lp.c.dtype),
+        ]
+    )
+    r_bcoo = jsp.BCOO((r_data, jnp.stack([r_rows, r_cols], axis=1)), shape=(n, z_size))
+
+    # AT_padded and r_bcoo occupy disjoint columns (duals vs r), so summing
+    # them just places both sets of entries into one (n, z_size) block.
+    constraint_block = (AT_padded + r_bcoo).sum_duplicates()
+
+    A_eq_new = constraint_block
+    b_eq_new = -lp.c
+    A_ineq_new = jsp.BCOO(
+        (jnp.zeros(0, dtype=lp.c.dtype), jnp.zeros((0, 2), dtype=index_dtype)),
+        shape=(0, z_size),
+    )
+    b_ineq_new = jnp.zeros(0, dtype=lp.c.dtype)
+
+    y_eq_lower = jnp.full(lp.n_eq, -jnp.inf, dtype=lp.c.dtype)
+    y_eq_upper = jnp.full(lp.n_eq, jnp.inf, dtype=lp.c.dtype)
+    n_ineq = lp.A_ineq.shape[0]
+    y_ineq_lower = jnp.zeros(n_ineq, dtype=lp.c.dtype)
+    y_ineq_upper = jnp.full(n_ineq, jnp.inf, dtype=lp.c.dtype)
+
+    # r_rest ∈ R: lower-only → [0, inf), upper-only → (-inf, 0], free → {0}.
+    has_only_lower_rest = jnp.asarray(has_only_lower_np[rest_idx])
+    has_only_upper_rest = jnp.asarray(has_only_upper_np[rest_idx])
+    r_rest_lower = jnp.where(
+        has_only_lower_rest, 0.0, jnp.where(has_only_upper_rest, -jnp.inf, 0.0)
+    )
+    r_rest_upper = jnp.where(
+        has_only_lower_rest, jnp.inf, jnp.where(has_only_upper_rest, 0.0, 0.0)
+    )
+
+    # r_plus, r_minus ≥ 0 for two-sided columns.
+    r_plus_lower = jnp.zeros(n_two_sided, dtype=lp.c.dtype)
+    r_plus_upper = jnp.full(n_two_sided, jnp.inf, dtype=lp.c.dtype)
+    r_minus_lower = jnp.zeros(n_two_sided, dtype=lp.c.dtype)
+    r_minus_upper = jnp.full(n_two_sided, jnp.inf, dtype=lp.c.dtype)
+
+    lower_new = jnp.concatenate(
+        [y_eq_lower, y_ineq_lower, r_rest_lower, r_plus_lower, r_minus_lower]
+    )
+    upper_new = jnp.concatenate(
+        [y_eq_upper, y_ineq_upper, r_rest_upper, r_plus_upper, r_minus_upper]
+    )
+
+    # solve() minimizes c_new @ z; the true dual maximizes
+    # b_eq^T y_eq + b_ineq^T y_ineq + l^T r_plus - u^T r_minus (two-sided cols)
+    # + box_infimum terms for the single-bound r_rest columns, so c_new is the
+    # negative of all of that.
+    lower_rest = jnp.asarray(lower_bounds_np[rest_idx], dtype=lp.c.dtype)
+    upper_rest = jnp.asarray(upper_bounds_np[rest_idx], dtype=lp.c.dtype)
+    # Only one of lower_rest/upper_rest is finite per rest column (has_both is
+    # excluded from rest); the other is ±inf but multiplies a r bound pinned to
+    # 0 in that regime, so replace the non-finite side with 0 to avoid inf*0.
+    c_r_rest = -jnp.where(has_only_lower_rest, lower_rest, 0.0) - jnp.where(
+        has_only_upper_rest, upper_rest, 0.0
+    )
+    lower_two_sided = jnp.asarray(lower_bounds_np[two_sided_idx], dtype=lp.c.dtype)
+    upper_two_sided = jnp.asarray(upper_bounds_np[two_sided_idx], dtype=lp.c.dtype)
+    c_r_plus = -lower_two_sided
+    c_r_minus = upper_two_sided
+
+    c_new = jnp.concatenate(
+        [
+            -lp.b_eq,
+            -lp.b_ineq,
+            c_r_rest,
+            c_r_plus,
+            c_r_minus,
+        ]
+    )
+
+    dual_lp = JaddleLP(
+        c=c_new,
+        A_eq=A_eq_new,
+        b_eq=b_eq_new,
+        A_ineq=A_ineq_new,
+        b_ineq=b_ineq_new,
+        lower_bounds=lower_new,
+        upper_bounds=upper_new,
+    )
+    # Layout needed to reconstruct r (length n) and unpack z downstream.
+    dual_lp.rest_idx = rest_idx
+    dual_lp.two_sided_idx = two_sided_idx
+    dual_lp.rest_offset = rest_offset
+    dual_lp.plus_offset = plus_offset
+    dual_lp.minus_offset = minus_offset
+    return dual_lp
+
+
+def build_dual_feasibility_lp(lp: JaddleLP) -> JaddleLP:
+    """
+    Builds Equation (7) of Applegate et al. (arXiv:2501.07018) as its own LP:
+    `lp_to_dual`'s true dual LP with its objective zeroed out (a feasibility
+    problem, so it doesn't require the piecewise-linear box term of the true
+    dual to be optimized — only for `z` to satisfy `Aᵀy - r = -c` within the
+    y/r bounds `lp_to_dual` already encodes).
+
+        maximize_{y, r}  0
+        subject to:      Aᵀy - r = -c,  y ∈ Y,  r ∈ R
+
+    (equivalently, minimizing 0 subject to the same constraint — same feasible
+    set, same PDHG dynamics either way). This is exactly the stationarity
+    condition ``c + Aᵀy = r`` this codebase's own gradient uses, so a
+    (dual_eq, dual_ineq) solving this problem is directly comparable to (and
+    interchangeable with) any dual iterate `solve()` itself produces.
+    """
+    dual_lp = lp_to_dual(lp)
+    zeroed = JaddleLP(
+        c=jnp.zeros_like(dual_lp.c),
+        A_eq=dual_lp.A_eq,
+        b_eq=dual_lp.b_eq,
+        A_ineq=dual_lp.A_ineq,
+        b_ineq=dual_lp.b_ineq,
+        lower_bounds=dual_lp.lower_bounds,
+        upper_bounds=dual_lp.upper_bounds,
+    )
+    zeroed.rest_idx = dual_lp.rest_idx
+    zeroed.two_sided_idx = dual_lp.two_sided_idx
+    zeroed.rest_offset = dual_lp.rest_offset
+    zeroed.plus_offset = dual_lp.plus_offset
+    zeroed.minus_offset = dual_lp.minus_offset
+    return zeroed
+
+
+def evaluate_lp_certificate(lp: JaddleLP, primal, dual_eq, dual_ineq):
+    """
+    Standalone, TRUE-units reimplementation of `solve()`'s internal
+    `compute_epoch_metrics`/`relative_gap` (jaddle_linear.py ~1458), for judging
+    the quality of an (x, y) pair produced OUTSIDE a `solve()` call (e.g. from
+    `solve_dual_feasibility`), where none of `solve()`'s internal scale factors
+    (`col_scale`, `row_scale`, `c_max`) are available. `compute_epoch_metrics`
+    itself can't be called directly for this: it's a closure over those scaled-
+    space factors and operates on the solver's internal scaled iterate, not on
+    true-unit (x, y).
+
+    This runs the identical box_infimum / duality-gap decomposition with every
+    scale factor set to its identity (col_scale=row_scale=c_max=1), which is
+    algebraically equivalent to compute_epoch_metrics when `primal`/`dual_eq`/
+    `dual_ineq` are already in true (unscaled) units — the case here, since
+    `solve()` always returns `result["solution"]` unscaled back to true units.
+
+    Returns a dict: ``objective``, ``dual_objective``, ``duality_gap``,
+    ``relative_gap``, ``primal_feasibility_residual``, ``dual_feasibility_residual``.
+    """
+    dual = jnp.concatenate([dual_eq, dual_ineq])
+    Ax = lp.A @ primal
+    reduced_cost = lp.c + lp.A_T @ dual
+    Ax_minus_b = Ax - lp.b
+    grad_dual_eq = Ax_minus_b[: lp.n_eq]
+    grad_dual_ineq = Ax_minus_b[lp.n_eq :]
+
+    objective_value = lp.objective(primal)
+
+    lower_bounds = lp.lower_bounds
+    upper_bounds = lp.upper_bounds
+    finite_lower = jnp.isfinite(lower_bounds)
+    finite_upper = jnp.isfinite(upper_bounds)
+    has_both_bounds = finite_lower & finite_upper
+    has_only_lower = finite_lower & (~finite_upper)
+    has_only_upper = (~finite_lower) & finite_upper
+
+    lower_term = reduced_cost * lower_bounds
+    upper_term = reduced_cost * upper_bounds
+    box_infimum = jnp.where(
+        has_both_bounds,
+        jnp.minimum(lower_term, upper_term),
+        jnp.where(
+            has_only_lower, lower_term, jnp.where(has_only_upper, upper_term, 0.0)
+        ),
+    )
+
+    proj_box = projection_box(primal - reduced_cost, lower_bounds, upper_bounds)
+    dual_feasibility_violation = jnp.where(
+        has_both_bounds,
+        jnp.abs(primal - proj_box),
+        jnp.where(
+            has_only_lower,
+            jnp.maximum(-reduced_cost, 0.0),
+            jnp.where(
+                has_only_upper,
+                jnp.maximum(reduced_cost, 0.0),
+                jnp.abs(reduced_cost),
+            ),
+        ),
+    )
+    dual_feasibility_residual = jnp.max(dual_feasibility_violation, initial=0.0)
+
+    ineq_violations = jnp.maximum(grad_dual_ineq, 0.0)
+    eq_violations = jnp.abs(grad_dual_eq)
+    primal_feasibility_residual = jnp.maximum(
+        jnp.max(ineq_violations, initial=0.0), jnp.max(eq_violations, initial=0.0)
+    )
+
+    relative_primal_feasibility_residual = primal_feasibility_residual / (
+        1.0 + jnp.max(jnp.abs(lp.b), initial=0.0)
+    )
+    relative_dual_feasibility_residual = dual_feasibility_residual / (
+        1.0 + jnp.max(jnp.abs(lp.c), initial=0.0)
+    )
+
+    gap_bound_comp = reduced_cost @ primal - jnp.sum(box_infimum)
+    gap_ineq_comp = -(dual_ineq @ grad_dual_ineq)
+    gap_eq_comp = -(dual_eq @ grad_dual_eq)
+    duality_gap = gap_bound_comp + gap_ineq_comp + gap_eq_comp
+
+    dual_objective = objective_value - duality_gap
+    relative_gap = jnp.abs(duality_gap) / (
+        1.0 + jnp.abs(objective_value) + jnp.abs(dual_objective)
+    )
+
+    return {
+        "objective": objective_value,
+        "dual_objective": dual_objective,
+        "duality_gap": duality_gap,
+        "relative_gap": relative_gap,
+        "primal_feasibility_residual": primal_feasibility_residual,
+        "dual_feasibility_residual": dual_feasibility_residual,
+        "relative_primal_feasibility_residual": relative_primal_feasibility_residual,
+        "relative_dual_feasibility_residual": relative_dual_feasibility_residual,
+    }
+
+
+def solve_dual_feasibility(
+    lp: JaddleLP,
+    initial_dual_eq=None,
+    initial_dual_ineq=None,
+    **kwargs,
+):
+    """
+    Solves the dual feasibility problem, Equation (7) of Applegate et al.
+    (arXiv:2501.07018), by handing `build_dual_feasibility_lp`'s LP (the true
+    dual LP from `lp_to_dual`, with its objective zeroed) to `solve()`
+    unmodified — this is the literal PDLP-on-(7) construction from Algorithm 4
+    step 3, using this codebase's own primal-dual saddle solver rather than a
+    bespoke update rule. The imported (`initial_dual_eq`, `initial_dual_ineq`)
+    dual — typically the outer solve's own warm-started dual — seeds `y`; `r`
+    is seeded consistently from it rather than left at zero.
+
+    Returns `solve()`'s result dict, with `solution.primal` split back into
+    `dual_eq`/`dual_ineq` (the y found for the original LP) and `r` (the
+    recovered reduced costs, length n, reassembled from the LP's r_rest/
+    r_plus/r_minus split), added as extra keys.
+    """
+    dual_feasibility_lp = build_dual_feasibility_lp(lp)
+    rest_idx = dual_feasibility_lp.rest_idx
+    two_sided_idx = dual_feasibility_lp.two_sided_idx
+    rest_offset = dual_feasibility_lp.rest_offset
+    plus_offset = dual_feasibility_lp.plus_offset
+    minus_offset = dual_feasibility_lp.minus_offset
+
+    n_eq = lp.n_eq
+    n_ineq = lp.A_ineq.shape[0]
+    n = lp.c.shape[0]
+    n_rest = rest_idx.shape[0]
+    n_two_sided = two_sided_idx.shape[0]
+
+    initial_solution = None
+    if initial_dual_eq is not None or initial_dual_ineq is not None:
+        y_eq0 = (
+            jnp.zeros(n_eq, dtype=lp.c.dtype)
+            if initial_dual_eq is None
+            else initial_dual_eq
+        )
+        y_ineq0 = (
+            jnp.zeros(n_ineq, dtype=lp.c.dtype)
+            if initial_dual_ineq is None
+            else initial_dual_ineq
+        )
+        # Seed r at the warm start's OWN reduced cost c + A^Ty0, not zero: r is
+        # completely unconstrained (free) for any two-sided-box variable, so a
+        # zero-seeded r has nothing pulling it back if PDHG's first few steps
+        # overshoot while it catches up to the true reduced cost — starting it
+        # already at the right value removes that transient entirely (measured
+        # on stp3d: r=0 seed corrupted the polish within single-digit PDHG
+        # iterations even though the warm y0 was already near-optimal).
+        y0 = jnp.concatenate([y_eq0, y_ineq0])
+        r0 = lp.c + lp.A_T @ y0
+        r0_rest = r0[rest_idx]
+        r0_two_sided = r0[two_sided_idx]
+        # r = r_plus - r_minus with both >= 0: seed the positive part on
+        # whichever side r0 actually sits, zero on the other, so z0 already
+        # satisfies the split's sign constraints exactly (no projection jolt).
+        r0_plus = jnp.maximum(r0_two_sided, 0.0)
+        r0_minus = jnp.maximum(-r0_two_sided, 0.0)
+        z0 = jnp.concatenate([y_eq0, y_ineq0, r0_rest, r0_plus, r0_minus])
+        # dual_ineq/dual_eq here are the DUAL-FEASIBILITY LP's own duals (for
+        # its equality block `A^Ty - r = -c`, which has n rows) — not y_eq0/
+        # y_ineq0, which are its primal block. The dual-feasibility LP has 0
+        # inequality rows, but `solve()` pads any zero-row A_ineq to a single
+        # dummy row (jaddle_linear.py ~1188) without a matching primal LP
+        # constructed here, so dual_ineq must be length 1, not 0, to match.
+        initial_solution = SaddleState(
+            primal=z0,
+            dual_ineq=jnp.zeros(1, dtype=lp.c.dtype),
+            dual_eq=jnp.zeros(n, dtype=lp.c.dtype),
+        )
+
+    result = solve(
+        dual_feasibility_lp,
+        initial_solution=initial_solution,
+        **kwargs,
+    )
+
+    z = result["solution"].primal
+    result["dual_eq"] = z[:n_eq]
+    result["dual_ineq"] = z[n_eq : n_eq + n_ineq]
+
+    r_rest = z[rest_offset : rest_offset + n_rest]
+    r_plus = z[plus_offset : plus_offset + n_two_sided]
+    r_minus = z[minus_offset : minus_offset + n_two_sided]
+    r = jnp.zeros(n, dtype=lp.c.dtype)
+    r = r.at[rest_idx].set(r_rest)
+    r = r.at[two_sided_idx].set(r_plus - r_minus)
+    result["r"] = r
+
+    return result
+
+
+# %%
+
+
 def primal_polish(
     lp: JaddleLP,
     warm_start: SaddleState,
-    tol: float = 1e-6,
     **kwargs,
 ):
+    """
+    Runs Algorithm 4 step 2 (Applegate et al., arXiv:2501.07018): PDHG on the
+    primal feasibility problem (their Eq. 6), warm-started from `warm_start`.
+
+    Since Eq. 6 has a zero objective, its dual has no notion of "the" solution
+    — an unconstrained solve wanders freely through the feasible set and can
+    drift arbitrarily far from `warm_start` (measured on stp3d: 8+ iterations
+    already destroys the polish, since gradient steps toward feasibility can
+    move a long way in objective terms while barely moving the residual on an
+    underdetermined problem). The paper's fix is to cap this to a short burst
+    (`k/8` iterations, `k` = outer solve's iteration count so far) rather than
+    solving to convergence — `max_iters` here plays that role, passed through
+    as `iterations_per_epoch` with a single epoch so it caps the actual PDHG
+    iteration count, not an epoch count (whose default iteration budget of
+    256 is far too long for this warm-start use).
+    """
+    initial_solution = SaddleState(
+        primal=warm_start.primal,
+        dual_ineq=jnp.zeros_like(warm_start.dual_ineq),
+        dual_eq=jnp.zeros_like(warm_start.dual_eq),
+    )
+
     lp_feasible = JaddleLP(
         c=jnp.zeros_like(lp.c),
         A_ineq=lp.A_ineq,
@@ -2827,12 +3289,128 @@ def primal_polish(
         upper_bounds=lp.upper_bounds,
     )
 
+    kwargs.setdefault("max_epochs", 1)
+    kwargs.setdefault("iterations_per_epoch", 8)
+
     return solve(
         lp_feasible,
-        initial_solution=warm_start,
-        primal_feasibility_tolerance=tol,
+        initial_solution=initial_solution,
+        **kwargs,
+    )["solution"].primal
+
+
+def dual_polish(
+    lp: JaddleLP,
+    warm_start: SaddleState,
+    **kwargs,
+):
+    """
+    Runs Algorithm 4 step 3: PDHG on the dual feasibility problem (Eq. 7),
+    warm-started from `warm_start`. See `primal_polish`'s docstring for why
+    `max_iters` (a short capped burst, not a full solve) is essential here —
+    the exact same unconstrained-drift failure mode was measured on stp3d:
+    dual_polish warm-started from a near-optimal y (relative_gap 2.3e-4)
+    degraded to relative_gap ~1.0 after just 8 iterations of unconstrained
+    PDHG on Eq. 7, because the dual feasibility problem's zero objective gives
+    the solver no reason to stay near the warm start.
+    """
+
+    kwargs.setdefault("max_epochs", 1)
+    kwargs.setdefault("iterations_per_epoch", 1)
+
+    result = solve_dual_feasibility(
+        lp,
+        initial_dual_eq=warm_start.dual_eq,
+        initial_dual_ineq=warm_start.dual_ineq,
         **kwargs,
     )
 
+    return result["dual_eq"], result["dual_ineq"]
 
-# %%
+
+def solve_with_polishing(
+    lp: JaddleLP,
+    max_rounds: int = 5,
+    max_epochs=None,
+    tol=1e-6,
+    **kwargs,
+):
+
+    if kwargs.get("verbose", False):
+        print("Solving original problem...")
+
+    # primal_polish/dual_polish/evaluate_lp_certificate all require a JaddleLP
+    # (BCOO blocks) — solve() itself accepts a scipy-backed LP too and converts
+    # it internally, but that conversion is local to solve() and never visible
+    # here. Normalise once so the polishing loop below always has BCOO to work
+    # with, regardless of which form the caller passed in.
+    if not isinstance(lp, JaddleLP):
+        lp = to_jaddle_sparse(lp)
+
+    rounds = 0
+    # First, solve the original problem
+    result = solve(
+        lp,
+        primal_feasibility_tolerance=tol,
+        dual_feasibility_tolerance=tol,
+        dual_gap_tolerance=tol,
+        max_epochs=max_epochs,
+        **kwargs,
+    )
+
+    # If the solver converged, perform primal and dual polishing
+    while not result["converged"] and rounds <= max_rounds:
+        rounds += 1
+
+        if kwargs.get("verbose", False):
+            print(f"Polishing round {rounds}...")
+        polished_primal = primal_polish(
+            lp,
+            warm_start=result["solution"],
+            **kwargs,
+        )
+
+        solution = SaddleState(
+            primal=polished_primal,
+            dual_ineq=result["solution"].dual_ineq,
+            dual_eq=result["solution"].dual_eq,
+        )
+
+        lp_cert = evaluate_lp_certificate(
+            lp,
+            polished_primal,
+            result["solution"].dual_eq,
+            result["solution"].dual_ineq,
+        )
+
+        if kwargs.get("verbose", False):
+            print(
+                f"Relative primal feasibility residual: {lp_cert['relative_primal_feasibility_residual']}"
+            )
+            print(
+                f"Relative dual feasibility residual: {lp_cert['relative_dual_feasibility_residual']}"
+            )
+            print(f"Relative gap: {lp_cert['relative_gap']}")
+
+        if (
+            lp_cert["relative_gap"] < tol
+            and lp_cert["relative_primal_feasibility_residual"] < tol
+            and lp_cert["relative_dual_feasibility_residual"] < tol
+        ):
+            if kwargs.get("verbose", False):
+                print("Polished solution is feasible and optimal. Stopping polishing.")
+            break
+
+        if kwargs.get("verbose", False):
+            print(f"Re-solving with polished solution as warm start...")
+
+        result = solve(
+            lp,
+            initial_solution=solution,
+            primal_feasibility_tolerance=tol,
+            dual_feasibility_tolerance=tol,
+            dual_gap_tolerance=tol,
+            max_epochs=max_epochs,
+            **kwargs,
+        )
+    return result

@@ -3,10 +3,10 @@ import scipy.sparse as sp
 import highspy as hspy
 import jax.numpy as jnp
 import jax.experimental.sparse as jsp
-from jaddle.jaddle_basic_types import JaddleLP
+from jaddle.jaddle_basic_types import JaddleLP, LP
 
 
-def highs_to_standard_form_sparse(lp: hspy.HighsLp) -> "JaddleLP":
+def highs_to_standard_form_sparse(lp: hspy.HighsLp):
     """
     Converts a HighsLp object to standard form matrices:
         min c^T x
@@ -14,8 +14,8 @@ def highs_to_standard_form_sparse(lp: hspy.HighsLp) -> "JaddleLP":
              A_ineq x <= b_ineq
              x >= lower_bounds
              x <= upper_bounds
-    Returns: JaddleLP (JAX-native; device-side sparse). Stages that need a scipy
-    view (scaling, polish, crossover) call ``JaddleLP.to_scipy()``.
+    Returns: LP (JAX-native; device-side sparse). Stages that need a scipy
+    view (scaling, polish, crossover) call ``LP.to_scipy()``.
     """
 
     c = np.array(lp.col_cost_, dtype=np.float64)
@@ -74,6 +74,4 @@ def highs_to_standard_form_sparse(lp: hspy.HighsLp) -> "JaddleLP":
         A_ineq = sp.csc_matrix((0, num_col), dtype=np.float64)
         b_ineq = np.empty(0, dtype=np.float64)
 
-    return JaddleLP.from_scipy(
-        c, A_eq, b_eq, A_ineq, b_ineq, lower_bounds, upper_bounds
-    )
+    return LP(c, A_eq, b_eq, A_ineq, b_ineq, lower_bounds, upper_bounds)
