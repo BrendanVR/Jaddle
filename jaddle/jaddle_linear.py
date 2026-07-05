@@ -991,6 +991,7 @@ def solve(
     scale=True,
     scaled_objective=True,
     scaled_rhs=True,
+    scaled_augmented=True,
     restarts=0,
     epochs_per_restart=10,
     restart_multiplier=1.0,
@@ -1267,7 +1268,10 @@ def solve(
         # convergence test + true-units norm fixes were in place. PC then applies
         # its single Pock-Chambolle finishing pass.
         lp, row_scale, col_scale, c_max = scale_problem(
-            lp, scaled_objective=scaled_objective, scaled_rhs=scaled_rhs
+            lp,
+            scaled_objective=scaled_objective,
+            scaled_rhs=scaled_rhs,
+            augmented=scaled_augmented,
         )
 
         if verbose:
