@@ -239,17 +239,23 @@ def run_jaddle(lp, tol, max_epochs):
     t0 = time.perf_counter()
     result = jl.solve(
         lp,
+        max_epochs=max_epochs,
         primal_feasibility_tolerance=tol,
         dual_feasibility_tolerance=tol,
         dual_gap_tolerance=tol,
-        max_epochs=max_epochs,
         update_mode="pdhg",
-        restarts=100,
+        adaptive_eta=1.0,
+        average=True,
         verbose=True,
-        iterations_per_epoch=256,
+        iterations_per_epoch=128 * 100,
         scale=True,
         scaled_augmented=True,
-        k_scale=1e4,
+        scaled_objective=True,
+        scaled_rhs=True,
+        ruiz_iterations=10,
+        pc_iterations=1,
+        k_scale=1e6,
+        k_theta=0.1,
     )
     wall_seconds = time.perf_counter() - t0
 

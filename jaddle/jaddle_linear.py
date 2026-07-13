@@ -992,6 +992,9 @@ def solve(
     scaled_objective=True,
     scaled_rhs=True,
     scaled_augmented=True,
+    augmented_weight=1.0,
+    ruiz_iterations=10,
+    pc_iterations=1,
     restarts=0,
     epochs_per_restart=10,
     restart_multiplier=1.0,
@@ -1272,6 +1275,9 @@ def solve(
             scaled_objective=scaled_objective,
             scaled_rhs=scaled_rhs,
             augmented=scaled_augmented,
+            augmented_weight=augmented_weight,
+            ruiz_iter=ruiz_iterations,
+            pc_iter=pc_iterations,
         )
 
         if verbose:
@@ -2525,7 +2531,7 @@ def __convert_to_scipy(jsp_mat: jsp.BCOO) -> sp.csc_matrix:
     return sp.csc_matrix((data, (row, col)), shape=jsp_mat.shape)
 
 
-def __build_scaling_coo(lp: LP, augmented: bool):
+def __build_scaling_coo(lp: LP, augmented: bool, augmented_weight: float = 1.0):
     """Build the (absolute) COO operand the equilibration loops iterate over.
 
     Returns ``(absdata, row_idx, col_idx, n_rows, n_cols, A, b, m, n)`` where the
@@ -2533,6 +2539,17 @@ def __build_scaling_coo(lp: LP, augmented: bool):
     ``augmented`` else ``A`` alone) as flat COO arrays suitable for JAX
     ``segment_*`` reductions, and ``A``/``b``/``m``/``n`` are the unscaled
     constraint operator and RHS used to apply the final row/col scales.
+
+    ``augmented_weight`` (only meaningful when ``augmented``) scales the appended
+    ``c^T`` row's participation in the equilibration, interpolating between the
+    two endpoints for a single-dense-big-M-row instance like germanrr: the big-M
+    magnitude is conserved and Ruiz can only decide whether it lands in the
+    matrix or in the cost vector (their product ``matrix_ratio * c_max`` is
+    invariant ~= sqrt of the raw big-M ratio). ``1.0`` is full augmented (cost
+    stays O(1), matrix keeps the residual big-M spread); ``->0`` approaches
+    plain-matrix Ruiz (matrix flattens, cost blows up). An intermediate value
+    (~1e-3..1e-2 on germanrr) balances the two so neither the operator nor the
+    cost is maximally ill-scaled. No effect on instances without a big-M row.
 
     The matrix is assembled once in scipy (cheap: ~14 ms even on stp3d); only the
     iterative equilibration -- the part that dominates -- runs in JAX.
@@ -2545,7 +2562,7 @@ def __build_scaling_coo(lp: LP, augmented: bool):
     if augmented:
         c_norm = np.max(np.abs(c)) or 1.0
         b_col = sp.csc_matrix(b.reshape(-1, 1))
-        c_row = sp.csc_matrix((c / c_norm).reshape(1, -1))
+        c_row = sp.csc_matrix((augmented_weight * c / c_norm).reshape(1, -1))
         zero = sp.csc_matrix((1, 1))
         M = sp.bmat([[A, b_col], [c_row, zero]]).tocoo()
     else:
@@ -2576,8 +2593,9 @@ def __equilibrate_jax(
     Row/col norms of ``D_r M D_c`` factor as ``row_scale * reduce(|M| * col_scale)``
     so the scaled matrix is never rematerialised -- each sweep is two gathers and
     two segmented reductions over the nnz, mirroring the original numpy loop. The
-    empty-row/col guard is implicit: ``segment_*`` yields 0 for absent segments,
-    which the ``<= threshold -> 1.0`` clamp maps to a unit (no-op) scale.
+    empty-row/col guard is implicit: absent segments yield the reduction
+    identity (0 for ``segment_sum``, -inf for ``segment_max``), which the
+    ``<= threshold -> 1.0`` clamp maps to a unit (no-op) scale either way.
     """
     lo, hi = clip_bounds
 
@@ -2588,14 +2606,20 @@ def __equilibrate_jax(
 
     def body(_, carry):
         row_scale, col_scale = carry
+        # Simultaneous (Jacobi) update: both norms are taken from the SAME
+        # incoming (row_scale, col_scale), matching Ruiz/Pock-Chambolle and
+        # PDLP. A sequential (Gauss-Seidel) update — col norms of the already
+        # row-rescaled matrix — voids the PC single-pass guarantee
+        # ||D_r^1/2 A D_c^1/2||_2 <= 1 (e.g. [[2]] -> 2^(1/4)).
         row_norms = reduce_segments(absdata * col_scale[col_idx], row_idx, n_rows)
         row_norms = row_norms * row_scale
         row_norms = jnp.where(row_norms <= threshold, 1.0, row_norms)
-        row_scale = row_scale * jnp.clip(1.0 / jnp.sqrt(row_norms), lo, hi)
 
         col_norms = reduce_segments(absdata * row_scale[row_idx], col_idx, n_cols)
         col_norms = col_norms * col_scale
         col_norms = jnp.where(col_norms <= threshold, 1.0, col_norms)
+
+        row_scale = row_scale * jnp.clip(1.0 / jnp.sqrt(row_norms), lo, hi)
         col_scale = col_scale * jnp.clip(1.0 / jnp.sqrt(col_norms), lo, hi)
         return row_scale, col_scale
 
@@ -2623,7 +2647,12 @@ def __apply_scaling(lp: LP, A, b, dr, dc):
 
 
 def ruiz_scaling(
-    lp: LP, max_iter=30, threshold=1e-8, clip_bounds=(1e-6, 1e6), augmented=True
+    lp: LP,
+    max_iter=30,
+    threshold=1e-8,
+    clip_bounds=(1e-6, 1e6),
+    augmented=True,
+    augmented_weight=1.0,
 ):
     """
     Applies Ruiz scaling to an LP in standard form with sparse matrices:
@@ -2634,7 +2663,7 @@ def ruiz_scaling(
     Returns scaled LP, row_scaling (length m), col_scaling (length n).
 
     ``augmented`` selects what is equilibrated:
-      * ``False`` (default, PDLP-style): equilibrate ``A`` alone — the operator
+      * ``False`` (PDLP-style): equilibrate ``A`` alone — the operator
         that defines the saddle dynamics — and let ``b``/``c`` ride the resulting
         row/col scales. The augmented variant lets the appended ``b`` column and
         ``c`` row absorb scaling, which under-equilibrates the constraint ROWS on
@@ -2650,7 +2679,7 @@ def ruiz_scaling(
     # m+1/n+1; A-only: m/n); the dr/dc slices below take the first m/n entries —
     # the LP's true dimensions — dropping the augmented row/col when present.
     absdata, row_idx, col_idx, n_rows, n_cols, A, b, m, n = __build_scaling_coo(
-        lp, augmented
+        lp, augmented, augmented_weight
     )
 
     row_scale, col_scale = __equilibrate_jax(
@@ -2671,7 +2700,12 @@ def ruiz_scaling(
 
 
 def pc_scaling(
-    lp: LP, max_iter=10, threshold=1e-8, clip_bounds=(1e-6, 1e6), augmented=True
+    lp: LP,
+    max_iter=1,
+    threshold=1e-8,
+    clip_bounds=(1e-6, 1e6),
+    augmented=True,
+    augmented_weight=1.0,
 ):
     """
     Applies PC scaling to an LP in standard form with sparse matrices:
@@ -2682,7 +2716,8 @@ def pc_scaling(
     Returns scaled LP, row_scaling (length m), col_scaling (length n).
 
     Scaling is derived from the augmented matrix [[A, b], [c^T, 0]] so that
-    both cost and constraint information drive the equilibration.
+    both cost and constraint information drive the equilibration. See
+    ``__build_scaling_coo`` for ``augmented_weight``.
     """
 
     # Build |M| once in scipy, then equilibrate in JAX. The L1 row/col norms of
@@ -2690,7 +2725,7 @@ def pc_scaling(
     # (|M|^T @ row_scale) — i.e. segment_sum over the nnz — so the scaled matrix
     # is never rematerialised.
     absdata, row_idx, col_idx, n_rows, n_cols, A, b, m, n = __build_scaling_coo(
-        lp, augmented=augmented
+        lp, augmented=augmented, augmented_weight=augmented_weight
     )
 
     row_scale, col_scale = __equilibrate_jax(
@@ -2712,13 +2747,14 @@ def pc_scaling(
 
 def scale_problem(
     lp: LP,
-    ruiz_iter=10,
+    ruiz_iter=40,
     pc_iter=1,
     threshold=1e-8,
     clip_bounds=(1e-6, 1e6),
     augmented=True,
-    scaled_objective=False,
-    scaled_rhs=False,
+    augmented_weight=1.0,
+    scaled_objective=True,
+    scaled_rhs=True,
 ):
     """
     Applies Ruiz+PC scaling to an LP in standard form with sparse matrices:
@@ -2730,9 +2766,48 @@ def scale_problem(
 
     Scaling is derived from the augmented matrix [[A, b], [c^T, 0]] so that
     both cost and constraint information drive the equilibration.
+
+    Ordering (PDLP convention): equilibration (Ruiz + PC) runs FIRST, on the raw
+    ``c``/``b``, so the appended cost row / RHS column of the augmented matrix
+    carry their true magnitudes into the sweeps. The objective/RHS constant
+    normalisation (``c_max``/``b_max``) is applied AFTERWARDS, to the already
+    equilibrated ``c``/``b``. Doing the constant normalisation first would feed
+    pre-flattened ``c``/``b`` into the augmented equilibration and change the
+    resulting row/col scales; PDLP equilibrates, then rescales objective and RHS.
     """
 
+    # --- Equilibration first (on raw c/b) -------------------------------------
+    # Apply Ruiz scaling to equilibrate the rows/cols of A.
+    lp_scaled, dr_ruiz, dc_ruiz = ruiz_scaling(
+        lp,
+        max_iter=ruiz_iter,
+        threshold=threshold,
+        clip_bounds=clip_bounds,
+        augmented=augmented,
+        augmented_weight=augmented_weight,
+    )
+
+    # Then apply PC scaling to equilibrate the rows/cols of the augmented matrix [[A,b],[c^T,0]].
+    lp_scaled_final, dr_pc, dc_pc = pc_scaling(
+        lp_scaled,
+        max_iter=pc_iter,
+        threshold=threshold,
+        clip_bounds=clip_bounds,
+        augmented=augmented,
+        augmented_weight=augmented_weight,
+    )
+
+    # Combine the row and column scalings from both methods.
+    dr_combined = dr_ruiz * dr_pc
+    dc_combined = dc_ruiz * dc_pc
+
+    # --- Objective/RHS constant normalisation second (on equilibrated c/b) ----
+    lp = lp_scaled_final
+
     if scaled_objective:
+        # Normalise by the ||c||_inf of the EQUILIBRATED cost so the constant is
+        # measured in scaled space. Returned as `c_max` and multiplied back
+        # through at every unscaling site (objective, duals).
         c_max = np.max(np.abs(lp.c))
         c_max = c_max if c_max > 0 else 1.0
         lp = LP(
@@ -2749,12 +2824,13 @@ def scale_problem(
 
     if scaled_rhs:
         # Rescale every row (both A's row and b's entry) by the SAME global
-        # scalar ||b||_inf. Dividing a whole row of Ax=b by a nonzero constant
-        # doesn't change its feasible set, so this is free — unlike scaling b
-        # alone, which would change the constraint. Folded into row_scale below
-        # (not a separate c_max-style constant) so every existing true-units
-        # unscaling site (b_norm, constraint_bound, the final dual output
-        # rescale) picks it up automatically with no further threading.
+        # scalar ||b||_inf of the EQUILIBRATED RHS. Dividing a whole row of Ax=b
+        # by a nonzero constant doesn't change its feasible set, so this is free
+        # — unlike scaling b alone, which would change the constraint. Folded
+        # into dr_combined (not a separate c_max-style constant) so every
+        # existing true-units unscaling site (b_norm, constraint_bound, the final
+        # dual output rescale) picks it up automatically with no further
+        # threading.
         b = np.concatenate([lp.b_eq, lp.b_ineq])
         b_max = np.max(np.abs(b)) if b.size else 1.0
         b_max = b_max if b_max > 0 else 1.0
@@ -2767,36 +2843,9 @@ def scale_problem(
             lp.lower_bounds,
             lp.upper_bounds,
         )
-
-    else:
-        b_max = 1.0
-
-    # First apply Ruiz scaling to equilibrate the rows/cols of A.
-    lp_scaled, dr_ruiz, dc_ruiz = ruiz_scaling(
-        lp,
-        max_iter=ruiz_iter,
-        threshold=threshold,
-        clip_bounds=clip_bounds,
-        augmented=augmented,
-    )
-
-    # Then apply PC scaling to equilibrate the rows/cols of the augmented matrix [[A,b],[c^T,0]].
-    lp_scaled_final, dr_pc, dc_pc = pc_scaling(
-        lp_scaled,
-        max_iter=pc_iter,
-        threshold=threshold,
-        clip_bounds=clip_bounds,
-        augmented=augmented,
-    )
-
-    # Combine the row and column scalings from both methods.
-    dr_combined = dr_ruiz * dr_pc
-    dc_combined = dc_ruiz * dc_pc
-
-    if scaled_rhs:
         dr_combined = dr_combined / b_max
 
-    return to_jaddle_sparse(lp_scaled_final), dr_combined, dc_combined, c_max
+    return to_jaddle_sparse(lp), dr_combined, dc_combined, c_max
 
 
 def project_onto_eq(lp: JaddleLP, primal: jnp.ndarray, tol=1e-6) -> jnp.ndarray:
