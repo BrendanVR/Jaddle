@@ -188,6 +188,7 @@ def load_relaxed_lp(
         # Default tolerances. Time only the run() call (excl. read/relax), the
         # like-for-like counterpart to jaddle's solve-only timer.
         kkt_tol = tol if highs_kkt_tolerance is None else highs_kkt_tolerance
+        highs.setOptionValue("presolve", "on")
         highs.setOptionValue("kkt_tolerance", kkt_tol)
         highs.setOptionValue("solver", highs_solver)
         t0 = time.perf_counter()
@@ -243,19 +244,19 @@ def run_jaddle(lp, tol, max_epochs):
         primal_feasibility_tolerance=tol,
         dual_feasibility_tolerance=tol,
         dual_gap_tolerance=tol,
-        update_mode="pdhg",
-        adaptive_eta=1.0,
+        update_mode="alternating",
+        optimiser=jo.optimistic_gd(1 / 2),
+        adaptive_eta=None,
         average=True,
         verbose=True,
         iterations_per_epoch=128 * 100,
         scale=True,
-        scaled_augmented=True,
+        scaled_augmented=False,
         scaled_objective=True,
-        scaled_rhs=True,
+        scaled_rhs=False,
         ruiz_iterations=10,
         pc_iterations=1,
-        k_scale=1e6,
-        k_theta=0.1,
+        vertex_bias=1e-4,
     )
     wall_seconds = time.perf_counter() - t0
 
