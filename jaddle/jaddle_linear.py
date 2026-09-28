@@ -152,13 +152,16 @@ def __sps(
     merit_fn=None,
     check_every=None,
     merit_threshold=-jnp.inf,
+    stall_threshold=-jnp.inf,
 ):
     # In-epoch restart check: when `merit_fn` and `check_every` are given, the
     # epoch runs in chunks of `check_every` iterations and exits early once
     # min(merit_fn(average), merit_fn(state)) <= `merit_threshold` (the caller's
     # sufficient-progress threshold), so `solve`'s restart fires without waiting
-    # for the epoch boundary. The epoch length rounds down to a whole number of
-    # chunks.
+    # for the epoch boundary. It also exits on cuPDLP's condition (ii): merit <=
+    # `stall_threshold` (necessary decay) AND rising vs the previous chunk; the
+    # returned `stalled` flag tells `solve` to restart on it. The epoch length
+    # rounds down to a whole number of chunks.
     # The stepping scheme is selected by `update_mode`. This derived boolean
     # keeps the dense per-scheme branching below readable while the string stays
     # the single source of truth.
@@ -351,13 +354,14 @@ def __sps(
             opt_state,
             total_weight=0.0,
             merit_threshold=-jnp.inf,
+            stall_threshold=-jnp.inf,
             *,
             max_iter,
         ):
             apply_updates = optax.apply_updates
 
             # ---- Shared machinery for the cuPDLP-style adaptive line search ----
-            # Each adaptive update_mode supplies a `trial(eta, state, k)` that
+            # Each adaptive update_mode supplies a `trial(eta, state, k, Ax_old, pre)` that
             # takes one raw step at base step `eta` and returns
             # (candidate_state, eta_bar), where eta_bar is the largest admissible
             # base step implied by the trial movement. The retry/reject loop and
@@ -375,8 +379,11 @@ def __sps(
                 # the retry loop accepts and the eta-growth branch is suppressed.
                 return jnp.where(interaction > 0.0, move / (2.0 * interaction), jnp.inf)
 
-            def make_adaptive_step(trial):
-                # `trial(eta, state, k, Ax_old)` returns (cand, eta_bar, Ax_new):
+            def make_adaptive_step(trial, prep):
+                # `prep(state)` computes the eta-INDEPENDENT part of the trial
+                # (pdhg: c + Aᵀy; extragradient: the full gradient at state) once
+                # per iteration, so line-search retries don't redo its matvec.
+                # `trial(eta, state, k, Ax_old, pre)` returns (cand, eta_bar, Ax_new):
                 # Ax_old = A @ state.primal (carried, not recomputed); Ax_new =
                 # A @ cand.primal (carried forward to the next iteration — for
                 # halpern, blended with Ax_anchor first). When the path doesn't
@@ -406,10 +413,13 @@ def __sps(
                     def body(c):
                         eta_c, _, eta_bar_c, _ = c
                         eta_s = jnp.minimum((1.0 - ip1 ** (-0.3)) * eta_bar_c, eta_c)
-                        cand_s, eta_bar_s, Ax_new_s = trial(eta_s, state, k, Ax_old)
+                        cand_s, eta_bar_s, Ax_new_s = trial(
+                            eta_s, state, k, Ax_old, pre
+                        )
                         return (eta_s, cand_s, eta_bar_s, Ax_new_s)
 
-                    cand0, eta_bar0, Ax_new0 = trial(eta, state, k, Ax_old)
+                    pre = prep(state)
+                    cand0, eta_bar0, Ax_new0 = trial(eta, state, k, Ax_old, pre)
                     eta0, cand, eta_bar, Ax_new = jax.lax.while_loop(
                         cond, body, (eta, cand0, eta_bar0, Ax_new0)
                     )
@@ -492,10 +502,9 @@ def __sps(
                 # primal x_bar = 2 x_new - x_old. interaction = dyᵀ A dx (one A·dx).
                 # Halpern uses this same PDHG operator as its base T(z); the anchor
                 # combination is applied in make_adaptive_step.
-                def _trial(eta, state, k, Ax_old):
+                def _trial(eta, state, k, Ax_old, gp):
                     tau = eta / k
                     sigma = eta * k
-                    gp = grad_primal_only(state)
                     x_new = projection_primal(state.primal - tau * gp)
                     # Ax_old = A @ state.primal is carried from the previous
                     # iteration (pdhg: last iter's A @ x_new; halpern: the
@@ -525,7 +534,7 @@ def __sps(
                     interaction = jnp.abs(jnp.vdot(dy, A_dx))
                     return cand, _descent_bound(state, cand, k, interaction), Ax_new
 
-                step = make_adaptive_step(_trial)
+                step = make_adaptive_step(_trial, grad_primal_only)
 
             elif adaptive_step and update_mode == "extragradient":
                 # Extragradient (Korpelevich) raw step with a Malitsky-Tam local
@@ -542,12 +551,11 @@ def __sps(
                 # (Korpelevich convention).
                 _MT = 1.0 / jnp.sqrt(2.0)
 
-                def _trial(eta, state, k, Ax_old):
+                def _trial(eta, state, k, Ax_old, g):
                     # Extragradient doesn't carry Ax (its line search is matvec-free
                     # and it isn't the default path); Ax_old is None, Ax_new is None.
                     tau = eta / k
                     sigma = eta * k
-                    g = grad(state)
                     # Look-ahead z_half = proj(z - step ∘ g): descend primal,
                     # subtract the optax-convention dual gradient (matches the
                     # non-adaptive extragradient / pdhg sign).
@@ -593,7 +601,7 @@ def __sps(
                     eta_bar = jnp.where(dg2 > 0.0, _MT * jnp.sqrt(dz2 / dg2), jnp.inf)
                     return cand, eta_bar, None
 
-                step = make_adaptive_step(_trial)
+                step = make_adaptive_step(_trial, grad)
 
             elif update_mode == "alternating":
 
@@ -874,6 +882,7 @@ def __sps(
                 )
                 return new_carry, None
 
+            stalled = jnp.asarray(False)
             if merit_fn is None or check_every is None or check_every >= max_iter:
                 scan_out, _ = jax.lax.scan(
                     step_typed,
@@ -885,11 +894,11 @@ def __sps(
                 n_chunks = max_iter // check_every
 
                 def chunk_cond(c):
-                    chunk, _, done = c
+                    chunk, _, done, _, _ = c
                     return (chunk < n_chunks) & (~done)
 
                 def chunk_body(c):
-                    chunk, carry, _ = c
+                    chunk, carry, _, _, prev_m = c
                     carry, _ = jax.lax.scan(
                         step_typed, carry, None, length=check_every
                     )
@@ -897,12 +906,24 @@ def __sps(
                     m = merit_fn(s)
                     if average:
                         m = jnp.minimum(m, merit_fn(avg))
-                    return chunk + 1, carry, m <= merit_threshold
+                    # Condition (ii) needs a previous chunk in this epoch, so the
+                    # first chunk (prev_m = inf) can only fire condition (i).
+                    stalled = (
+                        (m <= stall_threshold) & jnp.isfinite(prev_m) & (m > prev_m)
+                    )
+                    done = (m <= merit_threshold) | stalled
+                    return chunk + 1, carry, done, stalled, m
 
-                _, scan_out, _ = jax.lax.while_loop(
+                _, scan_out, _, stalled, _ = jax.lax.while_loop(
                     chunk_cond,
                     chunk_body,
-                    (jnp.asarray(0), step_carry, jnp.asarray(False)),
+                    (
+                        jnp.asarray(0),
+                        step_carry,
+                        jnp.asarray(False),
+                        jnp.asarray(False),
+                        jnp.asarray(jnp.inf, state.primal.dtype),
+                    ),
                 )
             i, state, average_state, opt_state, total_weight = scan_out
 
@@ -913,7 +934,7 @@ def __sps(
                 inner, (k0, eta0, anchor0, _AxA, _AxS) = opt_state
                 opt_state = (inner, (k0, eta0, anchor0))
 
-            return i, state, average_state, opt_state, total_weight
+            return i, state, average_state, opt_state, total_weight, stalled
 
         _LINEAR_RUN_EPOCH_CACHE[cache_key] = run_epoch
 
@@ -975,6 +996,7 @@ def __sps(
         opt_state,
         total_weight,
         merit_threshold,
+        stall_threshold,
         max_iter=max_iter,
     )
 
@@ -1021,7 +1043,7 @@ def solve(
     report_best=True,
     update_mode="pdhg",
     k_scale=1e2,
-    k_theta=0.01,
+    k_theta=0.2,
     k_init=None,
     k_update_per_epoch=True,
     adaptive_eta=0.0,
@@ -1043,7 +1065,7 @@ def solve(
     halpern_reanchor_per_epoch=False,
     iterations_per_epoch_decay=1.0,
     iterations_per_epoch_min=100,
-    restart_check_every=None,
+    restart_check_every="auto",
     eq_projection_threshold=None,
     vertex_bias=0.0,
     vertex_bias_seed=0,
@@ -1160,9 +1182,10 @@ def solve(
             modes raise. Requires ``k_scale`` set. ``eta`` resets to this seed at
             each restart. A reasonable seed is ``1.0`` on Ruiz+PC-scaled problems.
         k_theta: Smoothing coefficient for the log-space primal-weight update at
-            each restart (default 0.5 = geometric mean of the movement-based
-            target and the current weight, matching PDLP). Smaller = slower
-            adaptation. Only used when ``k_scale`` is set.
+            each restart / epoch (default 0.2; PDLP uses 0.5, which certified
+            ~0.1% off-optimum on binschedule2/mzzv11, while 0.01 adapted too
+            slowly). Smaller = slower adaptation. Only used when ``k_scale`` is
+            set.
         primal_stop: Opt-in, dual-free termination (default ``False``). When
             ``True``, termination ignores the dual certificate entirely and stops
             on **primal feasibility** (``constraint_bound`` within
@@ -1199,8 +1222,11 @@ def solve(
             iterations inside an epoch and end the epoch early once the
             sufficient-progress test (``restart_decay``) would fire, so restarts
             aren't delayed to the epoch boundary. Costs ~2 matvec pairs per check.
-            Epoch lengths round down to a multiple of it. Default ``None`` (check
-            only at epoch boundaries).
+            Also exits on the condition-(ii) stall (merit within
+            ``necessary_decay`` of the last restart and rising chunk-to-chunk).
+            Epoch lengths round down to a multiple of it. Default ``"auto"``
+            (a tenth of the current epoch length); ``None`` checks only at epoch
+            boundaries.
         seed_iterations: Extra CGLS iterations refining the default primal seed
             toward ``min ‖Ax − b‖²`` before box projection (2 matvecs each).
             0 (default) keeps the one-shot diagonal (Jacobi) seed. Ignored when
@@ -1978,29 +2004,40 @@ def solve(
             return True
         return False
 
-    # PDLP-style primal-weight rebalance from the primal-vs-dual *movement*
-    # between two iterates (distance, not per-step gradient norms). Shared by the
-    # restart rebalance and the per-epoch rebalance: log-space geometric-mean
-    # blend of the movement-ratio target with the current weight (k_theta), then
-    # clamp to [k_lo, k_hi]. Squared norms avoid two sqrts; the ratio is preserved.
     def _inloop_merit(s):
         # Same restart merit `solve` computes at the epoch boundary, traced into
         # __sps for the in-epoch sufficient-progress check.
         obj, _pgn, _cs, cb, dfr, dg, dgf, *_rest = compute_epoch_metrics(s)
         return kkt_merit(cb, dfr, dg, dgf, obj)
 
-    def _restart_threshold():
-        # Sufficient-progress threshold for the in-epoch check; -inf disables it
-        # (no finite baseline yet, restarts exhausted, or the check is off).
+    def _check_every():
+        # "auto": ten in-epoch checks per epoch (tracks iterations_per_epoch
+        # decay). None disables the in-epoch check.
+        if restart_check_every == "auto":
+            return max(1, current_iterations_per_epoch // 10)
+        return restart_check_every
+
+    def _restart_thresholds():
+        # (sufficient-progress, necessary-decay) thresholds for the in-epoch
+        # check; -inf disables both (no finite baseline yet, restarts exhausted,
+        # or the check is off).
         if (
-            restart_check_every is None
+            _check_every() is None
             or not restarts
             or restarts_done >= restarts
             or not bool(jnp.isfinite(merit_at_last_restart))
         ):
-            return -float("inf")
-        return float(restart_decay * merit_at_last_restart)
+            return -float("inf"), -float("inf")
+        return (
+            float(restart_decay * merit_at_last_restart),
+            float(necessary_decay * merit_at_last_restart),
+        )
 
+    # PDLP-style primal-weight rebalance from the primal-vs-dual *movement*
+    # between two iterates (distance, not per-step gradient norms). Shared by the
+    # restart rebalance and the per-epoch rebalance: log-space geometric-mean
+    # blend of the movement-ratio target with the current weight (k_theta), then
+    # clamp to [k_lo, k_hi]. Squared norms avoid two sqrts; the ratio is preserved.
     def _rebalance_k(new_state, ref_state, k_prev):
         dp = new_state.primal - ref_state.primal
         dd = jnp.concatenate(
@@ -2035,6 +2072,7 @@ def solve(
                 average_state,
                 opt_state,
                 total_weight,
+                inloop_stalled,
             ) = __sps(
                 current_iterations_per_epoch,
                 i - restart_i_offset,
@@ -2053,10 +2091,12 @@ def solve(
                 k_scaling=k_scaling,
                 k_init=k_init,
                 adaptive_eta=adaptive_eta,
-                merit_fn=_inloop_merit if restart_check_every else None,
-                check_every=restart_check_every,
-                merit_threshold=_restart_threshold(),
+                merit_fn=_inloop_merit if _check_every() else None,
+                check_every=_check_every(),
+                merit_threshold=_restart_thresholds()[0],
+                stall_threshold=_restart_thresholds()[1],
             )
+            inloop_stalled = bool(inloop_stalled)
             # Iterations actually run (an in-epoch restart check may exit early).
             iters_this_epoch = int(shifted_i) - (i - restart_i_offset)
             # __sps increments the (restart-shifted) counter; restore global i.
@@ -2290,11 +2330,19 @@ def solve(
                 # feasibility tail that the absolute sufficient-decay test (0.2x)
                 # misses. `restart_decay` keeps driving the (i) sufficient trigger;
                 # `necessary_decay` is the looser (ii) threshold.
+                # The in-epoch check already saw the turnaround chunk-to-chunk
+                # (`inloop_stalled`); the epoch-level comparison can't, since the
+                # epoch ended mid-rise.
                 stalling_restart = (
                     merit_is_finite
-                    and bool(jnp.isfinite(prev_epoch_merit))
                     and bool(restart_merit <= necessary_decay * merit_at_last_restart)
-                    and bool(restart_merit > prev_epoch_merit)
+                    and (
+                        inloop_stalled
+                        or (
+                            bool(jnp.isfinite(prev_epoch_merit))
+                            and bool(restart_merit > prev_epoch_merit)
+                        )
+                    )
                 )
 
                 if sufficient_progress or stalling_restart or cycle_exhausted:
