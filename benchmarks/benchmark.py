@@ -127,13 +127,6 @@ def parse_args():
         "value as --tol).",
     )
     p.add_argument(
-        "--restart-check-every",
-        type=int,
-        default=None,
-        help="Check the restart merit every N iterations inside an epoch "
-        "(jl.solve restart_check_every). Default: epoch boundaries only.",
-    )
-    p.add_argument(
         "--skip-bigm-column",
         action="store_true",
         help="Skip instances with a big-M / penalty COLUMN structure (a dense "
@@ -142,6 +135,13 @@ def parse_args():
         "flatten within-column anisotropy threaded through one shared row, so the "
         "saddle solver never approaches primal feasibility (germanrr: PFR frozen "
         "~1e7, objective still drifting at 80 epochs). See benchmarks/scan_bigm.py.",
+    )
+    p.add_argument(
+        "--jax-profile",
+        default="float64",
+        choices=["float64", "float32", "float16"],
+        help="JAX precision profile passed to jaddle_optimisers.configure_jax "
+        "(default: float64).",
     )
     return p.parse_args()
 
@@ -226,7 +226,7 @@ def load_relaxed_lp(
     return lp, opt_obj, highs_status, highs_seconds, offset
 
 
-def run_jaddle(lp, tol, max_epochs, restart_check_every=None):
+def run_jaddle(lp, tol, max_epochs):
     """Solve with Jaddle's saddle-point solver. Returns a dict of metrics.
 
     Three times are reported:
@@ -251,20 +251,20 @@ def run_jaddle(lp, tol, max_epochs, restart_check_every=None):
         primal_feasibility_tolerance=tol,
         dual_feasibility_tolerance=tol,
         dual_gap_tolerance=tol,
-        update_mode="pdhg",
+        update_mode="halpern",
         adaptive_eta=1.0,
-        average=True,
+        average=False,
         verbose=True,
-        iterations_per_epoch=128 * 100,
+        iterations_per_epoch=128 * 10,
         restarts=1000,
         epochs_per_restart=100,
+        restart_check_every=128,
         scale=True,
         scaled_augmented=False,
         scaled_objective=True,
         scaled_rhs=True,
         ruiz_iterations=10,
         pc_iterations=1,
-        restart_check_every=restart_check_every,
     )
     wall_seconds = time.perf_counter() - t0
 
@@ -331,7 +331,7 @@ def discover_instances(args):
 
 def main():
     args = parse_args()
-    jo.configure_jax("float64")
+    jo.configure_jax(args.jax_profile)
 
     instances = discover_instances(args)
     if not instances:
@@ -364,9 +364,7 @@ def main():
                     "highs_solve_seconds": highs_seconds,
                 }
             )
-            jres = run_jaddle(
-                jaddle_lp, args.tol, args.max_epochs, args.restart_check_every
-            )
+            jres = run_jaddle(jaddle_lp, args.tol, args.max_epochs)
             # jaddle solves the presolved reduced problem (objective = c^T x);
             # add the presolve offset to compare against the full-problem opt_obj.
             jres["jaddle_obj"] += offset
