@@ -247,18 +247,15 @@ def run_jaddle(lp, tol, max_epochs):
     t0 = time.perf_counter()
     result = jl.solve(
         lp,
+        verbose=True,
         max_epochs=max_epochs,
         primal_feasibility_tolerance=tol,
         dual_feasibility_tolerance=tol,
         dual_gap_tolerance=tol,
-        update_mode="halpern",
-        halpern_reanchor_per_epoch=True,
-        average=True,
-        adaptive_eta=1.0,
-        verbose=True,
+        update_mode="pdhg",
         iterations_per_epoch=128 * 10,
         restarts=1000,
-        epochs_per_restart=100,
+        epochs_per_restart=20,
     )
     wall_seconds = time.perf_counter() - t0
 

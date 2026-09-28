@@ -1041,9 +1041,9 @@ def solve(
     report_best=True,
     update_mode="pdhg",
     k_scale=1e8,
-    k_theta=0.2,
+    k_theta="adaptive",
     k_init=None,
-    k_update_per_epoch=True,
+    k_update_per_epoch=False,
     adaptive_eta=0.0,
     scale=True,
     scaled_objective=True,
@@ -1150,7 +1150,7 @@ def solve(
             scaled space the solver iterates in). Pass a float to override
             (``1.0`` = symmetric steps, the PC/Ruiz-scaled baseline). Only used
             when ``k_scale`` is set.
-        k_update_per_epoch: When ``True`` (default), the primal weight ``k`` is
+        k_update_per_epoch: When ``True``, the primal weight ``k`` is
             rebalanced at every epoch boundary (not only at restarts) using the
             primal-vs-dual iterate movement over the just-finished epoch — same
             log-space geometric-mean blend (``k_theta``) and ``[1/k_scale,
@@ -1159,8 +1159,10 @@ def solve(
             ``eta``; only the ``k`` component of the optimiser state changes, so
             the gradient reweighting tracks the local primal/dual progress within a
             restart cycle. Active only for ``update_mode`` in
-            ``{"pdhg", "extragradient", "halpern"}`` with ``k_scale`` set. Set
-            ``False`` to keep the prior behaviour (k frozen between restarts).
+            ``{"pdhg", "extragradient", "halpern"}`` with ``k_scale`` set.
+            ``False`` (default, the PDLP convention) keeps k frozen between
+            restarts: under a wide ``k_scale`` clamp the per-epoch update let k
+            run away on mzzv11 (k→1e8, gap 0.94).
         adaptive_eta: Enables a cuPDLP-style per-iteration adaptive step size with
             a line search. ``None`` (default) keeps the optimiser's fixed learning
             rate. A float seeds a single scalar base step ``eta`` that drives the
@@ -1176,10 +1178,16 @@ def solve(
             modes raise. Requires ``k_scale`` set. ``eta`` resets to this seed at
             each restart. A reasonable seed is ``1.0`` on Ruiz+PC-scaled problems.
         k_theta: Smoothing coefficient for the log-space primal-weight update at
-            each restart / epoch (default 0.2; PDLP uses 0.5, which certified
-            ~0.1% off-optimum on binschedule2/mzzv11, while 0.01 adapted too
-            slowly). Smaller = slower adaptation. Only used when ``k_scale`` is
-            set.
+            each restart / epoch. A float fixes it (PDLP uses 0.5; smaller =
+            slower adaptation). Only used when ``k_scale`` is set.
+            ``"adaptive"`` (default) sets it from data as a trust region on log k:
+            starting at 0.5, each restart doubles theta (capped at 1) if the
+            restart merit fell over the cycle since the previous k move, else
+            halves it (floored at 0.05) and reverts k to its value before that
+            move. The movement ratio alone can't tell a correct k move from a
+            runaway (mzzv11's per-epoch runaway was monotone), but the merit can.
+            Epochs to certify, restart-only vs fixed 0.5: barwon 41 vs 166,
+            binschedule2 39 vs 61, plus gains on stp3d and mzzv11.
         primal_stop: Opt-in, dual-free termination (default ``False``). When
             ``True``, termination ignores the dual certificate entirely and stops
             on **primal feasibility** (``constraint_bound`` within
@@ -1842,6 +1850,15 @@ def solve(
     iterations_since_restart = 0
     current_cycle_cap_iters = float(epochs_per_restart) * float(iterations_per_epoch)
     merit_at_last_restart = jnp.inf
+    # k_theta="adaptive": live smoothing coefficient, and k before the last
+    # restart rebalance (the revert target when that move made the merit worse).
+    if isinstance(k_theta, str):
+        if k_theta != "adaptive":
+            raise ValueError(f"k_theta must be a float or 'adaptive', got {k_theta!r}")
+        adaptive_theta, theta_live = True, 0.5
+    else:
+        adaptive_theta, theta_live = False, float(k_theta)
+    k_before_last_move = None
     # Previous epoch's RELATIVE (tolerance-comparable) primal/dual residuals.
     # Used only to gate the cycle-cap restart while the merit is non-finite
     # (dual-infeasible): see the `still_improving` guard below. inf until the
@@ -2008,7 +2025,7 @@ def solve(
     # restart rebalance and the per-epoch rebalance: log-space geometric-mean
     # blend of the movement-ratio target with the current weight (k_theta), then
     # clamp to [k_lo, k_hi]. Squared norms avoid two sqrts; the ratio is preserved.
-    def _rebalance_k(new_state, ref_state, k_prev):
+    def _rebalance_k(new_state, ref_state, k_prev, theta):
         dp = new_state.primal - ref_state.primal
         dd = jnp.concatenate(
             [
@@ -2021,7 +2038,7 @@ def solve(
         # PDLP primal-weight update: omega = ||dy|| / ||dx|| under tau = eta/k,
         # sigma = eta*k, balancing k||dx||^2 against ||dy||^2 / k.
         k_target = jnp.sqrt(move_d2 / move_p2)
-        log_k = k_theta * jnp.log(k_target) + (1.0 - k_theta) * jnp.log(k_prev)
+        log_k = theta * jnp.log(k_target) + (1.0 - theta) * jnp.log(k_prev)
         return jnp.clip(jnp.exp(log_k), k_lo, k_hi)
 
     start_time = time.time()
@@ -2330,7 +2347,23 @@ def solve(
                         # The k-slot is (k, eta[, anchor]) in adaptive_step mode,
                         # plain k otherwise. Read k accordingly.
                         k_prev = opt_state[1][0] if adaptive_step else opt_state[1]
-                        k_new = _rebalance_k(state, state_at_last_restart, k_prev)
+                        if (
+                            adaptive_theta
+                            and k_before_last_move is not None
+                            and merit_is_finite
+                            and bool(jnp.isfinite(merit_at_last_restart))
+                        ):
+                            # Trust region on log k: the cycle just finished ran
+                            # under the last k move, so judge that move by it.
+                            if bool(restart_merit < merit_at_last_restart):
+                                theta_live = min(1.0, 2.0 * theta_live)
+                            else:
+                                theta_live = max(0.05, 0.5 * theta_live)
+                                k_prev = k_before_last_move
+                        k_before_last_move = k_prev
+                        k_new = _rebalance_k(
+                            state, state_at_last_restart, k_prev, theta_live
+                        )
                         if halpern:
                             # Restarted Halpern: reset eta AND re-anchor z_0 to the
                             # cycle-start iterate `state`. The lambda counter resets
@@ -2396,6 +2429,8 @@ def solve(
                         if k_scaling:
                             _k_show = opt_state[1][0] if adaptive_step else opt_state[1]
                             k_msg = f", k={float(_k_show):.3e}"
+                            if adaptive_theta:
+                                k_msg += f", k_theta={theta_live:.3g}"
                         else:
                             k_msg = ""
                         print(
@@ -2418,7 +2453,7 @@ def solve(
             # within the current restart cycle.
             if k_per_epoch and not restarted_this_epoch:
                 k_prev = opt_state[1][0] if adaptive_step else opt_state[1]
-                k_new = _rebalance_k(state, state_at_last_epoch, k_prev)
+                k_new = _rebalance_k(state, state_at_last_epoch, k_prev, theta_live)
                 if adaptive_step or halpern:
                     # k-slot is (k, eta) for adaptive pdhg/extragradient and
                     # (k, eta, anchor) for halpern; rewrite only the k leaf.
