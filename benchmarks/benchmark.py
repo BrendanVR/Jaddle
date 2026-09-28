@@ -247,8 +247,8 @@ def run_jaddle(lp, tol, max_epochs):
     t0 = time.perf_counter()
     result = jl.solve(
         lp,
-        verbose=True,
         max_epochs=max_epochs,
+        verbose=True,
         primal_feasibility_tolerance=tol,
         dual_feasibility_tolerance=tol,
         dual_gap_tolerance=tol,
