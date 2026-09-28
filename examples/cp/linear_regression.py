@@ -17,12 +17,16 @@ np.random.seed(42)
 # Generate synthetic data
 n_samples = 1000
 X = np.linspace(0, 2 * np.pi, n_samples).reshape(-1, 1)
-y = 3 * np.sin(X.ravel()) + np.random.normal(0, 0.5, n_samples)
+y = (
+    3 * np.sin(X.ravel())
+    + 2 * np.cos(5 * X.ravel())
+    + np.random.normal(0, 0.5, n_samples)
+)
 
 # %%
 # Apply Random Fourier Features
-gamma = 1.0
-rbf_sampler = RBFSampler(gamma=gamma, n_components=500, random_state=42)
+gamma = 10.0
+rbf_sampler = RBFSampler(gamma=gamma, n_components=50, random_state=42)
 X_transformed = rbf_sampler.fit_transform(X).astype(np.float32)
 
 # Convert to JAX arrays
@@ -38,7 +42,7 @@ def objective(w):
 
 
 def constraints_ineq(w):
-    return jnp.array([jnp.dot(w, w) - 25.0])  # L2 norm constraint (||w||^2 <= 25)
+    return jnp.array([jnp.dot(w, w) - 1000.0])  # L2 norm constraint (||w||^2 <= 25)
 
 
 def constraints_eq(w):

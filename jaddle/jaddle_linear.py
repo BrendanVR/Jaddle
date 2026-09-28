@@ -899,9 +899,7 @@ def __sps(
 
                 def chunk_body(c):
                     chunk, carry, _, _, prev_m = c
-                    carry, _ = jax.lax.scan(
-                        step_typed, carry, None, length=check_every
-                    )
+                    carry, _ = jax.lax.scan(step_typed, carry, None, length=check_every)
                     _, s, avg, _, _ = carry
                     m = merit_fn(s)
                     if average:
@@ -1042,7 +1040,7 @@ def solve(
     average=True,
     report_best=True,
     update_mode="pdhg",
-    k_scale=1e2,
+    k_scale=1e8,
     k_theta=0.2,
     k_init=None,
     k_update_per_epoch=True,
@@ -1069,10 +1067,6 @@ def solve(
     eq_projection_threshold=None,
     vertex_bias=0.0,
     vertex_bias_seed=0,
-    seed_iterations=0,
-    seed_crash=False,
-    seed_couple=True,
-    seed_gate=True,
     reference_objective=None,
 ):
     """
@@ -1227,24 +1221,6 @@ def solve(
             Epoch lengths round down to a multiple of it. Default ``"auto"``
             (a tenth of the current epoch length); ``None`` checks only at epoch
             boundaries.
-        seed_iterations: Extra CGLS iterations refining the default primal seed
-            toward ``min ‖Ax − b‖²`` before box projection (2 matvecs each).
-            0 (default) keeps the one-shot diagonal (Jacobi) seed. Ignored when
-            ``initial_solution`` is supplied.
-        seed_crash: Simplex-style crash on the default seed — variables whose
-            reduced cost at the dual seed has a clear sign are pushed to the
-            finite bound that sign selects, making the primal seed
-            complementarity-consistent with the dual seed and more vertex-like.
-            Default ``False``. Ignored when ``initial_solution`` is supplied.
-        seed_couple: Zero the default seed's inequality duals on rows strictly
-            slack at the primal seed, so the start point doesn't fabricate a
-            complementarity violation. Default ``True``. Ignored when
-            ``initial_solution`` is supplied.
-        seed_gate: Keep-better gate on the default seed — its relative KKT
-            score is compared against the box-projected zero start (the PDLP
-            default) and the better candidate is used, so seeding is never
-            worse than starting cold. Default ``True``. Ignored when
-            ``initial_solution`` is supplied.
         reference_objective: True optimal objective value ``z*`` from a reference
             solver, in the ORIGINAL problem's units. Purely diagnostic: when
             supplied and ``verbose=True``, each epoch also logs the true relative
@@ -1393,13 +1369,7 @@ def solve(
     # and must NOT be rescaled again.
     user_supplied_initial = initial_solution is not None
     if initial_solution is None:
-        initial_solution = lp.initial_solution(
-            seed_iterations=seed_iterations,
-            seed_crash=seed_crash,
-            seed_couple=seed_couple,
-            seed_gate=seed_gate,
-            verbose=verbose,
-        )
+        initial_solution = lp.initial_solution()
 
     # lp.initial_solution() allocates with the JAX default float width (f32, or
     # f64 under x64), which mismatches the profile dtype the LP data carries

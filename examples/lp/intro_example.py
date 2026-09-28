@@ -5,10 +5,8 @@
 # %%
 import jax
 import numpy as np
-import optax
 import scipy.sparse as sp
 import jaddle.jaddle_linear as jl
-import jaddle.jaddle_optimisers as jo
 
 jax.config.update("jax_platform_name", "cpu")  # Using CPU for toy problem
 
