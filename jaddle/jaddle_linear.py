@@ -1949,7 +1949,9 @@ def solve(
         )
         move_p2 = jnp.vdot(dp, dp) + 1e-60
         move_d2 = jnp.vdot(dd, dd) + 1e-60
-        k_target = jnp.sqrt(move_p2 / move_d2)
+        # PDLP primal-weight update: omega = ||dy|| / ||dx|| under tau = eta/k,
+        # sigma = eta*k, balancing k||dx||^2 against ||dy||^2 / k.
+        k_target = jnp.sqrt(move_d2 / move_p2)
         log_k = k_theta * jnp.log(k_target) + (1.0 - k_theta) * jnp.log(k_prev)
         return jnp.clip(jnp.exp(log_k), k_lo, k_hi)
 
