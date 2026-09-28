@@ -149,7 +149,16 @@ def __sps(
     k_scaling=False,
     k_init=1.0,
     adaptive_eta=None,
+    merit_fn=None,
+    check_every=None,
+    merit_threshold=-jnp.inf,
 ):
+    # In-epoch restart check: when `merit_fn` and `check_every` are given, the
+    # epoch runs in chunks of `check_every` iterations and exits early once
+    # min(merit_fn(average), merit_fn(state)) <= `merit_threshold` (the caller's
+    # sufficient-progress threshold), so `solve`'s restart fires without waiting
+    # for the epoch boundary. The epoch length rounds down to a whole number of
+    # chunks.
     # The stepping scheme is selected by `update_mode`. This derived boolean
     # keeps the dense per-scheme branching below readable while the string stays
     # the single source of truth.
@@ -320,6 +329,8 @@ def __sps(
         bool(k_scaling),
         adaptive_step,
         halpern,
+        id(merit_fn),
+        check_every,
     )
     run_epoch = _LINEAR_RUN_EPOCH_CACHE.get(cache_key)
 
@@ -339,6 +350,7 @@ def __sps(
             average_state,
             opt_state,
             total_weight=0.0,
+            merit_threshold=-jnp.inf,
             *,
             max_iter,
         ):
@@ -862,12 +874,36 @@ def __sps(
                 )
                 return new_carry, None
 
-            scan_out, _ = jax.lax.scan(
-                step_typed,
-                step_carry,
-                None,
-                length=max_iter,
-            )
+            if merit_fn is None or check_every is None or check_every >= max_iter:
+                scan_out, _ = jax.lax.scan(
+                    step_typed,
+                    step_carry,
+                    None,
+                    length=max_iter,
+                )
+            else:
+                n_chunks = max_iter // check_every
+
+                def chunk_cond(c):
+                    chunk, _, done = c
+                    return (chunk < n_chunks) & (~done)
+
+                def chunk_body(c):
+                    chunk, carry, _ = c
+                    carry, _ = jax.lax.scan(
+                        step_typed, carry, None, length=check_every
+                    )
+                    _, s, avg, _, _ = carry
+                    m = merit_fn(s)
+                    if average:
+                        m = jnp.minimum(m, merit_fn(avg))
+                    return chunk + 1, carry, m <= merit_threshold
+
+                _, scan_out, _ = jax.lax.while_loop(
+                    chunk_cond,
+                    chunk_body,
+                    (jnp.asarray(0), step_carry, jnp.asarray(False)),
+                )
             i, state, average_state, opt_state, total_weight = scan_out
 
             if carry_Ax:
@@ -938,6 +974,7 @@ def __sps(
         average_state,
         opt_state,
         total_weight,
+        merit_threshold,
         max_iter=max_iter,
     )
 
@@ -1006,6 +1043,7 @@ def solve(
     halpern_reanchor_per_epoch=False,
     iterations_per_epoch_decay=1.0,
     iterations_per_epoch_min=100,
+    restart_check_every=None,
     eq_projection_threshold=None,
     vertex_bias=0.0,
     vertex_bias_seed=0,
@@ -1157,6 +1195,12 @@ def solve(
             precomputed factorisation of ``A_eq A_eq^T``. Default ``None``
             disables projection. Only useful when equality feasibility is the
             bottleneck; has no effect when there are no equality constraints.
+        restart_check_every: Evaluate the restart merit every this many
+            iterations inside an epoch and end the epoch early once the
+            sufficient-progress test (``restart_decay``) would fire, so restarts
+            aren't delayed to the epoch boundary. Costs ~2 matvec pairs per check.
+            Epoch lengths round down to a multiple of it. Default ``None`` (check
+            only at epoch boundaries).
         seed_iterations: Extra CGLS iterations refining the default primal seed
             toward ``min ‖Ax − b‖²`` before box projection (2 matvecs each).
             0 (default) keeps the one-shot diagonal (Jacobi) seed. Ignored when
@@ -1939,6 +1983,24 @@ def solve(
     # restart rebalance and the per-epoch rebalance: log-space geometric-mean
     # blend of the movement-ratio target with the current weight (k_theta), then
     # clamp to [k_lo, k_hi]. Squared norms avoid two sqrts; the ratio is preserved.
+    def _inloop_merit(s):
+        # Same restart merit `solve` computes at the epoch boundary, traced into
+        # __sps for the in-epoch sufficient-progress check.
+        obj, _pgn, _cs, cb, dfr, dg, dgf, *_rest = compute_epoch_metrics(s)
+        return kkt_merit(cb, dfr, dg, dgf, obj)
+
+    def _restart_threshold():
+        # Sufficient-progress threshold for the in-epoch check; -inf disables it
+        # (no finite baseline yet, restarts exhausted, or the check is off).
+        if (
+            restart_check_every is None
+            or not restarts
+            or restarts_done >= restarts
+            or not bool(jnp.isfinite(merit_at_last_restart))
+        ):
+            return -float("inf")
+        return float(restart_decay * merit_at_last_restart)
+
     def _rebalance_k(new_state, ref_state, k_prev):
         dp = new_state.primal - ref_state.primal
         dd = jnp.concatenate(
@@ -1991,7 +2053,12 @@ def solve(
                 k_scaling=k_scaling,
                 k_init=k_init,
                 adaptive_eta=adaptive_eta,
+                merit_fn=_inloop_merit if restart_check_every else None,
+                check_every=restart_check_every,
+                merit_threshold=_restart_threshold(),
             )
+            # Iterations actually run (an in-epoch restart check may exit early).
+            iters_this_epoch = int(shifted_i) - (i - restart_i_offset)
             # __sps increments the (restart-shifted) counter; restore global i.
             # `shifted_i` comes back as a JAX array (it is the scan-carried loop
             # index). Coerce to a Python int so the `start_iter` argument fed to
@@ -2108,7 +2175,7 @@ def solve(
             restarted_this_epoch = False
             if restarts and restarts_done < restarts:
                 epochs_since_restart += 1
-                iterations_since_restart += current_iterations_per_epoch
+                iterations_since_restart += iters_this_epoch
 
                 # `merit` is the metric of the *reported* point: with
                 # report_best it is already the better of {average, iterate};

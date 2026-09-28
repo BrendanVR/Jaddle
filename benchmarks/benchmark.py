@@ -127,6 +127,13 @@ def parse_args():
         "value as --tol).",
     )
     p.add_argument(
+        "--restart-check-every",
+        type=int,
+        default=None,
+        help="Check the restart merit every N iterations inside an epoch "
+        "(jl.solve restart_check_every). Default: epoch boundaries only.",
+    )
+    p.add_argument(
         "--skip-bigm-column",
         action="store_true",
         help="Skip instances with a big-M / penalty COLUMN structure (a dense "
@@ -219,7 +226,7 @@ def load_relaxed_lp(
     return lp, opt_obj, highs_status, highs_seconds, offset
 
 
-def run_jaddle(lp, tol, max_epochs):
+def run_jaddle(lp, tol, max_epochs, restart_check_every=None):
     """Solve with Jaddle's saddle-point solver. Returns a dict of metrics.
 
     Three times are reported:
@@ -257,6 +264,7 @@ def run_jaddle(lp, tol, max_epochs):
         scaled_rhs=True,
         ruiz_iterations=10,
         pc_iterations=1,
+        restart_check_every=restart_check_every,
     )
     wall_seconds = time.perf_counter() - t0
 
@@ -356,7 +364,9 @@ def main():
                     "highs_solve_seconds": highs_seconds,
                 }
             )
-            jres = run_jaddle(jaddle_lp, args.tol, args.max_epochs)
+            jres = run_jaddle(
+                jaddle_lp, args.tol, args.max_epochs, args.restart_check_every
+            )
             # jaddle solves the presolved reduced problem (objective = c^T x);
             # add the presolve offset to compare against the full-problem opt_obj.
             jres["jaddle_obj"] += offset
