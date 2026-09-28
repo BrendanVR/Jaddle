@@ -180,6 +180,21 @@ def optimistic_gd(lr):
     )
 
 
+def optimistic_adadelta(lr):
+    primal = optax.chain(
+        optax.scale_by_adadelta(),
+        optax.optimistic_gradient_descent(lr),
+    )
+    dual = optax.chain(
+        optax.scale_by_adadelta(),
+        optax.optimistic_gradient_descent(lr),
+    )
+    return create_saddle_optimiser(
+        primal,
+        dual,
+    )
+
+
 def gd_dual_momentum(lr, momentum=0.3, nesterov=True):
     primal = optax.inject_hyperparams(optax.sgd)(
         learning_rate=lr,

@@ -154,6 +154,84 @@ def _diagonal_primal(A_eq, b_eq, A_ineq, b_ineq, lower, upper, n_vars):
     return optax.projections.projection_box(x, lower, upper)
 
 
+def _cgls_refine(A, A_T, b, x0, iterations):
+    """Refine ``x0`` toward ``min ‖Ax − b‖²`` with a few CGLS iterations.
+
+    CGLS is conjugate gradient applied implicitly to the normal equations
+    ``AᵀAx = Aᵀb`` without ever forming ``AᵀA``: each iteration costs exactly
+    one ``A @ p`` and one ``Aᵀ @ r`` matvec, and ‖Ax − b‖ decreases
+    monotonically over the growing Krylov subspace — unlike re-iterating the
+    Jacobi step of :func:`_diagonal_primal`, which need not converge at all.
+    Inequality rows are treated as targets ``Ax ≈ b`` (the same convention as
+    the one-shot diagonal seed); the caller box-projects the result. Runs
+    eagerly, once, at seed time, so a plain Python loop suffices.
+    """
+    x = x0
+    r = b - A @ x
+    s = A_T @ r
+    p = s
+    gamma = jnp.vdot(s, s)
+    for _ in range(iterations):
+        if not np.isfinite(float(gamma)) or float(gamma) <= 0.0:
+            break
+        q = A @ p
+        q_sq = jnp.vdot(q, q)
+        if not np.isfinite(float(q_sq)) or float(q_sq) <= 0.0:
+            break
+        alpha = gamma / q_sq
+        x = x + alpha * p
+        r = r - alpha * q
+        s = A_T @ r
+        gamma_new = jnp.vdot(s, s)
+        p = s + (gamma_new / gamma) * p
+        gamma = gamma_new
+    return x
+
+
+def _seed_kkt_score(A, A_T, b, c, n_eq, lower, upper, state):
+    """Relative KKT score of a candidate start point (scaled space, ∞-norms).
+
+    ``max(primal, dual)`` residual, each normalised PDLP-style (primal by
+    ``1+‖b‖∞``, dual by ``1+‖c‖∞``) so the two sides are comparable. The dual
+    violation uses the same bound-class rules as the solver's DFR metric:
+    projected-gradient magnitude for boxed variables, classical reduced-cost
+    sign rules for one-sided/free ones. Used by the ``initial_solution``
+    keep-better gate to compare seed candidates; costs 2 matvecs.
+    """
+    Ax = A @ state.primal
+    eq_res = jnp.max(jnp.abs(Ax[:n_eq] - b[:n_eq]), initial=0.0)
+    ineq_res = jnp.max(jnp.maximum(Ax[n_eq:] - b[n_eq:], 0.0), initial=0.0)
+    primal_rel = jnp.maximum(eq_res, ineq_res) / (
+        1.0 + jnp.max(jnp.abs(b), initial=0.0)
+    )
+
+    dual = jnp.concatenate([state.dual_eq, state.dual_ineq])
+    reduced_cost = c + A_T @ dual
+    finite_lower = jnp.isfinite(lower)
+    finite_upper = jnp.isfinite(upper)
+    has_both = finite_lower & finite_upper
+    has_only_lower = finite_lower & (~finite_upper)
+    has_only_upper = (~finite_lower) & finite_upper
+    proj = optax.projections.projection_box(state.primal - reduced_cost, lower, upper)
+    dual_violation = jnp.where(
+        has_both,
+        jnp.abs(state.primal - proj),
+        jnp.where(
+            has_only_lower,
+            jnp.maximum(-reduced_cost, 0.0),
+            jnp.where(
+                has_only_upper,
+                jnp.maximum(reduced_cost, 0.0),
+                jnp.abs(reduced_cost),  # free variable
+            ),
+        ),
+    )
+    dual_rel = jnp.max(dual_violation, initial=0.0) / (
+        1.0 + jnp.max(jnp.abs(c), initial=0.0)
+    )
+    return jnp.maximum(primal_rel, dual_rel)
+
+
 class LP:
     def __init__(
         self,
@@ -317,7 +395,37 @@ class JaddleLP:
     def complementarity_slack(self, x, dual_ineq):
         return (dual_ineq * (self.A_ineq @ x - self.b_ineq)).sum()
 
-    def initial_solution(self):
+    def initial_solution(
+        self,
+        seed_iterations=0,
+        seed_crash=False,
+        seed_couple=True,
+        seed_gate=True,
+        verbose=False,
+    ):
+        """Build the default start point (in this LP's — i.e. scaled — space).
+
+        Assembles the diagonal (Jacobi) primal/dual seeds, then optionally:
+
+        - ``seed_iterations``: refine the primal with that many CGLS
+          iterations on ``min ‖Ax − b‖²`` (2 matvecs each) before
+          box-projecting — a strictly stronger version of the one-shot
+          diagonal step. 0 (default) keeps the one-shot seed.
+        - ``seed_crash``: simplex-style crash — variables whose reduced cost
+          ``r = c + Aᵀy`` at the dual seed has a clear sign are pushed to the
+          finite bound that sign selects (``r > 0`` → lower, ``r < 0`` →
+          upper), making the primal complementarity-consistent with the dual
+          seed and more vertex-like.
+        - ``seed_couple``: complementarity coupling — inequality duals are
+          zeroed on rows that are strictly slack at the (final) primal seed,
+          so the start point doesn't fabricate a complementarity violation
+          the solver must first undo.
+        - ``seed_gate``: keep-better gate — the assembled seed's relative KKT
+          score (:func:`_seed_kkt_score`) is compared against the
+          box-projected zero start (the PDLP default) and the better
+          candidate is returned, so seeding is never worse than starting
+          cold.
+        """
         n_eq = self.num_eq_constraints()
         n_ineq = self.num_ineq_constraints()
         primal = _diagonal_primal(
@@ -332,7 +440,60 @@ class JaddleLP:
         dual_eq, dual_ineq = _diagonal_dual(
             self.A_eq, self.A_ineq, self.c, n_eq, n_ineq
         )
-        return SaddleState(primal=primal, dual_ineq=dual_ineq, dual_eq=dual_eq)
+
+        if seed_iterations > 0 and self.num_constraints() > 0:
+            primal = _cgls_refine(self.A, self.A_T, self.b, primal, seed_iterations)
+            primal = optax.projections.projection_box(
+                primal, self.lower_bounds, self.upper_bounds
+            )
+
+        if seed_crash:
+            dual = jnp.concatenate([dual_eq, dual_ineq])
+            reduced_cost = self.c + self.A_T @ dual
+            crash_lower = (reduced_cost > 0) & jnp.isfinite(self.lower_bounds)
+            crash_upper = (reduced_cost < 0) & jnp.isfinite(self.upper_bounds)
+            primal = jnp.where(
+                crash_lower,
+                self.lower_bounds,
+                jnp.where(crash_upper, self.upper_bounds, primal),
+            )
+
+        if seed_couple and n_ineq > 0:
+            # Zero the dual on rows strictly slack at the primal seed
+            # (relative tolerance, so near-active rows keep their dual): a
+            # positive multiplier on a slack row is a complementarity
+            # violation the seed would otherwise hand the solver.
+            slack = self.b_ineq - self.A_ineq @ primal
+            strictly_slack = slack > 1e-6 * (1.0 + jnp.abs(self.b_ineq))
+            dual_ineq = jnp.where(strictly_slack, 0.0, dual_ineq)
+
+        seeded = SaddleState(primal=primal, dual_ineq=dual_ineq, dual_eq=dual_eq)
+        if not seed_gate:
+            return seeded
+
+        zero_start = SaddleState(
+            primal=optax.projections.projection_box(
+                jnp.zeros_like(primal), self.lower_bounds, self.upper_bounds
+            ),
+            dual_ineq=jnp.zeros_like(dual_ineq),
+            dual_eq=jnp.zeros_like(dual_eq),
+        )
+        seeded_score = _seed_kkt_score(
+            self.A, self.A_T, self.b, self.c, n_eq,
+            self.lower_bounds, self.upper_bounds, seeded,
+        )
+        zero_score = _seed_kkt_score(
+            self.A, self.A_T, self.b, self.c, n_eq,
+            self.lower_bounds, self.upper_bounds, zero_start,
+        )
+        use_seed = bool(seeded_score <= zero_score)
+        if verbose:
+            winner = "diagonal seed" if use_seed else "zero start"
+            print(
+                f"Seed gate: diagonal seed KKT {float(seeded_score):.3e} "
+                f"vs zero start {float(zero_score):.3e} -> {winner}"
+            )
+        return seeded if use_seed else zero_start
 
     def to_scipy(self) -> "LP":
         """Materialise a scipy-backed ``LP`` (CSC matrices, numpy vectors).
