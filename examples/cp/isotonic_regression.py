@@ -15,9 +15,9 @@ jo.configure_jax("float32")
 # %% [markdown]
 # ## Generate Synthetic Data
 # We will create synthetic data that follows a cubic relationship with some added noise.
-n = 100
+n = 10000
 x = np.linspace(-1, 1, n)
-y = x**3
+y = x.copy()
 y += 0.15 * np.random.randn(n)  # add noise
 
 

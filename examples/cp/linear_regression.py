@@ -15,22 +15,18 @@ np.random.seed(42)
 
 # %%
 # Generate synthetic data
-n_samples = 1000
-X = np.linspace(0, 2 * np.pi, n_samples).reshape(-1, 1)
-y = (
-    3 * np.sin(X.ravel())
-    + 2 * np.cos(5 * X.ravel())
-    + np.random.normal(0, 0.5, n_samples)
-)
+n_samples = 200
+X = np.linspace(0, 2 * np.pi, n_samples)
+y = 3 * np.sin(X) + 2 * np.cos(5 * X) + np.random.normal(0, 0.5, n_samples)
 
 # %%
 # Apply Random Fourier Features
 gamma = 10.0
 rbf_sampler = RBFSampler(gamma=gamma, n_components=50, random_state=42)
-X_transformed = rbf_sampler.fit_transform(X).astype(np.float32)
+X_transformed = rbf_sampler.fit_transform(X.reshape(-1, 1))
 
 # Convert to JAX arrays
-X_jax = jnp.array(X_transformed)
+X_jax = jnp.array(X_transformed, dtype=jnp.float32)
 y_jax = jnp.array(y, dtype=jnp.float32)
 
 
@@ -42,7 +38,7 @@ def objective(w):
 
 
 def constraints_ineq(w):
-    return jnp.array([jnp.dot(w, w) - 1000.0])  # L2 norm constraint (||w||^2 <= 25)
+    return jnp.array([jnp.dot(w, w) - 100.0])  # L2 norm constraint (||w||^2 <= 100)
 
 
 def constraints_eq(w):
@@ -87,6 +83,9 @@ solution = jc.solve(
     verbose=True,
     k_scale=None,
 )["solution"]
+
+l2_norm = jnp.linalg.norm(solution.primal, ord=2)
+print("L2 norm of solution.primal:", l2_norm)
 
 # %%
 y_pred = jnp.dot(X_jax, solution.primal)

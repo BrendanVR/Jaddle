@@ -32,11 +32,14 @@ import highspy as hspy
 import jaddle.jaddle_optimisers as jo
 import jaddle.jaddle_linear as jl
 import jaddle.highs_helpers as hh
+import jaddle.presolve as presolve
 from jaddle.jaddle_basic_types import JaddleLP, SaddleState
 
 import jax
 import jax.numpy as jnp
 import jax.experimental.sparse as jsp
+
+import optax
 
 from scan_bigm import is_bigm_cost, is_bigm_matrix, is_bigm_column
 
@@ -137,6 +140,13 @@ def parse_args():
         "~1e7, objective still drifting at 80 epochs). See benchmarks/scan_bigm.py.",
     )
     p.add_argument(
+        "--eliminate-defined-vars",
+        action="store_true",
+        help="After HiGHS presolve, substitute out variables defined by a dense "
+        "equality row (z = sum_j a_j x_j, e.g. gmut-*), which HiGHS keeps. See "
+        "jaddle.presolve.eliminate_defined_variables.",
+    )
+    p.add_argument(
         "--jax-profile",
         default="float64",
         choices=["float64", "float32", "float16"],
@@ -152,6 +162,7 @@ def load_relaxed_lp(
     tol=1e-3,
     highs_verbose=False,
     highs_kkt_tolerance=None,
+    eliminate_defined_vars=False,
 ):
     """Load an MPS file via HiGHS, relax integrality, solve for a trusted
     reference objective with the requested HiGHS solver, and convert to Jaddle's
@@ -223,6 +234,9 @@ def load_relaxed_lp(
     # optimum `opt_obj`. The offset is a pure constant — it shifts the objective
     # but not the argmin, so it stays a reporting concern and never enters solve().
     offset = float(highs_lp.offset_)
+    if eliminate_defined_vars:
+        lp, extra_offset, _ = presolve.eliminate_defined_variables(lp, verbose=True)
+        offset += extra_offset
     return lp, opt_obj, highs_status, highs_seconds, offset
 
 
@@ -252,10 +266,12 @@ def run_jaddle(lp, tol, max_epochs):
         primal_feasibility_tolerance=tol,
         dual_feasibility_tolerance=tol,
         dual_gap_tolerance=tol,
-        update_mode="pdhg",
+        update_mode="halpern",
+        halpern_reanchor_per_epoch=True,
+        adaptive_eta=1,
         iterations_per_epoch=128 * 10,
+        epochs_per_restart=10,
         restarts=1000,
-        epochs_per_restart=20,
     )
     wall_seconds = time.perf_counter() - t0
 
@@ -344,6 +360,7 @@ def main():
                 tol=args.tol,
                 highs_verbose=args.highs_verbose,
                 highs_kkt_tolerance=args.highs_kkt_tolerance,
+                eliminate_defined_vars=args.eliminate_defined_vars,
             )
 
             row.update(

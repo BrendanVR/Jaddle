@@ -23,6 +23,7 @@ import csv
 import time
 
 import jaddle.jaddle_optimisers as jo
+import jaddle.presolve as presolve
 import jaddle.sciopt_helpers as sh
 
 from benchmark import DATA_DIR, REPO_ROOT, _fmt, discover_instances, run_jaddle
@@ -94,6 +95,13 @@ def parse_args():
         help="Enable SCIP's own presolve logging.",
     )
     p.add_argument(
+        "--eliminate-defined-vars",
+        action="store_true",
+        help="After SCIP presolve, substitute out variables defined by a dense "
+        "equality row (z = sum_j a_j x_j, e.g. gmut-*). See "
+        "jaddle.presolve.eliminate_defined_variables.",
+    )
+    p.add_argument(
         "--jax-profile",
         default="float64",
         choices=["float64", "float32", "float16"],
@@ -103,7 +111,7 @@ def parse_args():
     return p.parse_args()
 
 
-def load_presolved_lp(path, scip_verbose=False):
+def load_presolved_lp(path, scip_verbose=False, eliminate_defined_vars=False):
     """Read an MPS file with PySCIPOpt, relax integrality, presolve with SCIP and
     convert to Jaddle's sparse standard form.
 
@@ -115,6 +123,9 @@ def load_presolved_lp(path, scip_verbose=False):
     t0 = time.perf_counter()
     model = sh.read_relaxed_model(path, presolve=True, quiet=not scip_verbose)
     lp, offset = sh.scip_to_standard_form_sparse(model)
+    if eliminate_defined_vars:
+        lp, extra_offset, _ = presolve.eliminate_defined_variables(lp, verbose=True)
+        offset += extra_offset
     presolve_seconds = time.perf_counter() - t0
 
     if lp.A_ineq.shape[0] == 0 and lp.A_eq.shape[0] == 0:
@@ -143,7 +154,9 @@ def main():
         row = {"problem": name, "size_mb": round(size_mb, 1)}
         try:
             jaddle_lp, presolve_seconds, offset = load_presolved_lp(
-                path, scip_verbose=args.scip_verbose
+                path,
+                scip_verbose=args.scip_verbose,
+                eliminate_defined_vars=args.eliminate_defined_vars,
             )
             row.update(
                 {

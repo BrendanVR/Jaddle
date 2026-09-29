@@ -21,7 +21,7 @@ jo.configure_jax("float64")
 # %% [markdown]
 # ## Load the LP
 # We load a MIPLIB LP from an MPS file using the `highspy` library.
-PROBLEM_NAME = "mzzv11"  # name of MIPLIB problem (without .mps extension)
+PROBLEM_NAME = "stp3d"  # name of MIPLIB problem (without .mps extension)
 # Download the MPS file from the MIPLIB website (https://miplib.zib.de/) and
 # place it in the `data/` directory at the repo root, or override PATH_TO_MPS.
 PATH_TO_MPS = os.path.join(

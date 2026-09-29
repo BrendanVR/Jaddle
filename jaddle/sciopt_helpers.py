@@ -5,6 +5,14 @@ from pyscipopt import SCIP_PARAMSETTING
 from jaddle.jaddle_basic_types import LP
 
 
+def try_set(model, name, value):
+    try:
+        model.setParam(name, value)
+        print(f"set {name} = {value}")
+    except KeyError:
+        print(f"skipped (not in this build): {name}")
+
+
 def read_relaxed_model(path: str, presolve: bool = False, quiet: bool = True):
     """
     Reads an LP/MPS file into a PySCIPOpt Model and relaxes integrality, so the
@@ -24,11 +32,23 @@ def read_relaxed_model(path: str, presolve: bool = False, quiet: bool = True):
         if v.vtype() != "CONTINUOUS":
             model.chgVarType(v, "C")
     if presolve:
-        model.setPresolve(SCIP_PARAMSETTING.OFF)
-        model.setParam("presolving/maxrounds", -1)
-        model.setParam("presolving/milp/maxrounds", -1)
-        model.setParam("misc/allowstrongdualreds", False)
-        model.setParam("misc/allowweakdualreds", False)
+        # Symmetry detection (graph automorphisms) can hang for minutes on large
+        # instances (neos-4260495-otere) and is useless for an LP relaxation --
+        # it only serves integer branching.
+        # PaPILO (milp presolver)
+        model.setPresolve(SCIP_PARAMSETTING.AGGRESSIVE)
+        try_set(model, "misc/usesymmetry", 0)
+        try_set(model, "presolving/milp/maxrounds", -1)  # no cap on rounds
+        try_set(model, "presolving/milp/threads", 0)  # 0 = auto; or set your core count
+        try_set(model, "presolving/milp/enableprobing", True)
+        try_set(model, "presolving/milp/enabledualinfer", True)
+        try_set(model, "presolving/milp/enabledomcol", True)
+        try_set(model, "presolving/milp/enableparallelrows", True)
+        try_set(model, "presolving/milp/enablemultiaggr", True)  # off by default
+        try_set(model, "presolving/milp/enablesparsify", True)  # off by default
+        try_set(
+            model, "presolving/milp/modifyconsfac", 1.0
+        )  # allow more constraint modification
         model.presolve()
     return model
 
