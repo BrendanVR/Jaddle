@@ -263,14 +263,13 @@ def run_jaddle(lp, tol, max_epochs):
         lp,
         max_epochs=max_epochs,
         verbose=True,
+        log_every=10,
         primal_feasibility_tolerance=tol,
         dual_feasibility_tolerance=tol,
         dual_gap_tolerance=tol,
-        update_mode="halpern",
-        halpern_reanchor_per_epoch=True,
-        iterations_per_epoch=128 * 10,
-        epochs_per_restart=10,
+        update_mode="alternating",
         restarts=1000,
+        iterations_per_epoch=1000,
     )
     wall_seconds = time.perf_counter() - t0
 

@@ -135,20 +135,17 @@ def __sps(
     max_iter,
     start_iter,
     lp: JaddleLP,
-    optimiser,
     initial_solution,
     initial_avg_state=None,
     initial_opt_state=None,
-    weight_function=lambda _: 1.0,
     total_weight=0.0,
     primal_damping=0.0,
     dual_damping_ineq=0.0,
     dual_damping_eq=0.0,
     average=True,
-    update_mode="synchronous",
-    k_scaling=False,
+    update_mode="pdhg",
     k_init=1.0,
-    adaptive_eta=None,
+    adaptive_eta=1.0,
     merit_fn=None,
     check_every=None,
     merit_threshold=-jnp.inf,
@@ -162,176 +159,59 @@ def __sps(
     # `stall_threshold` (necessary decay) AND rising vs the previous chunk; the
     # returned `stalled` flag tells `solve` to restart on it. The epoch length
     # rounds down to a whole number of chunks.
-    # The stepping scheme is selected by `update_mode`. This derived boolean
-    # keeps the dense per-scheme branching below readable while the string stays
-    # the single source of truth.
-    extragradient = update_mode == "extragradient"
-    # cuPDLP-style per-iteration adaptive step size. When `adaptive_eta` is not
-    # None the stepping scheme replaces the optimiser's fixed learning rate with
-    # a single scalar base step eta, line-searched every iteration: a trial step
-    # is taken, the largest admissible step eta_bar = move / (2|interaction|) is
-    # formed from the trial movement, and the step is rejected + shrunk if it
-    # overshot eta_bar. The primal/dual steps are tau=eta/k, sigma=eta*k (k is the
-    # primal weight). eta is packed alongside k in the k-slot of opt_state.
-    # Requires k_scaling (it needs k). Supported for pdhg (extrapolation) and
-    # extragradient (corrector) — the two schemes that are contractive on the
-    # bilinear saddle; each supplies its own per-iteration `trial`, while the
-    # retry loop and eta advancement are shared. Plain Arrow-Hurwicz
-    # (synchronous) and Gauss-Seidel (alternating) are not contractive here and a
-    # line search cannot fix that, so they are excluded.
-    adaptive_modes = ("pdhg", "extragradient")
-    adaptive_step = adaptive_eta is not None and update_mode in adaptive_modes
-    # Halpern-anchored PDHG (restarted Halpern). The base operator T(z) is the
-    # adaptive PDHG step; each iterate is then anchored back toward z_0 (the
-    # iterate at the start of the current restart cycle):
-    #     z_{k+1} = lambda_k z_0 + (1 - lambda_k) T(z_k),   lambda_k = 1/(k+2),
-    # with the local index k = i - start_iter reset each restart (so lambda_k
-    # restarts from 1/2). The anchor combination is a convex combination of two
-    # feasible iterates, so feasibility is preserved without re-projection.
-    # Halpern always rides the adaptive PDHG step, so it implies adaptive_step
-    # and requires adaptive_eta + k_scaling. The anchor z_0 is carried in the
-    # k-slot alongside (k, eta).
+    #
+    # Every mode is cuPDLP-style adaptive PDHG: a single scalar base step eta is
+    # line-searched every iteration (a trial step is taken, the largest
+    # admissible step eta_bar = move / (2|interaction|) is formed from the trial
+    # movement, and the step is rejected + shrunk if it overshot eta_bar). The
+    # primal/dual steps are tau=eta/k, sigma=eta*k, with k the primal weight
+    # (rebalanced at restarts in `solve`). The modes differ only in the dual's
+    # extrapolation and an optional anchor:
+    #   * "pdhg":        dual reads x_bar = 2 x_new - x_old (theta=1).
+    #   * "alternating": dual reads x_new (theta=0, Gauss-Seidel). Not
+    #                    contractive in general; relies on averaging/restarts.
+    #   * "halpern":     pdhg operator T(z), anchored back toward z_0 (the
+    #                    iterate at the start of the restart cycle):
+    #                        z_{k+1} = lambda_k z_0 + (1 - lambda_k) T(z_k),
+    #                    lambda_k = 1/(k+1) with the restart-shifted index. The
+    #                    convex combination of two feasible iterates stays
+    #                    feasible, so no re-projection is needed.
     halpern = update_mode == "halpern"
-    if halpern:
-        if adaptive_eta is None:
-            raise ValueError("update_mode='halpern' requires adaptive_eta")
-        adaptive_step = True
-    if adaptive_step and not k_scaling:
-        raise ValueError("adaptive_eta requires k_scaling (primal weight k)")
-    # k-scaling is an orthogonal option (any update_mode): a primal weight k
-    # rescales the primal/dual gradients by (1/k, k) before opt_update, so the
-    # dual/primal step ratio is k**2. When on, k is packed into opt_state and
-    # rebalanced at each restart in `solve` (PDLP-style); constant within an
-    # epoch.
+    theta = 0.0 if update_mode == "alternating" else 1.0
 
     def projection_primal(primal_state):
         return projection_box(primal_state, lp.lower_bounds, lp.upper_bounds)
 
-    def grad(state):
-        # Fused matvecs: 2 sparse ops (A @ x, Aᵀ @ y) instead of 4. The
-        # controllers below act on post-optimiser update norms, not on A·dx, so
-        # there is nothing to gain from returning Ax.
-        dual = jnp.concatenate([state.dual_eq, state.dual_ineq])
-        Ax = lp.A @ state.primal  # shape: (n_eq + n_ineq,)
-        ATd = lp.A_T @ dual  # shape: (n_vars,)
-        grad_primal = lp.c + ATd + primal_damping * state.primal
-        residual = lp.b - Ax
-        grad_dual_eq = residual[: lp.n_eq] + dual_damping_eq * state.dual_eq
-        grad_dual_ineq = residual[lp.n_eq :] + dual_damping_ineq * state.dual_ineq
-        return SaddleState(
-            primal=grad_primal,
-            dual_ineq=grad_dual_ineq,
-            dual_eq=grad_dual_eq,
-        )
-
     def grad_primal_only(state):
-        # Primal partial only: c + Aᵀd (+ damping). One sparse matvec (Aᵀ @ d);
-        # the A @ x matvec that the full `grad` does for the dual residual is
-        # skipped entirely. Used by the alternating/pdhg primal half.
+        # Primal partial: c + Aᵀd (+ damping). One sparse matvec (Aᵀ @ d).
         dual = jnp.concatenate([state.dual_eq, state.dual_ineq])
         ATd = lp.A_T @ dual
         return lp.c + ATd + primal_damping * state.primal
 
-    def grad_dual_only(state):
-        # Dual partials only: b - Ax (+ damping). One sparse matvec (A @ x); the
-        # Aᵀ @ d matvec is skipped. Used by the alternating/pdhg dual half.
-        Ax = lp.A @ state.primal
-        residual = lp.b - Ax
-        grad_dual_eq = residual[: lp.n_eq] + dual_damping_eq * state.dual_eq
-        grad_dual_ineq = residual[lp.n_eq :] + dual_damping_ineq * state.dual_ineq
-        return grad_dual_ineq, grad_dual_eq
-
     def grad_dual_only_from_Ax(Ax, state):
-        # Same as grad_dual_only but reuses a pre-computed A @ state.primal,
-        # saving the matvec when Ax is already available at the call site.
+        # Dual partials b - Ax (+ damping) from a pre-computed A @ x.
         residual = lp.b - Ax
         grad_dual_eq = residual[: lp.n_eq] + dual_damping_eq * state.dual_eq
         grad_dual_ineq = residual[lp.n_eq :] + dual_damping_ineq * state.dual_ineq
         return grad_dual_ineq, grad_dual_eq
 
-    def opt_update(gradient, opt_state, state):
-        return optimiser.update(gradient, opt_state, state)
-
-    def keep_only_primal(updates):
-        return SaddleState(
-            primal=updates.primal,
-            dual_ineq=jnp.zeros_like(updates.dual_ineq),
-            dual_eq=jnp.zeros_like(updates.dual_eq),
-        )
-
-    def keep_only_dual(updates):
-        return SaddleState(
-            primal=jnp.zeros_like(updates.primal),
-            dual_ineq=updates.dual_ineq,
-            dual_eq=updates.dual_eq,
-        )
-
-    def scale_by_k(gradient, k):
-        # Primal weight split: (1/k, k) on (primal, dual) gradients.
-        return SaddleState(
-            primal=gradient.primal / k,
-            dual_ineq=gradient.dual_ineq * k,
-            dual_eq=gradient.dual_eq * k,
-        )
-
-    # When k-scaling is on, k is carried as the last element of opt_state. These
-    # helpers keep the step bodies agnostic to whether k is packed or not.
-    # In adaptive_step mode the packed k-slot is a (k, eta) pair so the
-    # per-iteration step size eta rides alongside the primal weight k; otherwise
-    # it is just k (or absent when k_scaling is off). These helpers keep the step
-    # bodies agnostic to the packing.
-    # Adaptive PDHG carries A @ x_old in the k-slot so the step can reuse last
-    # iteration's A @ x_new instead of recomputing it — a 3->2 matvec cut per
-    # iteration. Plain adaptive pdhg carries (k, eta, Ax). Halpern's anchor
-    # blend changes the primal after the matvec, so the carried Ax_new alone
-    # wouldn't match next iter's x_old — but A is linear, so the blended
-    # iterate's matvec is one axpy away:
+    # opt_state is the step-size state: (k, eta) for pdhg/alternating and
+    # (k, eta, anchor) for halpern. Inside the epoch it is extended with a
+    # carried A @ x so each iteration reuses last iteration's A @ x_new instead
+    # of recomputing it — a 3->2 matvec cut. pdhg/alternating carry
+    # (k, eta, Ax). Halpern's anchor blend changes the primal after the matvec,
+    # but A is linear, so the blended iterate's matvec is one axpy away:
     #     A @ (lam z_0 + (1-lam) cand) = lam (A @ z_0) + (1-lam) Ax_new.
     # The anchor z_0 is constant within an epoch (restarts / re-anchors only
-    # fire at epoch boundaries in `solve`), so A @ z_0 is loop-invariant.
-    # Halpern therefore carries (k, eta, anchor, Ax_anchor, Ax_state) with
-    # Ax_anchor = A @ anchor.primal and Ax_state = A @ state.primal — the same
-    # 3->2 matvec cut. Extragradient is a different operator with no A @ x_old
-    # to reuse and keeps its (k, eta) slot.
-    carry_Ax = adaptive_step and update_mode == "pdhg" and not halpern
-
-    def unpack_k(opt_state):
-        if k_scaling:
-            if halpern:
-                inner, (k, eta, anchor, Ax_anchor, Ax_state) = opt_state
-                return inner, k, eta, anchor, Ax_anchor, Ax_state
-            if carry_Ax:
-                inner, (k, eta, Ax) = opt_state
-                return inner, k, eta, Ax
-            if adaptive_step:
-                inner, (k, eta) = opt_state
-                return inner, k, eta
-            return opt_state
-        return opt_state, None
-
-    def pack_k(opt_state, k, eta=None, anchor=None, Ax=None, Ax_anchor=None):
-        if k_scaling:
-            if halpern:
-                return (opt_state, (k, eta, anchor, Ax_anchor, Ax))
-            if carry_Ax:
-                return (opt_state, (k, eta, Ax))
-            if adaptive_step:
-                return (opt_state, (k, eta))
-            return (opt_state, k)
-        return opt_state
-
+    # fire at epoch boundaries in `solve`), so A @ z_0 is loop-invariant and
+    # halpern carries (k, eta, anchor, Ax_anchor, Ax_state).
     cache_key = (
         id(lp),
-        id(optimiser),
-        id(weight_function),
         float(primal_damping),
         float(dual_damping_ineq),
         float(dual_damping_eq),
         average,
         update_mode,
-        bool(k_scaling),
-        adaptive_step,
-        halpern,
         id(merit_fn),
         check_every,
     )
@@ -358,17 +238,8 @@ def __sps(
             *,
             max_iter,
         ):
-            apply_updates = optax.apply_updates
-
-            # ---- Shared machinery for the cuPDLP-style adaptive line search ----
-            # Each adaptive update_mode supplies a `trial(eta, state, k, Ax_old, pre)` that
-            # takes one raw step at base step `eta` and returns
-            # (candidate_state, eta_bar), where eta_bar is the largest admissible
-            # base step implied by the trial movement. The retry/reject loop and
-            # the eta advancement are identical across modes and live here.
             def _descent_bound(state, cand, k, interaction):
                 # eta_bar = move / (2 |interaction|), move = k‖dx‖² + (1/k)‖dy‖².
-                # interaction is the mode-specific coupling term (already abs'd).
                 dx = cand.primal - state.primal
                 dy_eq = cand.dual_eq - state.dual_eq
                 dy_ineq = cand.dual_ineq - state.dual_ineq
@@ -379,500 +250,134 @@ def __sps(
                 # the retry loop accepts and the eta-growth branch is suppressed.
                 return jnp.where(interaction > 0.0, move / (2.0 * interaction), jnp.inf)
 
-            def make_adaptive_step(trial, prep):
-                # `prep(state)` computes the eta-INDEPENDENT part of the trial
-                # (pdhg: c + Aᵀy; extragradient: the full gradient at state) once
-                # per iteration, so line-search retries don't redo its matvec.
-                # `trial(eta, state, k, Ax_old, pre)` returns (cand, eta_bar, Ax_new):
-                # Ax_old = A @ state.primal (carried, not recomputed); Ax_new =
-                # A @ cand.primal (carried forward to the next iteration — for
-                # halpern, blended with Ax_anchor first). When the path doesn't
-                # carry Ax (extragradient), Ax_old/Ax_new are None.
-                def step(carry, _):
-                    i, state, average_state, opt_state, total_weight = carry
-                    if halpern:
-                        opt_state, k, eta, anchor, Ax_anchor, Ax_old = unpack_k(
-                            opt_state
-                        )
-                    elif carry_Ax:
-                        opt_state, k, eta, Ax_old = unpack_k(opt_state)
-                    else:
-                        # extragradient: adaptive but doesn't carry Ax.
-                        opt_state, k, eta = unpack_k(opt_state)
-                        Ax_old = None
-                    ip1 = jnp.asarray(i + 1, eta.dtype)
+            def trial(eta, state, k, Ax_old, gp):
+                # One raw PDHG step at base step eta. `gp` = c + Aᵀy at state
+                # (eta-independent, computed once per iteration so line-search
+                # retries don't redo its matvec). Ax_old = A @ state.primal is
+                # carried; only Ax_new = A @ x_new is computed here, and the
+                # dual reads x_bar = x_new + theta (x_new - x_old), so
+                # A @ x_bar = Ax_old + (1 + theta) A_dx.
+                tau = eta / k
+                sigma = eta * k
+                x_new = projection_primal(state.primal - tau * gp)
+                Ax_new = lp.A @ x_new
+                A_dx = Ax_new - Ax_old
+                Ax_bar = Ax_old + (1.0 + theta) * A_dx
+                gd_ineq, gd_eq = grad_dual_only_from_Ax(Ax_bar, state)
+                dual_ineq = projection_non_negative(state.dual_ineq - sigma * gd_ineq)
+                dual_eq = state.dual_eq - sigma * gd_eq
+                cand = SaddleState(primal=x_new, dual_ineq=dual_ineq, dual_eq=dual_eq)
+                dy = jnp.concatenate(
+                    [dual_eq - state.dual_eq, dual_ineq - state.dual_ineq]
+                )
+                interaction = jnp.abs(jnp.vdot(dy, A_dx))
+                return cand, _descent_bound(state, cand, k, interaction), Ax_new
 
-                    # Retry: while the trial step exceeds its admissible bound,
-                    # shrink eta to just under eta_bar and re-trial. The
-                    # (1-(i+1)^-0.3) factor < 1 guarantees strict decrease, so the
-                    # loop terminates. Carry (eta, cand, eta_bar, Ax_new).
-                    def cond(c):
-                        eta_c, _, eta_bar_c, _ = c
-                        return eta_c > eta_bar_c
+            def step(carry, _):
+                i, state, average_state, opt_state, total_weight = carry
+                if halpern:
+                    k, eta, anchor, Ax_anchor, Ax_old = opt_state
+                else:
+                    k, eta, Ax_old = opt_state
+                ip1 = jnp.asarray(i + 1, eta.dtype)
 
-                    def body(c):
-                        eta_c, _, eta_bar_c, _ = c
-                        eta_s = jnp.minimum((1.0 - ip1 ** (-0.3)) * eta_bar_c, eta_c)
-                        cand_s, eta_bar_s, Ax_new_s = trial(
-                            eta_s, state, k, Ax_old, pre
-                        )
-                        return (eta_s, cand_s, eta_bar_s, Ax_new_s)
+                # Retry: while the trial step exceeds its admissible bound,
+                # shrink eta to just under eta_bar and re-trial. The
+                # (1-(i+1)^-0.3) factor < 1 guarantees strict decrease, so the
+                # loop terminates. Carry (eta, cand, eta_bar, Ax_new).
+                def cond(c):
+                    eta_c, _, eta_bar_c, _ = c
+                    return eta_c > eta_bar_c
 
-                    pre = prep(state)
-                    cand0, eta_bar0, Ax_new0 = trial(eta, state, k, Ax_old, pre)
-                    eta0, cand, eta_bar, Ax_new = jax.lax.while_loop(
-                        cond, body, (eta, cand0, eta_bar0, Ax_new0)
+                def body(c):
+                    eta_c, _, eta_bar_c, _ = c
+                    eta_s = jnp.minimum((1.0 - ip1 ** (-0.3)) * eta_bar_c, eta_c)
+                    cand_s, eta_bar_s, Ax_new_s = trial(eta_s, state, k, Ax_old, gp)
+                    return (eta_s, cand_s, eta_bar_s, Ax_new_s)
+
+                gp = grad_primal_only(state)
+                cand0, eta_bar0, Ax_new0 = trial(eta, state, k, Ax_old, gp)
+                eta0, cand, eta_bar, Ax_new = jax.lax.while_loop(
+                    cond, body, (eta, cand0, eta_bar0, Ax_new0)
+                )
+
+                if halpern:
+                    # Halpern anchor: blend T(z_k)=cand back toward z_0.
+                    # lambda_k = 1/(k_local+1) where k_local is the
+                    # restart-shifted iteration index `i` (== i_global -
+                    # restart_i_offset, reset to ~1 each cycle by `solve`), so
+                    # lambda decays as the cycle progresses and re-warms toward
+                    # 1/2 at each restart.
+                    k_local = jnp.asarray(i, eta.dtype)
+                    lam = 1.0 / (k_local + 1.0)
+                    new_state = jax.tree.map(
+                        lambda z0, tz: lam * z0 + (1.0 - lam) * tz,
+                        anchor,
+                        cand,
+                    )
+                    # Advance the matvec carry through the blend by linearity
+                    # of A: A @ new_primal = lam Ax_anchor + (1-lam) Ax_new.
+                    Ax_next = lam * Ax_anchor + (1.0 - lam) * Ax_new
+                else:
+                    new_state = cand
+                    Ax_next = Ax_new
+
+                # Advance eta for the next iterate (growth allowed once the
+                # step is accepted). When eta_bar is +inf the step did not move
+                # (e.g. pinned on the box): hold eta rather than letting the
+                # growth branch run away to NaN.
+                eta_next = jnp.minimum(
+                    (1.0 - ip1 ** (-0.3)) * eta_bar,
+                    (1.0 + ip1 ** (-0.6)) * eta0,
+                )
+                eta_next = jnp.where(jnp.isfinite(eta_bar), eta_next, eta0)
+                eta_next = jnp.where(jnp.isfinite(eta_next), eta_next, eta0)
+                eta_next = jnp.maximum(eta_next, 1e-12)
+                if halpern:
+                    opt_state = (k, eta_next, anchor, Ax_anchor, Ax_next)
+                else:
+                    opt_state = (k, eta_next, Ax_next)
+
+                if average:
+                    # PDLP-style step-size-weighted average (Applegate et al.,
+                    # "Practical LP using PDHG", the restart-average
+                    # z̄ⁿ = Σ ηₖ zᵏ / Σ ηₖ): weight each iterate by the eta
+                    # ACTUALLY used to produce it (eta0, the accepted
+                    # post-retry-shrink step).
+                    w = eta0
+                    total_weight = total_weight + w
+                    average_state = optax.incremental_update(
+                        new_state, average_state, w / total_weight
                     )
 
-                    if halpern:
-                        # Halpern anchor: blend T(z_k)=cand back toward z_0.
-                        # lambda_k = 1/(k_local+1) where k_local is the
-                        # restart-shifted iteration index `i` (== i_global -
-                        # restart_i_offset, reset to ~1 each cycle by `solve`), so
-                        # lambda decays as the cycle progresses and re-warms toward
-                        # 1/2 at each restart. The anchor z_0 itself is reset to
-                        # the cycle-start iterate in `solve`. Convex combination of
-                        # two feasible iterates stays feasible — no re-projection.
-                        k_local = jnp.asarray(i, eta.dtype)
-                        lam = 1.0 / (k_local + 1.0)
-                        new_state = jax.tree.map(
-                            lambda z0, tz: lam * z0 + (1.0 - lam) * tz,
-                            anchor,
-                            cand,
-                        )
-                        # Advance the matvec carry through the blend by linearity
-                        # of A: A @ new_primal = lam Ax_anchor + (1-lam) Ax_new.
-                        # One axpy replaces next iteration's A @ state.primal.
-                        Ax_state_next = lam * Ax_anchor + (1.0 - lam) * Ax_new
-                    else:
-                        new_state = cand
-
-                    # Advance eta for the next iterate (growth allowed once the
-                    # step is accepted). When eta_bar is +inf the step did not move
-                    # (e.g. pinned on the box): hold eta rather than letting the
-                    # growth branch run away to NaN.
-                    eta_next = jnp.minimum(
-                        (1.0 - ip1 ** (-0.3)) * eta_bar,
-                        (1.0 + ip1 ** (-0.6)) * eta0,
-                    )
-                    eta_next = jnp.where(jnp.isfinite(eta_bar), eta_next, eta0)
-                    eta_next = jnp.where(jnp.isfinite(eta_next), eta_next, eta0)
-                    eta_next = jnp.maximum(eta_next, 1e-12)
-                    if halpern:
-                        opt_state = pack_k(
-                            opt_state,
-                            k,
-                            eta_next,
-                            anchor=anchor,
-                            Ax=Ax_state_next,
-                            Ax_anchor=Ax_anchor,
-                        )
-                    else:
-                        # Carry A @ new_state.primal (== Ax_new, since new_state ==
-                        # cand on the pdhg path) for the next iteration's Ax_old.
-                        opt_state = pack_k(opt_state, k, eta_next, Ax=Ax_new)
-
-                    if average:
-                        # PDLP-style step-size-weighted average (Applegate et al.,
-                        # "Practical LP using PDHG", the restart-average
-                        # z̄ⁿ = Σ ηₖ zᵏ / Σ ηₖ): weight each iterate by the eta
-                        # ACTUALLY used to produce it (eta0, the accepted
-                        # post-retry-shrink step), not weight_function(i). Under a
-                        # fixed step size this reduces to a uniform average, so it
-                        # only changes behaviour for the adaptive-eta / halpern
-                        # paths where eta genuinely varies iteration-to-iteration.
-                        w = eta0
-                        total_weight = total_weight + w
-                        average_state = optax.incremental_update(
-                            new_state, average_state, w / total_weight
-                        )
-
-                    return (
-                        i + 1,
-                        new_state,
-                        average_state,
-                        opt_state,
-                        total_weight,
-                    )
-
-                return step
-
-            if (adaptive_step and update_mode == "pdhg") or halpern:
-                # PDHG raw step: primal first, then dual reads the EXTRAPOLATED
-                # primal x_bar = 2 x_new - x_old. interaction = dyᵀ A dx (one A·dx).
-                # Halpern uses this same PDHG operator as its base T(z); the anchor
-                # combination is applied in make_adaptive_step.
-                def _trial(eta, state, k, Ax_old, gp):
-                    tau = eta / k
-                    sigma = eta * k
-                    x_new = projection_primal(state.primal - tau * gp)
-                    # Ax_old = A @ state.primal is carried from the previous
-                    # iteration (pdhg: last iter's A @ x_new; halpern: the
-                    # anchor-blended lam·Ax_anchor + (1-lam)·Ax_new), saving one
-                    # matvec. Only Ax_new = A @ x_new is computed here.
-                    # A_dx = Ax_new - Ax_old; x_bar = 2*x_new - x_old so
-                    # A @ x_bar = Ax_old + 2 * A_dx.
-                    if Ax_old is None:
-                        Ax_old = lp.A @ state.primal
-                    Ax_new = lp.A @ x_new
-                    A_dx = Ax_new - Ax_old
-                    Ax_bar = Ax_old + 2.0 * A_dx
-                    # Dual variables are unchanged from state at this point, so
-                    # state can be passed directly — grad_dual_only_from_Ax only
-                    # reads state.dual_eq / state.dual_ineq.
-                    gd_ineq, gd_eq = grad_dual_only_from_Ax(Ax_bar, state)
-                    dual_ineq = projection_non_negative(
-                        state.dual_ineq - sigma * gd_ineq
-                    )
-                    dual_eq = state.dual_eq - sigma * gd_eq
-                    cand = SaddleState(
-                        primal=x_new, dual_ineq=dual_ineq, dual_eq=dual_eq
-                    )
-                    dy = jnp.concatenate(
-                        [dual_eq - state.dual_eq, dual_ineq - state.dual_ineq]
-                    )
-                    interaction = jnp.abs(jnp.vdot(dy, A_dx))
-                    return cand, _descent_bound(state, cand, k, interaction), Ax_new
-
-                step = make_adaptive_step(_trial, grad_primal_only)
-
-            elif adaptive_step and update_mode == "extragradient":
-                # Extragradient (Korpelevich) raw step with a Malitsky-Tam local
-                # Lipschitz line search. The look-ahead and corrector already
-                # evaluate the gradient twice, so the local Lipschitz estimate
-                #     L_hat = ‖g_half - g‖_w / ‖z_half - z‖_w
-                # (w = the k-weighted norm: k on the primal block, 1/k on the dual)
-                # comes with NO extra matvec, unlike the pdhg family's A·dx. The
-                # extragradient step is admissible while eta · L_hat <= 1/sqrt(2)
-                # (Malitsky-Tam), so the largest admissible base step is
-                #     eta_bar = (1/sqrt(2)) / L_hat.
-                # The shared retry loop shrinks eta toward eta_bar; the corrector
-                # is taken at the accepted eta, evaluated at the original state
-                # (Korpelevich convention).
-                _MT = 1.0 / jnp.sqrt(2.0)
-
-                def _trial(eta, state, k, Ax_old, g):
-                    # Extragradient doesn't carry Ax (its line search is matvec-free
-                    # and it isn't the default path); Ax_old is None, Ax_new is None.
-                    tau = eta / k
-                    sigma = eta * k
-                    # Look-ahead z_half = proj(z - step ∘ g): descend primal,
-                    # subtract the optax-convention dual gradient (matches the
-                    # non-adaptive extragradient / pdhg sign).
-                    xh = projection_primal(state.primal - tau * g.primal)
-                    yh_ineq = projection_non_negative(
-                        state.dual_ineq - sigma * g.dual_ineq
-                    )
-                    yh_eq = state.dual_eq - sigma * g.dual_eq
-                    state_half = SaddleState(
-                        primal=xh, dual_ineq=yh_ineq, dual_eq=yh_eq
-                    )
-                    g_half = grad(state_half)
-                    # Corrector from the ORIGINAL state using the look-ahead grad.
-                    x_new = projection_primal(state.primal - tau * g_half.primal)
-                    dual_ineq = projection_non_negative(
-                        state.dual_ineq - sigma * g_half.dual_ineq
-                    )
-                    dual_eq = state.dual_eq - sigma * g_half.dual_eq
-                    cand = SaddleState(
-                        primal=x_new, dual_ineq=dual_ineq, dual_eq=dual_eq
-                    )
-
-                    # Local Lipschitz estimate in the k-weighted norm, measured on
-                    # the look-ahead displacement (the same z used for g, g_half).
-                    def _wnorm2(p, de, di):
-                        return k * jnp.vdot(p, p) + (1.0 / k) * (
-                            jnp.vdot(de, de) + jnp.vdot(di, di)
-                        )
-
-                    dg2 = _wnorm2(
-                        g_half.primal - g.primal,
-                        g_half.dual_eq - g.dual_eq,
-                        g_half.dual_ineq - g.dual_ineq,
-                    )
-                    dz2 = _wnorm2(
-                        xh - state.primal,
-                        yh_eq - state.dual_eq,
-                        yh_ineq - state.dual_ineq,
-                    )
-                    # eta_bar = (1/sqrt2) ‖dz‖ / ‖dg‖. No gradient change (dg2 -> 0)
-                    # means the step is locally unconstrained: flag with +inf so
-                    # the retry accepts and eta-growth is suppressed.
-                    eta_bar = jnp.where(dg2 > 0.0, _MT * jnp.sqrt(dz2 / dg2), jnp.inf)
-                    return cand, eta_bar, None
-
-                step = make_adaptive_step(_trial, grad)
-
-            elif update_mode == "alternating":
-
-                def step(carry, _):
-                    i, state, average_state, opt_state, total_weight = carry
-                    opt_state, k = unpack_k(opt_state)
-
-                    # 1) Primal-only update. Only the primal gradient is needed
-                    #    here, so compute just c + Aᵀd (one matvec) instead of the
-                    #    full grad (which would also do A @ x for an unused dual).
-                    gp = grad_primal_only(state)
-                    if k_scaling:
-                        gp = gp / k
-                    primal_gradient = SaddleState(
-                        primal=gp,
-                        dual_ineq=jnp.zeros_like(state.dual_ineq),
-                        dual_eq=jnp.zeros_like(state.dual_eq),
-                    )
-                    primal_updates, _ = opt_update(primal_gradient, opt_state, state)
-                    state = apply_updates(state, keep_only_primal(primal_updates))
-                    state = SaddleState(
-                        primal=projection_primal(state.primal),
-                        dual_ineq=state.dual_ineq,
-                        dual_eq=state.dual_eq,
-                    )
-
-                    # 2) Dual-only update (post-primal dual gradients). Only the
-                    #    dual gradient is needed, so compute just b - Ax (one
-                    #    matvec) instead of the full grad.
-                    gd_ineq, gd_eq = grad_dual_only(state)
-                    if k_scaling:
-                        gd_ineq = gd_ineq * k
-                        gd_eq = gd_eq * k
-                    combined_gradient = SaddleState(
-                        primal=gp,
-                        dual_ineq=gd_ineq,
-                        dual_eq=gd_eq,
-                    )
-                    dual_updates, opt_state = opt_update(
-                        combined_gradient, opt_state, state
-                    )
-                    state = apply_updates(state, keep_only_dual(dual_updates))
-                    state = SaddleState(
-                        primal=state.primal,
-                        dual_ineq=projection_non_negative(state.dual_ineq),
-                        dual_eq=state.dual_eq,
-                    )
-                    opt_state = pack_k(opt_state, k)
-
-                    # `average` is a Python-level static, so when False the
-                    # incremental_update is dropped from the hot loop entirely.
-                    if average:
-                        w = weight_function(i)
-                        total_weight = total_weight + w
-                        average_state = optax.incremental_update(
-                            state, average_state, w / total_weight
-                        )
-
-                    return (i + 1, state, average_state, opt_state, total_weight)
-
-            elif update_mode == "pdhg":
-                # Chambolle-Pock PDHG: identical to `alternating` (Gauss-Seidel
-                # primal-then-dual), except the dual gradient is evaluated at the
-                # EXTRAPOLATED primal x_bar = 2 x^{k+1} - x^k instead of at
-                # x^{k+1}. That over-relaxation is the only thing separating plain
-                # Arrow-Hurwicz from true PDHG, and it is what lifts the
-                # step-size restriction / buys the O(1/k) convergence. It costs
-                # one axpy on the primal (no extra matvec): the dual gradient
-                # b - A x_bar is linear in the primal, so we feed grad() a state
-                # whose primal is x_bar.
-                def step(carry, _):
-                    i, state, average_state, opt_state, total_weight = carry
-                    opt_state, k = unpack_k(opt_state)
-
-                    x_old = state.primal
-
-                    # 1) Primal-only update (same as alternating): c + Aᵀd, one
-                    #    matvec.
-                    gp = grad_primal_only(state)
-                    if k_scaling:
-                        gp = gp / k
-                    primal_gradient = SaddleState(
-                        primal=gp,
-                        dual_ineq=jnp.zeros_like(state.dual_ineq),
-                        dual_eq=jnp.zeros_like(state.dual_eq),
-                    )
-                    primal_updates, _ = opt_update(primal_gradient, opt_state, state)
-                    state = apply_updates(state, keep_only_primal(primal_updates))
-                    state = SaddleState(
-                        primal=projection_primal(state.primal),
-                        dual_ineq=state.dual_ineq,
-                        dual_eq=state.dual_eq,
-                    )
-
-                    # 2) Dual-only update, but the dual gradient reads the
-                    #    extrapolated primal x_bar = 2 x^{k+1} - x^k. Just b - A
-                    #    x_bar (one matvec) — the primal half of the full grad is
-                    #    unused here.
-                    x_bar = 2.0 * state.primal - x_old
-                    extrapolated = SaddleState(
-                        primal=x_bar,
-                        dual_ineq=state.dual_ineq,
-                        dual_eq=state.dual_eq,
-                    )
-                    gd_ineq, gd_eq = grad_dual_only(extrapolated)
-                    if k_scaling:
-                        gd_ineq = gd_ineq * k
-                        gd_eq = gd_eq * k
-                    combined_gradient = SaddleState(
-                        primal=gp,
-                        dual_ineq=gd_ineq,
-                        dual_eq=gd_eq,
-                    )
-                    dual_updates, opt_state = opt_update(
-                        combined_gradient, opt_state, state
-                    )
-                    state = apply_updates(state, keep_only_dual(dual_updates))
-                    state = SaddleState(
-                        primal=state.primal,
-                        dual_ineq=projection_non_negative(state.dual_ineq),
-                        dual_eq=state.dual_eq,
-                    )
-                    opt_state = pack_k(opt_state, k)
-
-                    if average:
-                        w = weight_function(i)
-                        total_weight = total_weight + w
-                        average_state = optax.incremental_update(
-                            state, average_state, w / total_weight
-                        )
-
-                    return (i + 1, state, average_state, opt_state, total_weight)
-
-            elif extragradient:
-                # Extragradient (Korpelevich) using jo.extragradient's two-call
-                # protocol, but routing gradients through the user-supplied
-                # optimiser for adaptive scaling (adam etc.). This gives the
-                # stabilising effect of the base optimiser plus the corrector
-                # step's second gradient evaluation.
-                #
-                # Each iteration:
-                #   Look-ahead: pass g at state through optimiser → la_updates,
-                #       la_opt_state (non-committed); state_half = proj(state +
-                #       la_updates).
-                #   Corrector:  pass g_half at state_half through the ORIGINAL
-                #       opt_state (not la_opt_state) → corr_updates, opt_state
-                #       (committed); state = proj(state + corr_updates).
-                #
-                # When k-scaling is on, a primal weight k rescales each gradient
-                # by (1/k, k) for (primal, dual) before opt_update, so the
-                # dual/primal step ratio is k**2. k is constant within the epoch
-                # — initialised from k_init and rebalanced at each restart in
-                # `solve` (PDLP-style), not adapted per iteration.
-                def step(carry, _):
-                    i, state, average_state, opt_state, total_weight = carry
-                    opt_state, k = unpack_k(opt_state)
-
-                    # --- Look-ahead gradient ---
-                    g = grad(state)
-
-                    # Look-ahead: run the user's optimiser on g at state to
-                    # get the look-ahead point. la_opt_state is NOT committed —
-                    # we discard it and reuse the original opt_state for the
-                    # corrector so that momentum/statistics only advance once.
-                    scaled_g = scale_by_k(g, k) if k_scaling else g
-                    la_updates, _ = opt_update(scaled_g, opt_state, state)
-                    state_half = apply_updates(state, la_updates)
-                    state_half = SaddleState(
-                        primal=projection_primal(state_half.primal),
-                        dual_ineq=projection_non_negative(state_half.dual_ineq),
-                        dual_eq=state_half.dual_eq,
-                    )
-
-                    # Corrector: run the user's optimiser on g_half at
-                    # state_half, but applied from original state (Korpelevich
-                    # convention). opt_state IS committed here.
-                    g_half = grad(state_half)
-                    scaled_g_half = scale_by_k(g_half, k) if k_scaling else g_half
-                    corr_updates, opt_state = opt_update(
-                        scaled_g_half, opt_state, state
-                    )
-                    state = apply_updates(state, corr_updates)
-                    state = SaddleState(
-                        primal=projection_primal(state.primal),
-                        dual_ineq=projection_non_negative(state.dual_ineq),
-                        dual_eq=state.dual_eq,
-                    )
-                    opt_state = pack_k(opt_state, k)
-
-                    if average:
-                        w = weight_function(i)
-                        total_weight = total_weight + w
-                        average_state = optax.incremental_update(
-                            state, average_state, w / total_weight
-                        )
-
-                    return (i + 1, state, average_state, opt_state, total_weight)
-
-            else:
-
-                def step(carry, _):
-                    i, state, average_state, opt_state, total_weight = carry
-                    opt_state, k = unpack_k(opt_state)
-
-                    g = grad(state)
-                    if k_scaling:
-                        g = scale_by_k(g, k)
-                    updates, opt_state = opt_update(g, opt_state, state)
-                    state = apply_updates(state, updates)
-                    state = SaddleState(
-                        primal=projection_primal(state.primal),
-                        dual_ineq=projection_non_negative(state.dual_ineq),
-                        dual_eq=state.dual_eq,
-                    )
-                    opt_state = pack_k(opt_state, k)
-
-                    # `average` is a Python-level static, so when False the
-                    # incremental_update is dropped from the hot loop entirely.
-                    if average:
-                        w = weight_function(i)
-                        total_weight = total_weight + w
-                        average_state = optax.incremental_update(
-                            state, average_state, w / total_weight
-                        )
-
-                    return (
-                        i + 1,
-                        state,
-                        average_state,
-                        opt_state,
-                        total_weight,
-                    )
+                return (i + 1, new_state, average_state, opt_state, total_weight)
 
             # Fixed iteration count per epoch: lax.scan (static `max_iter`) lets
             # XLA pipeline the loop body better than a while_loop whose only exit
             # condition is `i < end_iter`. `max_iter` is a static_argname, so a
-            # changing iterations_per_epoch (restart decay) triggers a recompile —
-            # the same tradeoff the convex solver already takes.
+            # changing iterations_per_epoch (restart decay) triggers a recompile.
             #
-            # scan requires the carry's output dtypes to match its input dtypes
-            # exactly. optax's inject_hyperparams carries an `is_initial_step`
-            # flag that is int at init but bool after the first update; some
-            # optimisers (e.g. optimistic_gradient_descent) thus drift the carry
-            # dtype on iteration 1, which scan rejects (while_loop tolerated it).
-            # Cast each step's output carry back to the input carry's dtypes so
-            # the loop is type-stable regardless of the user optimiser.
-            # Adaptive PDHG carries A @ x in the k-slot to save a matvec per
-            # iteration. The slot enters as (k, eta) from `solve` (which never sees
-            # Ax); seed Ax = A @ x_old here (one matvec/epoch — negligible) and
-            # strip it from the returned opt_state so the caller's contract is
-            # unchanged. Halpern's caller-facing slot is (k, eta, anchor); seed
-            # Ax_anchor = A @ anchor.primal and Ax_state = A @ state.primal the
-            # same way (two matvecs/epoch). Re-seeding every epoch also resets any
+            # The caller-facing opt_state is (k, eta[, anchor]); seed the Ax
+            # carry here (one or two matvecs/epoch — negligible) and strip it
+            # from the returned opt_state. Re-seeding every epoch also resets any
             # rounding drift the blended carry accumulated within the prior epoch.
-            if carry_Ax:
-                inner, (k0, eta0) = opt_state
-                opt_state = (inner, (k0, eta0, lp.A @ state.primal))
             if halpern:
-                inner, (k0, eta0, anchor0) = opt_state
+                k0, eta0, anchor0 = opt_state
                 opt_state = (
-                    inner,
-                    (
-                        k0,
-                        eta0,
-                        anchor0,
-                        lp.A @ anchor0.primal,
-                        lp.A @ state.primal,
-                    ),
+                    k0,
+                    eta0,
+                    anchor0,
+                    lp.A @ anchor0.primal,
+                    lp.A @ state.primal,
                 )
+            else:
+                k0, eta0 = opt_state
+                opt_state = (k0, eta0, lp.A @ state.primal)
 
             step_carry = (start_iter, state, average_state, opt_state, total_weight)
+            # scan requires the carry's output dtypes to match its input dtypes
+            # exactly (e.g. a Python-int start_iter); cast each step's output
+            # carry back to the input carry's dtypes so the loop is type-stable.
             _carry_dtypes = jax.tree.map(lambda x: jnp.asarray(x).dtype, step_carry)
 
             def step_typed(carry, _):
@@ -925,12 +430,10 @@ def __sps(
                 )
             i, state, average_state, opt_state, total_weight = scan_out
 
-            if carry_Ax:
-                inner, (k0, eta0, _Ax) = opt_state
-                opt_state = (inner, (k0, eta0))
             if halpern:
-                inner, (k0, eta0, anchor0, _AxA, _AxS) = opt_state
-                opt_state = (inner, (k0, eta0, anchor0))
+                opt_state = opt_state[:3]
+            else:
+                opt_state = opt_state[:2]
 
             return i, state, average_state, opt_state, total_weight, stalled
 
@@ -951,40 +454,20 @@ def __sps(
 
     if initial_opt_state is not None:
         opt_state = initial_opt_state
-    elif k_scaling:
-        # Pack the primal weight k alongside the optax state. In adaptive_step
-        # mode the slot is a (k, eta) pair so the per-iteration step rides along.
-        dtype = initial_solution.primal.dtype
-        if halpern:
-            # Halpern carries the anchor z_0 (the cycle-start iterate) in the
-            # k-slot. On a bare __sps call the anchor seeds from the incoming
-            # state; across a restart cycle `solve` threads it via opt_state.
-            k_slot = (
-                jnp.asarray(k_init, dtype),
-                jnp.asarray(adaptive_eta, dtype),
-                jax.tree.map(lambda x: x + 0, initial_solution),
-            )
-        elif adaptive_step:
-            k_slot = (jnp.asarray(k_init, dtype), jnp.asarray(adaptive_eta, dtype))
-        else:
-            k_slot = jnp.asarray(k_init, dtype)
-        opt_state = (optimiser.init(initial_solution), k_slot)
     else:
-        opt_state = optimiser.init(initial_solution)
+        dtype = initial_solution.primal.dtype
+        opt_state = (jnp.asarray(k_init, dtype), jnp.asarray(adaptive_eta, dtype))
+        if halpern:
+            # On a bare __sps call the anchor seeds from the incoming state;
+            # across a restart cycle `solve` threads it via opt_state.
+            opt_state = opt_state + (jax.tree.map(lambda x: x + 0, initial_solution),)
 
     # run_epoch DONATES `state` and `opt_state`. The caller's restart path may
-    # hand us a `state`/`opt_state` pair that shares buffers: `state =
-    # restart_point` aliases the live `average_state`, and `optimiser.init(state)`
-    # / inject_hyperparams reuse buffers tied to that same `state` (e.g. the
-    # scalar learning-rate float64[]). Donating two args that alias one buffer
-    # double-frees it, so the next epoch reads a deleted buffer. Break any such
-    # aliasing with an independent copy of each donated tree — one cheap pass per
-    # epoch, off the per-iteration hot path. (XLA elides the copy when there is
-    # nothing to alias.)
+    # hand us a `state`/`opt_state` pair that shares buffers (e.g. `state =
+    # restart_point` aliasing the halpern anchor). Donating two args that alias
+    # one buffer double-frees it, so break any aliasing with an independent copy
+    # of each donated tree — one cheap pass per epoch, off the hot path.
     state = jax.tree.map(lambda x: x + 0, state)
-    # jnp.copy (not `x + 0`) for opt_state: `+ 0` promotes boolean leaves such
-    # as optax adadelta's `is_initial_step` from bool to int32, breaking the
-    # scan/while carry dtype match.
     opt_state = jax.tree.map(jnp.copy, opt_state)
 
     return run_epoch(
@@ -999,31 +482,8 @@ def __sps(
     )
 
 
-def set_saddle_lrs(opt_state, primal_lr, dual_lr):
-    """Overwrite the injected ``learning_rate`` hyperparameters in a
-    ``create_saddle_optimiser`` (``optax.partition`` over ``"primal_opt"`` /
-    ``"dual_opt"``) state without changing its tree structure, so the jitted
-    epoch loop is not retraced.
-
-    Requires the two sub-optimisers to be built with
-    ``optax.inject_hyperparams(...)(learning_rate=...)`` so the learning rate is
-    a live array leaf rather than a baked-in schedule closure.
-    """
-    inner = dict(opt_state.inner_states)
-
-    def _set(sub, lr):
-        hp = dict(sub.inner_state.hyperparams)
-        hp["learning_rate"] = jnp.asarray(lr)
-        return sub._replace(inner_state=sub.inner_state._replace(hyperparams=hp))
-
-    inner["primal_opt"] = _set(inner["primal_opt"], primal_lr)
-    inner["dual_opt"] = _set(inner["dual_opt"], dual_lr)
-    return opt_state._replace(inner_states=inner)
-
-
 def solve(
     lp: JaddleLP,
-    optimiser=None,
     max_epochs=None,
     initial_solution=None,
     initial_opt_state=None,
@@ -1034,7 +494,6 @@ def solve(
     primal_feasibility_tolerance=1e-3,
     dual_feasibility_tolerance=1e-3,
     dual_gap_tolerance=1e-3,
-    weight_function=lambda _: 1.0,
     verbose=False,
     log_every=1,
     average=True,
@@ -1079,8 +538,12 @@ def solve(
     gap within ``dual_gap_tolerance`` (normalised by 1+|primal_obj|+|dual_obj|,
     the PDLP/cuPDLP convention, so RDG is directly comparable to PDLP).
 
+    Every update_mode is cuPDLP-style adaptive PDHG: plain projected
+    primal-descent / dual-ascent steps with a per-iteration line-searched step
+    size ``eta`` and a primal weight ``k`` (no optimiser plug-in).
+
     Adaptive restarts (PDLP-style) accelerate ill-conditioned problems. A
-    restart resets the optimiser momentum/averaging while keeping the current
+    restart resets the averaging (and the halpern anchor) while keeping the current
     iterate as a warm start, which prevents the saddle iteration from settling
     into slow rotational orbits. A restart fires when either the normalised KKT
     merit decays past ``restart_decay`` of its value at the last restart
@@ -1089,18 +552,15 @@ def solve(
 
     Args:
         restarts: Maximum number of warm restarts. 0 = no restarts (default).
-            Each restart resets the optimiser state (momentum) and averaging
-            while keeping the current iterate as a warm start. The LR schedule /
-            ``weight_function`` iteration counter also restarts from its initial
-            value.
+            Each restart resets the averaging (and the halpern anchor / lambda
+            counter) while keeping the current iterate as a warm start.
         epochs_per_restart: Length cap of the first restart cycle, expressed in
             epochs AT THE DEFAULT ``iterations_per_epoch`` (default 10) but
             internally converted to and tracked in ITERATIONS
             (``epochs_per_restart * iterations_per_epoch``), so the cycle-cap
             restart fires at the same point in the optimisation trajectory
             regardless of ``iterations_per_epoch``. This matters because a
-            restart is destructive (it wipes PDHG momentum/averaging via
-            ``optimiser.init``): tying the cap to a raw epoch count made the
+            restart is destructive (it wipes the PDHG averaging): tying the cap to a raw epoch count made the
             restart cadence an accident of how the iteration budget was chopped
             into epochs — e.g. on momentum1, ``iterations_per_epoch=1000``
             triggered a cap-exhaustion restart at 10,000 iterations while still
@@ -1119,67 +579,50 @@ def solve(
             cycle-start value AND has risen versus the previous epoch (rotational
             turnaround). Must be > ``restart_decay`` to be meaningful.
         update_mode: Selects the per-iterate stepping scheme. One of:
-            * ``"synchronous"`` (default): simultaneous primal/dual gradient
-              descent-ascent through the user optimiser.
-            * ``"alternating"``: primal step, then a dual step using the
-              post-primal dual gradient (Gauss–Seidel ordering).
-            * ``"extragradient"``: Korpelevich look-ahead/corrector step. Two
-              gradient evals per iter.
-            * ``"pdhg"``: Chambolle–Pock PDHG (primal step then dual step on the
-              extrapolated primal x_bar = 2x^{k+1} − x^k).
+            * ``"pdhg"`` (default): Chambolle–Pock PDHG (primal step then dual
+              step on the extrapolated primal x_bar = 2x^{k+1} − x^k).
+            * ``"alternating"``: primal step, then a dual step at the new primal
+              x^{k+1} (Gauss–Seidel, no extrapolation). Not contractive in
+              general; relies on averaging/restarts. Experimental.
             * ``"halpern"``: restarted Halpern-anchored PDHG. Each iterate is the
               adaptive PDHG step T(z) blended back toward an anchor z_0:
               ``z_{k+1} = lambda_k z_0 + (1−lambda_k) T(z_k)``, ``lambda_k =
               1/(k+1)`` (cycle-local k). The anchor z_0 and lambda counter reset
               to the current iterate at each restart, giving last-iterate
-              acceleration. Implies the ``adaptive_eta`` line search on the inner
-              PDHG operator, so it requires both ``adaptive_eta`` and ``k_scale``;
-              best paired with ``restarts > 0``.
-        k_scale: Primal-weight (k) scaling control. ``None`` disables it;
-            otherwise a float sets a symmetric clamp band ``[1/k_scale,
-            k_scale]`` for ``k`` (default ``10`` → ``[0.1, 10]``). When enabled —
-            orthogonal to ``update_mode``, so it composes with all three schemes
-            — a primal weight ``k`` rescales the primal/dual gradients by
-            ``(1/k, k)`` before each ``opt_update``, making the dual/primal step
-            ratio ``k**2``. ``k`` is initialised from ``k_init`` and rebalanced
+              acceleration. Best paired with ``restarts > 0``.
+        k_scale: Clamp band ``[1/k_scale, k_scale]`` for the primal weight ``k``
+            (default ``1e8``); ``None`` leaves ``k`` unclamped. The primal and
+            dual steps are ``eta / k`` and ``eta * k``, so the dual/primal step
+            ratio is ``k**2``. ``k`` is initialised from ``k_init`` and rebalanced
             at each restart (PDLP-style) from primal-vs-dual iterate movement; it
             is constant within an epoch (not adapted per iteration). Tuned by
             ``k_theta``/``k_scale`` and ``k_init``.
         k_init: Initial primal weight ``k``. ``None`` (default) initialises it to
             the PDLP heuristic ``||c|| / ||b||`` (objective vs RHS norms, in the
             scaled space the solver iterates in). Pass a float to override
-            (``1.0`` = symmetric steps, the PC/Ruiz-scaled baseline). Only used
-            when ``k_scale`` is set.
+            (``1.0`` = symmetric steps, the PC/Ruiz-scaled baseline).
         k_update_per_epoch: When ``True``, the primal weight ``k`` is
             rebalanced at every epoch boundary (not only at restarts) using the
             primal-vs-dual iterate movement over the just-finished epoch — same
             log-space geometric-mean blend (``k_theta``) and ``[1/k_scale,
             k_scale]`` clamp as the restart rebalance. Unlike a restart it does
-            NOT reset momentum/averaging or (for halpern) re-anchor ``z_0`` / reset
-            ``eta``; only the ``k`` component of the optimiser state changes, so
-            the gradient reweighting tracks the local primal/dual progress within a
-            restart cycle. Active only for ``update_mode`` in
-            ``{"pdhg", "extragradient", "halpern"}`` with ``k_scale`` set.
+            NOT reset averaging or (for halpern) re-anchor ``z_0`` / reset
+            ``eta``; only ``k`` changes, so the step split tracks the local
+            primal/dual progress within a restart cycle.
             ``False`` (default, the PDLP convention) keeps k frozen between
             restarts: under a wide ``k_scale`` clamp the per-epoch update let k
             run away on mzzv11 (k→1e8, gap 0.94).
-        adaptive_eta: Enables a cuPDLP-style per-iteration adaptive step size with
-            a line search. ``None`` (default) keeps the optimiser's fixed learning
-            rate. A float seeds a single scalar base step ``eta`` that drives the
-            primal step ``tau = eta / k`` and dual step ``sigma = eta * k``. Each
-            iteration takes a trial step, forms the largest admissible step, and
-            rejects + shrinks ``eta`` if the trial overshot; ``eta`` is then
-            advanced with a two-sided guard. The optimiser's adam/adadelta scaling
-            is bypassed in the hot loop. Supported for ``update_mode='pdhg'`` (the
-            admissible step comes from the interaction term
-            ``(y^{k+1}-y^k)ᵀ A (x^{k+1}-x^k)``, one extra matvec) and
-            ``update_mode='extragradient'`` (a Malitsky-Tam local-Lipschitz test
-            from the two gradients it already evaluates, no extra matvec). Other
-            modes raise. Requires ``k_scale`` set. ``eta`` resets to this seed at
-            each restart. A reasonable seed is ``1.0`` on Ruiz+PC-scaled problems.
+        adaptive_eta: Seed for the cuPDLP-style per-iteration adaptive step
+            ``eta``, which drives the primal step ``tau = eta / k`` and dual step
+            ``sigma = eta * k``. Each iteration takes a trial step, forms the
+            largest admissible step from the interaction term
+            ``(y^{k+1}-y^k)ᵀ A (x^{k+1}-x^k)``, and rejects + shrinks ``eta`` if
+            the trial overshot; ``eta`` is then advanced with a two-sided guard.
+            ``0.0`` (default) seeds it at ``1/||[[A,b],[c,0]]||_2``. The learned
+            ``eta`` is carried across restarts.
         k_theta: Smoothing coefficient for the log-space primal-weight update at
             each restart / epoch. A float fixes it (PDLP uses 0.5; smaller =
-            slower adaptation). Only used when ``k_scale`` is set.
+            slower adaptation).
             ``"adaptive"`` (default) sets it from data as a trust region on log k:
             starting at 0.5, each restart doubles theta (capped at 1) if the
             restart merit fell over the cycle since the previous k move, else
@@ -1247,8 +690,9 @@ def solve(
             * ``"converged"``: ``bool``, whether the solve terminated by meeting
               the LP optimality certificate or a ``primal_stop`` heuristic stop
               (see ``"stop_reason"`` to disambiguate).
-            * ``"opt_state"``: the final optimiser state, for warm-starting a
-              subsequent solve via ``initial_opt_state``.
+            * ``"opt_state"``: the final step-size state ``(k, eta)`` (plus the
+              anchor for halpern), for warm-starting a subsequent solve via
+              ``initial_opt_state``.
             * ``"stop_reason"``: ``str`` recording *why* the solve terminated:
               ``"certificate"`` (full LP optimality certificate met),
               ``"primal_stall"`` (the ``primal_stop`` heuristic fired — feasible
@@ -1275,55 +719,25 @@ def solve(
         )
         lp.b_eq = np.zeros((1,), dtype=lp.b_ineq.dtype)
 
-    if optimiser is None:
-        optimiser = jo.gd(0.5)
-
     if log_every < 1:
         raise ValueError("log_every must be >= 1")
 
     if verbose:
         print("----------------------------------------------")
 
-    valid_update_modes = [
-        "synchronous",
-        "alternating",
-        "extragradient",
-        "pdhg",
-        "halpern",
-    ]
+    valid_update_modes = ["pdhg", "alternating", "halpern"]
     if update_mode not in valid_update_modes:
         raise ValueError(f"update_mode must be one of {valid_update_modes}")
 
-    # ``k_scale`` is the public knob for primal-weight scaling: ``None`` disables
-    # it, otherwise it sets a symmetric clamp band ``[1/k_scale, k_scale]``.
-    k_scaling = k_scale is not None
-    if k_scaling:
+    # ``k_scale`` sets the clamp band ``[1/k_scale, k_scale]`` for the primal
+    # weight k; ``None`` leaves k unclamped.
+    if k_scale is not None:
         k_lo, k_hi = 1.0 / k_scale, k_scale
     else:
-        k_lo, k_hi = None, None
-
-    # cuPDLP per-iteration adaptive step size (needs the primal weight k). When
-    # on, the optimiser's fixed LR is bypassed in the hot loop and eta drives the
-    # step directly via the per-iteration line search. Supported for the saddle
-    # stepping schemes synchronous/alternating/pdhg/extragradient.
-    # Halpern-anchored PDHG (restarted Halpern). Rides the adaptive PDHG step, so
-    # it implies adaptive_step and requires adaptive_eta + k_scale. The anchor z_0
-    # is reset to the cycle-start iterate at each restart.
+        k_lo, k_hi = 0.0, np.inf
+    if adaptive_eta is None or adaptive_eta < 0.0:
+        raise ValueError("adaptive_eta must be a float >= 0 (0.0 = auto seed)")
     halpern = update_mode == "halpern"
-    _adaptive_modes = ("pdhg", "extragradient")
-    adaptive_step = (
-        adaptive_eta is not None and update_mode in _adaptive_modes
-    ) or halpern
-    if halpern and adaptive_eta is None:
-        raise ValueError("update_mode='halpern' requires adaptive_eta")
-    if adaptive_eta is not None and not halpern:
-        if update_mode not in _adaptive_modes:
-            raise ValueError(
-                f"adaptive_eta is only supported with update_mode in {_adaptive_modes} "
-                "or 'halpern'"
-            )
-    if adaptive_step and not k_scaling:
-        raise ValueError("adaptive_eta / halpern requires k_scale (primal weight k)")
 
     if verbose:
         print("====Starting Solve====")
@@ -1745,40 +1159,27 @@ def solve(
     # the scaled space the solver iterates in), which puts the primal/dual step
     # ratio in the right order of magnitude before iteration 1 instead of
     # starting symmetric.
-    if k_scaling and k_init is None:
+    if k_init is None:
         norm_c = float(jnp.linalg.norm(lp.c)) + 1e-30
         norm_b = float(jnp.linalg.norm(lp.b)) + 1e-30
         k_init = float(np.clip(norm_c / norm_b, k_lo, k_hi))
-    elif k_init is None:
-        k_init = 1.0
 
     i = 1
     state = initial_solution
     average_state = initial_solution
     if initial_opt_state is not None:
         opt_state = initial_opt_state
-    elif k_scaling:
-        # Pack the primal weight k with the optax state. In adaptive_step mode the
-        # k-slot is a (k, eta) pair carrying the per-iteration step size too.
-        _pik_dtype = initial_solution.primal.dtype
-        if halpern:
-            # Halpern carries the anchor z_0 (cycle-start iterate) in the k-slot,
-            # seeded from the initial solution and reset at each restart below.
-            _k_slot = (
-                jnp.asarray(k_init, _pik_dtype),
-                jnp.asarray(adaptive_eta, _pik_dtype),
-                jax.tree.map(lambda x: x + 0, initial_solution),
-            )
-        elif adaptive_step:
-            _k_slot = (
-                jnp.asarray(k_init, _pik_dtype),
-                jnp.asarray(adaptive_eta, _pik_dtype),
-            )
-        else:
-            _k_slot = jnp.asarray(k_init, _pik_dtype)
-        opt_state = (optimiser.init(initial_solution), _k_slot)
     else:
-        opt_state = optimiser.init(initial_solution)
+        # Step-size state (k, eta); halpern also carries the anchor z_0
+        # (cycle-start iterate), seeded from the initial solution and reset at
+        # each restart below.
+        _pik_dtype = initial_solution.primal.dtype
+        opt_state = (
+            jnp.asarray(k_init, _pik_dtype),
+            jnp.asarray(adaptive_eta, _pik_dtype),
+        )
+        if halpern:
+            opt_state = opt_state + (jax.tree.map(lambda x: x + 0, initial_solution),)
     primal_grad_norm = jnp.inf
     complementarity_slack = jnp.inf
     constraint_bound = jnp.inf
@@ -1816,13 +1217,8 @@ def solve(
     # Per-epoch primal-weight rebalance (k_update_per_epoch): reference iterate at
     # the end of the previous epoch, used to drive k from the primal-vs-dual
     # movement over the just-finished epoch. Independent copy for the same
-    # buffer-donation reason as state_at_last_restart. Only the three contractive
-    # schemes that can carry a meaningful k qualify.
-    k_per_epoch = (
-        k_scaling
-        and k_update_per_epoch
-        and update_mode in ("pdhg", "extragradient", "halpern")
-    )
+    # buffer-donation reason as state_at_last_restart.
+    k_per_epoch = bool(k_update_per_epoch)
     state_at_last_epoch = jax.tree.map(lambda x: x + 0, initial_solution)
 
     # Rolling window of recent objective values for the opt-in primal_stop rule
@@ -1831,16 +1227,16 @@ def solve(
     obj_window = jnp.full((max(int(primal_stop_window), 1),), jnp.inf)
 
     # Adaptive restart bookkeeping. `restart_i_offset` is subtracted from the
-    # global iteration counter `i` before it is handed to the optimiser /
-    # weight_function, so a restart re-zeros the LR schedule without disturbing
-    # the running epoch/iteration accounting.
+    # global iteration counter `i` before it is handed to __sps, so a restart
+    # re-zeros the halpern lambda counter and the eta growth schedule without
+    # disturbing the running epoch/iteration accounting.
     restarts_done = 0
     restart_i_offset = 0
     epochs_since_restart = 0
     # The cycle-exhaustion cap is tracked in ITERATIONS, not epochs, so that
     # `cycle_exhausted` fires at the same point in the optimisation trajectory
     # regardless of `iterations_per_epoch`. A restart is a destructive reset
-    # (optimiser.init(state) wipes PDHG momentum/averaging), so its cadence must
+    # (it wipes the PDHG averaging), so its cadence must
     # not depend on how the same iteration budget happens to be chopped into
     # epochs. Seed the cap in iterations from the epoch-count knob so the
     # default (epochs_per_restart=10) means the same thing it always has at the
@@ -1909,17 +1305,9 @@ def solve(
         return jnp.maximum(jnp.maximum(primal_term, dual_term), gap_term)
 
     def _read_k_eta(opt_state):
-        # Surface the live primal weight k and adaptive step eta from the
-        # opt_state k-slot for the epoch trace. Layout: (inner, k) for plain
-        # k-scaling, (inner, (k, eta[, anchor])) once adaptive_step/halpern adds
-        # the step (and anchor) to the slot. Returns (k, eta) with eta None when
-        # there is no adaptive step to report.
-        if not k_scaling:
-            return None, None
-        slot = opt_state[1]
-        if isinstance(slot, tuple):
-            return float(slot[0]), float(slot[1])
-        return float(slot), None
+        # Surface the live primal weight k and adaptive step eta for the epoch
+        # trace. opt_state is (k, eta[, anchor]).
+        return float(opt_state[0]), float(opt_state[1])
 
     def print_epoch_metrics(epoch_time=None, k_val=None, eta_val=None):
         time_str = f"|Time {epoch_time:.2f}s|" if epoch_time is not None else ""
@@ -2064,18 +1452,15 @@ def solve(
                 current_iterations_per_epoch,
                 i - restart_i_offset,
                 lp,
-                optimiser,
                 state,
                 average_state,
                 opt_state,
-                weight_function,
                 total_weight,
                 primal_damping,
                 dual_damping_ineq,
                 dual_damping_eq,
                 average,
                 update_mode,
-                k_scaling=k_scaling,
                 k_init=k_init,
                 adaptive_eta=adaptive_eta,
                 merit_fn=_inloop_merit if _check_every() else None,
@@ -2281,7 +1666,7 @@ def solve(
                 # destroys momentum for no gain (momentum1: an
                 # iterations_per_epoch=1000 run hit merit=inf cycle-exhaustion at
                 # 10,000 iterations while PFR/DFR were still improving every
-                # epoch; the optimiser.init() reset wiped the trajectory and it
+                # epoch; the restart reset wiped the trajectory and it
                 # never recovered, while iterations_per_epoch=10000 reached full
                 # convergence before the same cap fired). Only suppress the
                 # exhaustion path this way — sufficient_progress/stalling_restart
@@ -2335,61 +1720,52 @@ def solve(
                 if sufficient_progress or stalling_restart or cycle_exhausted:
                     restarted_this_epoch = True
                     # Warm-start restart from the better of {average, iterate};
-                    # reset momentum, averaging, weight accumulation and the LR /
-                    # weight_function schedule (via the iteration offset).
+                    # reset averaging, weight accumulation and the iteration
+                    # offset (halpern lambda / eta-growth schedule).
                     state = restart_point
-                    if k_scaling:
-                        # PDLP-style primal-weight rebalance: drive k from the
-                        # primal-vs-dual *movement* over the just-finished cycle
-                        # (distance between iterates), not per-step gradient
-                        # norms. log-space geometric-mean blend with the current
-                        # weight (k_theta), then clamp. Reset momentum.
-                        # The k-slot is (k, eta[, anchor]) in adaptive_step mode,
-                        # plain k otherwise. Read k accordingly.
-                        k_prev = opt_state[1][0] if adaptive_step else opt_state[1]
-                        if (
-                            adaptive_theta
-                            and k_before_last_move is not None
-                            and merit_is_finite
-                            and bool(jnp.isfinite(merit_at_last_restart))
-                        ):
-                            # Trust region on log k: the cycle just finished ran
-                            # under the last k move, so judge that move by it.
-                            if bool(restart_merit < merit_at_last_restart):
-                                theta_live = min(1.0, 2.0 * theta_live)
-                            else:
-                                theta_live = max(0.05, 0.5 * theta_live)
-                                k_prev = k_before_last_move
-                        k_before_last_move = k_prev
-                        k_new = _rebalance_k(
-                            state, state_at_last_restart, k_prev, theta_live
-                        )
-                        if halpern:
-                            # Restarted Halpern: reset eta AND re-anchor z_0 to the
-                            # cycle-start iterate `state`. The lambda counter resets
-                            # via restart_i_offset below. Independent anchor copy —
-                            # `state` is donated to __sps next epoch.
-                            _eta_dtype = state.primal.dtype
-                            k_slot = (
-                                k_new,
-                                jnp.asarray(adaptive_eta, _eta_dtype),
-                                jax.tree.map(lambda x: x + 0, state),
-                            )
-                        elif adaptive_step:
-                            # Carry the learned step size across the restart.
-                            # The adaptive rule grows eta ~100-250x above its
-                            # 1/||A|| seed over a cycle; re-seeding here forced
-                            # the rule to re-climb from scratch after every
-                            # restart (a stretch of tiny, conservative steps).
-                            # PDLP convention resets averaging/momentum at a
-                            # restart but keeps the step size, so carry the live
-                            # eta from the current opt_state instead of reseeding.
-                            k_slot = (k_new, opt_state[1][1])
+                    # PDLP-style primal-weight rebalance: drive k from the
+                    # primal-vs-dual *movement* over the just-finished cycle
+                    # (distance between iterates), not per-step gradient norms.
+                    # log-space geometric-mean blend with the current weight
+                    # (k_theta), then clamp.
+                    k_prev = opt_state[0]
+                    if (
+                        adaptive_theta
+                        and k_before_last_move is not None
+                        and merit_is_finite
+                        and bool(jnp.isfinite(merit_at_last_restart))
+                    ):
+                        # Trust region on log k: the cycle just finished ran
+                        # under the last k move, so judge that move by it.
+                        if bool(restart_merit < merit_at_last_restart):
+                            theta_live = min(1.0, 2.0 * theta_live)
                         else:
-                            k_slot = k_new
-                        opt_state = (optimiser.init(state), k_slot)
+                            theta_live = max(0.05, 0.5 * theta_live)
+                            k_prev = k_before_last_move
+                    k_before_last_move = k_prev
+                    k_new = _rebalance_k(
+                        state, state_at_last_restart, k_prev, theta_live
+                    )
+                    if halpern:
+                        # Restarted Halpern: reset eta AND re-anchor z_0 to the
+                        # cycle-start iterate `state`. The lambda counter resets
+                        # via restart_i_offset below. Independent anchor copy —
+                        # `state` is donated to __sps next epoch.
+                        _eta_dtype = state.primal.dtype
+                        opt_state = (
+                            k_new,
+                            jnp.asarray(adaptive_eta, _eta_dtype),
+                            jax.tree.map(lambda x: x + 0, state),
+                        )
                     else:
-                        opt_state = optimiser.init(state)
+                        # Carry the learned step size across the restart.
+                        # The adaptive rule grows eta ~100-250x above its
+                        # 1/||A|| seed over a cycle; re-seeding here forced
+                        # the rule to re-climb from scratch after every
+                        # restart (a stretch of tiny, conservative steps).
+                        # PDLP convention resets averaging at a restart but
+                        # keeps the step size.
+                        opt_state = (k_new, opt_state[1])
                     average_state = state
                     # __sps donates `state` each epoch (freeing the buffer in
                     # place), so state_at_last_restart must be an independent
@@ -2426,13 +1802,9 @@ def solve(
                         else:
                             reason = "cycle-cap"
                         which = "avg" if restart_used_avg else "iterate"
-                        if k_scaling:
-                            _k_show = opt_state[1][0] if adaptive_step else opt_state[1]
-                            k_msg = f", k={float(_k_show):.3e}"
-                            if adaptive_theta:
-                                k_msg += f", k_theta={theta_live:.3g}"
-                        else:
-                            k_msg = ""
+                        k_msg = f", k={float(opt_state[0]):.3e}"
+                        if adaptive_theta:
+                            k_msg += f", k_theta={theta_live:.3g}"
                         print(
                             f"Restart {restarts_done}/{restarts} at epoch {count} "
                             f"({reason}, merit={float(restart_merit):.2e} "
@@ -2446,20 +1818,13 @@ def solve(
                     prev_epoch_merit = restart_merit
 
             # Per-epoch primal-weight rebalance. A restart already rebalanced k
-            # (and reset momentum/anchor/eta), so only adjust k on epochs where no
-            # restart fired. Unlike the restart path this leaves the optimiser
-            # state, averaging, halpern anchor and adaptive eta untouched — it only
-            # rewrites the k component of the k-slot, tracking primal/dual progress
-            # within the current restart cycle.
+            # (and reset averaging/anchor/eta), so only adjust k on epochs where no
+            # restart fired. Unlike the restart path this leaves averaging, the
+            # halpern anchor and eta untouched — it only rewrites k, tracking
+            # primal/dual progress within the current restart cycle.
             if k_per_epoch and not restarted_this_epoch:
-                k_prev = opt_state[1][0] if adaptive_step else opt_state[1]
-                k_new = _rebalance_k(state, state_at_last_epoch, k_prev, theta_live)
-                if adaptive_step or halpern:
-                    # k-slot is (k, eta) for adaptive pdhg/extragradient and
-                    # (k, eta, anchor) for halpern; rewrite only the k leaf.
-                    opt_state = (opt_state[0], (k_new, *opt_state[1][1:]))
-                else:
-                    opt_state = (opt_state[0], k_new)
+                k_new = _rebalance_k(state, state_at_last_epoch, opt_state[0], theta_live)
+                opt_state = (k_new, *opt_state[1:])
             if k_per_epoch:
                 # Reference for next epoch's movement. Independent copy: `state` is
                 # donated to (freed by) __sps next epoch.
@@ -2473,15 +1838,12 @@ def solve(
             # real restart already fired this epoch — the restart's re-anchor
             # (above) takes precedence, so we don't re-anchor twice.
             if halpern and halpern_reanchor_per_epoch and not restarted_this_epoch:
-                # k-slot is (k, eta, anchor); rewrite only the anchor leaf with an
+                # opt_state is (k, eta, anchor); rewrite only the anchor with an
                 # independent copy (state is donated to __sps next epoch).
                 opt_state = (
                     opt_state[0],
-                    (
-                        opt_state[1][0],
-                        opt_state[1][1],
-                        jax.tree.map(lambda x: x + 0, state),
-                    ),
+                    opt_state[1],
+                    jax.tree.map(lambda x: x + 0, state),
                 )
                 # Reset the cycle-local index so lambda_k = 1/(k_local+1) re-warms
                 # toward 1/2 next epoch; without this lambda would stay ~0 and the
