@@ -268,7 +268,6 @@ def run_jaddle(lp, tol, max_epochs):
         dual_gap_tolerance=tol,
         update_mode="halpern",
         halpern_reanchor_per_epoch=True,
-        adaptive_eta=1,
         iterations_per_epoch=128 * 10,
         epochs_per_restart=10,
         restarts=1000,
