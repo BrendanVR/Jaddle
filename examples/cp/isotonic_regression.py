@@ -56,7 +56,6 @@ solution = jc.solve(
     verbose=True,
     primal_feasibility_tolerance=1e-5,
     update_mode="extragradient",
-    adaptive_eta=1,
     iterations_per_epoch=1000,
 )["solution"]
 

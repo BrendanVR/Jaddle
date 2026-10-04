@@ -57,31 +57,10 @@ cp = jc.JaddleCP(
 )
 
 # %%
-# Define the learning rate schedule and optimizer
-lr = optax.cosine_decay_schedule(
-    init_value=1 / 2,
-    decay_steps=5000,
-    alpha=1e-3,
-)
-
-optimiser = jo.create_saddle_optimiser(
-    optax.chain(
-        optax.scale_by_adadelta(),
-        optax.optimistic_gradient_descent(lr),
-    ),
-    optax.chain(
-        optax.scale_by_adadelta(),
-        optax.optimistic_gradient_descent(lr),
-    ),
-)
-
-# %%
 # Solve the problem using Jaddle Convex SPS optimizer
 solution = jc.solve(
     cp,
-    optimiser=optimiser,
-    verbose=True,
-    k_scale=None,
+    optimiser=jo.gd(0.01),
 )["solution"]
 
 l2_norm = jnp.linalg.norm(solution.primal, ord=2)
@@ -100,5 +79,7 @@ plt.legend()
 plt.title("Linear Regression with RBF Features")
 plt.grid(True, alpha=0.3)
 plt.show()
+
+# %%
 
 # %%

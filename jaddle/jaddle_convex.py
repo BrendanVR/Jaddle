@@ -24,15 +24,11 @@ def __sps(
     weight_function=lambda _: 1.0,
     total_weight=0.0,
     average=True,
-    update_mode="synchronous",
+    update_mode="alternating",
     k_scaling=False,
     k_init=1.0,
     adaptive_eta=None,
 ):
-    # The stepping scheme is selected by `update_mode`. This derived boolean
-    # keeps the per-scheme branching below readable while the string stays the
-    # single source of truth.
-    extragradient = update_mode == "extragradient"
     # Per-iteration adaptive step size (Malitsky-Tam local-Lipschitz line
     # search). When `adaptive_eta` is not None the extragradient scheme replaces
     # the optimiser's fixed learning rate with a single scalar base step eta,
@@ -43,8 +39,8 @@ def __sps(
     # eta · L_hat <= 1/sqrt(2). The primal/dual steps are tau=eta/k, sigma=eta*k.
     # eta is packed alongside k in the k-slot of opt_state. Requires k_scaling
     # (it needs k) and only extragradient (the contractive scheme here);
-    # synchronous/alternating are not contractive on the saddle and a line
-    # search cannot fix that, so they are excluded.
+    # alternating is not contractive on the saddle and a line search cannot
+    # fix that, so it is excluded.
     adaptive_step = adaptive_eta is not None and update_mode == "extragradient"
     if adaptive_step and not k_scaling:
         raise ValueError("adaptive_eta requires k_scaling (primal weight k)")
@@ -374,7 +370,8 @@ def __sps(
                         dual_ineq=projection_non_negative(state.dual_ineq),
                         dual_eq=state.dual_eq,
                     )
-                elif extragradient:
+                else:
+                    # extragradient
                     # --- Look-ahead gradient ---
                     g = grad(state)
 
@@ -394,17 +391,6 @@ def __sps(
                         scaled_g_half, opt_state, state
                     )
                     state = optax.apply_updates(state, corr_updates)
-                    state = SaddleState(
-                        primal=projection_primal(state.primal),
-                        dual_ineq=projection_non_negative(state.dual_ineq),
-                        dual_eq=state.dual_eq,
-                    )
-                else:
-                    gradient = grad(state)
-                    if k_scaling:
-                        gradient = scale_by_k(gradient, k)
-                    updates, opt_state = opt_update(gradient, opt_state, state)
-                    state = optax.apply_updates(state, updates)
                     state = SaddleState(
                         primal=projection_primal(state.primal),
                         dual_ineq=projection_non_negative(state.dual_ineq),
@@ -513,12 +499,12 @@ def solve(
 
     Args:
         update_mode: Selects the stepping scheme (single source of truth):
-            ``"synchronous"`` (default), ``"alternating"``, or
-            ``"extragradient"`` (Korpelevich two-call).
+            ``"alternating"`` (default; primal step, then dual step at the new
+            primal) or ``"extragradient"`` (Korpelevich two-call).
         k_scale: Primal-weight (k) scaling control. ``None`` disables it;
             otherwise a float sets a symmetric clamp band ``[1/k_scale,
             k_scale]`` for ``k`` (default ``10`` → ``[0.1, 10]``). When enabled —
-            orthogonal to ``update_mode``, so it composes with all three schemes
+            orthogonal to ``update_mode``, so it composes with both schemes
             — a primal weight ``k`` rescales the primal/dual gradients by
             ``(1/k, k)`` before each ``opt_update``, making the dual/primal step
             ratio ``k**2``. ``k`` is initialised from ``k_init`` and rebalanced
@@ -589,11 +575,7 @@ def solve(
     if verbose:
         print("----------------------------------------------")
 
-    valid_update_modes = [
-        "synchronous",
-        "alternating",
-        "extragradient",
-    ]
+    valid_update_modes = ["alternating", "extragradient"]
     if update_mode not in valid_update_modes:
         raise ValueError(f"update_mode must be one of {valid_update_modes}")
 

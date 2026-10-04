@@ -102,6 +102,12 @@ def parse_args():
         "jaddle.presolve.eliminate_defined_variables.",
     )
     p.add_argument(
+        "--update-mode",
+        default="pdhg",
+        choices=["alternating", "pdhg", "halpern"],
+        help="Jaddle LP update_mode passed to jl.solve (default: pdhg).",
+    )
+    p.add_argument(
         "--jax-profile",
         default="float64",
         choices=["float64", "float32", "float16"],
@@ -165,7 +171,7 @@ def main():
                     "presolve_seconds": presolve_seconds,
                 }
             )
-            jres = run_jaddle(jaddle_lp, args.tol, args.max_epochs)
+            jres = run_jaddle(jaddle_lp, args.tol, args.max_epochs, args.update_mode)
             # jaddle solves the presolved reduced problem (objective = c^T x);
             # add the presolve offset to report the full-problem objective.
             jres["jaddle_obj"] += offset

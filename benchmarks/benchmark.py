@@ -147,6 +147,12 @@ def parse_args():
         "jaddle.presolve.eliminate_defined_variables.",
     )
     p.add_argument(
+        "--update-mode",
+        default="pdhg",
+        choices=["alternating", "pdhg", "halpern"],
+        help="Jaddle LP update_mode passed to jl.solve (default: pdhg).",
+    )
+    p.add_argument(
         "--jax-profile",
         default="float64",
         choices=["float64", "float32", "float16"],
@@ -240,7 +246,7 @@ def load_relaxed_lp(
     return lp, opt_obj, highs_status, highs_seconds, offset
 
 
-def run_jaddle(lp, tol, max_epochs):
+def run_jaddle(lp, tol, max_epochs, update_mode="pdhg"):
     """Solve with Jaddle's saddle-point solver. Returns a dict of metrics.
 
     Three times are reported:
@@ -267,7 +273,7 @@ def run_jaddle(lp, tol, max_epochs):
         primal_feasibility_tolerance=tol,
         dual_feasibility_tolerance=tol,
         dual_gap_tolerance=tol,
-        update_mode="alternating",
+        update_mode=update_mode,
         restarts=1000,
         iterations_per_epoch=1000,
     )
@@ -370,7 +376,7 @@ def main():
                     "highs_solve_seconds": highs_seconds,
                 }
             )
-            jres = run_jaddle(jaddle_lp, args.tol, args.max_epochs)
+            jres = run_jaddle(jaddle_lp, args.tol, args.max_epochs, args.update_mode)
             # jaddle solves the presolved reduced problem (objective = c^T x);
             # add the presolve offset to compare against the full-problem opt_obj.
             jres["jaddle_obj"] += offset
