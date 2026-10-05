@@ -38,7 +38,7 @@ def objective(w):
 
 
 def constraints_ineq(w):
-    return jnp.array([jnp.dot(w, w) - 100.0])  # L2 norm constraint (||w||^2 <= 100)
+    return jnp.array([jnp.dot(w, w) - 200.0])  # L2 norm constraint (||w||^2 <= 100)
 
 
 def constraints_eq(w):
@@ -58,10 +58,7 @@ cp = jc.JaddleCP(
 
 # %%
 # Solve the problem using Jaddle Convex SPS optimizer
-solution = jc.solve(
-    cp,
-    optimiser=jo.gd(0.01),
-)["solution"]
+solution = jc.solve(cp)["solution"]
 
 l2_norm = jnp.linalg.norm(solution.primal, ord=2)
 print("L2 norm of solution.primal:", l2_norm)
