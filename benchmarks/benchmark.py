@@ -24,6 +24,7 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 import argparse
 import csv
+import gc
 import glob
 import time
 
@@ -275,7 +276,7 @@ def run_jaddle(lp, tol, max_epochs, update_mode="pdhg"):
         dual_gap_tolerance=tol,
         update_mode=update_mode,
         restarts=1000,
-        iterations_per_epoch=1000,
+        iterations_per_epoch=64 * 10,
     )
     wall_seconds = time.perf_counter() - t0
 
@@ -403,6 +404,14 @@ def main():
             row["error"] = repr(exc)
             print(f"  ERROR: {exc!r}")
         rows.append(row)
+        # Rewrite the CSV after every instance so a crash mid-sweep keeps results.
+        write_csv(args.csv, rows)
+        # Drop JAX's in-memory trace/compile caches: every instance has new
+        # shapes and closures, so nothing carries over, and keeping them grows
+        # host RSS by ~100 MB per instance over a long sweep.
+        jaddle_lp = None
+        jax.clear_caches()
+        gc.collect()
         print()
 
     write_csv(args.csv, rows)

@@ -17,9 +17,6 @@ import jaddle.jaddle_optimisers as jo
 np.set_printoptions(precision=2, suppress=True)
 
 
-_LINEAR_RUN_EPOCH_CACHE = {}
-
-
 # %%
 def estimate_augmented_spectral_norm(
     lp: JaddleLP,
@@ -150,7 +147,14 @@ def __sps(
     check_every=None,
     merit_threshold=-jnp.inf,
     stall_threshold=-jnp.inf,
+    epoch_cache=None,
 ):
+    # `epoch_cache` is a dict owned by the caller (one per `solve` call) that
+    # memoises the jitted epoch runner across epochs. It must NOT be module-global:
+    # each runner closes over `lp` and `merit_fn`, so a global cache pins every
+    # solved LP's scaled matrices and compiled executables for the life of the
+    # process (~250 MB host + GPU per MIPLIB instance; OOMs the benchmark sweep).
+    #
     # In-epoch restart check: when `merit_fn` and `check_every` are given, the
     # epoch runs in chunks of `check_every` iterations and exits early once
     # min(merit_fn(average), merit_fn(state)) <= `merit_threshold` (the caller's
@@ -215,7 +219,9 @@ def __sps(
         id(merit_fn),
         check_every,
     )
-    run_epoch = _LINEAR_RUN_EPOCH_CACHE.get(cache_key)
+    if epoch_cache is None:
+        epoch_cache = {}
+    run_epoch = epoch_cache.get(cache_key)
 
     if run_epoch is None:
 
@@ -437,7 +443,7 @@ def __sps(
 
             return i, state, average_state, opt_state, total_weight, stalled
 
-        _LINEAR_RUN_EPOCH_CACHE[cache_key] = run_epoch
+        epoch_cache[cache_key] = run_epoch
 
     state = initial_solution
 
@@ -1379,6 +1385,9 @@ def solve(
             return True
         return False
 
+    # Per-solve memo of jitted epoch runners (see __sps); freed when solve returns.
+    _epoch_cache = {}
+
     def _inloop_merit(s):
         # Same restart merit `solve` computes at the epoch boundary, traced into
         # __sps for the in-epoch sufficient-progress check.
@@ -1467,6 +1476,7 @@ def solve(
                 check_every=_check_every(),
                 merit_threshold=_restart_thresholds()[0],
                 stall_threshold=_restart_thresholds()[1],
+                epoch_cache=_epoch_cache,
             )
             inloop_stalled = bool(inloop_stalled)
             # Iterations actually run (an in-epoch restart check may exit early).
