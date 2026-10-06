@@ -647,6 +647,7 @@ def solve(
     cp: JaddleCP,
     optimiser=None,
     max_epochs=None,
+    max_seconds=None,
     initial_solution=None,
     initial_opt_state=None,
     iterations_per_epoch=int(1e3),
@@ -674,6 +675,12 @@ def solve(
     Solve a convex saddle-point problem via saddle-point optimisation.
 
     Args:
+        max_seconds: Wall-clock budget in seconds (default ``None`` = no limit).
+            Measured from entry into ``solve()``, so setup and ``precompile``
+            count against it. Checked at each epoch boundary: once the budget is
+            spent no further epoch starts and the current point is returned with
+            ``stop_reason="time_limit"``, so the solve can overrun by up to one
+            epoch (shrink ``iterations_per_epoch`` for a tighter cutoff).
         update_mode: Selects the stepping scheme (single source of truth):
             ``"extragradient"`` (default; Korpelevich two-call),
             ``"alternating"`` (primal step, then dual step at the new primal) or
@@ -741,13 +748,21 @@ def solve(
         dict: The solution together with diagnostics. Keys:
             * ``"solution"``: the ``SaddleState`` (primal/dual iterate).
             * ``"converged"``: ``bool``, whether the solve met the convergence
-              criteria (``False`` if the epoch budget was exhausted or the solve
-              was interrupted).
+              criteria (``False`` if the epoch / time budget was exhausted or the
+              solve was interrupted).
+            * ``"stop_reason"``: ``str``, why the solve terminated:
+              ``"converged"``, ``"max_epochs"``, ``"time_limit"`` (``max_seconds``
+              exhausted) or ``"interrupted"`` (KeyboardInterrupt).
             * ``"opt_state"``: the final optimiser state, for warm-starting a
               subsequent solve via ``initial_opt_state``.
             * ``"solve_seconds"``: ``float`` wall time of the epoch loop (incl. the
               first-epoch XLA compile but not the setup phase before it).
     """
+
+    # max_seconds is a wall-clock budget for the whole call, setup included.
+    solve_entry_time = time.time()
+    if max_seconds is not None and max_seconds <= 0:
+        raise ValueError("max_seconds must be > 0 (or None for no limit)")
 
     if adaptive_eta == "auto":
         if update_mode == "forward_reflected" or (
@@ -1019,6 +1034,7 @@ def solve(
         k_init = 1.0
 
     is_converged = True
+    stop_reason = "converged"
     state = initial_solution
     average_state = initial_solution
     if initial_opt_state is not None:
@@ -1114,7 +1130,16 @@ def solve(
             if max_epochs:
                 if check_max_epochs(count):
                     is_converged = False
+                    stop_reason = "max_epochs"
                     print(f"Reached maximum epochs: {max_epochs}. Stopping.")
+                    print("----------------------------------------------")
+                    break
+
+            if max_seconds is not None:
+                if time.time() - solve_entry_time >= max_seconds:
+                    is_converged = False
+                    stop_reason = "time_limit"
+                    print(f"Reached time limit: {max_seconds}s. Stopping.")
                     print("----------------------------------------------")
                     break
 
@@ -1285,6 +1310,7 @@ def solve(
             output = state
     except KeyboardInterrupt:
         is_converged = False
+        stop_reason = "interrupted"
         if average:
             output = average_state
         else:
@@ -1304,6 +1330,7 @@ def solve(
     return {
         "solution": output,
         "converged": is_converged,
+        "stop_reason": stop_reason,
         "opt_state": opt_state,
         "solve_seconds": end_time - start_time,
     }

@@ -67,6 +67,14 @@ def parse_args():
         help="Cap Jaddle epochs (None = run to convergence).",
     )
     p.add_argument(
+        "--max-seconds",
+        type=float,
+        default=None,
+        help="Per-instance Jaddle wall-clock budget in seconds, incl. scaling/"
+        "setup and XLA compile (None = no limit). Checked at epoch boundaries, "
+        "so a solve can overrun by up to one epoch.",
+    )
+    p.add_argument(
         "--csv",
         default=os.path.join(REPO_ROOT, "benchmark_sciopt_results.csv"),
         help="Path to write CSV results.",
@@ -171,7 +179,13 @@ def main():
                     "presolve_seconds": presolve_seconds,
                 }
             )
-            jres = run_jaddle(jaddle_lp, args.tol, args.max_epochs, args.update_mode)
+            jres = run_jaddle(
+                jaddle_lp,
+                args.tol,
+                args.max_epochs,
+                args.update_mode,
+                max_seconds=args.max_seconds,
+            )
             # jaddle solves the presolved reduced problem (objective = c^T x);
             # add the presolve offset to report the full-problem objective.
             jres["jaddle_obj"] += offset

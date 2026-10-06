@@ -86,6 +86,14 @@ def parse_args():
         help="Cap Jaddle epochs (None = run to convergence).",
     )
     p.add_argument(
+        "--max-seconds",
+        type=float,
+        default=None,
+        help="Per-instance Jaddle wall-clock budget in seconds, incl. scaling/"
+        "setup and XLA compile (None = no limit). Checked at epoch boundaries, "
+        "so a solve can overrun by up to one epoch.",
+    )
+    p.add_argument(
         "--csv",
         default=os.path.join(REPO_ROOT, "benchmark_results.csv"),
         help="Path to write CSV results.",
@@ -247,7 +255,7 @@ def load_relaxed_lp(
     return lp, opt_obj, highs_status, highs_seconds, offset
 
 
-def run_jaddle(lp, tol, max_epochs, update_mode="pdhg"):
+def run_jaddle(lp, tol, max_epochs, update_mode="pdhg", max_seconds=None):
     """Solve with Jaddle's saddle-point solver. Returns a dict of metrics.
 
     Three times are reported:
@@ -269,6 +277,7 @@ def run_jaddle(lp, tol, max_epochs, update_mode="pdhg"):
     result = jl.solve(
         lp,
         max_epochs=max_epochs,
+        max_seconds=max_seconds,
         verbose=True,
         log_every=10,
         primal_feasibility_tolerance=tol,
@@ -294,8 +303,9 @@ def run_jaddle(lp, tol, max_epochs, update_mode="pdhg"):
         "jaddle_converged": bool(converged),
         # "certificate" = full LP optimality cert met; "primal_stall" = the
         # primal_stop heuristic fired (feasible but not certified optimal, so the
-        # objective may be suboptimal even though converged=True); "max_epochs" =
-        # budget exhausted. Disambiguates the two ways converged can be True.
+        # objective may be suboptimal even though converged=True); "max_epochs" /
+        # "time_limit" = epoch / time budget exhausted. Disambiguates the two
+        # ways converged can be True.
         "jaddle_stop_reason": stop_reason,
         "jaddle_solve_seconds": solve_seconds,
         # Steady-state solve time with the first-epoch XLA compile amortised out:
@@ -377,7 +387,13 @@ def main():
                     "highs_solve_seconds": highs_seconds,
                 }
             )
-            jres = run_jaddle(jaddle_lp, args.tol, args.max_epochs, args.update_mode)
+            jres = run_jaddle(
+                jaddle_lp,
+                args.tol,
+                args.max_epochs,
+                args.update_mode,
+                max_seconds=args.max_seconds,
+            )
             # jaddle solves the presolved reduced problem (objective = c^T x);
             # add the presolve offset to compare against the full-problem opt_obj.
             jres["jaddle_obj"] += offset

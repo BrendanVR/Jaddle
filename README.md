@@ -13,21 +13,7 @@ Jaddle performs admirably on many hard linear and convex benchmarks, while remai
 ## ✨ Why Jaddle?
 
 - 🧩 Modular: built on JAX + Optax primitives
-- 🤸‍♀️ Flexible: swap optimizers in ~10 lines
 - 🚀 Portable: CPU / GPU / TPU
-
-## 🧪 Example Optimizer
-
-With Optax partitioning, even complicated primal–dual variants collapse into a few lines:
-
-```python
-import optax
-
-optimiser = jo.create_saddle_optimiser(
-    optax.optimistic_adam_v2(learning_rate=1e-3, alpha=0.05),
-    optax.adadelta(learning_rate=1.0),
-)
-```
 
 ## 📊 Benchmarks
 

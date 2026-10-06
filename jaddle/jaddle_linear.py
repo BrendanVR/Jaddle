@@ -491,6 +491,7 @@ def __sps(
 def solve(
     lp: JaddleLP,
     max_epochs=None,
+    max_seconds=None,
     initial_solution=None,
     initial_opt_state=None,
     iterations_per_epoch=256,
@@ -557,6 +558,13 @@ def solve(
     (no-progress restart). Set ``restarts=0`` to disable.
 
     Args:
+        max_seconds: Wall-clock budget in seconds (default ``None`` = no limit).
+            Measured from entry into ``solve()``, so scaling / setup and the
+            first-epoch XLA compile count against it. Checked at each epoch
+            boundary: once the budget is spent no further epoch starts and the
+            current point is returned with ``stop_reason="time_limit"``, so the
+            solve can overrun by up to one epoch (shrink
+            ``iterations_per_epoch`` for a tighter cutoff).
         restarts: Maximum number of warm restarts. 0 = no restarts (default).
             Each restart resets the averaging (and the halpern anchor / lambda
             counter) while keeping the current iterate as a warm start.
@@ -704,7 +712,8 @@ def solve(
               ``"primal_stall"`` (the ``primal_stop`` heuristic fired — feasible
               but not certified optimal, so the objective may be suboptimal even
               though ``"converged"`` is ``True``), ``"max_epochs"`` (epoch budget
-              exhausted), or ``"interrupted"`` (KeyboardInterrupt).
+              exhausted), ``"time_limit"`` (``max_seconds`` exhausted), or
+              ``"interrupted"`` (KeyboardInterrupt).
             * ``"solve_seconds"``: ``float`` wall time of the epoch loop (incl. the
               first-epoch XLA compile but not the scaling / sparse-setup phase).
             * ``"corrected_seconds"``: ``float`` steady-state runtime with the
@@ -714,6 +723,11 @@ def solve(
               formed (fewer than two epochs).
             * ``"epochs"``: ``int``, number of epochs run.
     """
+
+    # max_seconds is a wall-clock budget for the whole call, setup included.
+    solve_entry_time = time.time()
+    if max_seconds is not None and max_seconds <= 0:
+        raise ValueError("max_seconds must be > 0 (or None for no limit)")
 
     if lp.A_ineq.shape[0] == 0:
         lp.A_ineq = sp.coo_matrix(jnp.zeros((1, lp.A_eq.shape[1]), dtype=lp.A_eq.dtype))
@@ -1449,6 +1463,14 @@ def solve(
                     print("----------------------------------------------")
                     break
 
+            if max_seconds is not None:
+                if time.time() - solve_entry_time >= max_seconds:
+                    is_converged = False
+                    stop_reason = "time_limit"
+                    print(f"Reached time limit: {max_seconds}s. Stopping.")
+                    print("----------------------------------------------")
+                    break
+
             start_epoch_time = time.time()
             (
                 shifted_i,
@@ -1863,8 +1885,8 @@ def solve(
         # The while-loop exits the iteration *after* the converging epoch, so its
         # metrics were computed but only printed if it landed on a log_every
         # boundary. Print the final converged epoch's criteria here (skip when we
-        # broke out via max_epochs, which prints its own message and leaves
-        # is_converged False).
+        # broke out via max_epochs / max_seconds, which print their own message
+        # and leave is_converged False).
         if verbose and is_converged and count > 0:
             print("Convergence criteria met.")
             if report_best and average:
