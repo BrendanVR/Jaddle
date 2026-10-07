@@ -38,6 +38,10 @@ def read_relaxed_model(path: str, presolve: bool = False, quiet: bool = True):
         # PaPILO (milp presolver)
         model.setPresolve(SCIP_PARAMSETTING.AGGRESSIVE)
         try_set(model, "misc/usesymmetry", 0)
+        # The default sumepsilon (1e-6) vetoes substituting out a free column
+        # singleton whose defining row has huge coefficients (leo1: z = sum a_j x_j,
+        # a ~ 1e7), leaving a dense big-M row that HiGHS presolve would fold into c.
+        try_set(model, "numerics/sumepsilon", 1e-9)
         try_set(model, "presolving/milp/maxrounds", -1)  # no cap on rounds
         try_set(model, "presolving/milp/threads", 0)  # 0 = auto; or set your core count
         try_set(model, "presolving/milp/enableprobing", True)
@@ -88,9 +92,13 @@ def scip_to_standard_form_sparse(model: scip.Model, transformed: bool = None):
     col_of = {v.ptr(): j for j, v in enumerate(vars_)}
 
     if transformed:
-        # SCIP's transformed problem is always a minimisation.
+        # SCIP's transformed problem is always a minimisation. Its own offset is
+        # already sign-flipped, but the original-problem offset is not.
+        orig_sense = -1.0 if model.getObjectiveSense() == "maximize" else 1.0
         sense = 1.0
-        offset = model.getObjoffset(original=False) + model.getObjoffset(original=True)
+        offset = model.getObjoffset(original=False) + orig_sense * model.getObjoffset(
+            original=True
+        )
         lower_bounds = _clean([v.getLbGlobal() for v in vars_])
         upper_bounds = _clean([v.getUbGlobal() for v in vars_])
     else:

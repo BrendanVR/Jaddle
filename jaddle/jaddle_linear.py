@@ -5,6 +5,7 @@ import jax.experimental.sparse as jsp
 from optax.projections import projection_non_negative, projection_box
 import optax
 import numpy as np
+import copy
 import functools
 from typing import NamedTuple
 import time
@@ -488,6 +489,13 @@ def __sps(
     )
 
 
+def _vector_norm(v, norm):
+    """‖v‖∞ (``norm="inf"``) or ‖v‖₂ (``"l2"``); 0 for an empty vector."""
+    if norm == "l2":
+        return jnp.linalg.norm(v)
+    return jnp.max(jnp.abs(v), initial=0.0)
+
+
 def solve(
     lp: JaddleLP,
     max_epochs=None,
@@ -501,13 +509,16 @@ def solve(
     primal_feasibility_tolerance=1e-3,
     dual_feasibility_tolerance=1e-3,
     dual_gap_tolerance=1e-3,
+    dual_residual="pdlp",
+    termination_norm="inf",
+    restart_norm="inf",
     verbose=False,
     log_every=1,
     average=True,
     report_best=True,
     update_mode="pdhg",
     k_scale=1e8,
-    k_theta="adaptive",
+    k_theta=0.5,
     k_init=None,
     k_update_per_epoch=False,
     adaptive_eta=0.0,
@@ -518,7 +529,7 @@ def solve(
     augmented_weight=1.0,
     ruiz_iterations=10,
     pc_iterations=1,
-    restarts=0,
+    restarts=False,
     epochs_per_restart=10,
     restart_multiplier=1.0,
     restart_decay=0.2,
@@ -555,7 +566,7 @@ def solve(
     into slow rotational orbits. A restart fires when either the normalised KKT
     merit decays past ``restart_decay`` of its value at the last restart
     (sufficient-progress restart) or the current cycle reaches its length cap
-    (no-progress restart). Set ``restarts=0`` to disable.
+    (no-progress restart). Enable with ``restarts=True``.
 
     Args:
         max_seconds: Wall-clock budget in seconds (default ``None`` = no limit).
@@ -565,8 +576,31 @@ def solve(
             current point is returned with ``stop_reason="time_limit"``, so the
             solve can overrun by up to one epoch (shrink
             ``iterations_per_epoch`` for a tighter cutoff).
-        restarts: Maximum number of warm restarts. 0 = no restarts (default).
-            Each restart resets the averaging (and the halpern anchor / lambda
+        dual_residual: How reduced costs split between the dual residual (DFR)
+            and the dual objective (hence the gap). ``"pdlp"`` (default) follows
+            PDLP with ``handle_some_primal_gradients_on_finite_bounds_as_residuals``:
+            rᵢ > 0 is absorbed by a finite lower bound and rᵢ < 0 by a finite
+            upper bound when xᵢ is near it (|xᵢ - bound| <= |xᵢ|), adding rᵢ·bound
+            to the dual objective; every other component is a residual |rᵢ|.
+            Complementarity errors on boxed variables therefore show in the gap,
+            and far finite bounds (e.g. [0, 1e6] boxes) can't swamp the dual
+            objective. ``"projected"`` is the older per-variable projected-gradient
+            residual |x - proj(x - r)| for boxed variables, with every finite bound
+            always in the dual objective.
+        termination_norm: Norm used for the primal / dual feasibility
+            stopping tests (and the printed PFR / DFR): ``"inf"`` (default)
+            tests ‖r_p‖∞/(1+‖b‖∞) and ‖r_d‖∞/(1+‖c‖∞); ``"l2"`` tests
+            ‖r_p‖₂/(1+‖b‖₂) and ‖r_d‖₂/(1+‖c‖₂), the cuPDLP-C / PDLP default,
+            for like-for-like comparisons. Termination only: the restart merit
+            follows ``restart_norm``, so changing this alone leaves the iterate
+            trajectory unchanged and only moves the epoch at which it stops.
+        restart_norm: Norm (``"inf"`` default, or ``"l2"``) for the primal /
+            dual feasibility terms of the restart KKT merit and the
+            dual-infeasible ``still_improving`` cycle-cap guard, normalised by
+            1+‖b‖ / 1+‖c‖ in the same norm. ``"l2"`` matches cuPDLP-C's restart
+            criterion. Unlike ``termination_norm`` this changes the trajectory.
+        restarts: Enable adaptive warm restarts (default ``False``). There is
+            no cap on how many fire; the triggers alone decide. Each restart resets the averaging (and the halpern anchor / lambda
             counter) while keeping the current iterate as a warm start.
         epochs_per_restart: Length cap of the first restart cycle, expressed in
             epochs AT THE DEFAULT ``iterations_per_epoch`` (default 10) but
@@ -603,7 +637,7 @@ def solve(
               ``z_{k+1} = lambda_k z_0 + (1−lambda_k) T(z_k)``, ``lambda_k =
               1/(k+1)`` (cycle-local k). The anchor z_0 and lambda counter reset
               to the current iterate at each restart, giving last-iterate
-              acceleration. Best paired with ``restarts > 0``.
+              acceleration. Best paired with ``restarts=True``.
         k_scale: Clamp band ``[1/k_scale, k_scale]`` for the primal weight ``k``
             (default ``1e8``); ``None`` leaves ``k`` unclamped. The primal and
             dual steps are ``eta / k`` and ``eta * k``, so the dual/primal step
@@ -644,8 +678,7 @@ def solve(
             move. The movement ratio alone can't tell a correct k move from a
             runaway (mzzv11's per-epoch runaway was monotone), but the merit can.
             Epochs to certify, restart-only vs fixed 0.5: barwon 41 vs 166,
-            binschedule2 39 vs 61, plus gains on stp3d and mzzv11.
-        primal_stop: Opt-in, dual-free termination (default ``False``). When
+            binschedule2 39 vs 61, plus gains on stp3d and mzzv11.        primal_stop: Opt-in, dual-free termination (default ``False``). When
             ``True``, termination ignores the dual certificate entirely and stops
             on **primal feasibility** (``constraint_bound`` within
             ``primal_feasibility_tolerance``) **and** an **objective stall**. This
@@ -729,18 +762,20 @@ def solve(
     if max_seconds is not None and max_seconds <= 0:
         raise ValueError("max_seconds must be > 0 (or None for no limit)")
 
-    if lp.A_ineq.shape[0] == 0:
-        lp.A_ineq = sp.coo_matrix(jnp.zeros((1, lp.A_eq.shape[1]), dtype=lp.A_eq.dtype))
-        lp.b_ineq = np.zeros((1,), dtype=lp.b_eq.dtype)
-
-    if lp.A_eq.shape[0] == 0:
-        lp.A_eq = sp.coo_matrix(
-            jnp.zeros((1, lp.A_ineq.shape[1]), dtype=lp.A_ineq.dtype)
-        )
-        lp.b_eq = np.zeros((1,), dtype=lp.b_ineq.dtype)
+    lp = __pad_empty_blocks(lp)
 
     if log_every < 1:
         raise ValueError("log_every must be >= 1")
+    if dual_residual not in ("pdlp", "projected"):
+        raise ValueError(
+            f"dual_residual must be 'pdlp' or 'projected', got {dual_residual!r}"
+        )
+    if termination_norm not in ("inf", "l2"):
+        raise ValueError(
+            f"termination_norm must be 'inf' or 'l2', got {termination_norm!r}"
+        )
+    if restart_norm not in ("inf", "l2"):
+        raise ValueError(f"restart_norm must be 'inf' or 'l2', got {restart_norm!r}")
 
     if verbose:
         print("----------------------------------------------")
@@ -763,20 +798,15 @@ def solve(
         print("====Starting Solve====")
         print("----------------------------------------------")
 
-    # solve() takes a JaddleLP (the JAX-native, device-side representation). The
-    # scaling stage runs host-side on scipy (build [[A,b],[c,0]], diag-apply), so
-    # we materialise a scipy view once here; scaling returns a scipy LP that
-    # to_jaddle_sparse() converts back to the JaddleLP the solver iterates on. A
-    # raw scipy LP (e.g. hand-built in examples) is already in scipy form.
-    if isinstance(lp, JaddleLP):
-        lp = lp.to_scipy()
-
+    # solve() takes a JaddleLP (the JAX-native, device-side representation) or a
+    # raw scipy LP (e.g. hand-built in examples). scale_problem() accepts either
+    # and runs on device, returning the JaddleLP the solver iterates on.
     if scale:
         # Augmented Ruiz: equilibrate [[A,b],[c,0]] so cost and RHS information also
         # drive the equilibration. Conditions the constraint (esp. equality) block
         # better on cost/RHS-dominated problems (momentum1: A-only Ruiz froze the
         # primal at a far-from-optimal point; augmented converges in ~15 epochs).
-        # A-only Ruiz (ruiz_scaling(augmented=False)) is available as a knob but is
+        # A-only Ruiz (scale_problem(augmented=False)) is available as a knob but is
         # not the default — it broke both momentum1 and boeing once the relative
         # convergence test + true-units norm fixes were in place. PC then applies
         # its single Pock-Chambolle finishing pass.
@@ -798,7 +828,10 @@ def solve(
         row_scale = np.ones(lp.A_eq.shape[0] + lp.A_ineq.shape[0])
         col_scale = np.ones(lp.c.shape[0])
         c_max = 1.0
-        lp = to_jaddle_sparse(lp)
+        # solve() reassigns lp.c below (vertex_bias, c_max unscaling), so never
+        # iterate on the caller's JaddleLP itself. Its arrays are immutable, so a
+        # shallow copy suffices.
+        lp = copy.copy(lp) if isinstance(lp, JaddleLP) else to_jaddle_sparse(lp)
 
     if adaptive_eta == 0.0:
         adaptive_eta = 1 / estimate_augmented_spectral_norm(lp)
@@ -957,7 +990,19 @@ def solve(
             initial=0.0,
         ) / (1.0 + jnp.abs(objective_value))
 
-        constraint_bound = jnp.maximum(max_ineq_violation, max_eq_violation)
+        # Primal residual in a given norm. `constraint_bound` (restart_norm)
+        # feeds only the restart merit; `termination_pfr` (termination_norm)
+        # feeds the stopping test and printed PFR. When both norms match, XLA
+        # CSEs the duplicate reduction.
+        def primal_residual(norm):
+            if norm == "l2":
+                return jnp.sqrt(
+                    jnp.sum(ineq_violations**2) + jnp.sum(eq_violations**2)
+                )
+            return jnp.maximum(max_ineq_violation, max_eq_violation)
+
+        constraint_bound = primal_residual(restart_norm)
+        termination_pfr = primal_residual(termination_norm)
 
         # Scaled-space reduced cost / bounds — used ONLY by the duality-gap
         # decomposition below, which is built in scaled space and rescaled by
@@ -976,6 +1021,54 @@ def solve(
 
         lower_term = reduced_cost * lower_bounds
         upper_term = reduced_cost * upper_bounds
+
+        if dual_residual == "pdlp":
+            # PDLP convention (handle_some_primal_gradients_on_finite_bounds_as_
+            # residuals): a positive reduced cost is absorbed by a finite lower
+            # bound, a negative one by a finite upper bound, but only when the
+            # primal sits NEAR that bound (|x - bound| <= |x|). An absorbed rᵢ
+            # contributes rᵢ·boundᵢ to the dual objective and nothing to the dual
+            # residual; anything else is a dual residual |rᵢ| and contributes
+            # nothing to the dual objective. Without the "near" test a far finite
+            # bound (wairoa's [0, 1e6] boxes) multiplies a tiny reduced-cost error
+            # by 1e6 in the dual objective and the gap never closes. The test is
+            # scale-invariant (x and the bounds share col_scale), so the scaled
+            # masks serve the true-unit residual below too.
+            x_s = average_state.primal
+            pos, neg = reduced_cost > 0.0, reduced_cost < 0.0
+            lb_ok = finite_lower & (jnp.abs(x_s - lower_bounds) <= jnp.abs(x_s))
+            ub_ok = finite_upper & (jnp.abs(x_s - upper_bounds) <= jnp.abs(x_s))
+            absorb_lower = pos & lb_ok
+            absorb_upper = neg & ub_ok
+            box_infimum = jnp.where(
+                absorb_lower, lower_term, jnp.where(absorb_upper, upper_term, 0.0)
+            )
+            dual_feasibility_violation = jnp.where(
+                absorb_lower | absorb_upper, 0.0, jnp.abs(reduced_cost_true)
+            )
+            dual_feasibility_residual = _vector_norm(
+                dual_feasibility_violation, restart_norm
+            )
+            gap_bound_comp = (
+                reduced_cost @ average_state.primal - jnp.sum(box_infimum)
+            ) * c_max
+            gap_ineq_comp = -(average_state.dual_ineq @ grad_dual_ineq) * c_max
+            gap_eq_comp = -(average_state.dual_eq @ grad_dual_eq) * c_max
+            duality_gap = gap_bound_comp + gap_ineq_comp + gap_eq_comp
+            return (
+                objective_value,
+                primal_grad_norm,
+                complementarity_slack,
+                constraint_bound,
+                dual_feasibility_residual,
+                duality_gap,
+                jnp.isfinite(duality_gap),
+                gap_bound_comp,
+                gap_ineq_comp,
+                gap_eq_comp,
+                termination_pfr,
+                _vector_norm(dual_feasibility_violation, termination_norm),
+            )
 
         # box_infimum = inf over the box of rᵢ·xᵢ — the dual contribution of each
         # variable's bound. Taken as the finite bound·r product unconditionally,
@@ -1017,7 +1110,9 @@ def solve(
                 ),
             ),
         )
-        dual_feasibility_residual = jnp.max(dual_feasibility_violation)
+        dual_feasibility_residual = _vector_norm(
+            dual_feasibility_violation, restart_norm
+        )
 
         # Duality gap, computed directly as its three-way decomposition. At a
         # dual-feasible point these terms sum to the gap in true (unscaled-
@@ -1049,6 +1144,8 @@ def solve(
             gap_bound_comp,
             gap_ineq_comp,
             gap_eq_comp,
+            termination_pfr,
+            _vector_norm(dual_feasibility_violation, termination_norm),
         )
 
     def relative_gap(duality_gap, objective_value):
@@ -1114,9 +1211,10 @@ def solve(
         # that were PDLP-optimal (e.g. PFR_abs 2.5e-3 but PFR_rel 8.6e-7; DFR_abs
         # 2.4e-2 but DFR_rel 5.4e-4 — both well inside 1e-3 relative). `b_norm`/
         # `c_norm` are defined below in `solve` and resolved at call time via the
-        # closure.
-        relative_primal_residual = constraint_bound / (1.0 + b_norm)
-        relative_dual_residual = dual_feasibility_residual / (1.0 + c_norm)
+        # closure. The residuals passed in, and the termination_*_norm
+        # normalisers, are in `termination_norm`.
+        relative_primal_residual = constraint_bound / (1.0 + termination_b_norm)
+        relative_dual_residual = dual_feasibility_residual / (1.0 + termination_c_norm)
 
         # No-cancellation guard, and the ONLY gap test needed. `duality_gap` is
         # the SIGNED sum of three complementarity terms (bound, inequality,
@@ -1162,7 +1260,7 @@ def solve(
         # relaxations): an absolute `constraint_bound <= tol` test never fires even
         # when the relative PFR is deep inside tolerance, so primal_stop ran to
         # max_epochs while reporting a feasible-looking PFR.
-        relative_primal_residual = constraint_bound / (1.0 + b_norm)
+        relative_primal_residual = constraint_bound / (1.0 + termination_b_norm)
         feasible = relative_primal_residual <= primal_feasibility_tolerance
         oldest = obj_window[0]
         newest = obj_window[-1]
@@ -1204,6 +1302,8 @@ def solve(
     complementarity_slack = jnp.inf
     constraint_bound = jnp.inf
     dual_feasibility_residual = jnp.inf
+    termination_pfr = jnp.inf
+    termination_dfr = jnp.inf
     objective_value = jnp.inf
     duality_gap = jnp.inf
     dual_gap_is_finite = False
@@ -1297,8 +1397,14 @@ def solve(
     # convergence test and the gap sign-guard band wrong (true ‖c‖≈43 vs scaled
     # ‖c‖≈0.8), so the gap read +∞ at a point whose true relative gap was ~2e-3.
     _row_scale_all = jnp.concatenate([jnp_row_scale_eq, jnp_row_scale_ineq])
-    b_norm = float(jnp.max(jnp.abs(lp.b / _row_scale_all))) if lp.b.size else 0.0
-    c_norm = float(jnp.max(jnp.abs(lp.c / col_scale))) if lp.c.size else 0.0
+    # b_norm / c_norm normalise the restart merit (restart_norm); the
+    # termination_* pair normalises the stopping test / printed PFR, DFR.
+    _b_true = lp.b / _row_scale_all
+    _c_true = lp.c / col_scale
+    b_norm = float(_vector_norm(_b_true, restart_norm))
+    c_norm = float(_vector_norm(_c_true, restart_norm))
+    termination_b_norm = float(_vector_norm(_b_true, termination_norm))
+    termination_c_norm = float(_vector_norm(_c_true, termination_norm))
 
     def kkt_merit(
         constraint_bound,
@@ -1340,8 +1446,8 @@ def solve(
         # way `converged()` tests them — so the logged values match the stopping
         # criterion (an absolute DFR of 2e-2 can be a relative 5e-4 that passes).
         # RDG is already relative (÷(1+|obj|)).
-        relative_pfr = constraint_bound / (1.0 + b_norm)
-        relative_dfr = dual_feasibility_residual / (1.0 + c_norm)
+        relative_pfr = termination_pfr / (1.0 + termination_b_norm)
+        relative_dfr = termination_dfr / (1.0 + termination_c_norm)
         # RDGABS: the no-cancellation companion to RDG (see relative_gap_abs).
         # `converged()` requires BOTH RDG and RDGABS <= dual_gap_tolerance;
         # without printing RDGABS a run can show PFR/DFR/RDG all comfortably
@@ -1378,8 +1484,8 @@ def solve(
         nonlocal stop_reason
         certificate_met = bool(
             converged(
-                constraint_bound,
-                dual_feasibility_residual,
+                termination_pfr,
+                termination_dfr,
                 duality_gap,
                 dual_gap_is_finite,
                 objective_value,
@@ -1394,7 +1500,7 @@ def solve(
         if certificate_met:
             stop_reason = "certificate"
             return True
-        if primal_stop and bool(converged_primal(constraint_bound, obj_window)):
+        if primal_stop and bool(converged_primal(termination_pfr, obj_window)):
             stop_reason = "primal_stall"
             return True
         return False
@@ -1417,12 +1523,11 @@ def solve(
 
     def _restart_thresholds():
         # (sufficient-progress, necessary-decay) thresholds for the in-epoch
-        # check; -inf disables both (no finite baseline yet, restarts exhausted,
-        # or the check is off).
+        # check; -inf disables both (no finite baseline yet, restarts off, or
+        # the check is off).
         if (
             _check_every() is None
             or not restarts
-            or restarts_done >= restarts
             or not bool(jnp.isfinite(merit_at_last_restart))
         ):
             return -float("inf"), -float("inf")
@@ -1562,6 +1667,8 @@ def solve(
                 gap_bound_comp,
                 gap_ineq_comp,
                 gap_eq_comp,
+                termination_pfr,
+                termination_dfr,
             ) = metrics
 
             count += 1
@@ -1617,7 +1724,7 @@ def solve(
 
             # --- Adaptive restart decision ---
             restarted_this_epoch = False
-            if restarts and restarts_done < restarts:
+            if restarts:
                 epochs_since_restart += 1
                 iterations_since_restart += iters_this_epoch
 
@@ -1682,10 +1789,9 @@ def solve(
                 # the iterate is dual-infeasible so the duality gap (hence the KKT
                 # merit) is +∞ (see the box-infimum sign guard). Without this gate
                 # the progress tests below degenerate to `inf <= restart_decay*inf`
-                # → True, firing a restart EVERY epoch and exhausting the restart
-                # budget in the first few epochs (e.g. neos-3754480-nidda: 10/10
-                # restarts in 10 epochs, all on merit=inf), leaving none for the
-                # feasibility tail where they actually help. Only the length-based
+                # → True, firing a restart EVERY epoch (e.g. neos-3754480-nidda: 10
+                # restarts in 10 epochs, all on merit=inf) and wiping the averaging
+                # long before the feasibility tail where restarts actually help. Only the length-based
                 # `cycle_exhausted` path may fire on an inf merit.
                 merit_is_finite = bool(jnp.isfinite(restart_merit))
 
@@ -1838,7 +1944,7 @@ def solve(
                         if adaptive_theta:
                             k_msg += f", k_theta={theta_live:.3g}"
                         print(
-                            f"Restart {restarts_done}/{restarts} at epoch {count} "
+                            f"Restart {restarts_done} at epoch {count} "
                             f"({reason}, merit={float(restart_merit):.2e} "
                             f"[{which}], next cap={current_cycle_cap_iters:.0f} iters, "
                             f"iters/epoch={current_iterations_per_epoch}{k_msg})"
@@ -1855,7 +1961,9 @@ def solve(
             # halpern anchor and eta untouched — it only rewrites k, tracking
             # primal/dual progress within the current restart cycle.
             if k_per_epoch and not restarted_this_epoch:
-                k_new = _rebalance_k(state, state_at_last_epoch, opt_state[0], theta_live)
+                k_new = _rebalance_k(
+                    state, state_at_last_epoch, opt_state[0], theta_live
+                )
                 opt_state = (k_new, *opt_state[1:])
             if k_per_epoch:
                 # Reference for next epoch's movement. Independent copy: `state` is
@@ -1972,41 +2080,13 @@ def solve(
 
 # %%
 def to_jaddle_sparse(lp: LP):
-    # Resolve to the active precision profile's float width: float64 (x64,
-    # PDLP-style double precision), float32, or float16. jaddle_dtype() is the
-    # single source of truth; float64 requires x64 to be enabled (otherwise JAX
-    # silently truncates and spams warnings), so guard against that mismatch.
-    float_dtype = jo.jaddle_dtype()
-    if float_dtype == jnp.float64 and not jax.config.jax_enable_x64:
-        float_dtype = jnp.float32
-    # scipy.sparse cannot hold float16, so build the matrices in the nearest
-    # scipy-supported width and only cast the on-device BCOO data to the profile
-    # dtype afterwards. Half precision lives in JAX, not in the scipy CSR.
-    np_float = np.float64 if float_dtype == jnp.float64 else np.float32
-
-    A_eq_sp = lp.A_eq.astype(np_float)
-    A_eq_sp = A_eq_sp.sorted_indices()
-    A_eq_sp.sum_duplicates()
-    A_eq_sp = A_eq_sp.tocoo()
-
-    A_ineq_sp = lp.A_ineq.astype(np_float)
-    A_ineq_sp = A_ineq_sp.sorted_indices()
-    A_ineq_sp.sum_duplicates()
-    A_ineq_sp = A_ineq_sp.tocoo()
-
-    A_eq = jsp.BCOO.from_scipy_sparse(A_eq_sp).sort_indices()
-    A_ineq = jsp.BCOO.from_scipy_sparse(A_ineq_sp).sort_indices()
-    # Cast the sparse data array (indices stay integer) to the profile dtype.
-    A_eq = jsp.BCOO((A_eq.data.astype(float_dtype), A_eq.indices), shape=A_eq.shape)
-    A_ineq = jsp.BCOO(
-        (A_ineq.data.astype(float_dtype), A_ineq.indices), shape=A_ineq.shape
-    )
+    float_dtype, _ = __profile_dtypes()
 
     lp_jax = JaddleLP(
         jnp.array(lp.c, dtype=float_dtype),
-        A_eq,
+        __scipy_to_bcoo(lp.A_eq, float_dtype),
         jnp.array(lp.b_eq, dtype=float_dtype),
-        A_ineq,
+        __scipy_to_bcoo(lp.A_ineq, float_dtype),
         jnp.array(lp.b_ineq, dtype=float_dtype),
         jnp.array(lp.lower_bounds, dtype=float_dtype),
         jnp.array(lp.upper_bounds, dtype=float_dtype),
@@ -2075,73 +2155,108 @@ def __convert_to_scipy(jsp_mat: jsp.BCOO) -> sp.csc_matrix:
     return sp.csc_matrix((data, (row, col)), shape=jsp_mat.shape)
 
 
-def __build_scaling_coo(lp: LP, augmented: bool, augmented_weight: float = 1.0):
-    """Build the (absolute) COO operand the equilibration loops iterate over.
+def __profile_dtypes():
+    """Resolve the active precision profile's float width.
 
-    Returns ``(absdata, row_idx, col_idx, n_rows, n_cols, A, b, m, n)`` where the
-    first five describe ``|M|`` (the augmented ``[[A,b],[c^T/c_norm,0]]`` when
-    ``augmented`` else ``A`` alone) as flat COO arrays suitable for JAX
-    ``segment_*`` reductions, and ``A``/``b``/``m``/``n`` are the unscaled
-    constraint operator and RHS used to apply the final row/col scales.
-
-    ``augmented_weight`` (only meaningful when ``augmented``) scales the appended
-    ``c^T`` row's participation in the equilibration, interpolating between the
-    two endpoints for a single-dense-big-M-row instance like germanrr: the big-M
-    magnitude is conserved and Ruiz can only decide whether it lands in the
-    matrix or in the cost vector (their product ``matrix_ratio * c_max`` is
-    invariant ~= sqrt of the raw big-M ratio). ``1.0`` is full augmented (cost
-    stays O(1), matrix keeps the residual big-M spread); ``->0`` approaches
-    plain-matrix Ruiz (matrix flattens, cost blows up). An intermediate value
-    (~1e-3..1e-2 on germanrr) balances the two so neither the operator nor the
-    cost is maximally ill-scaled. No effect on instances without a big-M row.
-
-    The matrix is assembled once in scipy (cheap: ~14 ms even on stp3d); only the
-    iterative equilibration -- the part that dominates -- runs in JAX.
+    Returns ``(float_dtype, compute_dtype)``. ``float_dtype`` is the profile
+    width: float64 (x64, PDLP-style double precision), float32, or float16;
+    float64 requires x64 to be enabled (otherwise JAX silently truncates and
+    spams warnings), so it falls back to float32 when x64 is off.
+    ``compute_dtype`` is at least float32 -- scaling never runs in half
+    precision, and scipy.sparse cannot hold float16 anyway.
     """
-    A = sp.vstack([lp.A_eq, lp.A_ineq]).tocsr()
-    m, n = A.shape
-    b = np.concatenate([lp.b_eq, lp.b_ineq])
-    c = lp.c
+    float_dtype = jo.jaddle_dtype()
+    if float_dtype == jnp.float64 and not jax.config.jax_enable_x64:
+        float_dtype = jnp.float32
+    return float_dtype, jnp.promote_types(float_dtype, jnp.float32)
 
-    if augmented:
-        c_norm = np.max(np.abs(c)) or 1.0
-        b_col = sp.csc_matrix(b.reshape(-1, 1))
-        c_row = sp.csc_matrix((augmented_weight * c / c_norm).reshape(1, -1))
-        zero = sp.csc_matrix((1, 1))
-        M = sp.bmat([[A, b_col], [c_row, zero]]).tocoo()
+
+def __pad_empty_blocks(lp):
+    """Give an empty constraint block a single all-zero row (``0 = 0`` /
+    ``0 <= 0``) so downstream code never sees a zero-size constraint class.
+
+    Returns a new LP of the caller's kind (scipy ``LP`` or ``JaddleLP``) when
+    padding is needed, else ``lp`` itself; the caller's object is never modified.
+    """
+    if lp.A_eq.shape[0] > 0 and lp.A_ineq.shape[0] > 0:
+        return lp
+    n = lp.c.shape[0]
+
+    if isinstance(lp, JaddleLP):
+
+        def zero_row(like):
+            return jsp.BCOO(
+                (
+                    jnp.zeros(0, like.data.dtype),
+                    jnp.zeros((0, 2), like.indices.dtype),
+                ),
+                shape=(1, n),
+                indices_sorted=True,
+                unique_indices=True,
+            )
+
+        def zero_rhs(like):
+            return jnp.zeros(1, like.dtype)
+
     else:
-        M = A.tocoo()
 
-    absdata = jnp.asarray(np.abs(M.data))
-    row_idx = jnp.asarray(M.row.astype(np.int32))
-    col_idx = jnp.asarray(M.col.astype(np.int32))
-    return absdata, row_idx, col_idx, M.shape[0], M.shape[1], A, b, m, n
+        def zero_row(like):
+            return sp.csr_matrix((1, n), dtype=like.dtype)
+
+        def zero_rhs(like):
+            return np.zeros(1, np.asarray(like).dtype)
+
+    A_eq, b_eq, A_ineq, b_ineq = lp.A_eq, lp.b_eq, lp.A_ineq, lp.b_ineq
+    if A_eq.shape[0] == 0:
+        A_eq, b_eq = zero_row(A_eq), zero_rhs(b_eq)
+    if A_ineq.shape[0] == 0:
+        A_ineq, b_ineq = zero_row(A_ineq), zero_rhs(b_ineq)
+    return type(lp)(
+        lp.c, A_eq, b_eq, A_ineq, b_ineq, lp.lower_bounds, lp.upper_bounds
+    )
 
 
-@functools.partial(jax.jit, static_argnums=(3, 4, 5, 6, 7))
-def __equilibrate_jax(
+def __scipy_to_bcoo(A, dtype):
+    """Sorted, deduplicated BCOO of the scipy matrix ``A`` with ``dtype`` data.
+
+    Accepts any scipy sparse format. The scipy side is built at the nearest
+    scipy-supported width and only the on-device data is cast, so a float16
+    ``dtype`` lives in JAX alone.
+    """
+    np_float = np.float64 if jnp.dtype(dtype).itemsize == 8 else np.float32
+    # sorted_indices() copies, so sum_duplicates() never touches the caller's A.
+    A = sp.csr_matrix(A, dtype=np_float).sorted_indices()
+    A.sum_duplicates()
+    bcoo = jsp.BCOO.from_scipy_sparse(A.tocoo()).sort_indices()
+    return jsp.BCOO((bcoo.data.astype(dtype), bcoo.indices), shape=bcoo.shape)
+
+
+def __equilibrate(
     absdata,
     row_idx,
     col_idx,
-    n_rows,
-    n_cols,
+    row_scale,
+    col_scale,
     max_iter,
     use_max,
     clip_bounds,
     threshold,
 ):
-    """Run ``max_iter`` Sinkhorn-Ruiz equilibration sweeps in JAX.
+    """Run ``max_iter`` Sinkhorn-Ruiz equilibration sweeps from the given scales.
 
     ``use_max=True`` gives the L-infinity (Ruiz) norm via ``segment_max``;
     ``use_max=False`` gives the L1 (Pock-Chambolle) norm via ``segment_sum``.
     Row/col norms of ``D_r M D_c`` factor as ``row_scale * reduce(|M| * col_scale)``
     so the scaled matrix is never rematerialised -- each sweep is two gathers and
-    two segmented reductions over the nnz, mirroring the original numpy loop. The
+    two segmented reductions over the nnz. Starting from non-unit scales
+    therefore continues an earlier pass on the already-scaled matrix, returning
+    the product of the incoming scales and this pass's updates. The
     empty-row/col guard is implicit: absent segments yield the reduction
     identity (0 for ``segment_sum``, -inf for ``segment_max``), which the
     ``<= threshold -> 1.0`` clamp maps to a unit (no-op) scale either way.
     """
     lo, hi = clip_bounds
+    n_rows, n_cols = row_scale.shape[0], col_scale.shape[0]
 
     def reduce_segments(vals, seg, num):
         if use_max:
@@ -2167,130 +2282,162 @@ def __equilibrate_jax(
         col_scale = col_scale * jnp.clip(1.0 / jnp.sqrt(col_norms), lo, hi)
         return row_scale, col_scale
 
-    row_scale = jnp.ones(n_rows, dtype=absdata.dtype)
-    col_scale = jnp.ones(n_cols, dtype=absdata.dtype)
     return jax.lax.fori_loop(0, max_iter, body, (row_scale, col_scale))
 
 
-def __apply_scaling(lp: LP, A, b, dr, dc):
-    """Apply row scale ``dr`` (length m) and col scale ``dc`` (length n) to the LP."""
-    A_final = sp.diags(dr) @ A @ sp.diags(dc)
-    b_scaled = dr * b
-
-    n_eq = lp.A_eq.shape[0]
-    lp_scaled = LP(
-        lp.c * dc,
-        A_final[:n_eq, :],
-        b_scaled[:n_eq],
-        A_final[n_eq:, :],
-        b_scaled[n_eq:],
-        lp.lower_bounds / dc,
-        lp.upper_bounds / dc,
-    )
-    return lp_scaled, dr, dc
+def __nonzero_or_one(x):
+    return jnp.where(x > 0, x, 1.0)
 
 
-def ruiz_scaling(
-    lp: LP,
-    max_iter=30,
-    threshold=1e-8,
-    clip_bounds=(1e-6, 1e6),
-    augmented=True,
-    augmented_weight=1.0,
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "ruiz_iter",
+        "pc_iter",
+        "clip_bounds",
+        "augmented",
+        "scaled_objective",
+        "scaled_rhs",
+    ),
+)
+def __scale_problem_jax(
+    eq_data,
+    eq_idx,
+    ineq_data,
+    ineq_idx,
+    c,
+    b_eq,
+    b_ineq,
+    lower_bounds,
+    upper_bounds,
+    threshold,
+    augmented_weight,
+    *,
+    ruiz_iter,
+    pc_iter,
+    clip_bounds,
+    augmented,
+    scaled_objective,
+    scaled_rhs,
 ):
+    """Device-side body of ``scale_problem``: equilibrate, then apply the scales.
+
+    Takes the BCOO data/indices of ``A_eq``/``A_ineq`` plus the LP vectors and
+    returns ``(row_scale, col_scale, eq_data, ineq_data, c, b_eq, b_ineq,
+    lower_bounds, upper_bounds, c_max)``, all scaled. The sparsity pattern is
+    unchanged by diagonal scaling, so the callers reuse the input indices.
     """
-    Applies Ruiz scaling to an LP in standard form with sparse matrices:
-        min c^T x
-        s.t. A_eq x = b_eq
-             A_ineq x <= b_ineq
-             lower_bounds <= x <= upper_bounds
-    Returns scaled LP, row_scaling (length m), col_scaling (length n).
+    n_eq = b_eq.shape[0]
+    m, n = n_eq + b_ineq.shape[0], c.shape[0]
+    b = jnp.concatenate([b_eq, b_ineq])
 
-    ``augmented`` selects what is equilibrated:
-      * ``False`` (PDLP-style): equilibrate ``A`` alone — the operator
-        that defines the saddle dynamics — and let ``b``/``c`` ride the resulting
-        row/col scales. The augmented variant lets the appended ``b`` column and
-        ``c`` row absorb scaling, which under-equilibrates the constraint ROWS on
-        badly-scaled problems (observed on `boeing`: cols hit [1,1] but rows
-        retained a 130x spread, freezing complementarity / dual feasibility).
-      * ``True``: equilibrate the augmented ``[[A, b], [c^T, 0]]`` so cost and RHS
-        information also drive the equilibration (the previous default).
-    """
+    # [A_eq; A_ineq] as flat COO, ineq rows offset below the eq block.
+    a_row = jnp.concatenate([eq_idx[:, 0], ineq_idx[:, 0] + n_eq])
+    a_col = jnp.concatenate([eq_idx[:, 1], ineq_idx[:, 1]])
+    a_data = jnp.concatenate([eq_data, ineq_data])
 
-    # Build |M| once in scipy, then equilibrate in JAX. The L-infinity row/col
-    # norms factor as row_scale * max_over_row(|M| * col_scale), so the scaled
-    # matrix is never rematerialised. The scale vectors are sized to M (augmented:
-    # m+1/n+1; A-only: m/n); the dr/dc slices below take the first m/n entries —
-    # the LP's true dimensions — dropping the augmented row/col when present.
-    absdata, row_idx, col_idx, n_rows, n_cols, A, b, m, n = __build_scaling_coo(
-        lp, augmented, augmented_weight
-    )
+    if augmented:
+        # |[[A, b], [w c^T/||c||_inf, 0]]|: b is column n, the cost row is row m.
+        # ``augmented_weight`` (w) scales the cost row's participation,
+        # interpolating between the two endpoints for a single-dense-big-M-row
+        # instance like germanrr: the big-M magnitude is conserved and Ruiz can
+        # only decide whether it lands in the matrix or in the cost vector
+        # (their product ``matrix_ratio * c_max`` is invariant ~= sqrt of the
+        # raw big-M ratio). 1.0 is full augmented (cost stays O(1), matrix
+        # keeps the residual big-M spread); ->0 approaches A-only Ruiz (matrix
+        # flattens, cost blows up). An intermediate value (~1e-3..1e-2 on
+        # germanrr) balances the two. No effect without a big-M row.
+        # Zero b/c entries are stored but inert: they add 0 to an L1 sum, can't
+        # lift an L-inf max above a real entry, and an all-zero row/col still
+        # hits the <= threshold -> 1.0 clamp.
+        c_norm = __nonzero_or_one(jnp.max(jnp.abs(c), initial=0.0))
+        absdata = jnp.abs(
+            jnp.concatenate([a_data, b, augmented_weight * c / c_norm])
+        )
+        row_idx = jnp.concatenate(
+            [a_row, jnp.arange(m, dtype=a_row.dtype), jnp.full(n, m, a_row.dtype)]
+        )
+        col_idx = jnp.concatenate(
+            [a_col, jnp.full(m, n, a_col.dtype), jnp.arange(n, dtype=a_col.dtype)]
+        )
+        n_rows, n_cols = m + 1, n + 1
+    else:
+        absdata, row_idx, col_idx = jnp.abs(a_data), a_row, a_col
+        n_rows, n_cols = m, n
 
-    row_scale, col_scale = __equilibrate_jax(
-        absdata,
-        row_idx,
-        col_idx,
-        n_rows,
-        n_cols,
-        max_iter,
-        True,  # L-infinity (Ruiz) via segment_max
-        clip_bounds,
+    ones_r = jnp.ones(n_rows, dtype=absdata.dtype)
+    ones_c = jnp.ones(n_cols, dtype=absdata.dtype)
+    row_scale, col_scale = __equilibrate(
+        absdata, row_idx, col_idx, ones_r, ones_c, ruiz_iter, True, clip_bounds,
         threshold,
     )
 
-    dr = np.asarray(row_scale)[:m]
-    dc = np.asarray(col_scale)[:n]
-    return __apply_scaling(lp, A, b, dr, dc)
+    if augmented:
+        # PC equilibrates the augmented matrix of the Ruiz-SCALED LP, whose b
+        # column and cost row are rebuilt from the scaled vectors rather than
+        # carrying Ruiz's appended row/col scales: the b column is D_r b (col
+        # scale 1) and the cost row is re-normalised to w (c∘d_c)/||c∘d_c||_inf.
+        # Continuing from the Ruiz scales reproduces that by resetting the
+        # appended col scale to 1 and choosing the appended row scale so that
+        # |w c_j / c_norm| · row_scale[m] · d_c,j equals the re-normalised row.
+        c_ruiz = __nonzero_or_one(jnp.max(jnp.abs(c * col_scale[:n]), initial=0.0))
+        row_scale = row_scale.at[m].set(c_norm / c_ruiz)
+        col_scale = col_scale.at[n].set(1.0)
 
-
-def pc_scaling(
-    lp: LP,
-    max_iter=1,
-    threshold=1e-8,
-    clip_bounds=(1e-6, 1e6),
-    augmented=True,
-    augmented_weight=1.0,
-):
-    """
-    Applies PC scaling to an LP in standard form with sparse matrices:
-        min c^T x
-        s.t. A_eq x = b_eq
-                A_ineq x <= b_ineq
-                lower_bounds <= x <= upper_bounds
-    Returns scaled LP, row_scaling (length m), col_scaling (length n).
-
-    Scaling is derived from the augmented matrix [[A, b], [c^T, 0]] so that
-    both cost and constraint information drive the equilibration. See
-    ``__build_scaling_coo`` for ``augmented_weight``.
-    """
-
-    # Build |M| once in scipy, then equilibrate in JAX. The L1 row/col norms of
-    # D_r M D_c factor as row_scale * (|M| @ col_scale) and col_scale *
-    # (|M|^T @ row_scale) — i.e. segment_sum over the nnz — so the scaled matrix
-    # is never rematerialised.
-    absdata, row_idx, col_idx, n_rows, n_cols, A, b, m, n = __build_scaling_coo(
-        lp, augmented=augmented, augmented_weight=augmented_weight
+    row_scale, col_scale = __equilibrate(
+        absdata, row_idx, col_idx, row_scale, col_scale, pc_iter, False,
+        clip_bounds, threshold,
     )
+    dr, dc = row_scale[:m], col_scale[:n]
 
-    row_scale, col_scale = __equilibrate_jax(
-        absdata,
-        row_idx,
-        col_idx,
-        n_rows,
-        n_cols,
-        max_iter,
-        False,  # L1 (PC) via segment_sum
-        clip_bounds,
-        threshold,
+    # Apply D_r A D_c directly to the stored nonzeros.
+    eq_data = eq_data * dr[eq_idx[:, 0]] * dc[eq_idx[:, 1]]
+    ineq_data = ineq_data * dr[n_eq + ineq_idx[:, 0]] * dc[ineq_idx[:, 1]]
+    c = c * dc
+    b = b * dr
+    lower_bounds = lower_bounds / dc
+    upper_bounds = upper_bounds / dc
+
+    # --- Objective/RHS constant normalisation second (on equilibrated c/b) ----
+    if scaled_objective:
+        # Normalise by the ||c||_inf of the EQUILIBRATED cost so the constant is
+        # measured in scaled space. Returned as `c_max` and multiplied back
+        # through at every unscaling site (objective, duals).
+        c_max = __nonzero_or_one(jnp.max(jnp.abs(c), initial=0.0))
+        c = c / c_max
+    else:
+        c_max = jnp.ones((), dtype=c.dtype)
+
+    if scaled_rhs:
+        # Rescale every row (both A's row and b's entry) by the SAME global
+        # scalar ||b||_inf of the EQUILIBRATED RHS. Dividing a whole row of Ax=b
+        # by a nonzero constant doesn't change its feasible set, so this is free
+        # — unlike scaling b alone, which would change the constraint. Folded
+        # into dr (not a separate c_max-style constant) so every existing
+        # true-units unscaling site (b_norm, constraint_bound, the final dual
+        # output rescale) picks it up automatically with no further threading.
+        b_max = __nonzero_or_one(jnp.max(jnp.abs(b), initial=0.0))
+        eq_data = eq_data / b_max
+        ineq_data = ineq_data / b_max
+        b = b / b_max
+        dr = dr / b_max
+
+    return (
+        dr,
+        dc,
+        eq_data,
+        ineq_data,
+        c,
+        b[:n_eq],
+        b[n_eq:],
+        lower_bounds,
+        upper_bounds,
+        c_max,
     )
-
-    dr = np.asarray(row_scale)[:m]
-    dc = np.asarray(col_scale)[:n]
-    return __apply_scaling(lp, A, b, dr, dc)
 
 
 def scale_problem(
-    lp: LP,
+    lp,
     ruiz_iter=40,
     pc_iter=1,
     threshold=1e-8,
@@ -2306,10 +2453,19 @@ def scale_problem(
         s.t. A_eq x = b_eq
              A_ineq x <= b_ineq
              lower_bounds <= x <= upper_bounds
-    Returns scaled LP, row_scaling (length m), col_scaling (length n).
+    ``lp`` is a ``JaddleLP`` or a scipy-backed ``LP``. Returns the scaled
+    ``JaddleLP``, row_scaling (length m), col_scaling (length n) as device
+    arrays, and the objective constant ``c_max``.
 
-    Scaling is derived from the augmented matrix [[A, b], [c^T, 0]] so that
-    both cost and constraint information drive the equilibration.
+    ``augmented`` selects what is equilibrated:
+      * ``True`` (default): the augmented ``[[A, b], [c^T, 0]]`` so cost and RHS
+        information also drive the equilibration.
+      * ``False`` (PDLP-style): ``A`` alone, with ``b``/``c`` riding the
+        resulting row/col scales. It froze momentum1's primal and broke boeing
+        once the relative convergence test + true-units norm fixes were in.
+
+    ``ruiz_iter`` L-infinity (Ruiz) sweeps run first, then ``pc_iter`` L1
+    (Pock-Chambolle) sweeps continue from the Ruiz scales.
 
     Ordering (PDLP convention): equilibration (Ruiz + PC) runs FIRST, on the raw
     ``c``/``b``, so the appended cost row / RHS column of the augmented matrix
@@ -2318,78 +2474,62 @@ def scale_problem(
     equilibrated ``c``/``b``. Doing the constant normalisation first would feed
     pre-flattened ``c``/``b`` into the augmented equilibration and change the
     resulting row/col scales; PDLP equilibrates, then rescales objective and RHS.
+
+    Everything runs on device in one jitted call: the matrix never round-trips
+    through scipy (that plumbing was ~95% of the old host-side pipeline's time,
+    ~1 s on scpm1 vs ~50 ms for the sweeps themselves).
     """
-
-    # --- Equilibration first (on raw c/b) -------------------------------------
-    # Apply Ruiz scaling to equilibrate the rows/cols of A.
-    lp_scaled, dr_ruiz, dc_ruiz = ruiz_scaling(
-        lp,
-        max_iter=ruiz_iter,
-        threshold=threshold,
-        clip_bounds=clip_bounds,
-        augmented=augmented,
-        augmented_weight=augmented_weight,
-    )
-
-    # Then apply PC scaling to equilibrate the rows/cols of the augmented matrix [[A,b],[c^T,0]].
-    lp_scaled_final, dr_pc, dc_pc = pc_scaling(
-        lp_scaled,
-        max_iter=pc_iter,
-        threshold=threshold,
-        clip_bounds=clip_bounds,
-        augmented=augmented,
-        augmented_weight=augmented_weight,
-    )
-
-    # Combine the row and column scalings from both methods.
-    dr_combined = dr_ruiz * dr_pc
-    dc_combined = dc_ruiz * dc_pc
-
-    # --- Objective/RHS constant normalisation second (on equilibrated c/b) ----
-    lp = lp_scaled_final
-
-    if scaled_objective:
-        # Normalise by the ||c||_inf of the EQUILIBRATED cost so the constant is
-        # measured in scaled space. Returned as `c_max` and multiplied back
-        # through at every unscaling site (objective, duals).
-        c_max = np.max(np.abs(lp.c))
-        c_max = c_max if c_max > 0 else 1.0
-        lp = LP(
-            lp.c / c_max,
-            lp.A_eq,
-            lp.b_eq,
-            lp.A_ineq,
-            lp.b_ineq,
-            lp.lower_bounds,
-            lp.upper_bounds,
-        )
+    float_dtype, compute_dtype = __profile_dtypes()
+    if isinstance(lp, JaddleLP):
+        A_eq, A_ineq = lp.A_eq, lp.A_ineq
     else:
-        c_max = 1.0
+        # Convert at the compute width rather than the profile width, so a
+        # float16 profile can't overflow raw big-M coefficients before scaling
+        # brings them down.
+        A_eq = __scipy_to_bcoo(lp.A_eq, compute_dtype)
+        A_ineq = __scipy_to_bcoo(lp.A_ineq, compute_dtype)
 
-    if scaled_rhs:
-        # Rescale every row (both A's row and b's entry) by the SAME global
-        # scalar ||b||_inf of the EQUILIBRATED RHS. Dividing a whole row of Ax=b
-        # by a nonzero constant doesn't change its feasible set, so this is free
-        # — unlike scaling b alone, which would change the constraint. Folded
-        # into dr_combined (not a separate c_max-style constant) so every
-        # existing true-units unscaling site (b_norm, constraint_bound, the final
-        # dual output rescale) picks it up automatically with no further
-        # threading.
-        b = np.concatenate([lp.b_eq, lp.b_ineq])
-        b_max = np.max(np.abs(b)) if b.size else 1.0
-        b_max = b_max if b_max > 0 else 1.0
-        lp = LP(
-            lp.c,
-            lp.A_eq / b_max,
-            lp.b_eq / b_max,
-            lp.A_ineq / b_max,
-            lp.b_ineq / b_max,
-            lp.lower_bounds,
-            lp.upper_bounds,
+    def vec(v):
+        return jnp.asarray(v, dtype=compute_dtype)
+
+    dr, dc, eq_data, ineq_data, c, b_eq, b_ineq, lb, ub, c_max = __scale_problem_jax(
+        A_eq.data.astype(compute_dtype),
+        A_eq.indices,
+        A_ineq.data.astype(compute_dtype),
+        A_ineq.indices,
+        vec(lp.c),
+        vec(lp.b_eq),
+        vec(lp.b_ineq),
+        vec(lp.lower_bounds),
+        vec(lp.upper_bounds),
+        threshold,
+        augmented_weight,
+        ruiz_iter=ruiz_iter,
+        pc_iter=pc_iter,
+        clip_bounds=tuple(clip_bounds),
+        augmented=augmented,
+        scaled_objective=scaled_objective,
+        scaled_rhs=scaled_rhs,
+    )
+
+    def rebuild(data, like):
+        return jsp.BCOO(
+            (data.astype(float_dtype), like.indices),
+            shape=like.shape,
+            indices_sorted=like.indices_sorted,
+            unique_indices=like.unique_indices,
         )
-        dr_combined = dr_combined / b_max
 
-    return to_jaddle_sparse(lp), dr_combined, dc_combined, c_max
+    lp_scaled = JaddleLP(
+        c.astype(float_dtype),
+        rebuild(eq_data, A_eq),
+        b_eq.astype(float_dtype),
+        rebuild(ineq_data, A_ineq),
+        b_ineq.astype(float_dtype),
+        lb.astype(float_dtype),
+        ub.astype(float_dtype),
+    )
+    return lp_scaled, dr, dc, float(c_max)
 
 
 def project_onto_eq(lp: JaddleLP, primal: jnp.ndarray, tol=1e-6) -> jnp.ndarray:

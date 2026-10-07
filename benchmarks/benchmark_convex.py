@@ -86,11 +86,11 @@ TOL = dict(primal_grad_norm_tolerance=1e-6, primal_feasibility_tolerance=1e-6,
 CONFIGS = {
     "alt_gd": dict(update_mode="alternating", optimiser=jo.gd(0.05)),
     "eg_ad": dict(update_mode="extragradient", adaptive_eta=0.5),
-    "eg_ad_rs": dict(update_mode="extragradient", adaptive_eta=0.5, restarts=1000,
+    "eg_ad_rs": dict(update_mode="extragradient", adaptive_eta=0.5, restarts=True,
                      epochs_per_restart=5),
     "frb_ad": dict(update_mode="forward_reflected", adaptive_eta=0.5),
     "frb_ad_rs": dict(update_mode="forward_reflected", adaptive_eta=0.5,
-                      restarts=1000, epochs_per_restart=5),
+                      restarts=True, epochs_per_restart=5),
 }
 
 

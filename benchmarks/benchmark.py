@@ -150,9 +150,11 @@ def parse_args():
     )
     p.add_argument(
         "--eliminate-defined-vars",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="After HiGHS presolve, substitute out variables defined by a dense "
-        "equality row (z = sum_j a_j x_j, e.g. gmut-*), which HiGHS keeps. See "
+        "equality row (z = sum_j a_j x_j, e.g. gmut-*, proteindesign*), which "
+        "HiGHS keeps. On by default; --no-eliminate-defined-vars disables it. See "
         "jaddle.presolve.eliminate_defined_variables.",
     )
     p.add_argument(
@@ -177,7 +179,7 @@ def load_relaxed_lp(
     tol=1e-3,
     highs_verbose=False,
     highs_kkt_tolerance=None,
-    eliminate_defined_vars=False,
+    eliminate_defined_vars=True,
 ):
     """Load an MPS file via HiGHS, relax integrality, solve for a trusted
     reference objective with the requested HiGHS solver, and convert to Jaddle's
@@ -284,8 +286,10 @@ def run_jaddle(lp, tol, max_epochs, update_mode="pdhg", max_seconds=None):
         dual_feasibility_tolerance=tol,
         dual_gap_tolerance=tol,
         update_mode=update_mode,
-        restarts=1000,
-        iterations_per_epoch=64 * 10,
+        restarts=True,
+        iterations_per_epoch=64 * 20,
+        termination_norm="l2",
+        restart_norm="l2",
     )
     wall_seconds = time.perf_counter() - t0
 

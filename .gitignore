@@ -7,4 +7,6 @@
 /venv
 .vscode
 *.csv
-/useful_stuff
+/useful_stuff/third_party
+/tools/glop_presolve/build
+/third_party

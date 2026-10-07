@@ -33,6 +33,19 @@ def highs_to_standard_form_sparse(lp: hspy.HighsLp):
 
     row_lower = np.array(lp.row_lower_, dtype=np.float64)
     row_upper = np.array(lp.row_upper_, dtype=np.float64)
+    return rows_to_standard_form(c, A, row_lower, row_upper, lower_bounds, upper_bounds)
+
+
+def rows_to_standard_form(c, A, row_lower, row_upper, lower_bounds, upper_bounds):
+    """
+    Converts a row-bounded LP
+        min c^T x  s.t.  row_lower <= A x <= row_upper,  lower <= x <= upper
+    (infinite bounds as +-inf) to the standard form of
+    ``highs_to_standard_form_sparse``: rows with equal finite bounds become
+    A_eq x = b_eq, every other finite row bound becomes a row of
+    A_ineq x <= b_ineq. Returns: LP.
+    """
+    num_col = A.shape[1]
 
     # Equality constraints: use a numeric tolerance and require finite bounds
     eps = 1e-8

@@ -29,8 +29,9 @@ import jaddle.sciopt_helpers as sh
 from benchmark import DATA_DIR, REPO_ROOT, _fmt, discover_instances, run_jaddle
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Jaddle LP benchmark with SCIP presolve.")
+def make_parser(description, default_csv):
+    """Options shared by the external-presolve benchmarks (SCIP, glop)."""
+    p = argparse.ArgumentParser(description=description)
     p.add_argument(
         "--data-dir", default=DATA_DIR, help="Directory of .mps files to glob."
     )
@@ -76,7 +77,7 @@ def parse_args():
     )
     p.add_argument(
         "--csv",
-        default=os.path.join(REPO_ROOT, "benchmark_sciopt_results.csv"),
+        default=os.path.join(REPO_ROOT, default_csv),
         help="Path to write CSV results.",
     )
     p.add_argument(
@@ -98,14 +99,9 @@ def parse_args():
         "benchmarks/scan_bigm.py.",
     )
     p.add_argument(
-        "--scip-verbose",
-        action="store_true",
-        help="Enable SCIP's own presolve logging.",
-    )
-    p.add_argument(
         "--eliminate-defined-vars",
         action="store_true",
-        help="After SCIP presolve, substitute out variables defined by a dense "
+        help="After presolve, substitute out variables defined by a dense "
         "equality row (z = sum_j a_j x_j, e.g. gmut-*). See "
         "jaddle.presolve.eliminate_defined_variables.",
     )
@@ -121,6 +117,18 @@ def parse_args():
         choices=["float64", "float32", "float16"],
         help="JAX precision profile passed to jaddle_optimisers.configure_jax "
         "(default: float64).",
+    )
+    return p
+
+
+def parse_args():
+    p = make_parser(
+        "Jaddle LP benchmark with SCIP presolve.", "benchmark_sciopt_results.csv"
+    )
+    p.add_argument(
+        "--scip-verbose",
+        action="store_true",
+        help="Enable SCIP's own presolve logging.",
     )
     return p.parse_args()
 
@@ -151,6 +159,20 @@ def load_presolved_lp(path, scip_verbose=False, eliminate_defined_vars=False):
 
 def main():
     args = parse_args()
+    run_benchmark(
+        args,
+        lambda path: load_presolved_lp(
+            path,
+            scip_verbose=args.scip_verbose,
+            eliminate_defined_vars=args.eliminate_defined_vars,
+        ),
+        presolver="SCIP",
+    )
+
+
+def run_benchmark(args, load, presolver):
+    """Presolve each instance with `load(path) -> (lp, presolve_seconds, offset)`
+    and solve it with Jaddle; write the CSV and print a markdown table."""
     jo.configure_jax(args.jax_profile)
 
     instances = discover_instances(args)
@@ -167,11 +189,7 @@ def main():
         print(f"=== {name} ({size_mb:.1f} MB) ===")
         row = {"problem": name, "size_mb": round(size_mb, 1)}
         try:
-            jaddle_lp, presolve_seconds, offset = load_presolved_lp(
-                path,
-                scip_verbose=args.scip_verbose,
-                eliminate_defined_vars=args.eliminate_defined_vars,
-            )
+            jaddle_lp, presolve_seconds, offset = load(path)
             row.update(
                 {
                     "n_vars": int(jaddle_lp.num_variables()),
@@ -193,7 +211,7 @@ def main():
             row["offset"] = offset
             row["error"] = ""
             print(
-                f"  SCIP presolve={presolve_seconds:.2f}s  |  "
+                f"  {presolver} presolve={presolve_seconds:.2f}s  |  "
                 f"Jaddle: obj={jres['jaddle_obj']:.6g} "
                 f"(solve={jres['jaddle_solve_seconds']:.2f}s, "
                 f"corrected={jres['jaddle_corrected_seconds']:.2f}s, "
@@ -207,7 +225,7 @@ def main():
         print()
 
     write_csv(args.csv, rows)
-    print_markdown(rows)
+    print_markdown(rows, presolver)
     print(f"\nCSV written to {args.csv}")
 
 
@@ -238,17 +256,17 @@ def write_csv(path, rows):
             writer.writerow({k: row.get(k, "") for k in CSV_FIELDS})
 
 
-def print_markdown(rows):
-    print("\n## Benchmark Results (SCIP presolve)\n")
+def print_markdown(rows, presolver="SCIP"):
+    print(f"\n## Benchmark Results ({presolver} presolve)\n")
     print(
-        "_LPs presolved with SCIP; no reference optimum is computed. Jaddle solve "
+        f"_LPs presolved with {presolver}; no reference optimum is computed. Jaddle solve "
         "time is solve-only (iterate loop incl. first-epoch XLA compile, excl. "
         "setup/scaling); corrected time amortises the one-off first-epoch compile "
         "out (`n·(solve−first)/(n−1)`); see `jaddle_wall_seconds` in the CSV for "
         "full call time._\n"
     )
     print(
-        "| Problem | Vars | Cons | SCIP presolve (s) | Jaddle obj | "
+        f"| Problem | Vars | Cons | {presolver} presolve (s) | Jaddle obj | "
         "Jaddle solve (s) | Jaddle corrected (s) | Converged | Stop |"
     )
     print("|---|---:|---:|---:|---:|---:|---:|:---:|:---:|")

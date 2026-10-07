@@ -99,10 +99,10 @@ class LP:
         return self.A_eq.shape[0] + self.A_ineq.shape[0]
 
     def ineq_slack(self, x):
-        return jnp.max(jnp.maximum(self.A_ineq @ x - self.b_ineq, 0.0))
+        return jnp.max(jnp.maximum(self.A_ineq @ x - self.b_ineq, 0.0), initial=0.0)
 
     def eq_slack(self, x):
-        return jnp.max(jnp.abs(self.A_eq @ x - self.b_eq))
+        return jnp.max(jnp.abs(self.A_eq @ x - self.b_eq), initial=0.0)
 
     def diff_eq_slack(self, x):
         return self.A_eq @ x - self.b_eq
@@ -216,10 +216,10 @@ class JaddleLP:
         return self.A_eq.shape[0] + self.A_ineq.shape[0]
 
     def ineq_slack(self, x):
-        return jnp.max(jnp.maximum(self.A_ineq @ x - self.b_ineq, 0.0))
+        return jnp.max(jnp.maximum(self.A_ineq @ x - self.b_ineq, 0.0), initial=0.0)
 
     def eq_slack(self, x):
-        return jnp.max(jnp.abs(self.A_eq @ x - self.b_eq))
+        return jnp.max(jnp.abs(self.A_eq @ x - self.b_eq), initial=0.0)
 
     def diff_eq_slack(self, x):
         return self.A_eq @ x - self.b_eq

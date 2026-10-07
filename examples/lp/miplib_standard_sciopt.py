@@ -50,7 +50,7 @@ solution_jaddle = jl.solve(
     lp,
     verbose=True,
     iterations_per_epoch=128 * 10,
-    restarts=1000,
+    restarts=True,
     epochs_per_restart=20,
 )["solution"]
 

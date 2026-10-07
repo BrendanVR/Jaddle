@@ -38,7 +38,9 @@ def eliminate_defined_variables(
 
     Targets rows ``a*z + r.x = b`` where ``z`` has zero cost and appears in no
     other equality row, e.g. ``z = sum_j a_j x_j`` aggregates whose coefficients mirror the
-    objective (gmut-*, leo1). HiGHS/SCIP leave these in place: ``z`` is not a
+    objective (gmut-*, leo1). Also targets the objective-row variant where ``z``
+    is the row's only costed entry (``min z, z = sum_j a_j x_j``, proteindesign*):
+    the substitution then turns the dense row into a dense cost vector. HiGHS/SCIP leave these in place: ``z`` is not a
     column singleton (it is used by inequality rows too), not free (so the
     substitution needs an explicit bound row), and substituting a dense row
     exceeds their fill-in limits. For PDHG the dense row is the problem -- it
@@ -82,10 +84,18 @@ def eliminate_defined_variables(
         idx, val = A_eq.indices[lo:hi], A_eq.data[lo:hi]
         ok = (col_eq_uses[idx] == 1) & (col_ineq_uses[idx] <= max_col_uses)
         ok &= np.abs(val) > 1e-9
-        # The aggregate carries no cost of its own (the cost is spread over the
-        # summands). Without this, a costed summand x_j would be substituted
-        # instead, leaving the aggregate -- and the pathology -- in place.
-        ok &= c[idx] == 0.0
+        costed = c[idx] != 0.0
+        if np.count_nonzero(costed) == 1 and ok[costed][0]:
+            # Objective row ``min z, z = sum_j a_j x_j`` (proteindesign*): the
+            # row's only costed entry IS the aggregate, so substitute it and its
+            # cost moves onto the zero-cost summands.
+            ok = costed
+        else:
+            # The aggregate carries no cost of its own (the cost is spread over
+            # the summands). Without this, a costed summand x_j would be
+            # substituted instead, leaving the aggregate -- and the pathology --
+            # in place.
+            ok &= ~costed
         if not ok.any():
             continue
         # Fewest inequality uses (least fill -- the aggregate variable itself,

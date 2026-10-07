@@ -663,7 +663,7 @@ def solve(
     k_theta=0.5,
     k_init=None,
     adaptive_eta="auto",
-    restarts=0,
+    restarts=False,
     epochs_per_restart=10,
     restart_multiplier=1.0,
     restart_decay=0.2,
@@ -724,8 +724,9 @@ def solve(
             here) and requires ``k_scale`` (the primal weight k). The learned
             ``eta`` is carried across restarts. The optimiser's learning rate is
             bypassed in the hot loop.
-        restarts: Maximum number of warm restarts (default 0 = disabled). Each
-            restart resets the optimiser momentum and averaging while keeping the
+        restarts: Enable adaptive warm restarts (default ``False``). There is
+            no cap on how many fire; the triggers alone decide. Each restart
+            resets the optimiser momentum and averaging while keeping the
             current iterate as a warm start. A restart fires when the normalised
             KKT merit drops below ``restart_decay`` × the merit at the last
             restart (sufficient-progress restart) or the cycle-length cap is
@@ -1192,7 +1193,7 @@ def solve(
                 print("----------------------------------------------")
 
             # --- Adaptive restart decision ---
-            if restarts and restarts_done < restarts:
+            if restarts:
                 epochs_since_restart += 1
 
                 merit = kkt_merit(
@@ -1297,7 +1298,7 @@ def solve(
                         else:
                             k_msg = ""
                         print(
-                            f"Restart {restarts_done}/{restarts} at epoch {count} "
+                            f"Restart {restarts_done} at epoch {count} "
                             f"({reason}, merit={float(restart_merit):.2e} "
                             f"[{which}], next cap={current_cycle_cap:.0f} epochs, "
                             f"iters/epoch={current_iterations_per_epoch}{k_msg})"
