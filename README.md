@@ -79,26 +79,42 @@ Jaddle well suited to research and experimentation.
 
 ## Installation
 
-Clone the repository and install it in editable mode:
+Jaddle requires Python 3.11 or later. Clone the repository and install it:
 
 ```bash
+git clone https://github.com/BrendanVR/Jaddle.git
+cd Jaddle
 pip install -e .
 ```
 
 This installs the core dependencies: `jax`, `optax`, `numpy`, `scipy` and
-`highspy`. For GPU execution, install a CUDA-enabled JAX build following the
-[JAX installation guide](https://docs.jax.dev/en/latest/installation.html),
-for example `pip install -U "jax[cuda12]"`.
+`highspy`, and runs on CPU. Optional features are available as extras, which
+can be combined, for example `pip install -e ".[cuda12,examples]"`:
 
-Optional dependencies:
+| Extra | Installs | Used for |
+|---|---|---|
+| `cuda12`, `cuda13` | CUDA-enabled JAX | GPU execution. Choose the extra that matches your CUDA driver; see the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) for TPU and other platforms. |
+| `scip` | `pyscipopt` | Reading and presolving MPS files with SCIP (`jaddle.sciopt_helpers`) |
+| `glop` | `ortools` | Presolving with OR-Tools glop (`jaddle.glop_helpers`). Also requires building the helper with `tools/glop_presolve/build.sh`. |
+| `examples` | `matplotlib`, `scikit-learn` | The convex examples |
+| `test` | `pytest` | Running the test suite |
+| `dev` | `examples`, `test`, `build`, `twine` | Development and packaging |
 
-| Package | Used for |
-|---|---|
-| `pyscipopt` | Reading and presolving MPS files with SCIP (`jaddle.sciopt_helpers`) |
-| `ortools` | Presolving with OR-Tools glop (`jaddle.glop_helpers`; also requires `tools/glop_presolve/build.sh`) |
-| `matplotlib`, `scikit-learn` | The convex examples (`pip install -e ".[examples]"` installs scikit-learn) |
+Jaddle is developed on Linux, including WSL 2. Continuous integration tests
+it on Python 3.11, 3.12 and 3.13.
 
-Jaddle is developed and tested on Linux, including WSL 2.
+### Running the tests
+
+```bash
+pip install -e ".[examples,test]"
+pytest
+```
+
+The suite runs on CPU in double precision and takes well under a minute. It
+checks both solvers against exact or reference solutions (SciPy's HiGHS
+interface for LPs, closed-form solutions for the convex problems), the
+defined-variable presolve, and the self-contained examples. GitHub Actions runs
+it on every push and pull request.
 
 ## Quick start
 
@@ -143,7 +159,7 @@ result = jc.solve(cp)
 p = result["solution"].primal
 ```
 
-The [`examples/`](examples/README.md) directory contains complete, annotated
+The [`examples/`](https://github.com/BrendanVR/Jaddle/blob/main/examples/README.md) directory contains complete, annotated
 versions of both, together with examples that load and solve MIPLIB instances.
 
 ## The linear programming solver
@@ -381,22 +397,23 @@ limit per instance, Jaddle certifies optimality on **374 of the 383**
 instances.
 
 The benchmark harnesses, instance diagnostics and instructions for reproducing
-these results are described in [`benchmarks/README.md`](benchmarks/README.md).
+these results are described in [`benchmarks/README.md`](https://github.com/BrendanVR/Jaddle/blob/main/benchmarks/README.md).
 
 ## Repository layout
 
 | Path | Contents |
 |---|---|
-| [`jaddle/jaddle_linear.py`](jaddle/jaddle_linear.py) | LP solver, scaling, certification and polishing |
-| [`jaddle/jaddle_convex.py`](jaddle/jaddle_convex.py) | Convex solver |
-| [`jaddle/jaddle_basic_types.py`](jaddle/jaddle_basic_types.py) | `SaddleState`, `JaddleCP`, `LP` and `JaddleLP` |
-| [`jaddle/jaddle_optimisers.py`](jaddle/jaddle_optimisers.py) | Precision profiles and Optax saddle-point optimisers |
-| [`jaddle/presolve.py`](jaddle/presolve.py) | Defined-variable elimination and postsolve |
-| [`jaddle/highs_helpers.py`](jaddle/highs_helpers.py), [`sciopt_helpers.py`](jaddle/sciopt_helpers.py), [`glop_helpers.py`](jaddle/glop_helpers.py) | Converters and presolve interfaces for HiGHS, SCIP and OR-Tools glop |
-| [`examples/`](examples/README.md) | Worked LP and convex examples |
-| [`benchmarks/`](benchmarks/README.md) | MIPLIB and convex benchmark harnesses |
-| [`tools/glop_presolve/`](tools/glop_presolve/) | C++ helper exposing glop's presolver |
+| [`jaddle/jaddle_linear.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_linear.py) | LP solver, scaling, certification and polishing |
+| [`jaddle/jaddle_convex.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_convex.py) | Convex solver |
+| [`jaddle/jaddle_basic_types.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_basic_types.py) | `SaddleState`, `JaddleCP`, `LP` and `JaddleLP` |
+| [`jaddle/jaddle_optimisers.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_optimisers.py) | Precision profiles and Optax saddle-point optimisers |
+| [`jaddle/presolve.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/presolve.py) | Defined-variable elimination and postsolve |
+| [`jaddle/highs_helpers.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/highs_helpers.py), [`sciopt_helpers.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/sciopt_helpers.py), [`glop_helpers.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/glop_helpers.py) | Converters and presolve interfaces for HiGHS, SCIP and OR-Tools glop |
+| [`examples/`](https://github.com/BrendanVR/Jaddle/blob/main/examples/README.md) | Worked LP and convex examples |
+| [`benchmarks/`](https://github.com/BrendanVR/Jaddle/blob/main/benchmarks/README.md) | MIPLIB and convex benchmark harnesses |
+| [`tools/glop_presolve/`](https://github.com/BrendanVR/Jaddle/tree/main/tools/glop_presolve) | C++ helper exposing glop's presolver |
+| [`tests/`](https://github.com/BrendanVR/Jaddle/tree/main/tests) | Test suite (`pytest`) |
 
 ## License
 
-Jaddle is released under the MIT License. See [LICENSE.txt](LICENSE.txt).
+Jaddle is released under the MIT License. See [LICENSE.txt](https://github.com/BrendanVR/Jaddle/blob/main/LICENSE.txt).

@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jaddle"
+version = "0.1.0"
+description = "First-order primal-dual solvers for large-scale linear and convex programs, written in JAX"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE.txt"]
+authors = [{ name = "Brendan van Rooyen" }]
+requires-python = ">=3.11"
+keywords = [
+    "optimization",
+    "linear programming",
+    "convex optimization",
+    "pdhg",
+    "pdlp",
+    "saddle point",
+    "jax",
+    "gpu",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+# Floors are the versions Jaddle is developed and tested against.
+dependencies = [
+    "jax>=0.10",
+    "optax>=0.2.8",
+    "numpy>=2.0",
+    "scipy>=1.13",
+    "highspy>=1.14",
+]
+
+[project.optional-dependencies]
+cuda12 = ["jax[cuda12]>=0.10"]
+cuda13 = ["jax[cuda13]>=0.10"]
+scip = ["pyscipopt>=6.0"]
+glop = ["ortools>=9.15"]
+examples = ["matplotlib>=3.8", "scikit-learn>=1.5"]
+test = ["pytest>=8"]
+dev = ["jaddle[examples,test]", "build", "twine"]
+
+[project.urls]
+Homepage = "https://github.com/BrendanVR/Jaddle"
+Source = "https://github.com/BrendanVR/Jaddle"
+Issues = "https://github.com/BrendanVR/Jaddle/issues"
+
+[tool.setuptools.packages.find]
+include = ["jaddle*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
