@@ -220,6 +220,7 @@ def worker_main(config_path):
                     cfg["update_mode"],
                     cfg["max_seconds"],
                     verbose=cfg["jaddle_verbose"],
+                    cost_col_floor=cfg["cost_col_floor"],
                 ),
             )
             sol = jax.block_until_ready(result["solution"])
@@ -296,6 +297,7 @@ def run_worker(solver, lp_dir, args):
                 "max_epochs": args.max_epochs,
                 "max_seconds": args.max_seconds,
                 "update_mode": args.update_mode,
+                "cost_col_floor": args.cost_col_floor,
                 "jax_profile": args.jax_profile,
                 "mpax_algorithm": args.mpax_algorithm,
                 "mpax_norm": args.mpax_norm,

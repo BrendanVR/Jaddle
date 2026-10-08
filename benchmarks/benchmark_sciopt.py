@@ -30,6 +30,7 @@ from benchmark import (
     DATA_DIR,
     REPO_ROOT,
     _fmt,
+    add_cost_col_floor_flag,
     add_jaddle_verbose_flag,
     discover_instances,
     run_jaddle,
@@ -53,9 +54,9 @@ def make_parser(
     p.add_argument(
         "--max-mb",
         type=float,
-        default=100.0,
-        help="Skip .mps files larger than this many MB (default 100; huge "
-        "instances can OOM or run for very long). Set 0 to disable.",
+        default=None,
+        help="Skip .mps files larger than this many MB (default: no limit; huge "
+        "instances can OOM or run for very long).",
     )
     p.add_argument(
         "--min-mb",
@@ -129,6 +130,7 @@ def make_parser(
         help="JAX precision profile passed to jaddle_optimisers.configure_jax "
         "(default: float64).",
     )
+    add_cost_col_floor_flag(p)
     add_jaddle_verbose_flag(p, jaddle_verbose, jaddle_verbose_text)
     return p
 
@@ -216,6 +218,7 @@ def run_benchmark(args, load, presolver):
                 args.update_mode,
                 max_seconds=args.max_seconds,
                 verbose=args.jaddle_verbose,
+                cost_col_floor=args.cost_col_floor,
             )
             # jaddle solves the presolved reduced problem (objective = c^T x);
             # add the presolve offset to report the full-problem objective.

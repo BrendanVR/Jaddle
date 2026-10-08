@@ -403,9 +403,9 @@ recompilation.
 
 Jaddle's LP solver is evaluated on the LP relaxations of the 383 MIPLIB 2017
 instances used in the PDLP papers (100k–10M nonzeros). With default solver
-settings, HiGHS presolve, a relative tolerance of `1e-4` and a 600-second
-limit per instance, Jaddle certifies optimality on **374 of the 383**
-instances.
+settings, HiGHS presolve, a relative tolerance of `1e-4` and a 3600-second
+limit per instance, Jaddle certifies optimality on **376 of the 383**
+instances. Two instances are rendered empty by HiGHS presolve. We achieved an SGM10 of 7.2 seconds for the full solve, with a corrected score of 2.96 seconds when removing Jaddles problem scaling and compile time overheads. We do not converge on the fhnw-binschedule0, fhnw-binschedule1, hgms30, hgms62 and map16715-04 instances. However, by changing the cost_col_floor input option, which alters problem scaling, we can rescue convergence on
 
 The benchmark harnesses, instance diagnostics and instructions for reproducing
 these results are described in [`benchmarks/README.md`](https://github.com/BrendanVR/Jaddle/blob/main/benchmarks/README.md).

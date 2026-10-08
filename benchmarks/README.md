@@ -77,11 +77,12 @@ tools/glop_presolve/build.sh   # downloads the matching OR-Tools C++ release int
 |---|---|---|
 | `--data-dir DIR` | `data/` | Directory to glob for `*.mps` files. |
 | `--only NAME ...` | all | Restrict the run to these instance names (without `.mps`). |
-| `--max-mb X` / `--min-mb X` | `100` / `0` | Skip files above or below a size in MB. `--max-mb 0` removes the cap. |
+| `--max-mb X` / `--min-mb X` | none / `0` | Skip files above or below a size in MB. By default there is no upper limit. |
 | `--tol X` | `1e-3` | Relative tolerance for primal feasibility, dual feasibility and duality gap. |
 | `--max-epochs N` | none | Cap on Jaddle epochs. |
 | `--max-seconds S` | none | Per-instance Jaddle wall-clock budget, including setup and XLA compile. It is checked at epoch boundaries. |
 | `--update-mode` | `alternating` | Passed to `jl.solve`: `alternating`, `pdhg` or `halpern`. |
+| `--cost-col-floor X` | `0` | Passed to `jl.solve` as `cost_col_floor`. A costed column whose largest scaled matrix entry is below `X` is rescaled so that entry becomes 1. This fixes epigraph objectives such as fhnw-binschedule0. `0` disables it, as in `jl.solve`'s default; try `1e-2` to enable it. |
 | `--jax-profile` | `float64` | Passed to `configure_jax`: `float64`, `float32` or `float16`. |
 | `--skip-bigm` | off | Skip instances with cost big-M (see [`scan_bigm.py`](#scan_bigmpy)). |
 | `--skip-bigm-matrix` | off | Skip instances with matrix (row) big-M. |

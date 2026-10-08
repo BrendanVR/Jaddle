@@ -63,6 +63,19 @@ def add_jaddle_verbose_flag(p, default, default_text="%(default)s"):
     )
 
 
+def add_cost_col_floor_flag(p):
+    """Add the --cost-col-floor flag every LP benchmark script shares."""
+    p.add_argument(
+        "--cost-col-floor",
+        type=float,
+        default=0.0,
+        help="cost_col_floor passed to jl.solve: a costed column whose largest "
+        "scaled matrix entry is below it is rescaled so that entry becomes 1 "
+        "(fixes epigraph objectives, e.g. fhnw-binschedule0). 0 disables it, "
+        "matching jl.solve's default; try 1e-2 to enable (default: %(default)s).",
+    )
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Jaddle vs HiGHS-PDLP LP benchmark.")
     p.add_argument(
@@ -77,9 +90,9 @@ def parse_args():
     p.add_argument(
         "--max-mb",
         type=float,
-        default=100.0,
-        help="Skip .mps files larger than this many MB (default 100; huge "
-        "instances can OOM or run for very long). Set 0 to disable.",
+        default=None,
+        help="Skip .mps files larger than this many MB (default: no limit; huge "
+        "instances can OOM or run for very long).",
     )
     p.add_argument(
         "--min-mb",
@@ -185,6 +198,7 @@ def parse_args():
         help="JAX precision profile passed to jaddle_optimisers.configure_jax "
         "(default: float64).",
     )
+    add_cost_col_floor_flag(p)
     add_jaddle_verbose_flag(p, default=True)
     return p.parse_args()
 
@@ -276,7 +290,9 @@ def load_relaxed_lp(
     return lp, opt_obj, highs_status, highs_seconds, offset
 
 
-def jaddle_solve_kwargs(tol, max_epochs, update_mode, max_seconds=None, verbose=True):
+def jaddle_solve_kwargs(
+    tol, max_epochs, update_mode, max_seconds=None, verbose=True, cost_col_floor=0.0
+):
     """The ``jl.solve`` settings every benchmark harness uses, so all of them
     (and benchmark_mpax.py's Jaddle arm) run the same configuration."""
     return dict(
@@ -290,10 +306,19 @@ def jaddle_solve_kwargs(tol, max_epochs, update_mode, max_seconds=None, verbose=
         update_mode=update_mode,
         iterations_per_epoch=64 * 10,
         epochs_per_restart=10,
+        cost_col_floor=cost_col_floor,
     )
 
 
-def run_jaddle(lp, tol, max_epochs, update_mode="pdhg", max_seconds=None, verbose=True):
+def run_jaddle(
+    lp,
+    tol,
+    max_epochs,
+    update_mode="pdhg",
+    max_seconds=None,
+    verbose=True,
+    cost_col_floor=0.0,
+):
     """Solve with Jaddle's saddle-point solver. Returns a dict of metrics.
 
     Three times are reported:
@@ -314,7 +339,9 @@ def run_jaddle(lp, tol, max_epochs, update_mode="pdhg", max_seconds=None, verbos
     t0 = time.perf_counter()
     result = jl.solve(
         lp,
-        **jaddle_solve_kwargs(tol, max_epochs, update_mode, max_seconds, verbose),
+        **jaddle_solve_kwargs(
+            tol, max_epochs, update_mode, max_seconds, verbose, cost_col_floor
+        ),
     )
     wall_seconds = time.perf_counter() - t0
 
@@ -423,6 +450,7 @@ def main():
                 args.update_mode,
                 max_seconds=args.max_seconds,
                 verbose=args.jaddle_verbose,
+                cost_col_floor=args.cost_col_floor,
             )
             # jaddle solves the presolved reduced problem (objective = c^T x);
             # add the presolve offset to compare against the full-problem opt_obj.
