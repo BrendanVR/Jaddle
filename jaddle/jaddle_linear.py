@@ -529,6 +529,7 @@ def solve(
     augmented_weight=1.0,
     ruiz_iterations=10,
     pc_iterations=1,
+    cost_col_floor=1e-2,
     restarts=False,
     epochs_per_restart=10,
     restart_multiplier=1.0,
@@ -704,6 +705,12 @@ def solve(
             left to their usual per-epoch handling. No effect unless
             ``update_mode="halpern"``. On an epoch where a real restart fires, the
             restart's own re-anchor takes precedence (no double re-anchor).
+        cost_col_floor: Scaling floor for cost-pinned columns: a costed column
+            whose largest scaled matrix entry is below it is rescaled so that
+            entry becomes 1. Fixes epigraph objectives (``min z, z >= a_k.x``
+            over dense rows, fhnw-binschedule0) where augmented Ruiz leaves the
+            variable huge in scaled units. Default ``1e-2``; ``0`` disables. See
+            ``scale_problem``.
         eq_projection_threshold: When set, after each epoch the unscaled equality
             residual is checked; if it exceeds this value the primal (and average)
             are projected onto the equality manifold ``A_eq x = b_eq`` via the
@@ -818,6 +825,7 @@ def solve(
             augmented_weight=augmented_weight,
             ruiz_iter=ruiz_iterations,
             pc_iter=pc_iterations,
+            cost_col_floor=cost_col_floor,
         )
 
         if verbose:
@@ -2312,6 +2320,7 @@ def __scale_problem_jax(
     upper_bounds,
     threshold,
     augmented_weight,
+    cost_col_floor,
     *,
     ruiz_iter,
     pc_iter,
@@ -2422,6 +2431,34 @@ def __scale_problem_jax(
         b = b / b_max
         dr = dr / b_max
 
+    # --- Cost-pinned column floor (after both normalisations) -----------------
+    # Augmented Ruiz lets the cost entry set a costed column's scale. When the
+    # column's matrix entries are tiny next to its cost, the scaled variable
+    # must take a huge value at the optimum and PDHG crawls towards it
+    # (fhnw-binschedule0: min z over z >= load_k(x), dense load rows squashed to
+    # ~1e-4, z_s* ~ 1.7e4 at 99.8% of ||x_s*||). Rescale such columns so their
+    # largest matrix entry is 1; c and the bounds ride along, c_max is
+    # untouched. Costed columns only: the same floor on every column fires on
+    # half of binschedule0's columns and collapses the step size.
+    a_col_all = jnp.concatenate([eq_idx[:, 1], ineq_idx[:, 1]])
+    col_max = (
+        jnp.zeros(n, dtype=c.dtype)
+        .at[a_col_all]
+        .max(jnp.abs(jnp.concatenate([eq_data, ineq_data])))
+    )
+    pinned = (c != 0.0) & (col_max > threshold) & (col_max < cost_col_floor)
+    col_boost = jnp.where(
+        pinned,
+        jnp.minimum(1.0 / jnp.where(pinned, col_max, 1.0), clip_bounds[1]),
+        1.0,
+    )
+    eq_data = eq_data * col_boost[eq_idx[:, 1]]
+    ineq_data = ineq_data * col_boost[ineq_idx[:, 1]]
+    c = c * col_boost
+    lower_bounds = lower_bounds / col_boost
+    upper_bounds = upper_bounds / col_boost
+    dc = dc * col_boost
+
     return (
         dr,
         dc,
@@ -2446,6 +2483,7 @@ def scale_problem(
     augmented_weight=1.0,
     scaled_objective=True,
     scaled_rhs=True,
+    cost_col_floor=1e-2,
 ):
     """
     Applies Ruiz+PC scaling to an LP in standard form with sparse matrices:
@@ -2474,6 +2512,12 @@ def scale_problem(
     equilibrated ``c``/``b``. Doing the constant normalisation first would feed
     pre-flattened ``c``/``b`` into the augmented equilibration and change the
     resulting row/col scales; PDLP equilibrates, then rescales objective and RHS.
+
+    ``cost_col_floor``: a costed column whose largest scaled matrix entry is
+    below this floor is rescaled so that entry becomes 1 (its cost and bounds
+    rescale with it). Under augmented Ruiz such a column's scale is pinned by
+    its cost, which leaves the variable huge in scaled units (an epigraph
+    ``min z, z >= a_k.x`` over dense rows, fhnw-binschedule0). ``0`` disables.
 
     Everything runs on device in one jitted call: the matrix never round-trips
     through scipy (that plumbing was ~95% of the old host-side pipeline's time,
@@ -2504,6 +2548,7 @@ def scale_problem(
         vec(lp.upper_bounds),
         threshold,
         augmented_weight,
+        cost_col_floor,
         ruiz_iter=ruiz_iter,
         pc_iter=pc_iter,
         clip_bounds=tuple(clip_bounds),
