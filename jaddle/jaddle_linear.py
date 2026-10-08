@@ -129,32 +129,23 @@ def estimate_augmented_inf_norm(lp: JaddleLP):
 
 # %%
 # Solvers for constrained linear optimisation via saddle point formulation
-def __sps(
-    max_iter,
-    start_iter,
+def _make_epoch_fn(
     lp: JaddleLP,
-    initial_solution,
-    initial_avg_state=None,
-    initial_opt_state=None,
-    total_weight=0.0,
     primal_damping=0.0,
     dual_damping_ineq=0.0,
     dual_damping_eq=0.0,
     average=True,
     update_mode="pdhg",
-    k_init=1.0,
-    adaptive_eta=1.0,
     merit_fn=None,
     check_every=None,
-    merit_threshold=-jnp.inf,
-    stall_threshold=-jnp.inf,
-    epoch_cache=None,
 ):
-    # `epoch_cache` is a dict owned by the caller (one per `solve` call) that
-    # memoises the jitted epoch runner across epochs. It must NOT be module-global:
-    # each runner closes over `lp` and `merit_fn`, so a global cache pins every
-    # solved LP's scaled matrices and compiled executables for the life of the
-    # process (~250 MB host + GPU per MIPLIB instance; OOMs the benchmark sweep).
+    # Returns `run_epoch(start_iter, state, average_state, opt_state,
+    # total_weight, merit_threshold, stall_threshold, *, max_iter)`, which runs
+    # one epoch of `max_iter` iterations and returns
+    # (i, state, average_state, opt_state, total_weight, stalled). It is a plain
+    # traceable function, not jitted: `solve` calls it inside its device-side
+    # epoch loop (`run_chunk`), which is jitted as a whole. `max_iter` must be a
+    # Python int (it is the scan length).
     #
     # In-epoch restart check: when `merit_fn` and `check_every` are given, the
     # epoch runs in chunks of `check_every` iterations and exits early once
@@ -210,274 +201,8 @@ def __sps(
     # The anchor z_0 is constant within an epoch (restarts / re-anchors only
     # fire at epoch boundaries in `solve`), so A @ z_0 is loop-invariant and
     # halpern carries (k, eta, anchor, Ax_anchor, Ax_state).
-    cache_key = (
-        id(lp),
-        float(primal_damping),
-        float(dual_damping_ineq),
-        float(dual_damping_eq),
-        average,
-        update_mode,
-        id(merit_fn),
-        check_every,
-    )
-    if epoch_cache is None:
-        epoch_cache = {}
-    run_epoch = epoch_cache.get(cache_key)
 
-    if run_epoch is None:
-
-        # `average_state` is deliberately not donated: when averaging is off the
-        # caller passes the same buffer for both `state` and `average_state`, and
-        # XLA rejects donating one buffer twice.
-        @functools.partial(
-            jax.jit,
-            static_argnames=("max_iter",),
-            donate_argnames=("state", "opt_state", "total_weight"),
-        )
-        def run_epoch(
-            start_iter,
-            state,
-            average_state,
-            opt_state,
-            total_weight=0.0,
-            merit_threshold=-jnp.inf,
-            stall_threshold=-jnp.inf,
-            *,
-            max_iter,
-        ):
-            def _descent_bound(state, cand, k, interaction):
-                # eta_bar = move / (2 |interaction|), move = k‖dx‖² + (1/k)‖dy‖².
-                dx = cand.primal - state.primal
-                dy_eq = cand.dual_eq - state.dual_eq
-                dy_ineq = cand.dual_ineq - state.dual_ineq
-                move = k * jnp.vdot(dx, dx) + (1.0 / k) * (
-                    jnp.vdot(dy_eq, dy_eq) + jnp.vdot(dy_ineq, dy_ineq)
-                )
-                # No movement => any step is fine (avoid 0/0); flag with +inf so
-                # the retry loop accepts and the eta-growth branch is suppressed.
-                return jnp.where(interaction > 0.0, move / (2.0 * interaction), jnp.inf)
-
-            def trial(eta, state, k, Ax_old, gp):
-                # One raw PDHG step at base step eta. `gp` = c + Aᵀy at state
-                # (eta-independent, computed once per iteration so line-search
-                # retries don't redo its matvec). Ax_old = A @ state.primal is
-                # carried; only Ax_new = A @ x_new is computed here, and the
-                # dual reads x_bar = x_new + theta (x_new - x_old), so
-                # A @ x_bar = Ax_old + (1 + theta) A_dx.
-                tau = eta / k
-                sigma = eta * k
-                x_new = projection_primal(state.primal - tau * gp)
-                Ax_new = lp.A @ x_new
-                A_dx = Ax_new - Ax_old
-                Ax_bar = Ax_old + (1.0 + theta) * A_dx
-                gd_ineq, gd_eq = grad_dual_only_from_Ax(Ax_bar, state)
-                dual_ineq = projection_non_negative(state.dual_ineq - sigma * gd_ineq)
-                dual_eq = state.dual_eq - sigma * gd_eq
-                cand = SaddleState(primal=x_new, dual_ineq=dual_ineq, dual_eq=dual_eq)
-                dy = jnp.concatenate(
-                    [dual_eq - state.dual_eq, dual_ineq - state.dual_ineq]
-                )
-                interaction = jnp.abs(jnp.vdot(dy, A_dx))
-                return cand, _descent_bound(state, cand, k, interaction), Ax_new
-
-            def step(carry, _):
-                i, state, average_state, opt_state, total_weight = carry
-                if halpern:
-                    k, eta, anchor, Ax_anchor, Ax_old = opt_state
-                else:
-                    k, eta, Ax_old = opt_state
-                ip1 = jnp.asarray(i + 1, eta.dtype)
-
-                # Retry: while the trial step exceeds its admissible bound,
-                # shrink eta to just under eta_bar and re-trial. The
-                # (1-(i+1)^-0.3) factor < 1 guarantees strict decrease, so the
-                # loop terminates. Carry (eta, cand, eta_bar, Ax_new).
-                def cond(c):
-                    eta_c, _, eta_bar_c, _ = c
-                    return eta_c > eta_bar_c
-
-                def body(c):
-                    eta_c, _, eta_bar_c, _ = c
-                    eta_s = jnp.minimum((1.0 - ip1 ** (-0.3)) * eta_bar_c, eta_c)
-                    cand_s, eta_bar_s, Ax_new_s = trial(eta_s, state, k, Ax_old, gp)
-                    return (eta_s, cand_s, eta_bar_s, Ax_new_s)
-
-                gp = grad_primal_only(state)
-                cand0, eta_bar0, Ax_new0 = trial(eta, state, k, Ax_old, gp)
-                eta0, cand, eta_bar, Ax_new = jax.lax.while_loop(
-                    cond, body, (eta, cand0, eta_bar0, Ax_new0)
-                )
-
-                if halpern:
-                    # Halpern anchor: blend T(z_k)=cand back toward z_0.
-                    # lambda_k = 1/(k_local+1) where k_local is the
-                    # restart-shifted iteration index `i` (== i_global -
-                    # restart_i_offset, reset to ~1 each cycle by `solve`), so
-                    # lambda decays as the cycle progresses and re-warms toward
-                    # 1/2 at each restart.
-                    k_local = jnp.asarray(i, eta.dtype)
-                    lam = 1.0 / (k_local + 1.0)
-                    new_state = jax.tree.map(
-                        lambda z0, tz: lam * z0 + (1.0 - lam) * tz,
-                        anchor,
-                        cand,
-                    )
-                    # Advance the matvec carry through the blend by linearity
-                    # of A: A @ new_primal = lam Ax_anchor + (1-lam) Ax_new.
-                    Ax_next = lam * Ax_anchor + (1.0 - lam) * Ax_new
-                else:
-                    new_state = cand
-                    Ax_next = Ax_new
-
-                # Advance eta for the next iterate (growth allowed once the
-                # step is accepted). When eta_bar is +inf the step did not move
-                # (e.g. pinned on the box): hold eta rather than letting the
-                # growth branch run away to NaN.
-                eta_next = jnp.minimum(
-                    (1.0 - ip1 ** (-0.3)) * eta_bar,
-                    (1.0 + ip1 ** (-0.6)) * eta0,
-                )
-                eta_next = jnp.where(jnp.isfinite(eta_bar), eta_next, eta0)
-                eta_next = jnp.where(jnp.isfinite(eta_next), eta_next, eta0)
-                eta_next = jnp.maximum(eta_next, 1e-12)
-                if halpern:
-                    opt_state = (k, eta_next, anchor, Ax_anchor, Ax_next)
-                else:
-                    opt_state = (k, eta_next, Ax_next)
-
-                if average:
-                    # PDLP-style step-size-weighted average (Applegate et al.,
-                    # "Practical LP using PDHG", the restart-average
-                    # z̄ⁿ = Σ ηₖ zᵏ / Σ ηₖ): weight each iterate by the eta
-                    # ACTUALLY used to produce it (eta0, the accepted
-                    # post-retry-shrink step).
-                    w = eta0
-                    total_weight = total_weight + w
-                    average_state = optax.incremental_update(
-                        new_state, average_state, w / total_weight
-                    )
-
-                return (i + 1, new_state, average_state, opt_state, total_weight)
-
-            # Fixed iteration count per epoch: lax.scan (static `max_iter`) lets
-            # XLA pipeline the loop body better than a while_loop whose only exit
-            # condition is `i < end_iter`. `max_iter` is a static_argname, so a
-            # changing iterations_per_epoch (restart decay) triggers a recompile.
-            #
-            # The caller-facing opt_state is (k, eta[, anchor]); seed the Ax
-            # carry here (one or two matvecs/epoch — negligible) and strip it
-            # from the returned opt_state. Re-seeding every epoch also resets any
-            # rounding drift the blended carry accumulated within the prior epoch.
-            if halpern:
-                k0, eta0, anchor0 = opt_state
-                opt_state = (
-                    k0,
-                    eta0,
-                    anchor0,
-                    lp.A @ anchor0.primal,
-                    lp.A @ state.primal,
-                )
-            else:
-                k0, eta0 = opt_state
-                opt_state = (k0, eta0, lp.A @ state.primal)
-
-            step_carry = (start_iter, state, average_state, opt_state, total_weight)
-            # scan requires the carry's output dtypes to match its input dtypes
-            # exactly (e.g. a Python-int start_iter); cast each step's output
-            # carry back to the input carry's dtypes so the loop is type-stable.
-            _carry_dtypes = jax.tree.map(lambda x: jnp.asarray(x).dtype, step_carry)
-
-            def step_typed(carry, _):
-                new_carry = step(carry, _)
-                new_carry = jax.tree.map(
-                    lambda v, dt: v.astype(dt), new_carry, _carry_dtypes
-                )
-                return new_carry, None
-
-            stalled = jnp.asarray(False)
-            if merit_fn is None or check_every is None or check_every >= max_iter:
-                scan_out, _ = jax.lax.scan(
-                    step_typed,
-                    step_carry,
-                    None,
-                    length=max_iter,
-                )
-            else:
-                n_chunks = max_iter // check_every
-
-                def chunk_cond(c):
-                    chunk, _, done, _, _ = c
-                    return (chunk < n_chunks) & (~done)
-
-                def chunk_body(c):
-                    chunk, carry, _, _, prev_m = c
-                    carry, _ = jax.lax.scan(step_typed, carry, None, length=check_every)
-                    _, s, avg, _, _ = carry
-                    m = merit_fn(s)
-                    if average:
-                        m = jnp.minimum(m, merit_fn(avg))
-                    # Condition (ii) needs a previous chunk in this epoch, so the
-                    # first chunk (prev_m = inf) can only fire condition (i).
-                    stalled = (
-                        (m <= stall_threshold) & jnp.isfinite(prev_m) & (m > prev_m)
-                    )
-                    done = (m <= merit_threshold) | stalled
-                    return chunk + 1, carry, done, stalled, m
-
-                _, scan_out, _, stalled, _ = jax.lax.while_loop(
-                    chunk_cond,
-                    chunk_body,
-                    (
-                        jnp.asarray(0),
-                        step_carry,
-                        jnp.asarray(False),
-                        jnp.asarray(False),
-                        jnp.asarray(jnp.inf, state.primal.dtype),
-                    ),
-                )
-            i, state, average_state, opt_state, total_weight = scan_out
-
-            if halpern:
-                opt_state = opt_state[:3]
-            else:
-                opt_state = opt_state[:2]
-
-            return i, state, average_state, opt_state, total_weight, stalled
-
-        epoch_cache[cache_key] = run_epoch
-
-    state = initial_solution
-
-    if initial_avg_state is not None:
-        average_state = initial_avg_state
-    else:
-        average_state = initial_solution
-
-    # `state` is donated to run_epoch; if `average_state` aliases the same buffer
-    # (the common `average=False` case) XLA rejects the call (`f(donate(a), a)`).
-    # Give `average_state` its own buffer. One copy per epoch, off the hot path.
-    if average_state is state:
-        average_state = jax.tree.map(lambda x: x + 0, average_state)
-
-    if initial_opt_state is not None:
-        opt_state = initial_opt_state
-    else:
-        dtype = initial_solution.primal.dtype
-        opt_state = (jnp.asarray(k_init, dtype), jnp.asarray(adaptive_eta, dtype))
-        if halpern:
-            # On a bare __sps call the anchor seeds from the incoming state;
-            # across a restart cycle `solve` threads it via opt_state.
-            opt_state = opt_state + (jax.tree.map(lambda x: x + 0, initial_solution),)
-
-    # run_epoch DONATES `state` and `opt_state`. The caller's restart path may
-    # hand us a `state`/`opt_state` pair that shares buffers (e.g. `state =
-    # restart_point` aliasing the halpern anchor). Donating two args that alias
-    # one buffer double-frees it, so break any aliasing with an independent copy
-    # of each donated tree — one cheap pass per epoch, off the hot path.
-    state = jax.tree.map(lambda x: x + 0, state)
-    opt_state = jax.tree.map(jnp.copy, opt_state)
-
-    return run_epoch(
+    def run_epoch(
         start_iter,
         state,
         average_state,
@@ -485,8 +210,214 @@ def __sps(
         total_weight,
         merit_threshold,
         stall_threshold,
-        max_iter=max_iter,
-    )
+        *,
+        max_iter,
+    ):
+        def _descent_bound(state, cand, k, interaction):
+            # eta_bar = move / (2 |interaction|), move = k‖dx‖² + (1/k)‖dy‖².
+            dx = cand.primal - state.primal
+            dy_eq = cand.dual_eq - state.dual_eq
+            dy_ineq = cand.dual_ineq - state.dual_ineq
+            move = k * jnp.vdot(dx, dx) + (1.0 / k) * (
+                jnp.vdot(dy_eq, dy_eq) + jnp.vdot(dy_ineq, dy_ineq)
+            )
+            # No movement => any step is fine (avoid 0/0); flag with +inf so
+            # the retry loop accepts and the eta-growth branch is suppressed.
+            return jnp.where(interaction > 0.0, move / (2.0 * interaction), jnp.inf)
+
+        def trial(eta, state, k, Ax_old, gp):
+            # One raw PDHG step at base step eta. `gp` = c + Aᵀy at state
+            # (eta-independent, computed once per iteration so line-search
+            # retries don't redo its matvec). Ax_old = A @ state.primal is
+            # carried; only Ax_new = A @ x_new is computed here, and the
+            # dual reads x_bar = x_new + theta (x_new - x_old), so
+            # A @ x_bar = Ax_old + (1 + theta) A_dx.
+            tau = eta / k
+            sigma = eta * k
+            x_new = projection_primal(state.primal - tau * gp)
+            Ax_new = lp.A @ x_new
+            A_dx = Ax_new - Ax_old
+            Ax_bar = Ax_old + (1.0 + theta) * A_dx
+            gd_ineq, gd_eq = grad_dual_only_from_Ax(Ax_bar, state)
+            dual_ineq = projection_non_negative(state.dual_ineq - sigma * gd_ineq)
+            dual_eq = state.dual_eq - sigma * gd_eq
+            cand = SaddleState(primal=x_new, dual_ineq=dual_ineq, dual_eq=dual_eq)
+            dy = jnp.concatenate(
+                [dual_eq - state.dual_eq, dual_ineq - state.dual_ineq]
+            )
+            interaction = jnp.abs(jnp.vdot(dy, A_dx))
+            return cand, _descent_bound(state, cand, k, interaction), Ax_new
+
+        def step(carry, _):
+            i, state, average_state, opt_state, total_weight = carry
+            if halpern:
+                k, eta, anchor, Ax_anchor, Ax_old = opt_state
+            else:
+                k, eta, Ax_old = opt_state
+            ip1 = jnp.asarray(i + 1, eta.dtype)
+
+            # Retry: while the trial step exceeds its admissible bound,
+            # shrink eta to just under eta_bar and re-trial. The
+            # (1-(i+1)^-0.3) factor < 1 guarantees strict decrease, so the
+            # loop terminates. Carry (eta, cand, eta_bar, Ax_new).
+            def cond(c):
+                eta_c, _, eta_bar_c, _ = c
+                return eta_c > eta_bar_c
+
+            def body(c):
+                eta_c, _, eta_bar_c, _ = c
+                eta_s = jnp.minimum((1.0 - ip1 ** (-0.3)) * eta_bar_c, eta_c)
+                cand_s, eta_bar_s, Ax_new_s = trial(eta_s, state, k, Ax_old, gp)
+                return (eta_s, cand_s, eta_bar_s, Ax_new_s)
+
+            gp = grad_primal_only(state)
+            cand0, eta_bar0, Ax_new0 = trial(eta, state, k, Ax_old, gp)
+            eta0, cand, eta_bar, Ax_new = jax.lax.while_loop(
+                cond, body, (eta, cand0, eta_bar0, Ax_new0)
+            )
+
+            if halpern:
+                # Halpern anchor: blend T(z_k)=cand back toward z_0.
+                # lambda_k = 1/(k_local+1) where k_local is the
+                # restart-shifted iteration index `i` (== i_global -
+                # restart_i_offset, reset to ~1 each cycle by `solve`), so
+                # lambda decays as the cycle progresses and re-warms toward
+                # 1/2 at each restart.
+                k_local = jnp.asarray(i, eta.dtype)
+                lam = 1.0 / (k_local + 1.0)
+                new_state = jax.tree.map(
+                    lambda z0, tz: lam * z0 + (1.0 - lam) * tz,
+                    anchor,
+                    cand,
+                )
+                # Advance the matvec carry through the blend by linearity
+                # of A: A @ new_primal = lam Ax_anchor + (1-lam) Ax_new.
+                Ax_next = lam * Ax_anchor + (1.0 - lam) * Ax_new
+            else:
+                new_state = cand
+                Ax_next = Ax_new
+
+            # Advance eta for the next iterate (growth allowed once the
+            # step is accepted). When eta_bar is +inf the step did not move
+            # (e.g. pinned on the box): hold eta rather than letting the
+            # growth branch run away to NaN.
+            eta_next = jnp.minimum(
+                (1.0 - ip1 ** (-0.3)) * eta_bar,
+                (1.0 + ip1 ** (-0.6)) * eta0,
+            )
+            eta_next = jnp.where(jnp.isfinite(eta_bar), eta_next, eta0)
+            eta_next = jnp.where(jnp.isfinite(eta_next), eta_next, eta0)
+            eta_next = jnp.maximum(eta_next, 1e-12)
+            if halpern:
+                opt_state = (k, eta_next, anchor, Ax_anchor, Ax_next)
+            else:
+                opt_state = (k, eta_next, Ax_next)
+
+            if average:
+                # PDLP-style step-size-weighted average (Applegate et al.,
+                # "Practical LP using PDHG", the restart-average
+                # z̄ⁿ = Σ ηₖ zᵏ / Σ ηₖ): weight each iterate by the eta
+                # ACTUALLY used to produce it (eta0, the accepted
+                # post-retry-shrink step).
+                w = eta0
+                total_weight = total_weight + w
+                average_state = optax.incremental_update(
+                    new_state, average_state, w / total_weight
+                )
+
+            return (i + 1, new_state, average_state, opt_state, total_weight)
+
+        # Fixed iteration count per epoch: lax.scan (static `max_iter`) lets
+        # XLA pipeline the loop body better than a while_loop whose only exit
+        # condition is `i < end_iter`. `max_iter` is a static_argname, so a
+        # changing iterations_per_epoch (restart decay) triggers a recompile.
+        #
+        # The caller-facing opt_state is (k, eta[, anchor]); seed the Ax
+        # carry here (one or two matvecs/epoch — negligible) and strip it
+        # from the returned opt_state. Re-seeding every epoch also resets any
+        # rounding drift the blended carry accumulated within the prior epoch.
+        if halpern:
+            k0, eta0, anchor0 = opt_state
+            opt_state = (
+                k0,
+                eta0,
+                anchor0,
+                lp.A @ anchor0.primal,
+                lp.A @ state.primal,
+            )
+        else:
+            k0, eta0 = opt_state
+            opt_state = (k0, eta0, lp.A @ state.primal)
+
+        step_carry = (start_iter, state, average_state, opt_state, total_weight)
+        # scan requires the carry's output dtypes to match its input dtypes
+        # exactly (e.g. a Python-int start_iter); cast each step's output
+        # carry back to the input carry's dtypes so the loop is type-stable.
+        _carry_dtypes = jax.tree.map(lambda x: jnp.asarray(x).dtype, step_carry)
+
+        def step_typed(carry, _):
+            new_carry = step(carry, _)
+            new_carry = jax.tree.map(
+                lambda v, dt: v.astype(dt), new_carry, _carry_dtypes
+            )
+            return new_carry, None
+
+        stalled = jnp.asarray(False)
+        if merit_fn is None or check_every is None or check_every >= max_iter:
+            scan_out, _ = jax.lax.scan(
+                step_typed,
+                step_carry,
+                None,
+                length=max_iter,
+            )
+        else:
+            n_chunks = max_iter // check_every
+
+            def chunk_cond(c):
+                chunk, _, done, _, _ = c
+                return (chunk < n_chunks) & (~done)
+
+            def chunk_body(c):
+                chunk, carry, _, _, prev_m = c
+                carry, _ = jax.lax.scan(step_typed, carry, None, length=check_every)
+                _, s, avg, _, _ = carry
+                m = merit_fn(s)
+                if average:
+                    m = jnp.minimum(m, merit_fn(avg))
+                # Condition (ii) needs a previous chunk in this epoch, so the
+                # first chunk (prev_m = inf) can only fire condition (i).
+                stalled = (
+                    (m <= stall_threshold) & jnp.isfinite(prev_m) & (m > prev_m)
+                )
+                done = (m <= merit_threshold) | stalled
+                return chunk + 1, carry, done, stalled, m
+
+            _, scan_out, _, stalled, _ = jax.lax.while_loop(
+                chunk_cond,
+                chunk_body,
+                (
+                    jnp.asarray(0),
+                    step_carry,
+                    jnp.asarray(False),
+                    jnp.asarray(False),
+                    jnp.asarray(jnp.inf, state.primal.dtype),
+                ),
+            )
+        i, state, average_state, opt_state, total_weight = scan_out
+
+        if halpern:
+            opt_state = opt_state[:3]
+        else:
+            opt_state = opt_state[:2]
+
+        return i, state, average_state, opt_state, total_weight, stalled
+
+    return run_epoch
+
+
+# Epoch budget for a chunk that should run until convergence: large enough never
+# to bind, small enough that `count + n` cannot overflow an int32 counter.
+_UNBOUNDED_EPOCHS = 2**30
 
 
 def _vector_norm(v, norm):
@@ -542,7 +473,6 @@ def solve(
     iterations_per_epoch_decay=1.0,
     iterations_per_epoch_min=100,
     restart_check_every="auto",
-    eq_projection_threshold=None,
     vertex_bias=0.0,
     vertex_bias_seed=0,
     reference_objective=None,
@@ -569,14 +499,28 @@ def solve(
     (sufficient-progress restart) or the current cycle reaches its length cap
     (no-progress restart). On by default; disable with ``restarts=False``.
 
+    The epoch loop runs on the device: each call into JAX executes a chunk of
+    many epochs, including the metrics, convergence test and restart logic, with
+    no host synchronisation between them. Python regains control between
+    chunks (sized to take about a second) to enforce ``max_epochs`` /
+    ``max_seconds``, print the verbose log and handle Ctrl-C. With
+    ``verbose=True`` the per-epoch ``Time`` is therefore the average over the
+    epoch's chunk. When ``verbose``, ``max_epochs`` and ``max_seconds`` are all
+    unset, nothing needs the host between epochs, so the whole solve runs as a
+    single device call (only an ``iterations_per_epoch_decay`` restart, which
+    changes the compiled epoch length, returns to Python). In that mode Ctrl-C
+    takes effect only once the call returns, and ``"corrected_seconds"`` equals
+    ``"solve_seconds"``.
+
     Args:
         max_seconds: Wall-clock budget in seconds (default ``None`` = no limit).
             Measured from entry into ``solve()``, so scaling / setup and the
-            first-epoch XLA compile count against it. Checked at each epoch
-            boundary: once the budget is spent no further epoch starts and the
-            current point is returned with ``stop_reason="time_limit"``, so the
-            solve can overrun by up to one epoch (shrink
-            ``iterations_per_epoch`` for a tighter cutoff).
+            first-epoch XLA compile count against it. Checked between chunks
+            of epochs, and each chunk is sized from the measured epoch time to
+            fit the remaining budget; once the budget is spent the current
+            point is returned with ``stop_reason="time_limit"``. The solve can
+            overrun by about one epoch (shrink ``iterations_per_epoch`` for a
+            tighter cutoff).
         dual_residual: How reduced costs split between the dual residual (DFR)
             and the dual objective (hence the gap). ``"pdlp"`` (default) follows
             PDLP with ``handle_some_primal_gradients_on_finite_bounds_as_residuals``:
@@ -719,12 +663,6 @@ def solve(
             over dense rows, fhnw-binschedule0) where augmented Ruiz leaves the
             variable huge in scaled units. Default ``0`` (disabled); pass e.g.
             ``1e-2`` to enable. See ``scale_problem``.
-        eq_projection_threshold: When set, after each epoch the unscaled equality
-            residual is checked; if it exceeds this value the primal (and average)
-            are projected onto the equality manifold ``A_eq x = b_eq`` via the
-            precomputed factorisation of ``A_eq A_eq^T``. Default ``None``
-            disables projection. Only useful when equality feasibility is the
-            bottleneck; has no effect when there are no equality constraints.
         restart_check_every: Evaluate the restart merit every this many
             iterations inside an epoch and end the epoch early once the
             sufficient-progress test (``restart_decay``) would fire, so restarts
@@ -768,7 +706,7 @@ def solve(
               one-off first-epoch XLA compile amortised out:
               ``n * (solve_seconds - first_epoch_seconds) / (n - 1)`` where ``n``
               is the epoch count. Falls back to ``solve_seconds`` when it can't be
-              formed (fewer than two epochs).
+              formed (fewer than two epochs, or a single-call solve).
             * ``"epochs"``: ``int``, number of epochs run.
     """
 
@@ -892,27 +830,6 @@ def solve(
     jnp_row_scale_ineq = jnp.array(row_scale_ineq, dtype=_state_dtype)
     jnp_row_scale_eq = jnp.array(row_scale_eq, dtype=_state_dtype)
     col_scale = jnp.asarray(col_scale, dtype=_state_dtype)
-
-    # Precompute equality-constraint projection: x ← x - A_eq^T (A_eq A_eq^T)^{-1} (A_eq x - b_eq).
-    # The factorisation is done once in scipy (scaled space); the apply is a cheap
-    # pair of matvecs. Only built when eq_projection_threshold is set and there are
-    # equality constraints.
-    _eq_project = None
-    if eq_projection_threshold is not None and lp.A_eq.shape[0] > 0:
-        import scipy.sparse.linalg as spla
-
-        _A_eq_sp = __convert_to_scipy(lp.A_eq)
-        AeqAeqT = _A_eq_sp @ _A_eq_sp.T
-        _eq_factor = spla.factorized(AeqAeqT.tocsc())
-        _b_eq_np = np.array(lp.b_eq)
-
-        def _eq_project(primal):
-            # Run entirely in numpy/scipy to avoid materialising large JAX sparse
-            # intermediates on the GPU. Pull the primal to CPU, project, push back.
-            x = np.asarray(primal)
-            residual = _A_eq_sp @ x - _b_eq_np
-            correction = _eq_factor(residual)
-            return jnp.array(x - _A_eq_sp.T @ correction)
 
     # --- Vertex-biasing cost perturbation (Mangasarian tie-break) -------------
     # First-order saddle methods converge to the analytic centre of the optimal
@@ -1293,9 +1210,6 @@ def solve(
         stalled = window_full & (rel_change < primal_stop_obj_tol)
         return feasible & stalled
 
-    def check_max_epochs(count):
-        return count >= max_epochs
-
     # PDLP-style primal-weight initialisation. When k-scaling is on and k_init is
     # left as None we derive it from the objective/RHS norms ||c|| / ||b|| (in
     # the scaled space the solver iterates in), which puts the primal/dual step
@@ -1306,109 +1220,29 @@ def solve(
         norm_b = float(jnp.linalg.norm(lp.b)) + 1e-30
         k_init = float(np.clip(norm_c / norm_b, k_lo, k_hi))
 
-    i = 1
-    state = initial_solution
-    average_state = initial_solution
     if initial_opt_state is not None:
         opt_state = initial_opt_state
     else:
         # Step-size state (k, eta); halpern also carries the anchor z_0
         # (cycle-start iterate), seeded from the initial solution and reset at
-        # each restart below.
+        # each restart.
         _pik_dtype = initial_solution.primal.dtype
         opt_state = (
             jnp.asarray(k_init, _pik_dtype),
             jnp.asarray(adaptive_eta, _pik_dtype),
         )
         if halpern:
-            opt_state = opt_state + (jax.tree.map(lambda x: x + 0, initial_solution),)
-    primal_grad_norm = jnp.inf
-    complementarity_slack = jnp.inf
-    constraint_bound = jnp.inf
-    dual_feasibility_residual = jnp.inf
-    termination_pfr = jnp.inf
-    termination_dfr = jnp.inf
-    objective_value = jnp.inf
-    duality_gap = jnp.inf
-    dual_gap_is_finite = False
-    # Gap components (bound / inequality / equality complementarity). Seeded to inf
-    # so the no-cancellation guard in converged() can't fire before the first epoch
-    # has computed real metrics (inf gives relative_gap_abs = nan ≤ tol → False).
-    gap_bound_comp = jnp.inf
-    gap_ineq_comp = jnp.inf
-    gap_eq_comp = jnp.inf
-    count = 0
-    # Wall time of the very first epoch (which pays the one-off XLA compile).
-    # Captured so callers can form a "corrected" steady-state runtime that
-    # amortises out the compile: n_epochs * (solve - first) / (n_epochs - 1).
-    first_epoch_seconds = None
-    total_weight = 0.0
-    reported_used_avg = average
-    is_converged = True
-    # Why the loop terminated. Defaults to the budget-exhausted case; is_done()
-    # overwrites it with the test that actually fired ("certificate" or
-    # "primal_stall"), and the max_epochs break path leaves it as "max_epochs".
-    stop_reason = "max_epochs"
-    current_iterations_per_epoch = iterations_per_epoch
+            opt_state = opt_state + (initial_solution,)
 
-    # Iterate at the last restart (or the start), used to rebalance the primal
-    # weight k from the primal-vs-dual movement over the restart cycle. Must be an
-    # independent copy: `state` aliases initial_solution's buffer and is donated
-    # to (freed by) __sps each epoch, so sharing it would read as deleted at the
-    # first restart's k-rebalance.
-    state_at_last_restart = jax.tree.map(lambda x: x + 0, initial_solution)
-
-    # Per-epoch primal-weight rebalance (k_update_per_epoch): reference iterate at
-    # the end of the previous epoch, used to drive k from the primal-vs-dual
-    # movement over the just-finished epoch. Independent copy for the same
-    # buffer-donation reason as state_at_last_restart.
-    k_per_epoch = bool(k_update_per_epoch)
-    state_at_last_epoch = jax.tree.map(lambda x: x + 0, initial_solution)
-
-    # Rolling window of recent objective values for the opt-in primal_stop rule
-    # (oldest first). Seeded with inf so the window is not "full" until enough
-    # real epochs have elapsed.
-    obj_window = jnp.full((max(int(primal_stop_window), 1),), jnp.inf)
-
-    # Adaptive restart bookkeeping. `restart_i_offset` is subtracted from the
-    # global iteration counter `i` before it is handed to __sps, so a restart
-    # re-zeros the halpern lambda counter and the eta growth schedule without
-    # disturbing the running epoch/iteration accounting.
-    restarts_done = 0
-    restart_i_offset = 0
-    epochs_since_restart = 0
-    # The cycle-exhaustion cap is tracked in ITERATIONS, not epochs, so that
-    # `cycle_exhausted` fires at the same point in the optimisation trajectory
-    # regardless of `iterations_per_epoch`. A restart is a destructive reset
-    # (it wipes the PDHG averaging), so its cadence must
-    # not depend on how the same iteration budget happens to be chopped into
-    # epochs. Seed the cap in iterations from the epoch-count knob so the
-    # default (epochs_per_restart=10) means the same thing it always has at the
-    # default iterations_per_epoch; iterations_since_restart accumulates the
-    # ACTUAL per-epoch iteration count, so it stays correct even under
-    # iterations_per_epoch_decay.
-    iterations_since_restart = 0
-    current_cycle_cap_iters = float(epochs_per_restart) * float(iterations_per_epoch)
-    merit_at_last_restart = jnp.inf
-    # k_theta="adaptive": live smoothing coefficient, and k before the last
-    # restart rebalance (the revert target when that move made the merit worse).
+    # k_theta="adaptive": live smoothing coefficient, judged at each restart
+    # (see the restart logic in `epoch` below).
     if isinstance(k_theta, str):
         if k_theta != "adaptive":
             raise ValueError(f"k_theta must be a float or 'adaptive', got {k_theta!r}")
-        adaptive_theta, theta_live = True, 0.5
+        adaptive_theta, theta_init = True, 0.5
     else:
-        adaptive_theta, theta_live = False, float(k_theta)
-    k_before_last_move = None
-    # Previous epoch's RELATIVE (tolerance-comparable) primal/dual residuals.
-    # Used only to gate the cycle-cap restart while the merit is non-finite
-    # (dual-infeasible): see the `still_improving` guard below. inf until the
-    # first epoch sets it, so the guard can't fire before there is a real
-    # comparison point.
-    prev_relative_pfr = jnp.inf
-    prev_relative_dfr = jnp.inf
-    # Previous epoch's restart merit, for cuPDLP condition (ii) (stalling: merit
-    # rising again after necessary decay). inf until the first epoch sets it.
-    prev_epoch_merit = jnp.inf
+        adaptive_theta, theta_init = False, float(k_theta)
+    k_per_epoch = bool(k_update_per_epoch)
 
     # Normalisation constants for the restart merit (PDLP-style). Each KKT
     # residual is divided by 1 + its natural scale so the three terms are
@@ -1454,12 +1288,19 @@ def solve(
         dual_term = dual_feasibility_residual / (1.0 + c_norm)
         return jnp.maximum(jnp.maximum(primal_term, dual_term), gap_term)
 
-    def _read_k_eta(opt_state):
-        # Surface the live primal weight k and adaptive step eta for the epoch
-        # trace. opt_state is (k, eta[, anchor]).
-        return float(opt_state[0]), float(opt_state[1])
-
-    def print_epoch_metrics(epoch_time=None, k_val=None, eta_val=None):
+    def print_epoch_metrics(
+        epoch,
+        objective_value,
+        termination_pfr,
+        termination_dfr,
+        duality_gap,
+        gap_bound_comp,
+        gap_ineq_comp,
+        gap_eq_comp,
+        epoch_time=None,
+        k_val=None,
+        eta_val=None,
+    ):
         time_str = f"|Time {epoch_time:.2f}s|" if epoch_time is not None else ""
         ke_str = ""
         if k_val is not None:
@@ -1473,13 +1314,15 @@ def solve(
         relative_pfr = termination_pfr / (1.0 + termination_b_norm)
         relative_dfr = termination_dfr / (1.0 + termination_c_norm)
         # RDGABS: the no-cancellation companion to RDG (see relative_gap_abs).
-        # `converged()` requires BOTH RDG and RDGABS <= dual_gap_tolerance;
-        # without printing RDGABS a run can show PFR/DFR/RDG all comfortably
-        # inside tolerance yet never certify because RDGABS alone is still open
-        # (the gap components are cancelling rather than genuinely small) — this
-        # was invisible in the log before RDGABS was added here.
-        rdg_abs = relative_gap_abs(
-            objective_value, duality_gap, gap_bound_comp, gap_ineq_comp, gap_eq_comp
+        # `converged()` requires RDGABS <= dual_gap_tolerance; without printing
+        # it a run can show PFR/DFR/RDG all comfortably inside tolerance yet
+        # never certify because the gap components are cancelling rather than
+        # genuinely small.
+        rdg = float(relative_gap(duality_gap, objective_value))
+        rdg_abs = float(
+            relative_gap_abs(
+                objective_value, duality_gap, gap_bound_comp, gap_ineq_comp, gap_eq_comp
+            )
         )
         # OBJERR: true relative objective error vs a supplied reference optimum.
         # The duality gap (RDG) is a complementarity sum gated by the dual, so it
@@ -1492,11 +1335,11 @@ def solve(
             )
             objerr_str = f"|OBJERR {obj_err:.2e}|"
         print(
-            f"|Epoch {count}|"
+            f"|Epoch {epoch}|"
             f"|Obj{objective_value:.2e}|"
             f"|PFR {relative_pfr:.2e}|"
             f"|DFR {relative_dfr:.2e}|"
-            f"|RDG {relative_gap(duality_gap, objective_value):.2e}|"
+            f"|RDG {rdg:.2e}|"
             f"|RDGABS {rdg_abs:.2e}|"
             f"{objerr_str}"
             f"{ke_str}"
@@ -1504,61 +1347,11 @@ def solve(
         )
         print("----------------------------------------------")
 
-    def is_done():
-        nonlocal stop_reason
-        certificate_met = bool(
-            converged(
-                termination_pfr,
-                termination_dfr,
-                duality_gap,
-                dual_gap_is_finite,
-                objective_value,
-                gap_bound_comp,
-                gap_ineq_comp,
-                gap_eq_comp,
-            )
-        )
-        # Check the certificate first: when both the full certificate and the
-        # primal-stall heuristic would fire on the same epoch, attribute the stop
-        # to the certificate — it is the stronger (truly optimal) reason.
-        if certificate_met:
-            stop_reason = "certificate"
-            return True
-        if primal_stop and bool(converged_primal(termination_pfr, obj_window)):
-            stop_reason = "primal_stall"
-            return True
-        return False
-
-    # Per-solve memo of jitted epoch runners (see __sps); freed when solve returns.
-    _epoch_cache = {}
-
     def _inloop_merit(s):
         # Same restart merit `solve` computes at the epoch boundary, traced into
-        # __sps for the in-epoch sufficient-progress check.
+        # the epoch for the in-epoch sufficient-progress check.
         obj, _pgn, _cs, cb, dfr, dg, dgf, *_rest = compute_epoch_metrics(s)
         return kkt_merit(cb, dfr, dg, dgf, obj)
-
-    def _check_every():
-        # "auto": ten in-epoch checks per epoch (tracks iterations_per_epoch
-        # decay). None disables the in-epoch check.
-        if restart_check_every == "auto":
-            return max(1, current_iterations_per_epoch // 10)
-        return restart_check_every
-
-    def _restart_thresholds():
-        # (sufficient-progress, necessary-decay) thresholds for the in-epoch
-        # check; -inf disables both (no finite baseline yet, restarts off, or
-        # the check is off).
-        if (
-            _check_every() is None
-            or not restarts
-            or not bool(jnp.isfinite(merit_at_last_restart))
-        ):
-            return -float("inf"), -float("inf")
-        return (
-            float(restart_decay * merit_at_last_restart),
-            float(necessary_decay * merit_at_last_restart),
-        )
 
     # PDLP-style primal-weight rebalance from the primal-vs-dual *movement*
     # between two iterates (distance, not per-step gradient norms). Shared by the
@@ -1581,17 +1374,495 @@ def solve(
         log_k = theta * jnp.log(k_target) + (1.0 - theta) * jnp.log(k_prev)
         return jnp.clip(jnp.exp(log_k), k_lo, k_hi)
 
+    # --- Device-resident epoch loop -------------------------------------------
+    # Epochs run in chunks: one jitted lax.while_loop (`run_chunk`) executes many
+    # epochs back to back on the device -- the iterations, the end-of-epoch
+    # metrics, the termination test, and the restart / primal-weight logic -- so
+    # the host never waits on the device between epochs. Python regains control
+    # only between chunks, to enforce max_epochs / max_seconds, print the
+    # buffered epoch log and restart messages, and catch Ctrl-C. Chunks are sized
+    # to take about `_CHUNK_TARGET_SECONDS`, so those checks stay responsive.
+    #
+    # All loop state lives in the `carry` dict below. A chunk also ends early
+    # when a restart decays `iterations_per_epoch` (the epoch length is a static
+    # scan length, so the next chunk is compiled for the new length) or when the
+    # verbose log buffers fill.
+    _CHUNK_TARGET_SECONDS = 1.0
+    _LOG_CAP = 64  # buffered epoch-log rows per chunk
+    _EVT_CAP = 64  # buffered restart events per chunk
+    _metric_shapes = jax.eval_shape(compute_epoch_metrics, initial_solution)
+    _merit_dtype = _metric_shapes[3].dtype
+
+    def _initial_metrics():
+        # +inf everywhere (and gap finiteness False) so the convergence tests
+        # can't fire before the first epoch has computed real metrics.
+        return tuple(
+            jnp.zeros(m.shape, m.dtype)
+            if m.dtype == jnp.bool_
+            else jnp.full(m.shape, jnp.inf, m.dtype)
+            for m in _metric_shapes
+        )
+
+    def _merit_of(m):
+        return kkt_merit(m[3], m[4], m[5], m[6], m[0])
+
+    def _select(pred, a, b):
+        return jax.tree.map(lambda x, y: jnp.where(pred, x, y), a, b)
+
+    def _strong(tree):
+        # Strip JAX's weak typing (from Python-scalar inputs like jnp.asarray(0))
+        # so the carry handed to run_chunk always has exactly the types run_chunk
+        # returns; otherwise the second call retraces and recompiles the chunk.
+        return jax.tree.map(
+            lambda x: jax.lax.convert_element_type(x, jnp.asarray(x).dtype), tree
+        )
+
+    def _check_every_for(ipe):
+        # "auto": ten in-epoch checks per epoch. None disables the check.
+        if restart_check_every == "auto":
+            return max(1, ipe // 10)
+        return restart_check_every
+
+    def _build_chunk(ipe):
+        check_every = _check_every_for(ipe)
+        run_epoch = _make_epoch_fn(
+            lp,
+            primal_damping,
+            dual_damping_ineq,
+            dual_damping_eq,
+            average,
+            update_mode,
+            merit_fn=_inloop_merit if check_every else None,
+            check_every=check_every,
+        )
+        inloop_restart_check = bool(check_every) and restarts
+        ipe_after_restart = max(
+            iterations_per_epoch_min, int(ipe * iterations_per_epoch_decay)
+        )
+
+        def epoch(c):
+            mal = c["merit_at_last_restart"]
+            # In-epoch restart thresholds: sufficient progress and necessary
+            # decay relative to the merit at the last restart; -inf (never
+            # fires) until a finite baseline exists, or when the check is off.
+            if inloop_restart_check:
+                finite = jnp.isfinite(mal)
+                thr_sufficient = jnp.where(finite, restart_decay * mal, -jnp.inf)
+                thr_stall = jnp.where(finite, necessary_decay * mal, -jnp.inf)
+            else:
+                thr_sufficient = thr_stall = jnp.asarray(-jnp.inf, _merit_dtype)
+
+            # The epoch runs on the restart-shifted index, so a restart re-zeros
+            # the halpern lambda counter and the eta growth schedule.
+            start = c["i"] - c["restart_i_offset"]
+            shifted_i, state, avg, opt, total_weight, stalled = run_epoch(
+                start,
+                c["state"],
+                c["avg"],
+                c["opt"],
+                c["total_weight"],
+                thr_sufficient,
+                thr_stall,
+                max_iter=ipe,
+            )
+            i = shifted_i + c["restart_i_offset"]
+            # Iterations actually run (an in-epoch restart check may exit early).
+            iters_this_epoch = shifted_i - start
+            count = c["count"] + 1
+
+            metrics = compute_epoch_metrics(avg if average else state)
+            # `used_avg` tracks which point the metrics describe.
+            used_avg = jnp.asarray(average)
+            # report_best: when averaging is on, the average and the last iterate
+            # are different points and either can be the better solution
+            # (averaging stabilises rotational problems but lags the last iterate
+            # when it is already contracting). Report/converge on whichever has
+            # the lower KKT merit, at the cost of a second matvec pair per epoch.
+            if report_best and average:
+                state_metrics = compute_epoch_metrics(state)
+                iterate_better = _merit_of(state_metrics) < _merit_of(metrics)
+                metrics = _select(iterate_better, state_metrics, metrics)
+                used_avg = ~iterate_better
+            objective_value = metrics[0]
+
+            # Roll the latest objective into the primal_stop window (oldest first).
+            obj_window = jnp.concatenate(
+                [c["obj_window"][1:], jnp.reshape(objective_value, (1,))]
+            )
+
+            log, n_log, evt, n_evt = c["log"], c["n_log"], c["evt"], c["n_evt"]
+            if verbose:
+                write = (count == 1) | (count % log_every == 0)
+                row = jnp.stack(
+                    [
+                        count,
+                        objective_value,
+                        metrics[10],
+                        metrics[11],
+                        metrics[5],
+                        metrics[7],
+                        metrics[8],
+                        metrics[9],
+                        opt[0],
+                        opt[1],
+                    ]
+                ).astype(log.dtype)
+                log = jnp.where(write, log.at[n_log].set(row), log)
+                n_log = n_log + write
+
+            # --- Adaptive restart decision ---
+            restarted = jnp.asarray(False)
+            theta = c["theta"]
+            k_before, has_k_before = c["k_before_last_move"], c["has_k_before"]
+            at_restart = c["state_at_last_restart"]
+            restart_i_offset = c["restart_i_offset"]
+            iterations_since = c["iterations_since_restart"]
+            cycle_cap = c["cycle_cap"]
+            ipe_next = c["ipe"]
+            restarts_done = c["restarts_done"]
+            prev_pfr = c["prev_relative_pfr"]
+            prev_dfr = c["prev_relative_dfr"]
+            prev_epoch_merit = c["prev_epoch_merit"]
+            if restarts:
+                iterations_since = iterations_since + iters_this_epoch
+                # `merit` is the metric of the *reported* point: with report_best
+                # it is already the better of {average, iterate}; otherwise it is
+                # the average (averaging on) or the last iterate.
+                merit = _merit_of(metrics)
+                cycle_exhausted = iterations_since >= cycle_cap
+
+                # --- Two-point restart candidate (PDLP-style) ---
+                # Restart to whichever of {average, iterate} has the lower merit
+                # instead of always discarding a frequently-better average.
+                restart_used_avg = used_avg if average else jnp.asarray(False)
+                restart_point = _select(restart_used_avg, avg, state)
+                restart_merit = merit
+                near_threshold = merit <= restart_decay * mal
+                if average and not report_best:
+                    # report_best is off, so the iterate's metrics were not
+                    # computed yet. Only pay for them on epochs where a restart
+                    # can actually fire (cycle exhausted, or the average already
+                    # near the sufficient-progress threshold).
+                    need = cycle_exhausted | near_threshold
+                    state_merit = jax.lax.cond(
+                        need,
+                        lambda s: _merit_of(compute_epoch_metrics(s)).astype(
+                            merit.dtype
+                        ),
+                        lambda s: jnp.full((), jnp.inf, merit.dtype),
+                        state,
+                    )
+                    iterate_better = need & (state_merit < merit)
+                    restart_point = _select(iterate_better, state, restart_point)
+                    restart_merit = jnp.where(iterate_better, state_merit, restart_merit)
+                    restart_used_avg = restart_used_avg & ~iterate_better
+
+                # A non-finite merit carries no progress signal — it just means
+                # the iterate is dual-infeasible so the duality gap (hence the KKT
+                # merit) is +∞. Without this gate the progress tests below
+                # degenerate to `inf <= restart_decay*inf` → True, firing a
+                # restart EVERY epoch (neos-3754480-nidda: 10 restarts in 10
+                # epochs, all on merit=inf). Only the length-based
+                # `cycle_exhausted` path may fire on an inf merit.
+                merit_is_finite = jnp.isfinite(restart_merit)
+
+                # While still dual-infeasible, BOTH relative feasibility residuals
+                # decreasing epoch-over-epoch means the run is mid-flight on a
+                # good trajectory, not stuck — a cycle-cap restart there only
+                # destroys momentum (momentum1). Suppress just the exhaustion path.
+                relative_pfr = metrics[3] / (1.0 + b_norm)
+                relative_dfr = metrics[4] / (1.0 + c_norm)
+                still_improving = (
+                    (~merit_is_finite)
+                    & (relative_pfr < prev_pfr)
+                    & (relative_dfr < prev_dfr)
+                )
+                cycle_exhausted = cycle_exhausted & ~still_improving
+                prev_pfr, prev_dfr = relative_pfr, relative_dfr
+
+                # Seed the baseline on the first finite merit so the
+                # sufficient-progress test has something real to compare against.
+                mal = jnp.where(
+                    ~jnp.isfinite(mal) & merit_is_finite, restart_merit, mal
+                )
+
+                sufficient_progress = merit_is_finite & (
+                    restart_merit <= restart_decay * mal
+                )
+                # cuPDLP condition (ii) — "necessary decay + stalling": restart
+                # once the merit has decayed to <= necessary_decay of its
+                # cycle-start value AND has started rising again (the in-epoch
+                # check saw it chunk-to-chunk, or vs the previous epoch).
+                stalling_restart = (
+                    merit_is_finite
+                    & (restart_merit <= necessary_decay * mal)
+                    & (
+                        stalled
+                        | (
+                            jnp.isfinite(prev_epoch_merit)
+                            & (restart_merit > prev_epoch_merit)
+                        )
+                    )
+                )
+                restarted = sufficient_progress | stalling_restart | cycle_exhausted
+
+                # PDLP-style primal-weight rebalance from the movement over the
+                # just-finished cycle, blended in log space (k_theta), clamped.
+                k_prev = opt[0]
+                theta_new = theta
+                if adaptive_theta:
+                    # Trust region on log k: the cycle just finished ran under
+                    # the last k move, so judge that move by it.
+                    judge = has_k_before & merit_is_finite & jnp.isfinite(mal)
+                    improved = restart_merit < mal
+                    theta_new = jnp.where(
+                        judge,
+                        jnp.where(
+                            improved,
+                            jnp.minimum(1.0, 2.0 * theta),
+                            jnp.maximum(0.05, 0.5 * theta),
+                        ),
+                        theta,
+                    )
+                    k_prev = jnp.where(judge & ~improved, k_before, k_prev)
+                k_new = _rebalance_k(restart_point, at_restart, k_prev, theta_new)
+                if halpern:
+                    # Restarted Halpern: reset eta and re-anchor z_0 to the
+                    # cycle-start iterate.
+                    opt_restart = (
+                        k_new,
+                        jnp.asarray(adaptive_eta, opt[1].dtype),
+                        restart_point,
+                    )
+                else:
+                    # Carry the learned step size across the restart (PDLP
+                    # convention): re-seeding forced the adaptive rule to
+                    # re-climb from scratch after every restart.
+                    opt_restart = (k_new, opt[1])
+
+                # Warm-start from the restart point; reset averaging, the weight
+                # accumulator (else the new cycle's average stays frozen near the
+                # restart point) and the iteration offset.
+                theta = jnp.where(restarted, theta_new, theta)
+                k_before = jnp.where(restarted, k_prev, k_before)
+                has_k_before = has_k_before | restarted
+                opt = _select(restarted, opt_restart, opt)
+                state = _select(restarted, restart_point, state)
+                avg = _select(restarted, restart_point, avg)
+                at_restart = _select(restarted, restart_point, at_restart)
+                total_weight = jnp.where(restarted, 0.0, total_weight)
+                restart_i_offset = jnp.where(restarted, i - 1, restart_i_offset)
+                mal = jnp.where(restarted, restart_merit, mal)
+                # New cycle: no previous-epoch merit yet for condition (ii).
+                prev_epoch_merit = jnp.where(restarted, jnp.inf, restart_merit)
+                iterations_since = jnp.where(restarted, 0, iterations_since)
+                cycle_cap = jnp.where(
+                    restarted, cycle_cap * restart_multiplier, cycle_cap
+                )
+                ipe_next = jnp.where(restarted, ipe_after_restart, ipe_next)
+                restarts_done = restarts_done + restarted
+                if verbose:
+                    reason = jnp.where(
+                        sufficient_progress, 0, jnp.where(stalling_restart, 1, 2)
+                    )
+                    row = jnp.stack(
+                        [
+                            count,
+                            reason,
+                            restart_merit,
+                            restart_used_avg,
+                            k_new,
+                            theta_new,
+                            cycle_cap,
+                            ipe_next,
+                        ]
+                    ).astype(evt.dtype)
+                    evt = jnp.where(restarted, evt.at[n_evt].set(row), evt)
+                    n_evt = n_evt + restarted
+
+            # Per-epoch primal-weight rebalance (k_update_per_epoch): only on
+            # epochs where no restart fired (a restart already rebalanced k).
+            # Leaves averaging, the halpern anchor and eta untouched.
+            at_epoch = c["state_at_last_epoch"]
+            if k_per_epoch:
+                k_epoch = _rebalance_k(state, at_epoch, opt[0], theta)
+                opt = (jnp.where(restarted, opt[0], k_epoch),) + tuple(opt[1:])
+                at_epoch = state
+
+            # Optional per-epoch Halpern re-anchor: start a fresh Halpern cycle at
+            # every epoch boundary (anchor := current iterate, lambda counter
+            # reset), unless a real restart already re-anchored this epoch.
+            if halpern and halpern_reanchor_per_epoch:
+                opt = (opt[0], opt[1], _select(restarted, opt[2], state))
+                restart_i_offset = jnp.where(restarted, restart_i_offset, i - 1)
+
+            # Termination. Check the certificate first: when both it and the
+            # primal-stall heuristic fire on the same epoch, attribute the stop
+            # to the certificate — the stronger reason.
+            certificate = converged(
+                metrics[10],
+                metrics[11],
+                metrics[5],
+                metrics[6],
+                metrics[0],
+                metrics[7],
+                metrics[8],
+                metrics[9],
+            )
+            if primal_stop:
+                primal_stall = converged_primal(metrics[10], obj_window)
+            else:
+                primal_stall = jnp.asarray(False)
+
+            new = dict(
+                state=state,
+                avg=avg,
+                opt=opt,
+                state_at_last_restart=at_restart,
+                state_at_last_epoch=at_epoch,
+                metrics=metrics,
+                used_avg=used_avg,
+                count=count,
+                i=i,
+                restart_i_offset=restart_i_offset,
+                total_weight=total_weight,
+                obj_window=obj_window,
+                iterations_since_restart=iterations_since,
+                cycle_cap=cycle_cap,
+                merit_at_last_restart=mal,
+                theta=theta,
+                k_before_last_move=k_before,
+                has_k_before=has_k_before,
+                prev_relative_pfr=prev_pfr,
+                prev_relative_dfr=prev_dfr,
+                prev_epoch_merit=prev_epoch_merit,
+                restarts_done=restarts_done,
+                ipe=ipe_next,
+                done=certificate | primal_stall,
+                stop_code=jnp.where(certificate, 1, jnp.where(primal_stall, 2, 0)),
+                log=log,
+                n_log=n_log,
+                evt=evt,
+                n_evt=n_evt,
+            )
+            # Keep the loop carry type-stable.
+            return jax.tree.map(
+                lambda n, o: jnp.asarray(n).astype(jnp.asarray(o).dtype), new, c
+            )
+
+        @jax.jit
+        def run_chunk(c, n_epochs):
+            end = c["count"] + n_epochs
+
+            def cond(c):
+                go = (~c["done"]) & (c["count"] < end) & (c["ipe"] == ipe)
+                if verbose:
+                    go = go & (c["n_log"] < _LOG_CAP) & (c["n_evt"] < _EVT_CAP)
+                return go
+
+            return jax.lax.while_loop(cond, epoch, c)
+
+        return run_chunk
+
+    carry = dict(
+        state=initial_solution,
+        avg=initial_solution,
+        opt=opt_state,
+        state_at_last_restart=initial_solution,
+        state_at_last_epoch=initial_solution if k_per_epoch else None,
+        metrics=_initial_metrics(),
+        used_avg=jnp.asarray(average),
+        count=jnp.asarray(0),
+        i=jnp.asarray(1),
+        restart_i_offset=jnp.asarray(0),
+        total_weight=jnp.asarray(0.0),
+        obj_window=jnp.full((max(int(primal_stop_window), 1),), jnp.inf),
+        iterations_since_restart=jnp.asarray(0),
+        # The cycle cap is tracked in ITERATIONS so `cycle_exhausted` fires at the
+        # same point in the trajectory regardless of how iterations are chopped
+        # into epochs; iterations_since_restart accumulates the ACTUAL count.
+        cycle_cap=jnp.asarray(float(epochs_per_restart) * float(iterations_per_epoch)),
+        merit_at_last_restart=jnp.asarray(jnp.inf, _merit_dtype),
+        theta=jnp.asarray(theta_init),
+        k_before_last_move=jnp.asarray(1.0, opt_state[0].dtype),
+        has_k_before=jnp.asarray(False),
+        # Previous epoch's relative residuals (for the `still_improving` guard)
+        # and merit (for condition (ii)); inf until the first epoch sets them.
+        prev_relative_pfr=jnp.asarray(jnp.inf, _merit_dtype),
+        prev_relative_dfr=jnp.asarray(jnp.inf, _merit_dtype),
+        prev_epoch_merit=jnp.asarray(jnp.inf, _merit_dtype),
+        restarts_done=jnp.asarray(0),
+        ipe=jnp.asarray(iterations_per_epoch),
+        done=jnp.asarray(False),
+        stop_code=jnp.asarray(0),
+        log=jnp.zeros((_LOG_CAP, 10), _merit_dtype) if verbose else None,
+        n_log=jnp.asarray(0),
+        evt=jnp.zeros((_EVT_CAP, 8), _merit_dtype) if verbose else None,
+        n_evt=jnp.asarray(0),
+    )
+    carry = _strong(carry)
+
+    chunk_fns = {}
+    count = 0
+    done = False
+    stop_code = 0
+    current_ipe = int(iterations_per_epoch)
+    restarts_printed = 0
+    # With no logging and no budgets there is nothing for the host to do between
+    # epochs, so the whole solve is one call: the loop only returns when the
+    # certificate is met (or a restart changes iterations_per_epoch, whose new
+    # scan length needs a new compile).
+    single_call = not verbose and not max_epochs and max_seconds is None
+    # Wall time of the very first epoch (which pays the one-off XLA compile).
+    # Outside single-call mode the first chunk is exactly one epoch, so this
+    # keeps its meaning; callers use it to form a "corrected" runtime.
+    first_epoch_seconds = None
+    seconds_per_epoch = None
+    chunk_epochs = _UNBOUNDED_EPOCHS if single_call else 1
+    is_converged = True
+    # Why the loop terminated; overwritten below by the reason that fired.
+    stop_reason = "max_epochs"
+
+    def print_chunk_log(host, epoch_time):
+        nonlocal restarts_printed
+        entries = [(int(r[0]), 0, r) for r in host["log"][: int(host["n_log"])]]
+        entries += [(int(r[0]), 1, r) for r in host["evt"][: int(host["n_evt"])]]
+        for epoch_no, kind, r in sorted(entries, key=lambda e: e[:2]):
+            if kind == 0:
+                print_epoch_metrics(
+                    epoch_no,
+                    *(float(v) for v in r[1:8]),
+                    epoch_time=epoch_time,
+                    k_val=float(r[8]),
+                    eta_val=float(r[9]),
+                )
+                continue
+            restarts_printed += 1
+            reason = ("sufficient-progress", "stalling", "cycle-cap")[int(r[1])]
+            which = "avg" if r[3] else "iterate"
+            k_msg = f", k={float(r[4]):.3e}"
+            if adaptive_theta:
+                k_msg += f", k_theta={float(r[5]):.3g}"
+            print(
+                f"Restart {restarts_printed} at epoch {epoch_no} "
+                f"({reason}, merit={float(r[2]):.2e} "
+                f"[{which}], next cap={float(r[6]):.0f} iters, "
+                f"iters/epoch={int(r[7])}{k_msg})"
+            )
+            print("----------------------------------------------")
+
     start_time = time.time()
 
     try:
-        while not is_done():
-            if max_epochs:
-                if check_max_epochs(count):
-                    is_converged = False
-                    print(f"Reached maximum epochs: {max_epochs}. Stopping.")
-                    print("----------------------------------------------")
-                    break
-
+        while True:
+            if done:
+                stop_reason = "certificate" if stop_code == 1 else "primal_stall"
+                break
+            if max_epochs and count >= max_epochs:
+                is_converged = False
+                print(f"Reached maximum epochs: {max_epochs}. Stopping.")
+                print("----------------------------------------------")
+                break
             if max_seconds is not None:
                 if time.time() - solve_entry_time >= max_seconds:
                     is_converged = False
@@ -1600,451 +1871,88 @@ def solve(
                     print("----------------------------------------------")
                     break
 
-            start_epoch_time = time.time()
-            (
-                shifted_i,
-                state,
-                average_state,
-                opt_state,
-                total_weight,
-                inloop_stalled,
-            ) = __sps(
-                current_iterations_per_epoch,
-                i - restart_i_offset,
-                lp,
-                state,
-                average_state,
-                opt_state,
-                total_weight,
-                primal_damping,
-                dual_damping_ineq,
-                dual_damping_eq,
-                average,
-                update_mode,
-                k_init=k_init,
-                adaptive_eta=adaptive_eta,
-                merit_fn=_inloop_merit if _check_every() else None,
-                check_every=_check_every(),
-                merit_threshold=_restart_thresholds()[0],
-                stall_threshold=_restart_thresholds()[1],
-                epoch_cache=_epoch_cache,
-            )
-            inloop_stalled = bool(inloop_stalled)
-            # Iterations actually run (an in-epoch restart check may exit early).
-            iters_this_epoch = int(shifted_i) - (i - restart_i_offset)
-            # __sps increments the (restart-shifted) counter; restore global i.
-            # `shifted_i` comes back as a JAX array (it is the scan-carried loop
-            # index). Coerce to a Python int so the `start_iter` argument fed to
-            # __sps next epoch (i - restart_i_offset) stays a Python int. Otherwise
-            # it flips int -> ArrayImpl after epoch 1, and since start_iter is a
-            # traced (non-static) argument that type change retraces run_epoch —
-            # a second ~0.6s XLA compile billed to epoch 2.
-            i = int(shifted_i) + restart_i_offset
-            # Same flip for total_weight: it returns as a float64 JAX array but
-            # enters epoch 1 as a weak-typed Python float. Coerce back to a Python
-            # float so its type is stable across epochs — otherwise the weak->strong
-            # change retraces run_epoch a second time, billed to epoch 2.
-            total_weight = float(total_weight)
+            n_epochs = chunk_epochs
+            if max_epochs:
+                n_epochs = min(n_epochs, max_epochs - count)
+            if max_seconds is not None and seconds_per_epoch:
+                remaining = max_seconds - (time.time() - solve_entry_time)
+                n_epochs = min(n_epochs, max(1, int(remaining / seconds_per_epoch)))
 
-            # JAX dispatch is async: __sps returns futures that may still be in
-            # flight. Force them here so the epoch timer captures the real
-            # compute cost rather than billing the tail to the final
-            # block_until_ready (and thus to total runtime, not any epoch).
-            jax.block_until_ready(state)
+            run_chunk = chunk_fns.get(current_ipe)
+            if run_chunk is None:
+                run_chunk = chunk_fns[current_ipe] = _build_chunk(current_ipe)
 
-            metrics = compute_epoch_metrics(average_state if average else state)
-            # `reported_used_avg` tracks which point the bound metrics describe;
-            # the actual state objects are re-resolved from this flag at use
-            # sites (output, restart) so they stay current after eq-projection.
-            reported_used_avg = average
+            chunk_start = time.time()
+            new_carry = run_chunk(carry, n_epochs)
+            keys = ["count", "done", "stop_code", "ipe"]
+            if verbose:
+                keys += ["log", "n_log", "evt", "n_evt"]
+            # The one host/device synchronisation per chunk.
+            host = jax.device_get({k: new_carry[k] for k in keys})
+            carry = new_carry
+            chunk_seconds = time.time() - chunk_start
 
-            # report_best: when averaging is on, the average and the last iterate
-            # are different points and either can be the better solution
-            # (averaging stabilises rotational problems but lags the last iterate
-            # when it is already contracting). Compute the iterate's metrics too
-            # and report/converge on whichever has the lower KKT merit. This costs
-            # a second matvec pair per epoch, so it is opt-in.
-            if report_best and average:
-                state_metrics = compute_epoch_metrics(state)
-                avg_merit = kkt_merit(
-                    metrics[3], metrics[4], metrics[5], metrics[6], metrics[0]
-                )
-                st_merit = kkt_merit(
-                    state_metrics[3],
-                    state_metrics[4],
-                    state_metrics[5],
-                    state_metrics[6],
-                    state_metrics[0],
-                )
-                if bool(st_merit < avg_merit):
-                    metrics = state_metrics
-                    reported_used_avg = False
+            epochs_run = max(int(host["count"]) - count, 1)
+            count = int(host["count"])
+            done = bool(host["done"])
+            stop_code = int(host["stop_code"])
+            current_ipe = int(host["ipe"])
+            if single_call:
+                continue
+            if first_epoch_seconds is None:
+                first_epoch_seconds = chunk_seconds
+            else:
+                seconds_per_epoch = chunk_seconds / epochs_run
 
-            (
-                objective_value,
-                primal_grad_norm,
-                complementarity_slack,
-                constraint_bound,
-                dual_feasibility_residual,
-                duality_gap,
-                dual_gap_is_finite,
-                gap_bound_comp,
-                gap_ineq_comp,
-                gap_eq_comp,
-                termination_pfr,
-                termination_dfr,
-            ) = metrics
+            if verbose:
+                print_chunk_log(host, chunk_seconds / epochs_run)
+                zero = jnp.zeros_like(carry["n_log"])
+                carry = {**carry, "n_log": zero, "n_evt": zero}
 
-            count += 1
-
-            # Equality-constraint projection: if the unscaled equality residual
-            # exceeds the threshold, project the primal (and average) onto the
-            # equality manifold. Done after metrics so the logged residual reflects
-            # the pre-projection state; the projected iterate is the warm-start for
-            # the next epoch.
-            if _eq_project is not None:
-                eq_residual = float(
-                    np.max(
-                        np.abs(_A_eq_sp @ np.asarray(state.primal) - _b_eq_np)
-                        / np.asarray(jnp_row_scale_eq)
-                    )
-                )
-                if eq_residual > eq_projection_threshold:
-                    projected_primal = _eq_project(state.primal)
-                    state = SaddleState(
-                        primal=projected_primal,
-                        dual_eq=state.dual_eq,
-                        dual_ineq=state.dual_ineq,
-                    )
-                    if average:
-                        projected_avg_primal = _eq_project(average_state.primal)
-                        average_state = SaddleState(
-                            primal=projected_avg_primal,
-                            dual_eq=average_state.dual_eq,
-                            dual_ineq=average_state.dual_ineq,
-                        )
-                    if verbose:
-                        print(
-                            f"  → Equality projection (eq_residual={eq_residual:.2e})"
-                        )
-
-            # Roll the latest objective into the primal_stop window (oldest first).
-            obj_window = jnp.concatenate(
-                [obj_window[1:], jnp.reshape(objective_value, (1,))]
+            # Size the next chunk to take about _CHUNK_TARGET_SECONDS, growing
+            # by at most 8x per chunk (the first chunk's time includes compile).
+            per_epoch = chunk_seconds / epochs_run
+            chunk_epochs = int(
+                min(max(1.0, _CHUNK_TARGET_SECONDS / per_epoch), 8 * epochs_run)
             )
 
-            finish_epoch_time = time.time()
-
-            if count == 1:
-                first_epoch_seconds = finish_epoch_time - start_epoch_time
-
-            if verbose and (count == 1 or count % log_every == 0):
-                _k_trace, _eta_trace = _read_k_eta(opt_state)
-                print_epoch_metrics(
-                    finish_epoch_time - start_epoch_time,
-                    k_val=_k_trace,
-                    eta_val=_eta_trace,
-                )
-
-            # --- Adaptive restart decision ---
-            restarted_this_epoch = False
-            if restarts:
-                epochs_since_restart += 1
-                iterations_since_restart += iters_this_epoch
-
-                # `merit` is the metric of the *reported* point: with
-                # report_best it is already the better of {average, iterate};
-                # otherwise it is the average (averaging on) or the last iterate.
-                # This drives the restart *trigger*.
-                merit = kkt_merit(
-                    constraint_bound,
-                    dual_feasibility_residual,
-                    duality_gap,
-                    dual_gap_is_finite,
-                    objective_value,
-                )
-
-                # --- Two-point restart candidate (PDLP-style) ---
-                # When averaging is on, the average and the current iterate are
-                # genuinely different points and either can be the better warm
-                # start, so restart to whichever has the lower merit instead of
-                # always discarding a frequently-better average.
-                cycle_exhausted = iterations_since_restart >= current_cycle_cap_iters
-                # Resolve the restart point from the *current* state/average
-                # variables via the report_best decision flag, not an object
-                # captured before metrics. The equality-projection block above
-                # may have rebound state and average_state to fresh (projected)
-                # iterates; a stale object would warm-start off the equality
-                # manifold.
-                restart_used_avg = reported_used_avg if average else False
-                restart_point = average_state if restart_used_avg else state
-                restart_merit = merit
-                near_threshold = bool(merit <= restart_decay * merit_at_last_restart)
-                if average and report_best:
-                    # report_best already evaluated both points this epoch and
-                    # `reported_used_avg`/`merit` describe the better of the two —
-                    # reuse them directly, no extra matvec.
-                    pass
-                elif average and (cycle_exhausted or near_threshold):
-                    # report_best is off, so the iterate's metrics were not
-                    # computed yet. The second `compute_epoch_metrics(state)` is a
-                    # full matvec pair; gate it to epochs where a restart can
-                    # actually fire (cycle exhausted, or the average is already
-                    # near the sufficient-progress threshold so the better
-                    # state-point could tip it over). On other epochs neither
-                    # point triggers, so the extra metrics would be wasted.
-                    (
-                        st_obj,
-                        _st_pgn,
-                        _st_cs,
-                        st_cb,
-                        st_dfr,
-                        st_dg,
-                        st_dgf,
-                        *_rest,
-                    ) = compute_epoch_metrics(state)
-                    state_merit = kkt_merit(st_cb, st_dfr, st_dg, st_dgf, st_obj)
-                    if bool(state_merit < merit):
-                        restart_point = state
-                        restart_merit = state_merit
-                        restart_used_avg = False
-
-                # A non-finite merit carries no progress signal — it just means
-                # the iterate is dual-infeasible so the duality gap (hence the KKT
-                # merit) is +∞ (see the box-infimum sign guard). Without this gate
-                # the progress tests below degenerate to `inf <= restart_decay*inf`
-                # → True, firing a restart EVERY epoch (e.g. neos-3754480-nidda: 10
-                # restarts in 10 epochs, all on merit=inf) and wiping the averaging
-                # long before the feasibility tail where restarts actually help. Only the length-based
-                # `cycle_exhausted` path may fire on an inf merit.
-                merit_is_finite = bool(jnp.isfinite(restart_merit))
-
-                # `cycle_exhausted` is the one trigger allowed to fire on a
-                # non-finite merit (see above) — it's the safety valve that keeps
-                # a permanently dual-infeasible run restarting at all. But while
-                # still dual-infeasible, BOTH raw feasibility residuals monotone-
-                # decreasing epoch-over-epoch means the run is mid-flight on a
-                # perfectly good trajectory, not stuck — restarting there only
-                # destroys momentum for no gain (momentum1: an
-                # iterations_per_epoch=1000 run hit merit=inf cycle-exhaustion at
-                # 10,000 iterations while PFR/DFR were still improving every
-                # epoch; the restart reset wiped the trajectory and it
-                # never recovered, while iterations_per_epoch=10000 reached full
-                # convergence before the same cap fired). Only suppress the
-                # exhaustion path this way — sufficient_progress/stalling_restart
-                # already require merit_is_finite and are unaffected.
-                relative_pfr = float(constraint_bound) / (1.0 + b_norm)
-                relative_dfr = float(dual_feasibility_residual) / (1.0 + c_norm)
-                still_improving = (not merit_is_finite) and (
-                    relative_pfr < prev_relative_pfr
-                    and relative_dfr < prev_relative_dfr
-                )
-                if cycle_exhausted and not merit_is_finite and still_improving:
-                    cycle_exhausted = False
-                prev_relative_pfr = relative_pfr
-                prev_relative_dfr = relative_dfr
-
-                # Seed the baseline on the first finite merit so the
-                # sufficient-progress test has something real to compare against
-                # (avoids a spurious restart against the initial inf baseline). Only
-                # seed from a FINITE merit, so a dual-infeasible early run leaves the
-                # baseline inf until a real value appears rather than locking it to
-                # inf.
-                if not jnp.isfinite(merit_at_last_restart) and merit_is_finite:
-                    merit_at_last_restart = restart_merit
-
-                sufficient_progress = merit_is_finite and bool(
-                    restart_merit <= restart_decay * merit_at_last_restart
-                )
-
-                # cuPDLP.jl condition (ii) — "necessary decay + stalling": restart
-                # once the merit has decayed to <= necessary_decay (0.8) of its
-                # cycle-start value AND has started rising again vs the previous
-                # epoch (the rotational-stall turnaround). Catches the oscillating
-                # feasibility tail that the absolute sufficient-decay test (0.2x)
-                # misses. `restart_decay` keeps driving the (i) sufficient trigger;
-                # `necessary_decay` is the looser (ii) threshold.
-                # The in-epoch check already saw the turnaround chunk-to-chunk
-                # (`inloop_stalled`); the epoch-level comparison can't, since the
-                # epoch ended mid-rise.
-                stalling_restart = (
-                    merit_is_finite
-                    and bool(restart_merit <= necessary_decay * merit_at_last_restart)
-                    and (
-                        inloop_stalled
-                        or (
-                            bool(jnp.isfinite(prev_epoch_merit))
-                            and bool(restart_merit > prev_epoch_merit)
-                        )
-                    )
-                )
-
-                if sufficient_progress or stalling_restart or cycle_exhausted:
-                    restarted_this_epoch = True
-                    # Warm-start restart from the better of {average, iterate};
-                    # reset averaging, weight accumulation and the iteration
-                    # offset (halpern lambda / eta-growth schedule).
-                    state = restart_point
-                    # PDLP-style primal-weight rebalance: drive k from the
-                    # primal-vs-dual *movement* over the just-finished cycle
-                    # (distance between iterates), not per-step gradient norms.
-                    # log-space geometric-mean blend with the current weight
-                    # (k_theta), then clamp.
-                    k_prev = opt_state[0]
-                    if (
-                        adaptive_theta
-                        and k_before_last_move is not None
-                        and merit_is_finite
-                        and bool(jnp.isfinite(merit_at_last_restart))
-                    ):
-                        # Trust region on log k: the cycle just finished ran
-                        # under the last k move, so judge that move by it.
-                        if bool(restart_merit < merit_at_last_restart):
-                            theta_live = min(1.0, 2.0 * theta_live)
-                        else:
-                            theta_live = max(0.05, 0.5 * theta_live)
-                            k_prev = k_before_last_move
-                    k_before_last_move = k_prev
-                    k_new = _rebalance_k(
-                        state, state_at_last_restart, k_prev, theta_live
-                    )
-                    if halpern:
-                        # Restarted Halpern: reset eta AND re-anchor z_0 to the
-                        # cycle-start iterate `state`. The lambda counter resets
-                        # via restart_i_offset below. Independent anchor copy —
-                        # `state` is donated to __sps next epoch.
-                        _eta_dtype = state.primal.dtype
-                        opt_state = (
-                            k_new,
-                            jnp.asarray(adaptive_eta, _eta_dtype),
-                            jax.tree.map(lambda x: x + 0, state),
-                        )
-                    else:
-                        # Carry the learned step size across the restart.
-                        # The adaptive rule grows eta ~100-250x above its
-                        # 1/||A|| seed over a cycle; re-seeding here forced
-                        # the rule to re-climb from scratch after every
-                        # restart (a stretch of tiny, conservative steps).
-                        # PDLP convention resets averaging at a restart but
-                        # keeps the step size.
-                        opt_state = (k_new, opt_state[1])
-                    average_state = state
-                    # __sps donates `state` each epoch (freeing the buffer in
-                    # place), so state_at_last_restart must be an independent
-                    # copy — otherwise it aliases the donated buffer and reads as
-                    # deleted at the next restart's k-rebalance (line ~1534).
-                    state_at_last_restart = jax.tree.map(lambda x: x + 0, state)
-                    # Reset the averaging accumulator alongside `average_state`.
-                    # The running mean is avg += (w/total_weight)·(new − avg); if
-                    # total_weight keeps the prior cycles' accumulated weight while
-                    # average_state is re-seeded to the cycle-start point, the
-                    # post-restart ratio w/total_weight is far too small and the new
-                    # cycle's average stays frozen near the restart point. This made
-                    # 5×1000 (restarts fire on epoch boundaries) diverge from 1×5000
-                    # (fewer restarts) — same total iters, different result. Resetting
-                    # restores epoch-granularity invariance of the averaging.
-                    total_weight = 0.0
-                    restart_i_offset = i - 1
-                    merit_at_last_restart = restart_merit
-                    # New cycle: no previous-epoch merit yet for condition (ii).
-                    prev_epoch_merit = jnp.inf
-                    epochs_since_restart = 0
-                    iterations_since_restart = 0
-                    current_cycle_cap_iters *= restart_multiplier
-                    current_iterations_per_epoch = max(
-                        iterations_per_epoch_min,
-                        int(current_iterations_per_epoch * iterations_per_epoch_decay),
-                    )
-                    restarts_done += 1
-                    if verbose:
-                        if sufficient_progress:
-                            reason = "sufficient-progress"
-                        elif stalling_restart:
-                            reason = "stalling"
-                        else:
-                            reason = "cycle-cap"
-                        which = "avg" if restart_used_avg else "iterate"
-                        k_msg = f", k={float(opt_state[0]):.3e}"
-                        if adaptive_theta:
-                            k_msg += f", k_theta={theta_live:.3g}"
-                        print(
-                            f"Restart {restarts_done} at epoch {count} "
-                            f"({reason}, merit={float(restart_merit):.2e} "
-                            f"[{which}], next cap={current_cycle_cap_iters:.0f} iters, "
-                            f"iters/epoch={current_iterations_per_epoch}{k_msg})"
-                        )
-                        print("----------------------------------------------")
-                else:
-                    # No restart this epoch: record the merit so the next epoch's
-                    # condition (ii) can detect a turnaround (merit rising again).
-                    prev_epoch_merit = restart_merit
-
-            # Per-epoch primal-weight rebalance. A restart already rebalanced k
-            # (and reset averaging/anchor/eta), so only adjust k on epochs where no
-            # restart fired. Unlike the restart path this leaves averaging, the
-            # halpern anchor and eta untouched — it only rewrites k, tracking
-            # primal/dual progress within the current restart cycle.
-            if k_per_epoch and not restarted_this_epoch:
-                k_new = _rebalance_k(
-                    state, state_at_last_epoch, opt_state[0], theta_live
-                )
-                opt_state = (k_new, *opt_state[1:])
-            if k_per_epoch:
-                # Reference for next epoch's movement. Independent copy: `state` is
-                # donated to (freed by) __sps next epoch.
-                state_at_last_epoch = jax.tree.map(lambda x: x + 0, state)
-
-            # Optional per-epoch Halpern re-anchor: start a fresh Halpern cycle at
-            # every epoch boundary instead of only at restarts. Mirrors the
-            # restart re-anchor (anchor z_0 := current iterate, lambda counter
-            # reset via restart_i_offset so lambda re-warms toward 1/2), but
-            # leaves eta and k to their usual per-epoch handling. Skipped when a
-            # real restart already fired this epoch — the restart's re-anchor
-            # (above) takes precedence, so we don't re-anchor twice.
-            if halpern and halpern_reanchor_per_epoch and not restarted_this_epoch:
-                # opt_state is (k, eta, anchor); rewrite only the anchor with an
-                # independent copy (state is donated to __sps next epoch).
-                opt_state = (
-                    opt_state[0],
-                    opt_state[1],
-                    jax.tree.map(lambda x: x + 0, state),
-                )
-                # Reset the cycle-local index so lambda_k = 1/(k_local+1) re-warms
-                # toward 1/2 next epoch; without this lambda would stay ~0 and the
-                # fresh anchor would carry no weight (a silent no-op).
-                restart_i_offset = i - 1
-
-        # The while-loop exits the iteration *after* the converging epoch, so its
-        # metrics were computed but only printed if it landed on a log_every
-        # boundary. Print the final converged epoch's criteria here (skip when we
-        # broke out via max_epochs / max_seconds, which print their own message
-        # and leave is_converged False).
+        # Print the final converged epoch's criteria (skip when we stopped on a
+        # budget, which prints its own message and leaves is_converged False).
         if verbose and is_converged and count > 0:
+            m = jax.device_get(carry["metrics"])
             print("Convergence criteria met.")
             if report_best and average:
                 print(
-                    f"Reported point: {'average' if reported_used_avg else 'iterate'}"
+                    f"Reported point: "
+                    f"{'average' if bool(carry['used_avg']) else 'iterate'}"
                 )
             print("----------------------------------------------")
-            print_epoch_metrics()
-
-        if report_best and average:
-            output = average_state if reported_used_avg else state
-        elif average:
-            output = average_state
-        else:
-            output = state
+            print_epoch_metrics(
+                count,
+                float(m[0]),
+                float(m[10]),
+                float(m[11]),
+                float(m[5]),
+                float(m[7]),
+                float(m[8]),
+                float(m[9]),
+            )
     except KeyboardInterrupt:
+        # `carry` still holds the last completed chunk (it is not donated).
         is_converged = False
         stop_reason = "interrupted"
-        if report_best and average:
-            output = average_state if reported_used_avg else state
-        elif average:
-            output = average_state
-        else:
-            output = state
+        count = int(carry["count"])
         print("KeyboardInterrupt received. Returning current solution.")
         print("----------------------------------------------")
+
+    state, average_state, opt_state = carry["state"], carry["avg"], carry["opt"]
+    reported_used_avg = bool(carry["used_avg"])
+    if report_best and average:
+        output = average_state if reported_used_avg else state
+    elif average:
+        output = average_state
+    else:
+        output = state
 
     output = jax.block_until_ready(output)
 

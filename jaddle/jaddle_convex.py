@@ -3,14 +3,20 @@ import jax
 import jax.numpy as jnp
 from optax.projections import projection_non_negative, projection_box
 import optax
-import functools
 from typing import NamedTuple
 import time
 from jaddle.jaddle_basic_types import JaddleCP, SaddleState
 import jaddle.jaddle_optimisers as jo
 import numpy as np
 
-_CONVEX_RUN_EPOCH_CACHE = {}
+# Epoch budget for a chunk that should run until convergence: large enough never
+# to bind, small enough that `count + n` cannot overflow an int32 counter.
+_UNBOUNDED_EPOCHS = 2**30
+# Target wall time of one chunk of epochs between host check-ins.
+_CHUNK_TARGET_SECONDS = 1.0
+# Buffered verbose-log rows / restart events per chunk.
+_LOG_CAP = 64
+_EVT_CAP = 64
 
 _ADAPTIVE_MODES = ("extragradient", "forward_reflected")
 
@@ -36,22 +42,22 @@ def _init_k_slot(k, eta, state, update_mode):
     return (k, eta, eta + 0, zeros, zeros2, jnp.asarray(False))
 
 
-def __sps(
-    max_iter,
-    start_iter,
+def _make_epoch_fn(
     cp: JaddleCP,
     optimiser,
-    initial_solution,
-    initial_avg_state=None,
-    initial_opt_state=None,
     weight_function=lambda _: 1.0,
-    total_weight=0.0,
     average=True,
     update_mode="alternating",
     k_scaling=False,
-    k_init=1.0,
-    adaptive_eta=None,
+    adaptive_step=False,
 ):
+    # Returns `run_epoch(max_iter, start_iter, state, average_state, opt_state,
+    # total_weight)`, which runs one epoch of `max_iter` iterations and returns
+    # (i, state, average_state, opt_state, total_weight). It is a plain
+    # traceable function, not jitted: `solve` calls it inside its device-side
+    # epoch loop (`run_chunk`), which is jitted as a whole. `max_iter` must be a
+    # Python int (it is the scan length).
+    #
     # Per-iteration adaptive step size (Malitsky-Tam local-Lipschitz line
     # search). When `adaptive_eta` is not None the extragradient scheme replaces
     # the optimiser's fixed learning rate with a single scalar base step eta,
@@ -64,7 +70,6 @@ def __sps(
     # (it needs k) and a contractive scheme (extragradient or
     # forward-reflected); alternating is not contractive on the saddle and a
     # line search cannot fix that, so it is excluded.
-    adaptive_step = adaptive_eta is not None and update_mode in _ADAPTIVE_MODES
     if adaptive_step and not k_scaling:
         raise ValueError("adaptive_eta requires k_scaling (primal weight k)")
     # k-scaling is an orthogonal option (any update_mode): a primal weight k
@@ -182,205 +187,109 @@ def __sps(
             return (opt_state, k)
         return opt_state
 
-    cache_key = (
-        id(cp),
-        id(optimiser),
-        id(weight_function),
-        bool(average),
-        update_mode,
-        bool(k_scaling),
-        adaptive_step,
-    )
-    run_epoch = _CONVEX_RUN_EPOCH_CACHE.get(cache_key)
 
-    if run_epoch is None:
+    def run_epoch(
+        max_iter,
+        start_iter,
+        state,
+        average_state,
+        opt_state,
+        total_weight,
+    ):
+        # --- Adaptive extragradient step (Malitsky-Tam line search) ---
+        # Mirrors the linear solver's adaptive extragradient path. Each
+        # iteration takes a raw look-ahead + corrector at base step eta,
+        # estimates the local Lipschitz constant from the two gradient
+        # evaluations, and shrinks eta below eta_bar = (1/sqrt2)/L_hat if the
+        # trial overshot. No optimiser learning rate is consumed here — eta
+        # is the only step control.
+        if adaptive_step:
+            _MT = 1.0 / jnp.sqrt(2.0)
 
-        @functools.partial(
-            jax.jit,
-            static_argnames=("max_iter",),
-            # `average_state` is deliberately not donated: when averaging is off
-            # the caller passes the same buffer for both `state` and
-            # `average_state`, and XLA rejects donating one buffer twice.
-            donate_argnames=(
-                "state",
-                "opt_state",
-                "total_weight",
-            ),
-        )
-        def run_epoch(
-            max_iter,
-            start_iter,
-            state,
-            average_state,
-            opt_state,
-            total_weight=0.0,
-        ):
-            # --- Adaptive extragradient step (Malitsky-Tam line search) ---
-            # Mirrors the linear solver's adaptive extragradient path. Each
-            # iteration takes a raw look-ahead + corrector at base step eta,
-            # estimates the local Lipschitz constant from the two gradient
-            # evaluations, and shrinks eta below eta_bar = (1/sqrt2)/L_hat if the
-            # trial overshot. No optimiser learning rate is consumed here — eta
-            # is the only step control.
-            if adaptive_step:
-                _MT = 1.0 / jnp.sqrt(2.0)
+            # Local Lipschitz estimates are taken in the k-weighted geometry
+            # the steps live in (tau = eta/k, sigma = eta*k): displacements
+            # in the M-norm k‖dx‖² + ‖dy‖²/k, operator differences in the
+            # dual M⁻¹-norm ‖dg_x‖²/k + k‖dg_y‖².
+            def _znorm2(p, de, di, k):
+                return k * jnp.vdot(p, p) + (1.0 / k) * (
+                    jnp.vdot(de, de) + jnp.vdot(di, di)
+                )
 
-                # Local Lipschitz estimates are taken in the k-weighted geometry
-                # the steps live in (tau = eta/k, sigma = eta*k): displacements
-                # in the M-norm k‖dx‖² + ‖dy‖²/k, operator differences in the
-                # dual M⁻¹-norm ‖dg_x‖²/k + k‖dg_y‖².
-                def _znorm2(p, de, di, k):
-                    return k * jnp.vdot(p, p) + (1.0 / k) * (
-                        jnp.vdot(de, de) + jnp.vdot(di, di)
+            def _gnorm2(p, de, di, k):
+                return (1.0 / k) * jnp.vdot(p, p) + k * (
+                    jnp.vdot(de, de) + jnp.vdot(di, di)
+                )
+
+            def _advance_eta(eta_bar, eta0, ip1):
+                # Advance eta for the next iterate (growth allowed once the
+                # step is accepted). When eta_bar is +inf the step did not
+                # move: hold eta rather than letting growth run to NaN.
+                eta_next = jnp.minimum(
+                    (1.0 - ip1 ** (-0.3)) * eta_bar,
+                    (1.0 + ip1 ** (-0.6)) * eta0,
+                )
+                eta_next = jnp.where(jnp.isfinite(eta_bar), eta_next, eta0)
+                eta_next = jnp.where(jnp.isfinite(eta_next), eta_next, eta0)
+                return jnp.maximum(eta_next, 1e-12)
+
+            def _line_search(trial, eta, ip1, keep):
+                # Branch-free line search: one trial per iteration. If it
+                # overshot its admissible bound (eta > eta_bar), the trial
+                # is discarded — the outputs fall back to `keep` (the
+                # unchanged iterate) — and eta shrinks to just under
+                # eta_bar, so the next iteration retries from the same point.
+                # A retry loop (lax.while_loop) would force a device->host
+                # sync on its predicate every iteration, which dominates the
+                # per-iteration cost on GPU for cheap problems (~8x/epoch on
+                # isotonic n=10k); a rejection here only costs one iteration.
+                out, eta_bar = trial(eta)
+                accept = eta <= eta_bar
+                out = jax.tree.map(
+                    lambda a, b: jnp.where(accept, a, b), out, keep
+                )
+                eta_next = jnp.where(
+                    accept,
+                    _advance_eta(eta_bar, eta, ip1),
+                    jnp.maximum(
+                        jnp.minimum((1.0 - ip1 ** (-0.3)) * eta_bar, eta), 1e-12
+                    ),
+                )
+                return out, eta_next, accept
+
+            def _accumulate(i, new_state, average_state, total_weight, accept):
+                # Rejected trials leave the iterate unchanged and carry zero
+                # averaging weight.
+                if average:
+                    w = jnp.where(accept, weight_function(i), 0.0)
+                    total_weight = total_weight + w
+                    frac = jnp.where(total_weight > 0, w / total_weight, 0.0)
+                    average_state = optax.incremental_update(
+                        new_state, average_state, frac
                     )
+                return average_state, total_weight
 
-                def _gnorm2(p, de, di, k):
-                    return (1.0 / k) * jnp.vdot(p, p) + k * (
-                        jnp.vdot(de, de) + jnp.vdot(di, di)
-                    )
+            if update_mode == "forward_reflected":
+                # --- Adaptive forward-reflected-backward (Malitsky-Tam) ---
+                #   z+ = P(z - eta F(z) - eta_prev (F(z) - F(z_prev)))
+                # One operator evaluation per accepted step (F(z+) is the
+                # next iteration's F(z)), versus two for extragradient. The
+                # admissible step is eta · L_hat <= _FRB with L_hat measured
+                # between z and z+.
+                _FRB = 0.45
 
-                def _advance_eta(eta_bar, eta0, ip1):
-                    # Advance eta for the next iterate (growth allowed once the
-                    # step is accepted). When eta_bar is +inf the step did not
-                    # move: hold eta rather than letting growth run to NaN.
-                    eta_next = jnp.minimum(
-                        (1.0 - ip1 ** (-0.3)) * eta_bar,
-                        (1.0 + ip1 ** (-0.6)) * eta0,
-                    )
-                    eta_next = jnp.where(jnp.isfinite(eta_bar), eta_next, eta0)
-                    eta_next = jnp.where(jnp.isfinite(eta_next), eta_next, eta0)
-                    return jnp.maximum(eta_next, 1e-12)
+                inner0, (k0, eta0, eta_prev0, F_cur0, F_prev0, valid0) = opt_state
 
-                def _line_search(trial, eta, ip1, keep):
-                    # Branch-free line search: one trial per iteration. If it
-                    # overshot its admissible bound (eta > eta_bar), the trial
-                    # is discarded — the outputs fall back to `keep` (the
-                    # unchanged iterate) — and eta shrinks to just under
-                    # eta_bar, so the next iteration retries from the same point.
-                    # A retry loop (lax.while_loop) would force a device->host
-                    # sync on its predicate every iteration, which dominates the
-                    # per-iteration cost on GPU for cheap problems (~8x/epoch on
-                    # isotonic n=10k); a rejection here only costs one iteration.
-                    out, eta_bar = trial(eta)
-                    accept = eta <= eta_bar
-                    out = jax.tree.map(
-                        lambda a, b: jnp.where(accept, a, b), out, keep
-                    )
-                    eta_next = jnp.where(
-                        accept,
-                        _advance_eta(eta_bar, eta, ip1),
-                        jnp.maximum(
-                            jnp.minimum((1.0 - ip1 ** (-0.3)) * eta_bar, eta), 1e-12
-                        ),
-                    )
-                    return out, eta_next, accept
+                # Fresh start / restart: seed F at the current iterate once
+                # per epoch (outside the scan), so the reflection vanishes.
+                def _seed():
+                    g = grad(state)
+                    return g, jax.tree.map(lambda x: x + 0, g)
 
-                def _accumulate(i, new_state, average_state, total_weight, accept):
-                    # Rejected trials leave the iterate unchanged and carry zero
-                    # averaging weight.
-                    if average:
-                        w = jnp.where(accept, weight_function(i), 0.0)
-                        total_weight = total_weight + w
-                        frac = jnp.where(total_weight > 0, w / total_weight, 0.0)
-                        average_state = optax.incremental_update(
-                            new_state, average_state, frac
-                        )
-                    return average_state, total_weight
+                F_cur0, F_prev0 = jax.lax.cond(
+                    valid0, lambda: (F_cur0, F_prev0), _seed
+                )
 
-                if update_mode == "forward_reflected":
-                    # --- Adaptive forward-reflected-backward (Malitsky-Tam) ---
-                    #   z+ = P(z - eta F(z) - eta_prev (F(z) - F(z_prev)))
-                    # One operator evaluation per accepted step (F(z+) is the
-                    # next iteration's F(z)), versus two for extragradient. The
-                    # admissible step is eta · L_hat <= _FRB with L_hat measured
-                    # between z and z+.
-                    _FRB = 0.45
-
-                    inner0, (k0, eta0, eta_prev0, F_cur0, F_prev0, valid0) = opt_state
-
-                    # Fresh start / restart: seed F at the current iterate once
-                    # per epoch (outside the scan), so the reflection vanishes.
-                    def _seed():
-                        g = grad(state)
-                        return g, jax.tree.map(lambda x: x + 0, g)
-
-                    F_cur0, F_prev0 = jax.lax.cond(
-                        valid0, lambda: (F_cur0, F_prev0), _seed
-                    )
-
-                    def step(carry, _):
-                        (
-                            i,
-                            state,
-                            average_state,
-                            eta,
-                            eta_prev,
-                            F_cur,
-                            F_prev,
-                            total_weight,
-                        ) = carry
-                        ip1 = jnp.asarray(i + 1, eta.dtype)
-                        k = k0
-                        # Reflection term is fixed across line-search retries.
-                        refl = jax.tree.map(
-                            lambda a, b: eta_prev * (a - b), F_cur, F_prev
-                        )
-
-                        def trial(eta_t):
-                            x_new = projection_primal(
-                                state.primal
-                                - (eta_t * F_cur.primal + refl.primal) / k
-                            )
-                            dual_ineq = projection_non_negative(
-                                state.dual_ineq
-                                - k * (eta_t * F_cur.dual_ineq + refl.dual_ineq)
-                            )
-                            dual_eq = state.dual_eq - k * (
-                                eta_t * F_cur.dual_eq + refl.dual_eq
-                            )
-                            cand = SaddleState(
-                                primal=x_new, dual_ineq=dual_ineq, dual_eq=dual_eq
-                            )
-                            F_new = grad(cand)
-                            dg2 = _gnorm2(
-                                F_new.primal - F_cur.primal,
-                                F_new.dual_eq - F_cur.dual_eq,
-                                F_new.dual_ineq - F_cur.dual_ineq,
-                                k,
-                            )
-                            dz2 = _znorm2(
-                                x_new - state.primal,
-                                dual_eq - state.dual_eq,
-                                dual_ineq - state.dual_ineq,
-                                k,
-                            )
-                            eta_bar = jnp.where(
-                                dg2 > 0.0, _FRB * jnp.sqrt(dz2 / dg2), jnp.inf
-                            )
-                            # Accepted: shift the F history and record the step.
-                            return (cand, F_new, F_cur, eta_t), eta_bar
-
-                        # On rejection the whole FRB state (iterate, F history,
-                        # previous step) stays put; only eta shrinks.
-                        (new_state, F_new, F_old, eta_prev_new), eta_next, accept = (
-                            _line_search(
-                                trial, eta, ip1, (state, F_cur, F_prev, eta_prev)
-                            )
-                        )
-                        average_state, total_weight = _accumulate(
-                            i, new_state, average_state, total_weight, accept
-                        )
-                        return (
-                            i + 1,
-                            new_state,
-                            average_state,
-                            eta_next,
-                            eta_prev_new,
-                            F_new,
-                            F_old,
-                            total_weight,
-                        ), None
-
+                def step(carry, _):
                     (
                         i,
                         state,
@@ -390,205 +299,155 @@ def __sps(
                         F_cur,
                         F_prev,
                         total_weight,
-                    ), _ = jax.lax.scan(
-                        step,
-                        (
-                            start_iter,
-                            state,
-                            average_state,
-                            eta0,
-                            eta_prev0,
-                            F_cur0,
-                            F_prev0,
-                            total_weight,
-                        ),
-                        None,
-                        length=max_iter,
-                    )
-                    opt_state = (
-                        inner0,
-                        (k0, eta, eta_prev, F_cur, F_prev, jnp.asarray(True)),
-                    )
-                    return i, state, average_state, opt_state, total_weight
-
-                def _trial(eta, state, k, g):
-                    tau = eta / k
-                    sigma = eta * k
-                    xh = projection_primal(state.primal - tau * g.primal)
-                    yh_ineq = projection_non_negative(
-                        state.dual_ineq - sigma * g.dual_ineq
-                    )
-                    yh_eq = state.dual_eq - sigma * g.dual_eq
-                    state_half = SaddleState(
-                        primal=xh, dual_ineq=yh_ineq, dual_eq=yh_eq
-                    )
-                    g_half = grad(state_half)
-                    # Corrector from the ORIGINAL state using the look-ahead grad.
-                    x_new = projection_primal(state.primal - tau * g_half.primal)
-                    dual_ineq = projection_non_negative(
-                        state.dual_ineq - sigma * g_half.dual_ineq
-                    )
-                    dual_eq = state.dual_eq - sigma * g_half.dual_eq
-                    cand = SaddleState(
-                        primal=x_new, dual_ineq=dual_ineq, dual_eq=dual_eq
-                    )
-
-                    # Local Lipschitz estimate, measured on the look-ahead
-                    # displacement.
-                    dg2 = _gnorm2(
-                        g_half.primal - g.primal,
-                        g_half.dual_eq - g.dual_eq,
-                        g_half.dual_ineq - g.dual_ineq,
-                        k,
-                    )
-                    dz2 = _znorm2(
-                        xh - state.primal,
-                        yh_eq - state.dual_eq,
-                        yh_ineq - state.dual_ineq,
-                        k,
-                    )
-                    eta_bar = jnp.where(dg2 > 0.0, _MT * jnp.sqrt(dz2 / dg2), jnp.inf)
-                    return cand, eta_bar
-
-                def step(carry, _):
-                    i, state, average_state, opt_state, total_weight = carry
-                    opt_state, k, eta = unpack_k(opt_state)
+                    ) = carry
                     ip1 = jnp.asarray(i + 1, eta.dtype)
-
-                    g = grad(state)
-                    new_state, eta_next, accept = _line_search(
-                        lambda eta_t: _trial(eta_t, state, k, g), eta, ip1, state
+                    k = k0
+                    # Reflection term is fixed across line-search retries.
+                    refl = jax.tree.map(
+                        lambda a, b: eta_prev * (a - b), F_cur, F_prev
                     )
-                    opt_state = pack_k(opt_state, k, eta_next)
+
+                    def trial(eta_t):
+                        x_new = projection_primal(
+                            state.primal
+                            - (eta_t * F_cur.primal + refl.primal) / k
+                        )
+                        dual_ineq = projection_non_negative(
+                            state.dual_ineq
+                            - k * (eta_t * F_cur.dual_ineq + refl.dual_ineq)
+                        )
+                        dual_eq = state.dual_eq - k * (
+                            eta_t * F_cur.dual_eq + refl.dual_eq
+                        )
+                        cand = SaddleState(
+                            primal=x_new, dual_ineq=dual_ineq, dual_eq=dual_eq
+                        )
+                        F_new = grad(cand)
+                        dg2 = _gnorm2(
+                            F_new.primal - F_cur.primal,
+                            F_new.dual_eq - F_cur.dual_eq,
+                            F_new.dual_ineq - F_cur.dual_ineq,
+                            k,
+                        )
+                        dz2 = _znorm2(
+                            x_new - state.primal,
+                            dual_eq - state.dual_eq,
+                            dual_ineq - state.dual_ineq,
+                            k,
+                        )
+                        eta_bar = jnp.where(
+                            dg2 > 0.0, _FRB * jnp.sqrt(dz2 / dg2), jnp.inf
+                        )
+                        # Accepted: shift the F history and record the step.
+                        return (cand, F_new, F_cur, eta_t), eta_bar
+
+                    # On rejection the whole FRB state (iterate, F history,
+                    # previous step) stays put; only eta shrinks.
+                    (new_state, F_new, F_old, eta_prev_new), eta_next, accept = (
+                        _line_search(
+                            trial, eta, ip1, (state, F_cur, F_prev, eta_prev)
+                        )
+                    )
                     average_state, total_weight = _accumulate(
                         i, new_state, average_state, total_weight, accept
                     )
-
                     return (
                         i + 1,
                         new_state,
                         average_state,
-                        opt_state,
+                        eta_next,
+                        eta_prev_new,
+                        F_new,
+                        F_old,
                         total_weight,
                     ), None
 
-                (i, state, average_state, opt_state, total_weight), _ = jax.lax.scan(
+                (
+                    i,
+                    state,
+                    average_state,
+                    eta,
+                    eta_prev,
+                    F_cur,
+                    F_prev,
+                    total_weight,
+                ), _ = jax.lax.scan(
                     step,
                     (
                         start_iter,
                         state,
                         average_state,
-                        opt_state,
+                        eta0,
+                        eta_prev0,
+                        F_cur0,
+                        F_prev0,
                         total_weight,
                     ),
                     None,
                     length=max_iter,
                 )
+                opt_state = (
+                    inner0,
+                    (k0, eta, eta_prev, F_cur, F_prev, jnp.asarray(True)),
+                )
                 return i, state, average_state, opt_state, total_weight
 
+            def _trial(eta, state, k, g):
+                tau = eta / k
+                sigma = eta * k
+                xh = projection_primal(state.primal - tau * g.primal)
+                yh_ineq = projection_non_negative(
+                    state.dual_ineq - sigma * g.dual_ineq
+                )
+                yh_eq = state.dual_eq - sigma * g.dual_eq
+                state_half = SaddleState(
+                    primal=xh, dual_ineq=yh_ineq, dual_eq=yh_eq
+                )
+                g_half = grad(state_half)
+                # Corrector from the ORIGINAL state using the look-ahead grad.
+                x_new = projection_primal(state.primal - tau * g_half.primal)
+                dual_ineq = projection_non_negative(
+                    state.dual_ineq - sigma * g_half.dual_ineq
+                )
+                dual_eq = state.dual_eq - sigma * g_half.dual_eq
+                cand = SaddleState(
+                    primal=x_new, dual_ineq=dual_ineq, dual_eq=dual_eq
+                )
+
+                # Local Lipschitz estimate, measured on the look-ahead
+                # displacement.
+                dg2 = _gnorm2(
+                    g_half.primal - g.primal,
+                    g_half.dual_eq - g.dual_eq,
+                    g_half.dual_ineq - g.dual_ineq,
+                    k,
+                )
+                dz2 = _znorm2(
+                    xh - state.primal,
+                    yh_eq - state.dual_eq,
+                    yh_ineq - state.dual_ineq,
+                    k,
+                )
+                eta_bar = jnp.where(dg2 > 0.0, _MT * jnp.sqrt(dz2 / dg2), jnp.inf)
+                return cand, eta_bar
+
             def step(carry, _):
-                (
-                    i,
-                    state,
-                    average_state,
-                    opt_state,
-                    total_weight,
-                ) = carry
+                i, state, average_state, opt_state, total_weight = carry
+                opt_state, k, eta = unpack_k(opt_state)
+                ip1 = jnp.asarray(i + 1, eta.dtype)
 
-                opt_state, k = unpack_k(opt_state)
-
-                if update_mode == "alternating":
-                    # Only the primal half of the start gradient and the dual
-                    # half of the post-primal gradient are ever consumed, so
-                    # compute just those: a VJP+obj-grad for the primal, and a
-                    # plain residual eval for the dual (no VJP, no obj grad).
-                    grad_primal_start = grad_primal_only(state)
-                    if k_scaling:
-                        grad_primal_start = grad_primal_start / k
-
-                    primal_gradient = SaddleState(
-                        primal=grad_primal_start,
-                        dual_ineq=jnp.zeros_like(state.dual_ineq),
-                        dual_eq=jnp.zeros_like(state.dual_eq),
-                    )
-                    primal_updates, _ = opt_update(
-                        primal_gradient,
-                        opt_state,
-                        state,
-                    )
-                    primal_updates = keep_only_primal(primal_updates)
-                    state = optax.apply_updates(state, primal_updates)
-                    state = SaddleState(
-                        primal=projection_primal(state.primal),
-                        dual_ineq=state.dual_ineq,
-                        dual_eq=state.dual_eq,
-                    )
-
-                    dual_ineq_g, dual_eq_g = grad_dual_only(state)
-                    if k_scaling:
-                        dual_ineq_g = dual_ineq_g * k
-                        dual_eq_g = dual_eq_g * k
-                    combined_gradient = SaddleState(
-                        primal=grad_primal_start,
-                        dual_ineq=dual_ineq_g,
-                        dual_eq=dual_eq_g,
-                    )
-                    combined_updates, opt_state = opt_update(
-                        combined_gradient,
-                        opt_state,
-                        state,
-                    )
-                    dual_updates = keep_only_dual(combined_updates)
-                    state = optax.apply_updates(state, dual_updates)
-                    state = SaddleState(
-                        primal=state.primal,
-                        dual_ineq=projection_non_negative(state.dual_ineq),
-                        dual_eq=state.dual_eq,
-                    )
-                else:
-                    # extragradient
-                    # --- Look-ahead gradient ---
-                    g = grad(state)
-
-                    scaled_g = scale_by_k(g, k) if k_scaling else g
-                    la_updates, _ = opt_update(scaled_g, opt_state, state)
-                    state_half = optax.apply_updates(state, la_updates)
-                    state_half = SaddleState(
-                        primal=projection_primal(state_half.primal),
-                        dual_ineq=projection_non_negative(state_half.dual_ineq),
-                        dual_eq=state_half.dual_eq,
-                    )
-
-                    # Corrector: gradient at look-ahead point, applied from original state
-                    g_half = grad(state_half)
-                    scaled_g_half = scale_by_k(g_half, k) if k_scaling else g_half
-                    corr_updates, opt_state = opt_update(
-                        scaled_g_half, opt_state, state
-                    )
-                    state = optax.apply_updates(state, corr_updates)
-                    state = SaddleState(
-                        primal=projection_primal(state.primal),
-                        dual_ineq=projection_non_negative(state.dual_ineq),
-                        dual_eq=state.dual_eq,
-                    )
-
-                opt_state = pack_k(opt_state, k)
-
-                # `average` is a Python-static bool, so branch on it at trace
-                # time rather than threading a per-step lax.cond (which would
-                # force XLA to evaluate the predicate and the running-mean AXPY
-                # every iteration even when averaging is off — the same class of
-                # issue fixed at the epoch level for the metrics path).
-                if average:
-                    w = weight_function(i)
-                    total_weight = total_weight + w
-                    average_state = optax.incremental_update(
-                        state, average_state, w / total_weight
-                    )
+                g = grad(state)
+                new_state, eta_next, accept = _line_search(
+                    lambda eta_t: _trial(eta_t, state, k, g), eta, ip1, state
+                )
+                opt_state = pack_k(opt_state, k, eta_next)
+                average_state, total_weight = _accumulate(
+                    i, new_state, average_state, total_weight, accept
+                )
 
                 return (
                     i + 1,
-                    state,
+                    new_state,
                     average_state,
                     opt_state,
                     total_weight,
@@ -596,51 +455,136 @@ def __sps(
 
             (i, state, average_state, opt_state, total_weight), _ = jax.lax.scan(
                 step,
-                (start_iter, state, average_state, opt_state, total_weight),
+                (
+                    start_iter,
+                    state,
+                    average_state,
+                    opt_state,
+                    total_weight,
+                ),
                 None,
                 length=max_iter,
             )
-
             return i, state, average_state, opt_state, total_weight
 
-        _CONVEX_RUN_EPOCH_CACHE[cache_key] = run_epoch
+        def step(carry, _):
+            (
+                i,
+                state,
+                average_state,
+                opt_state,
+                total_weight,
+            ) = carry
 
-    state = initial_solution
+            opt_state, k = unpack_k(opt_state)
 
-    if initial_avg_state is not None:
-        average_state = initial_avg_state
-    else:
-        average_state = initial_solution
+            if update_mode == "alternating":
+                # Only the primal half of the start gradient and the dual
+                # half of the post-primal gradient are ever consumed, so
+                # compute just those: a VJP+obj-grad for the primal, and a
+                # plain residual eval for the dual (no VJP, no obj grad).
+                grad_primal_start = grad_primal_only(state)
+                if k_scaling:
+                    grad_primal_start = grad_primal_start / k
 
-    # `state` is donated to run_epoch; if `average_state` aliases the same
-    # buffer (the common `average=False` case, where the caller passes one
-    # buffer for both) XLA rejects the call (`f(donate(a), a)`). Give
-    # `average_state` its own buffer so donation of `state` is safe. The copy is
-    # one-per-epoch, off the hot path.
-    if average_state is state:
-        average_state = jax.tree.map(lambda x: x + 0, average_state)
+                primal_gradient = SaddleState(
+                    primal=grad_primal_start,
+                    dual_ineq=jnp.zeros_like(state.dual_ineq),
+                    dual_eq=jnp.zeros_like(state.dual_eq),
+                )
+                primal_updates, _ = opt_update(
+                    primal_gradient,
+                    opt_state,
+                    state,
+                )
+                primal_updates = keep_only_primal(primal_updates)
+                state = optax.apply_updates(state, primal_updates)
+                state = SaddleState(
+                    primal=projection_primal(state.primal),
+                    dual_ineq=state.dual_ineq,
+                    dual_eq=state.dual_eq,
+                )
 
-    if initial_opt_state is not None:
-        opt_state = initial_opt_state
-    elif k_scaling:
-        k_slot = _init_k_slot(
-            k_init,
-            adaptive_eta if adaptive_step else None,
-            initial_solution,
-            update_mode,
+                dual_ineq_g, dual_eq_g = grad_dual_only(state)
+                if k_scaling:
+                    dual_ineq_g = dual_ineq_g * k
+                    dual_eq_g = dual_eq_g * k
+                combined_gradient = SaddleState(
+                    primal=grad_primal_start,
+                    dual_ineq=dual_ineq_g,
+                    dual_eq=dual_eq_g,
+                )
+                combined_updates, opt_state = opt_update(
+                    combined_gradient,
+                    opt_state,
+                    state,
+                )
+                dual_updates = keep_only_dual(combined_updates)
+                state = optax.apply_updates(state, dual_updates)
+                state = SaddleState(
+                    primal=state.primal,
+                    dual_ineq=projection_non_negative(state.dual_ineq),
+                    dual_eq=state.dual_eq,
+                )
+            else:
+                # extragradient
+                # --- Look-ahead gradient ---
+                g = grad(state)
+
+                scaled_g = scale_by_k(g, k) if k_scaling else g
+                la_updates, _ = opt_update(scaled_g, opt_state, state)
+                state_half = optax.apply_updates(state, la_updates)
+                state_half = SaddleState(
+                    primal=projection_primal(state_half.primal),
+                    dual_ineq=projection_non_negative(state_half.dual_ineq),
+                    dual_eq=state_half.dual_eq,
+                )
+
+                # Corrector: gradient at look-ahead point, applied from original state
+                g_half = grad(state_half)
+                scaled_g_half = scale_by_k(g_half, k) if k_scaling else g_half
+                corr_updates, opt_state = opt_update(
+                    scaled_g_half, opt_state, state
+                )
+                state = optax.apply_updates(state, corr_updates)
+                state = SaddleState(
+                    primal=projection_primal(state.primal),
+                    dual_ineq=projection_non_negative(state.dual_ineq),
+                    dual_eq=state.dual_eq,
+                )
+
+            opt_state = pack_k(opt_state, k)
+
+            # `average` is a Python-static bool, so branch on it at trace
+            # time rather than threading a per-step lax.cond (which would
+            # force XLA to evaluate the predicate and the running-mean AXPY
+            # every iteration even when averaging is off — the same class of
+            # issue fixed at the epoch level for the metrics path).
+            if average:
+                w = weight_function(i)
+                total_weight = total_weight + w
+                average_state = optax.incremental_update(
+                    state, average_state, w / total_weight
+                )
+
+            return (
+                i + 1,
+                state,
+                average_state,
+                opt_state,
+                total_weight,
+            ), None
+
+        (i, state, average_state, opt_state, total_weight), _ = jax.lax.scan(
+            step,
+            (start_iter, state, average_state, opt_state, total_weight),
+            None,
+            length=max_iter,
         )
-        opt_state = (optimiser.init(initial_solution), k_slot)
-    else:
-        opt_state = optimiser.init(initial_solution)
 
-    return run_epoch(
-        max_iter,
-        start_iter,
-        state,
-        average_state,
-        opt_state,
-        total_weight,
-    )
+        return i, state, average_state, opt_state, total_weight
+
+    return run_epoch
 
 
 def solve(
@@ -674,13 +618,73 @@ def solve(
     """
     Solve a convex saddle-point problem via saddle-point optimisation.
 
+    Runs primal descent / dual ascent on the Lagrangian
+    ``f(x) + λᵀg(x) + μᵀh(x)`` (``λ >= 0``), with the primal projected onto the
+    box ``[lower_bounds, upper_bounds]``; all gradients come from ``jax.grad``.
+    Iterations run in compiled epochs of ``iterations_per_epoch`` steps. After
+    each epoch the convergence test is evaluated, and the solve stops once all
+    three of the following are within tolerance:
+
+    * stationarity, ``‖x - proj(x - ∇ₓL)‖∞ <= primal_grad_norm_tolerance``;
+    * primal feasibility, the largest violation ``max(g(x)⁺, |h(x)|) <=
+      primal_feasibility_tolerance``;
+    * complementary slackness, ``max|λ ⊙ g(x)| / (1 + |f(x)|) <=
+      complementarity_slack_tolerance``.
+
+    The epoch loop runs on the device: each call into JAX executes a chunk of
+    many epochs, including the metrics, convergence test and restart logic, with
+    no host synchronisation between them. Python regains control between chunks
+    (sized to take about a second) to enforce ``max_epochs`` / ``max_seconds``,
+    print the verbose log and handle Ctrl-C; with ``verbose=True`` the per-epoch
+    ``Time`` is the average over the epoch's chunk. When ``verbose``,
+    ``max_epochs`` and ``max_seconds`` are all unset, the whole solve runs as a
+    single device call (only an ``iterations_per_epoch_decay`` restart, which
+    changes the compiled epoch length, returns to Python); Ctrl-C then takes
+    effect only once the call returns.
+
     Args:
+        optimiser: Optax ``GradientTransformation`` for the primal and dual
+            players (build one with
+            ``jaddle_optimisers.create_saddle_optimiser``, or use a ready-made
+            one such as ``jo.gd`` or ``jo.optimistic_gd``). It drives the steps
+            whenever the adaptive step is off: always in ``"alternating"``
+            mode, and in ``"extragradient"`` mode when ``adaptive_eta=None``.
+            Passing one makes ``adaptive_eta="auto"`` resolve to ``None``.
+            ``None`` (default) uses plain gradient descent, ``jo.gd(0.5)``.
+        max_epochs: Epoch budget (default ``None`` = no limit). The solve stops
+            with ``stop_reason="max_epochs"`` once it is reached.
         max_seconds: Wall-clock budget in seconds (default ``None`` = no limit).
             Measured from entry into ``solve()``, so setup and ``precompile``
-            count against it. Checked at each epoch boundary: once the budget is
-            spent no further epoch starts and the current point is returned with
-            ``stop_reason="time_limit"``, so the solve can overrun by up to one
+            count against it. Checked between chunks of epochs, and each chunk is
+            sized from the measured epoch time to fit the remaining budget; once
+            the budget is spent the current point is returned with
+            ``stop_reason="time_limit"``. The solve can overrun by about one
             epoch (shrink ``iterations_per_epoch`` for a tighter cutoff).
+        initial_solution: Starting ``SaddleState`` (default ``None`` = zeros
+            for the primal and both duals), e.g. the ``"solution"`` of a
+            previous solve.
+        initial_opt_state: Starting step-size / optimiser state (default
+            ``None`` = fresh), e.g. the ``"opt_state"`` of a previous solve.
+            Pass it together with ``initial_solution`` to resume a solve.
+        iterations_per_epoch: Iterations per compiled epoch (default 1000).
+            Convergence, budgets, logging and restarts are checked between
+            epochs, so smaller values react faster at some per-epoch cost.
+        primal_grad_norm_tolerance: Stationarity tolerance (default 1e-2); see
+            the convergence test above.
+        primal_feasibility_tolerance: Constraint-violation tolerance (default
+            1e-3).
+        complementarity_slack_tolerance: Relative complementary-slackness
+            tolerance (default 1e-3).
+        weight_function: Weight ``w(i)`` given to iterate ``i`` in the running
+            average (default uniform, ``lambda _: 1.0``; see also
+            ``jaddle_optimisers.tail_average``). Only used when
+            ``average=True``.
+        verbose: Print per-epoch progress (default ``False``).
+        log_every: With ``verbose``, print every this many epochs (default 1).
+        average: Report and test convergence on the weighted running average
+            of the iterates rather than the last iterate (default ``False``);
+            restarts then resume from whichever of the two has the better merit. Averaging helps non-contractive schemes such as
+            ``"alternating"``; the adaptive schemes converge in the last iterate.
         update_mode: Selects the stepping scheme (single source of truth):
             ``"extragradient"`` (default; Korpelevich two-call),
             ``"alternating"`` (primal step, then dual step at the new primal) or
@@ -689,7 +693,7 @@ def solve(
         k_scale: Primal-weight (k) scaling control. ``None`` disables it;
             otherwise a float sets a symmetric clamp band ``[1/k_scale,
             k_scale]`` for ``k`` (default ``10`` → ``[0.1, 10]``). When enabled —
-            orthogonal to ``update_mode``, so it composes with both schemes
+            orthogonal to ``update_mode``, so it composes with every scheme
             — a primal weight ``k`` rescales the primal/dual gradients by
             ``(1/k, k)`` before each ``opt_update``, making the dual/primal step
             ratio ``k**2``. ``k`` is initialised from ``k_init`` and rebalanced
@@ -744,6 +748,11 @@ def solve(
             more time checking convergence.
         iterations_per_epoch_min: Floor for the decayed epoch length (default
             100). Only used when ``iterations_per_epoch_decay < 1``.
+        precompile: Compile the device loop before the timed loop starts
+            (default ``True``), so ``"solve_seconds"`` measures iteration time
+            rather than XLA compilation. The compile still counts against
+            ``max_seconds``. A restart that changes ``iterations_per_epoch``
+            compiles a new loop inside the timed region.
 
     Returns:
         dict: The solution together with diagnostics. Keys:
@@ -756,8 +765,11 @@ def solve(
               exhausted) or ``"interrupted"`` (KeyboardInterrupt).
             * ``"opt_state"``: the final optimiser state, for warm-starting a
               subsequent solve via ``initial_opt_state``.
-            * ``"solve_seconds"``: ``float`` wall time of the epoch loop (incl. the
-              first-epoch XLA compile but not the setup phase before it).
+            * ``"solve_seconds"``: ``float`` wall time of the epoch loop,
+              excluding setup. With ``precompile=True`` (default) it also
+              excludes XLA compilation; with ``precompile=False`` it includes
+              the first-epoch compile.
+            * ``"epochs"``: ``int``, number of epochs run.
     """
 
     # max_seconds is a wall-clock budget for the whole call, setup included.
@@ -908,104 +920,12 @@ def solve(
         complementarity_slack,
         constraint_bound,
     ):
+        # True while NOT yet converged.
         return (
             (primal_grad_norm > primal_grad_norm_tolerance)
             | (complementarity_slack > complementarity_slack_tolerance)
             | (constraint_bound > primal_feasibility_tolerance)
         )
-
-    def check_max_epochs(count):
-        return count >= max_epochs
-
-    def cond_fun(loop_vars):
-        (
-            i,
-            state,
-            average_state,
-            opt_state,
-            previous_objective,
-            primal_grad_norm,
-            complementarity_slack,
-            constraint_bound,
-            count,
-            objective_value,
-            duality_gap,
-            dual_gap_is_finite,
-            total_weight,
-        ) = loop_vars
-
-        return check_convergence(
-            primal_grad_norm, complementarity_slack, constraint_bound
-        )
-
-    def body_fun(loop_vars):
-        (
-            i,
-            state,
-            average_state,
-            opt_state,
-            previous_objective,
-            primal_grad_norm,
-            complementarity_slack,
-            constraint_bound,
-            count,
-            objective_value,
-            duality_gap,
-            dual_gap_is_finite,
-            total_weight,
-        ) = loop_vars
-
-        (
-            i,
-            state,
-            average_state,
-            opt_state,
-            total_weight,
-        ) = __sps(
-            iterations_per_epoch,
-            i,
-            cp,
-            optimiser,
-            state,
-            average_state,
-            opt_state,
-            weight_function,
-            total_weight,
-            average,
-            update_mode,
-            k_scaling,
-            k_init,
-            adaptive_eta,
-        )
-
-        (
-            objective_value,
-            primal_grad_norm,
-            complementarity_slack,
-            constraint_bound,
-            duality_gap,
-            dual_gap_is_finite,
-        ) = compute_epoch_metrics(average_state if average else state)
-
-        count += 1
-
-        return (
-            i,
-            state,
-            average_state,
-            opt_state,
-            previous_objective,
-            primal_grad_norm,
-            complementarity_slack,
-            constraint_bound,
-            count,
-            objective_value,
-            duality_gap,
-            dual_gap_is_finite,
-            total_weight,
-        )
-
-    i = 1
 
     if initial_solution is None:
         initial_solution = cp.initial_solution()
@@ -1034,10 +954,6 @@ def solve(
     elif k_init is None:
         k_init = 1.0
 
-    is_converged = True
-    stop_reason = "converged"
-    state = initial_solution
-    average_state = initial_solution
     if initial_opt_state is not None:
         opt_state = initial_opt_state
     elif k_scaling:
@@ -1050,92 +966,324 @@ def solve(
         opt_state = (optimiser.init(initial_solution), k_slot)
     else:
         opt_state = optimiser.init(initial_solution)
-    primal_grad_norm = jnp.inf
-    complementarity_slack = jnp.inf
-    constraint_bound = jnp.inf
-    objective_value = jnp.inf
-    duality_gap = jnp.inf
-    dual_gap_is_finite = False
-    count = 0
-    total_weight = 0.0
-    current_iterations_per_epoch = iterations_per_epoch
-
-    restarts_done = 0
-    restart_i_offset = 0
-    epochs_since_restart = 0
-    current_cycle_cap = float(epochs_per_restart)
-    merit_at_last_restart = jnp.inf
-    # Iterate at the last restart (or the start), used to rebalance the primal
-    # weight k from the primal-vs-dual movement over the restart cycle.
-    # Independent copy: `state` (== initial_solution) is donated to __sps each
-    # epoch, so an alias here would read as deleted at the first k-rebalance.
-    state_at_last_restart = jax.tree.map(lambda x: x + 0, initial_solution)
 
     def kkt_merit(primal_grad_norm, complementarity_slack, constraint_bound):
-        # Normalised KKT merit for the restart trigger. Each term is divided by
-        # (1 + its initial value) so all three are O(1) at the start. Since we
-        # don't track initial values, just use 1.0 as the normaliser (the merit
-        # is only compared with itself at successive restarts, so the scale
-        # cancels). The maximum of the three terms drives the trigger.
+        # Normalised KKT merit for the restart trigger: the maximum of the three
+        # residuals. It is only compared with itself at successive restarts, so
+        # a fixed normaliser of 1 is enough.
         return jnp.maximum(
             jnp.maximum(primal_grad_norm, complementarity_slack),
             constraint_bound,
         )
 
-    if precompile:
-        # Warm both jitted functions the hot loop uses (the scan body via
-        # __sps, and the end-of-epoch metrics) with the exact argument
-        # signatures the timed loop will feed them, so epoch 1 doesn't pay
-        # their first-call compile inside the timed measurement.
-        #
-        # NOTE: convex's run_epoch takes max_iter as a *static* argname (the
-        # scan length is baked into the compile), so it must be warmed with the
-        # real `current_iterations_per_epoch` value — warming with max_iter=1
-        # would compile a throwaway length-1 executable and leave the real one
-        # to compile cold in epoch 1. (Linear can use max_iter=1 because there
-        # it's a traced while_loop bound, not a static scan length.)
-        # run_epoch donates its state/opt_state buffers, so feed the warm-up
-        # *copies* — the real state/opt_state the timed loop uses must survive.
-        # Use jnp.copy (not `x + 0`): adding 0 promotes boolean leaves such as
-        # optax adadelta's `is_initial_step` from bool to int32, which then
-        # mismatches the scan carry's bool output and raises a dtype TypeError.
-        _warm_state = jax.tree.map(jnp.copy, state)
-        _warm_opt_state = jax.tree.map(jnp.copy, opt_state)
-        _precompile_result = __sps(
-            current_iterations_per_epoch,
-            i - restart_i_offset,
+    def _k_of(opt_state):
+        # The k-slot is a tuple led by k in adaptive_step mode, plain k otherwise.
+        return opt_state[1][0] if adaptive_step else opt_state[1]
+
+    def _rebalance_k(new_state, ref_state, k_prev):
+        # PDLP-style primal-weight rebalance: drive k from the primal-vs-dual
+        # *movement* over the just-finished cycle (distance between iterates),
+        # not per-step gradient norms. omega = ||dy|| / ||dx|| under tau = eta/k,
+        # sigma = eta*k (matches the linear solver), blended with the current
+        # weight in log space (k_theta), then clamped. Squared norms avoid two
+        # sqrts; the ratio is preserved.
+        dp = new_state.primal - ref_state.primal
+        dd = jnp.concatenate(
+            [
+                new_state.dual_eq - ref_state.dual_eq,
+                new_state.dual_ineq - ref_state.dual_ineq,
+            ]
+        )
+        move_p2 = jnp.vdot(dp, dp) + 1e-60
+        move_d2 = jnp.vdot(dd, dd) + 1e-60
+        k_target = jnp.sqrt(move_d2 / move_p2)
+        log_k = k_theta * jnp.log(k_target) + (1.0 - k_theta) * jnp.log(k_prev)
+        return jnp.clip(jnp.exp(log_k), k_lo, k_hi)
+
+    def _select(pred, a, b):
+        return jax.tree.map(lambda x, y: jnp.where(pred, x, y), a, b)
+
+    def _strong(tree):
+        # Strip JAX's weak typing (from Python-scalar inputs like jnp.asarray(0))
+        # so the carry handed to run_chunk always has exactly the types run_chunk
+        # returns; otherwise the second call retraces and recompiles the chunk.
+        return jax.tree.map(
+            lambda x: jax.lax.convert_element_type(x, jnp.asarray(x).dtype), tree
+        )
+
+    # --- Device-resident epoch loop -------------------------------------------
+    # Epochs run in chunks: one jitted lax.while_loop (`run_chunk`) executes many
+    # epochs back to back on the device -- the iterations, the end-of-epoch
+    # metrics, the convergence test and the restart / primal-weight logic -- so
+    # the host never waits on the device between epochs. Python regains control
+    # only between chunks, to enforce max_epochs / max_seconds, print the
+    # buffered epoch log and restart messages, and catch Ctrl-C. A chunk also
+    # ends early when a restart decays `iterations_per_epoch` (the epoch length
+    # is a static scan length, so the next chunk is compiled for the new length)
+    # or when the verbose log buffers fill.
+    _metric_shapes = jax.eval_shape(compute_epoch_metrics, initial_solution)
+    _merit_dtype = _metric_shapes[1].dtype
+
+    def _initial_metrics():
+        # +inf everywhere (and gap finiteness False) so the convergence test
+        # can't pass before the first epoch has computed real metrics.
+        return tuple(
+            jnp.zeros(m.shape, m.dtype)
+            if m.dtype == jnp.bool_
+            else jnp.full(m.shape, jnp.inf, m.dtype)
+            for m in _metric_shapes
+        )
+
+    def _build_chunk(ipe):
+        run_epoch = _make_epoch_fn(
             cp,
             optimiser,
-            _warm_state,
-            average_state,
-            _warm_opt_state,
             weight_function,
-            total_weight,
             average,
             update_mode,
             k_scaling,
-            k_init,
-            adaptive_eta,
+            adaptive_step,
         )
-        _precompile_metrics = compute_epoch_metrics(average_state if average else state)
-        jax.block_until_ready((_precompile_result, _precompile_metrics))
+        ipe_after_restart = max(
+            iterations_per_epoch_min, int(ipe * iterations_per_epoch_decay)
+        )
+
+        def epoch(c):
+            # The epoch runs on the restart-shifted index, so a restart re-zeros
+            # the iteration counter the step schedules and weights see.
+            start = c["i"] - c["restart_i_offset"]
+            shifted_i, state, avg, opt, total_weight = run_epoch(
+                ipe, start, c["state"], c["avg"], c["opt"], c["total_weight"]
+            )
+            i = shifted_i + c["restart_i_offset"]
+            count = c["count"] + 1
+
+            metrics = compute_epoch_metrics(avg if average else state)
+            objective_value, primal_grad_norm, complementarity_slack, constraint_bound = (
+                metrics[:4]
+            )
+
+            log, n_log, evt, n_evt = c["log"], c["n_log"], c["evt"], c["n_evt"]
+            if verbose:
+                write = (count == 1) | (count % log_every == 0)
+                row = jnp.stack(
+                    [
+                        count,
+                        objective_value,
+                        primal_grad_norm,
+                        complementarity_slack,
+                        constraint_bound,
+                    ]
+                ).astype(log.dtype)
+                log = jnp.where(write, log.at[n_log].set(row), log)
+                n_log = n_log + write
+
+            # --- Adaptive restart decision ---
+            restart_i_offset = c["restart_i_offset"]
+            at_restart = c["state_at_last_restart"]
+            mal = c["merit_at_last_restart"]
+            epochs_since = c["epochs_since_restart"]
+            cycle_cap = c["cycle_cap"]
+            ipe_next = c["ipe"]
+            if restarts:
+                epochs_since = epochs_since + 1
+                merit = kkt_merit(
+                    primal_grad_norm, complementarity_slack, constraint_bound
+                )
+
+                # Two-point restart: pick the better of average and iterate.
+                restart_point = avg if average else state
+                restart_merit = merit
+                restart_used_avg = jnp.asarray(bool(average))
+                if average:
+                    st = compute_epoch_metrics(state)
+                    state_merit = kkt_merit(st[1], st[2], st[3])
+                    iterate_better = state_merit < merit
+                    restart_point = _select(iterate_better, state, restart_point)
+                    restart_merit = jnp.where(iterate_better, state_merit, merit)
+                    restart_used_avg = ~iterate_better
+
+                mal = jnp.where(jnp.isfinite(mal), mal, restart_merit)
+                sufficient_progress = restart_merit <= restart_decay * mal
+                cycle_exhausted = epochs_since >= cycle_cap
+                restarted = sufficient_progress | cycle_exhausted
+
+                if k_scaling:
+                    k_new = _rebalance_k(restart_point, at_restart, _k_of(opt))
+                    # Carry the learned step size across the restart (PDLP
+                    # convention, as in the linear solver): re-seeding forced
+                    # the adaptive rule to re-climb from adaptive_eta after
+                    # every restart.
+                    k_slot = _init_k_slot(
+                        k_new,
+                        opt[1][1] if adaptive_step else None,
+                        restart_point,
+                        update_mode,
+                    )
+                    opt_restart = (optimiser.init(restart_point), k_slot)
+                else:
+                    k_new = jnp.asarray(jnp.nan, _merit_dtype)
+                    opt_restart = optimiser.init(restart_point)
+
+                # Warm-start from the restart point; reset the optimiser state,
+                # averaging, the weight accumulator and the iteration offset.
+                opt = _select(restarted, opt_restart, opt)
+                state = _select(restarted, restart_point, state)
+                avg = _select(restarted, restart_point, avg)
+                at_restart = _select(restarted, restart_point, at_restart)
+                total_weight = jnp.where(restarted, 0.0, total_weight)
+                restart_i_offset = jnp.where(restarted, i - 1, restart_i_offset)
+                mal = jnp.where(restarted, restart_merit, mal)
+                epochs_since = jnp.where(restarted, 0, epochs_since)
+                cycle_cap = jnp.where(
+                    restarted, cycle_cap * restart_multiplier, cycle_cap
+                )
+                ipe_next = jnp.where(restarted, ipe_after_restart, ipe_next)
+                if verbose:
+                    row = jnp.stack(
+                        [
+                            count,
+                            jnp.where(sufficient_progress, 0, 1),
+                            restart_merit,
+                            restart_used_avg,
+                            k_new,
+                            cycle_cap,
+                            ipe_next,
+                        ]
+                    ).astype(evt.dtype)
+                    evt = jnp.where(restarted, evt.at[n_evt].set(row), evt)
+                    n_evt = n_evt + restarted
+
+            new = dict(
+                state=state,
+                avg=avg,
+                opt=opt,
+                state_at_last_restart=at_restart,
+                metrics=metrics,
+                count=count,
+                i=i,
+                restart_i_offset=restart_i_offset,
+                total_weight=total_weight,
+                merit_at_last_restart=mal,
+                epochs_since_restart=epochs_since,
+                cycle_cap=cycle_cap,
+                ipe=ipe_next,
+                done=~check_convergence(
+                    primal_grad_norm, complementarity_slack, constraint_bound
+                ),
+                log=log,
+                n_log=n_log,
+                evt=evt,
+                n_evt=n_evt,
+            )
+            # Keep the loop carry type-stable.
+            return jax.tree.map(
+                lambda n, o: jnp.asarray(n).astype(jnp.asarray(o).dtype), new, c
+            )
+
+        @jax.jit
+        def run_chunk(c, n_epochs):
+            end = c["count"] + n_epochs
+
+            def cond(c):
+                go = (~c["done"]) & (c["count"] < end) & (c["ipe"] == ipe)
+                if verbose:
+                    go = go & (c["n_log"] < _LOG_CAP) & (c["n_evt"] < _EVT_CAP)
+                return go
+
+            return jax.lax.while_loop(cond, epoch, c)
+
+        return run_chunk
+
+    carry = _strong(
+        dict(
+            state=initial_solution,
+            avg=initial_solution,
+            opt=opt_state,
+            state_at_last_restart=initial_solution,
+            metrics=_initial_metrics(),
+            count=jnp.asarray(0),
+            i=jnp.asarray(1),
+            restart_i_offset=jnp.asarray(0),
+            total_weight=jnp.asarray(0.0),
+            merit_at_last_restart=jnp.asarray(jnp.inf, _merit_dtype),
+            epochs_since_restart=jnp.asarray(0),
+            cycle_cap=jnp.asarray(float(epochs_per_restart)),
+            ipe=jnp.asarray(iterations_per_epoch),
+            done=jnp.asarray(False),
+            log=jnp.zeros((_LOG_CAP, 5), _merit_dtype) if verbose else None,
+            n_log=jnp.asarray(0),
+            evt=jnp.zeros((_EVT_CAP, 7), _merit_dtype) if verbose else None,
+            n_evt=jnp.asarray(0),
+        )
+    )
+
+    def _epochs_arg(n):
+        # Same type on every call, so the (possibly AOT-compiled) chunk accepts it.
+        return jnp.asarray(n, carry["count"].dtype)
+
+    chunk_fns = {}
+    current_ipe = int(iterations_per_epoch)
+    if precompile:
+        # Compile the first chunk function ahead of time, so the first epoch
+        # doesn't pay its compile inside the timed measurement.
+        chunk_fns[current_ipe] = (
+            _build_chunk(current_ipe).lower(carry, _epochs_arg(1)).compile()
+        )
+
+    # With no logging and no budgets there is nothing for the host to do between
+    # epochs, so the whole solve is one call: the loop only returns once the
+    # convergence test passes (or a restart changes iterations_per_epoch, whose
+    # new scan length needs a new compile).
+    single_call = not verbose and not max_epochs and max_seconds is None
+    chunk_epochs = _UNBOUNDED_EPOCHS if single_call else 1
+    seconds_per_epoch = None
+    count = 0
+    done = False
+    restarts_printed = 0
+    is_converged = True
+    stop_reason = "converged"
+
+    def print_chunk_log(host, epoch_time):
+        nonlocal restarts_printed
+        entries = [(int(r[0]), 0, r) for r in host["log"][: int(host["n_log"])]]
+        entries += [(int(r[0]), 1, r) for r in host["evt"][: int(host["n_evt"])]]
+        for epoch_no, kind, r in sorted(entries, key=lambda e: e[:2]):
+            if kind == 0:
+                print(
+                    f"|Epoch {epoch_no}|"
+                    f"|Obj{float(r[1]):.2e}|"
+                    f"|PGN {float(r[2]):.2e}|"
+                    f"|CS {float(r[3]):.2e}|"
+                    f"|PFR {float(r[4]):.2e}|"
+                    f"|Time {epoch_time:.2f}s|"
+                )
+                print("----------------------------------------------")
+                continue
+            restarts_printed += 1
+            reason = "sufficient-progress" if r[1] == 0 else "cycle-cap"
+            which = "avg" if r[3] else "iterate"
+            k_msg = f", k={float(r[4]):.3e}" if k_scaling else ""
+            print(
+                f"Restart {restarts_printed} at epoch {epoch_no} "
+                f"({reason}, merit={float(r[2]):.2e} "
+                f"[{which}], next cap={float(r[5]):.0f} epochs, "
+                f"iters/epoch={int(r[6])}{k_msg})"
+            )
+            print("----------------------------------------------")
 
     start_time = time.time()
 
     try:
-        while check_convergence(
-            primal_grad_norm,
-            complementarity_slack,
-            constraint_bound,
-        ):
-            if max_epochs:
-                if check_max_epochs(count):
-                    is_converged = False
-                    stop_reason = "max_epochs"
-                    print(f"Reached maximum epochs: {max_epochs}. Stopping.")
-                    print("----------------------------------------------")
-                    break
-
+        while True:
+            if done:
+                break
+            if max_epochs and count >= max_epochs:
+                is_converged = False
+                stop_reason = "max_epochs"
+                print(f"Reached maximum epochs: {max_epochs}. Stopping.")
+                print("----------------------------------------------")
+                break
             if max_seconds is not None:
                 if time.time() - solve_entry_time >= max_seconds:
                     is_converged = False
@@ -1144,180 +1292,58 @@ def solve(
                     print("----------------------------------------------")
                     break
 
-            start_epoch_time = time.time()
-            (
-                shifted_i,
-                state,
-                average_state,
-                opt_state,
-                total_weight,
-            ) = __sps(
-                current_iterations_per_epoch,
-                i - restart_i_offset,
-                cp,
-                optimiser,
-                state,
-                average_state,
-                opt_state,
-                weight_function,
-                total_weight,
-                average,
-                update_mode,
-                k_scaling,
-                k_init,
-                adaptive_eta,
+            n_epochs = chunk_epochs
+            if max_epochs:
+                n_epochs = min(n_epochs, max_epochs - count)
+            if max_seconds is not None and seconds_per_epoch:
+                remaining = max_seconds - (time.time() - solve_entry_time)
+                n_epochs = min(n_epochs, max(1, int(remaining / seconds_per_epoch)))
+
+            run_chunk = chunk_fns.get(current_ipe)
+            if run_chunk is None:
+                run_chunk = chunk_fns[current_ipe] = _build_chunk(current_ipe)
+
+            chunk_start = time.time()
+            new_carry = run_chunk(carry, _epochs_arg(n_epochs))
+            keys = ["count", "done", "ipe"]
+            if verbose:
+                keys += ["log", "n_log", "evt", "n_evt"]
+            # The one host/device synchronisation per chunk.
+            host = jax.device_get({k: new_carry[k] for k in keys})
+            carry = new_carry
+            chunk_seconds = time.time() - chunk_start
+
+            epochs_run = max(int(host["count"]) - count, 1)
+            count = int(host["count"])
+            done = bool(host["done"])
+            current_ipe = int(host["ipe"])
+            if single_call:
+                continue
+            seconds_per_epoch = chunk_seconds / epochs_run
+
+            if verbose:
+                print_chunk_log(host, seconds_per_epoch)
+                zero = jnp.zeros_like(carry["n_log"])
+                carry = {**carry, "n_log": zero, "n_evt": zero}
+
+            # Size the next chunk to take about _CHUNK_TARGET_SECONDS, growing
+            # by at most 8x per chunk.
+            chunk_epochs = int(
+                min(
+                    max(1.0, _CHUNK_TARGET_SECONDS / seconds_per_epoch),
+                    8 * epochs_run,
+                )
             )
-            i = shifted_i + restart_i_offset
-
-            (
-                objective_value,
-                primal_grad_norm,
-                complementarity_slack,
-                constraint_bound,
-                duality_gap,
-                dual_gap_is_finite,
-            ) = compute_epoch_metrics(average_state if average else state)
-
-            finish_epoch_time = time.time()
-            count += 1
-
-            if verbose and (count == 1 or count % log_every == 0):
-                print(
-                    f"|Epoch {count}|"
-                    f"|Obj{objective_value:.2e}|"
-                    f"|PGN {primal_grad_norm:.2e}|"
-                    f"|CS {complementarity_slack:.2e}|"
-                    f"|PFR {constraint_bound:.2e}|"
-                    f"|Time {finish_epoch_time - start_epoch_time:.2f}s|"
-                )
-                print("----------------------------------------------")
-
-            # --- Adaptive restart decision ---
-            if restarts:
-                epochs_since_restart += 1
-
-                merit = kkt_merit(
-                    primal_grad_norm, complementarity_slack, constraint_bound
-                )
-
-                # Two-point restart: pick the better of average and iterate.
-                restart_point = average_state if average else state
-                restart_merit = merit
-                restart_used_avg = bool(average)
-                if average:
-                    (
-                        _obj,
-                        st_pgn,
-                        st_cs,
-                        st_cb,
-                        _dg,
-                        _dgf,
-                    ) = compute_epoch_metrics(state)
-                    state_merit = kkt_merit(st_pgn, st_cs, st_cb)
-                    if bool(state_merit < merit):
-                        restart_point = state
-                        restart_merit = state_merit
-                        restart_used_avg = False
-
-                if not jnp.isfinite(merit_at_last_restart):
-                    merit_at_last_restart = restart_merit
-
-                sufficient_progress = bool(
-                    restart_merit <= restart_decay * merit_at_last_restart
-                )
-                cycle_exhausted = epochs_since_restart >= current_cycle_cap
-
-                if sufficient_progress or cycle_exhausted:
-                    state = restart_point
-                    if k_scaling:
-                        # PDLP-style primal-weight rebalance: drive k from the
-                        # primal-vs-dual *movement* over the just-finished cycle
-                        # (distance between iterates), not per-step gradient
-                        # norms. log-space geometric-mean blend with the current
-                        # weight (k_theta), then clamp.
-                        dp = state.primal - state_at_last_restart.primal
-                        dd = jnp.concatenate(
-                            [
-                                state.dual_eq - state_at_last_restart.dual_eq,
-                                state.dual_ineq - state_at_last_restart.dual_ineq,
-                            ]
-                        )
-                        # Use squared norms to avoid two sqrt ops; ratio is preserved.
-                        move_p2 = jnp.vdot(dp, dp) + 1e-60
-                        move_d2 = jnp.vdot(dd, dd) + 1e-60
-                        # PDLP primal-weight update: omega = ||dy|| / ||dx||
-                        # under tau = eta/k, sigma = eta*k, balancing k||dx||^2
-                        # against ||dy||^2 / k (matches the linear solver).
-                        k_target = jnp.sqrt(move_d2 / move_p2)
-                        # The k-slot is a tuple led by k in adaptive_step mode,
-                        # plain k otherwise. Read k accordingly.
-                        k_prev = opt_state[1][0] if adaptive_step else opt_state[1]
-                        log_k = k_theta * jnp.log(k_target) + (1.0 - k_theta) * jnp.log(
-                            k_prev
-                        )
-                        k_new = jnp.clip(jnp.exp(log_k), k_lo, k_hi)
-                        # Carry the learned step size across the restart (PDLP
-                        # convention, as in the linear solver): re-seeding forced
-                        # the adaptive rule to re-climb from adaptive_eta after
-                        # every restart.
-                        k_slot = _init_k_slot(
-                            k_new,
-                            opt_state[1][1] if adaptive_step else None,
-                            state,
-                            update_mode,
-                        )
-                        opt_state = (optimiser.init(state), k_slot)
-                    else:
-                        opt_state = optimiser.init(state)
-                    average_state = state
-                    # __sps donates `state` each epoch (freeing the buffer in
-                    # place), so state_at_last_restart must be an independent
-                    # copy — otherwise it aliases the donated buffer and reads as
-                    # deleted at the next restart's k-rebalance.
-                    state_at_last_restart = jax.tree.map(lambda x: x + 0, state)
-                    total_weight = 0.0
-                    restart_i_offset = i - 1
-                    merit_at_last_restart = restart_merit
-                    epochs_since_restart = 0
-                    current_cycle_cap *= restart_multiplier
-                    current_iterations_per_epoch = max(
-                        iterations_per_epoch_min,
-                        int(current_iterations_per_epoch * iterations_per_epoch_decay),
-                    )
-                    restarts_done += 1
-                    if verbose:
-                        reason = (
-                            "sufficient-progress"
-                            if sufficient_progress
-                            else "cycle-cap"
-                        )
-                        which = "avg" if restart_used_avg else "iterate"
-                        if k_scaling:
-                            _k_val = opt_state[1][0] if adaptive_step else opt_state[1]
-                            k_msg = f", k={float(_k_val):.3e}"
-                        else:
-                            k_msg = ""
-                        print(
-                            f"Restart {restarts_done} at epoch {count} "
-                            f"({reason}, merit={float(restart_merit):.2e} "
-                            f"[{which}], next cap={current_cycle_cap:.0f} epochs, "
-                            f"iters/epoch={current_iterations_per_epoch}{k_msg})"
-                        )
-                        print("----------------------------------------------")
-
-        if average:
-            output = average_state
-        else:
-            output = state
     except KeyboardInterrupt:
+        # `carry` still holds the last completed chunk (it is not donated).
         is_converged = False
         stop_reason = "interrupted"
-        if average:
-            output = average_state
-        else:
-            output = state
+        count = int(carry["count"])
         print("KeyboardInterrupt received. Returning current solution.")
         print("----------------------------------------------")
+
+    opt_state = carry["opt"]
+    output = carry["avg"] if average else carry["state"]
 
     output = jax.block_until_ready(output)
     end_time = time.time()
@@ -1334,6 +1360,7 @@ def solve(
         "stop_reason": stop_reason,
         "opt_state": opt_state,
         "solve_seconds": end_time - start_time,
+        "epochs": count,
     }
 
 

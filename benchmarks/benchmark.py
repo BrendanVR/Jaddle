@@ -257,6 +257,22 @@ def load_relaxed_lp(
     return lp, opt_obj, highs_status, highs_seconds, offset
 
 
+def jaddle_solve_kwargs(tol, max_epochs, update_mode, max_seconds=None, verbose=True):
+    """The ``jl.solve`` settings every benchmark harness uses, so all of them
+    (and benchmark_mpax.py's Jaddle arm) run the same configuration."""
+    return dict(
+        max_epochs=max_epochs,
+        max_seconds=max_seconds,
+        verbose=verbose,
+        log_every=10,
+        primal_feasibility_tolerance=tol,
+        dual_feasibility_tolerance=tol,
+        dual_gap_tolerance=tol,
+        update_mode=update_mode,
+        iterations_per_epoch=64 * 10,
+    )
+
+
 def run_jaddle(lp, tol, max_epochs, update_mode="pdhg", max_seconds=None):
     """Solve with Jaddle's saddle-point solver. Returns a dict of metrics.
 
@@ -277,18 +293,7 @@ def run_jaddle(lp, tol, max_epochs, update_mode="pdhg", max_seconds=None):
 
     t0 = time.perf_counter()
     result = jl.solve(
-        lp,
-        max_epochs=max_epochs,
-        max_seconds=max_seconds,
-        verbose=True,
-        log_every=10,
-        primal_feasibility_tolerance=tol,
-        dual_feasibility_tolerance=tol,
-        dual_gap_tolerance=tol,
-        update_mode=update_mode,
-        iterations_per_epoch=64,
-        average=False,
-        report_best=False,
+        lp, **jaddle_solve_kwargs(tol, max_epochs, update_mode, max_seconds)
     )
     wall_seconds = time.perf_counter() - t0
 

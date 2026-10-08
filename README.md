@@ -36,13 +36,15 @@ Jaddle has no hand-written kernels. Every solver in the library is expressed
 in high-level JAX, and JAX's compiler and transformations supply the
 performance and portability. This brings several concrete benefits.
 
-**Compiled performance from Python.** Each epoch of iterations is traced once
-and compiled by XLA into a single fused program. Primal and dual updates, step
-size line searches, projections and residual computations run on the
-accelerator without returning control to Python between iterations. The inner
-loop of the LP solver is limited by the speed of sparse matrix–vector products,
-which is the limit any first-order LP method faces, rather than by interpreter
-overhead.
+**Compiled performance from Python.** Each solver's whole iteration loop is
+traced once and compiled by XLA into a single program. Primal and dual updates,
+step size line searches, projections, convergence checks and restart decisions
+all run on the accelerator, many epochs at a time, without returning control to
+Python. Python steps in only about once a second, to enforce time limits and
+print progress, and not at all when there is no logging or budget to enforce.
+The LP solver is therefore limited by the speed of sparse matrix–vector
+products, which is the limit any first-order LP method faces, rather than by
+interpreter overhead or host–device synchronisation.
 
 **Hardware portability.** The same source runs on a laptop CPU, a consumer GPU
 or a TPU pod. There are no device-specific code paths to maintain, and moving
@@ -79,17 +81,16 @@ Jaddle well suited to research and experimentation.
 
 ## Installation
 
-Jaddle requires Python 3.11 or later. Clone the repository and install it:
+Jaddle requires Python 3.11 or later and is available on
+[PyPI](https://pypi.org/project/jaddle/):
 
 ```bash
-git clone https://github.com/BrendanVR/Jaddle.git
-cd Jaddle
-pip install -e .
+pip install jaddle
 ```
 
 This installs the core dependencies: `jax`, `optax`, `numpy`, `scipy` and
 `highspy`, and runs on CPU. Optional features are available as extras, which
-can be combined, for example `pip install -e ".[cuda12,examples]"`:
+can be combined, for example `pip install "jaddle[cuda12,examples]"`:
 
 | Extra | Installs | Used for |
 |---|---|---|
@@ -103,10 +104,20 @@ can be combined, for example `pip install -e ".[cuda12,examples]"`:
 Jaddle is developed on Linux, including WSL 2. Continuous integration tests
 it on Python 3.11, 3.12 and 3.13.
 
-### Running the tests
+To work on Jaddle itself, or to run the examples, benchmarks and tests, install
+from a clone of the repository instead:
 
 ```bash
-pip install -e ".[examples,test]"
+git clone https://github.com/BrendanVR/Jaddle.git
+cd Jaddle
+pip install -e ".[dev]"
+```
+
+### Running the tests
+
+From the repository root:
+
+```bash
 pytest
 ```
 
