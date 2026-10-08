@@ -40,7 +40,7 @@ def parse_args():
     return p.parse_args()
 
 
-def load_presolved_lp(path, glop_verbose=False, eliminate_defined_vars=False):
+def load_presolved_lp(path, glop_verbose=False, eliminate_defined_vars=True):
     """Read an MPS file, relax integrality, presolve with glop and convert to
     Jaddle's sparse standard form.
 

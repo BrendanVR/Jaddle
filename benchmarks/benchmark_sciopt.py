@@ -100,16 +100,18 @@ def make_parser(description, default_csv):
     )
     p.add_argument(
         "--eliminate-defined-vars",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="After presolve, substitute out variables defined by a dense "
-        "equality row (z = sum_j a_j x_j, e.g. gmut-*). See "
+        "equality row (z = sum_j a_j x_j, e.g. gmut-*). On by default; "
+        "--no-eliminate-defined-vars disables it. See "
         "jaddle.presolve.eliminate_defined_variables.",
     )
     p.add_argument(
         "--update-mode",
         default="alternating",
         choices=["alternating", "pdhg", "halpern"],
-        help="Jaddle LP update_mode passed to jl.solve (default: pdhg).",
+        help="Jaddle LP update_mode passed to jl.solve (default: alternating).",
     )
     p.add_argument(
         "--jax-profile",
@@ -133,7 +135,7 @@ def parse_args():
     return p.parse_args()
 
 
-def load_presolved_lp(path, scip_verbose=False, eliminate_defined_vars=False):
+def load_presolved_lp(path, scip_verbose=False, eliminate_defined_vars=True):
     """Read an MPS file with PySCIPOpt, relax integrality, presolve with SCIP and
     convert to Jaddle's sparse standard form.
 

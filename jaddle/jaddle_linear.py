@@ -567,7 +567,7 @@ def solve(
     into slow rotational orbits. A restart fires when either the normalised KKT
     merit decays past ``restart_decay`` of its value at the last restart
     (sufficient-progress restart) or the current cycle reaches its length cap
-    (no-progress restart). Enable with ``restarts=True``.
+    (no-progress restart). On by default; disable with ``restarts=False``.
 
     Args:
         max_seconds: Wall-clock budget in seconds (default ``None`` = no limit).
@@ -589,20 +589,21 @@ def solve(
             residual |x - proj(x - r)| for boxed variables, with every finite bound
             always in the dual objective.
         termination_norm: Norm used for the primal / dual feasibility
-            stopping tests (and the printed PFR / DFR): ``"inf"`` (default)
-            tests ‖r_p‖∞/(1+‖b‖∞) and ‖r_d‖∞/(1+‖c‖∞); ``"l2"`` tests
-            ‖r_p‖₂/(1+‖b‖₂) and ‖r_d‖₂/(1+‖c‖₂), the cuPDLP-C / PDLP default,
-            for like-for-like comparisons. Termination only: the restart merit
+            stopping tests (and the printed PFR / DFR): ``"l2"`` (default)
+            tests ‖r_p‖₂/(1+‖b‖₂) and ‖r_d‖₂/(1+‖c‖₂), the cuPDLP-C / PDLP
+            default, for like-for-like comparisons; ``"inf"`` tests
+            ‖r_p‖∞/(1+‖b‖∞) and ‖r_d‖∞/(1+‖c‖∞). Termination only: the restart merit
             follows ``restart_norm``, so changing this alone leaves the iterate
             trajectory unchanged and only moves the epoch at which it stops.
-        restart_norm: Norm (``"inf"`` default, or ``"l2"``) for the primal /
+        restart_norm: Norm (``"l2"`` default, or ``"inf"``) for the primal /
             dual feasibility terms of the restart KKT merit and the
             dual-infeasible ``still_improving`` cycle-cap guard, normalised by
             1+‖b‖ / 1+‖c‖ in the same norm. ``"l2"`` matches cuPDLP-C's restart
             criterion. Unlike ``termination_norm`` this changes the trajectory.
-        restarts: Enable adaptive warm restarts (default ``False``). There is
-            no cap on how many fire; the triggers alone decide. Each restart resets the averaging (and the halpern anchor / lambda
-            counter) while keeping the current iterate as a warm start.
+        restarts: Enable adaptive warm restarts (default ``True``). There is
+            no cap on how many fire; the triggers alone decide. Each restart
+            resets the averaging (and the halpern anchor / lambda counter) while
+            keeping the current iterate as a warm start.
         epochs_per_restart: Length cap of the first restart cycle, expressed in
             epochs AT THE DEFAULT ``iterations_per_epoch`` (default 10) but
             internally converted to and tracked in ITERATIONS
@@ -628,11 +629,12 @@ def solve(
             cycle-start value AND has risen versus the previous epoch (rotational
             turnaround). Must be > ``restart_decay`` to be meaningful.
         update_mode: Selects the per-iterate stepping scheme. One of:
-            * ``"pdhg"`` (default): Chambolle–Pock PDHG (primal step then dual
-              step on the extrapolated primal x_bar = 2x^{k+1} − x^k).
-            * ``"alternating"``: primal step, then a dual step at the new primal
-              x^{k+1} (Gauss–Seidel, no extrapolation). Not contractive in
-              general; relies on averaging/restarts. Experimental.
+            * ``"alternating"`` (default): primal step, then a dual step at the
+              new primal x^{k+1} (Gauss–Seidel / alternating GDA, no
+              extrapolation). Not contractive in general; relies on
+              averaging/restarts.
+            * ``"pdhg"``: Chambolle–Pock PDHG (primal step then dual step on
+              the extrapolated primal x_bar = 2x^{k+1} − x^k).
             * ``"halpern"``: restarted Halpern-anchored PDHG. Each iterate is the
               adaptive PDHG step T(z) blended back toward an anchor z_0:
               ``z_{k+1} = lambda_k z_0 + (1−lambda_k) T(z_k)``, ``lambda_k =
@@ -667,19 +669,25 @@ def solve(
             largest admissible step from the interaction term
             ``(y^{k+1}-y^k)ᵀ A (x^{k+1}-x^k)``, and rejects + shrinks ``eta`` if
             the trial overshot; ``eta`` is then advanced with a two-sided guard.
-            ``0.0`` (default) seeds it at ``1/||[[A,b],[c,0]]||_2``. The learned
-            ``eta`` is carried across restarts.
+            A float > 0 sets the seed directly (default ``1.0``, a natural scale
+            once Ruiz/PC scaling has brought ``||A||`` to O(1)); ``"auto"`` (or
+            ``0.0``) seeds it at ``1/||[[A,b],[c,0]]||_2`` of the scaled LP,
+            estimated by power iteration. The line search corrects a poor seed
+            within a few iterations. The learned ``eta`` is carried across restarts.
         k_theta: Smoothing coefficient for the log-space primal-weight update at
-            each restart / epoch. A float fixes it (PDLP uses 0.5; smaller =
-            slower adaptation).
-            ``"adaptive"`` (default) sets it from data as a trust region on log k:
+            each restart / epoch. A float fixes it (default ``0.5``, as in PDLP;
+            smaller = slower adaptation).
+            ``"adaptive"`` sets it from data as a trust region on log k:
             starting at 0.5, each restart doubles theta (capped at 1) if the
             restart merit fell over the cycle since the previous k move, else
             halves it (floored at 0.05) and reverts k to its value before that
             move. The movement ratio alone can't tell a correct k move from a
             runaway (mzzv11's per-epoch runaway was monotone), but the merit can.
             Epochs to certify, restart-only vs fixed 0.5: barwon 41 vs 166,
-            binschedule2 39 vs 61, plus gains on stp3d and mzzv11.        primal_stop: Opt-in, dual-free termination (default ``False``). When
+            binschedule2 39 vs 61, plus gains on stp3d and mzzv11. It was the
+            default briefly, but fixed 0.5 proved safer across instances
+            (hgms30 ratchets k under ``"adaptive"``).
+        primal_stop: Opt-in, dual-free termination (default ``False``). When
             ``True``, termination ignores the dual certificate entirely and stops
             on **primal feasibility** (``constraint_bound`` within
             ``primal_feasibility_tolerance``) **and** an **objective stall**. This
@@ -709,8 +717,8 @@ def solve(
             whose largest scaled matrix entry is below it is rescaled so that
             entry becomes 1. Fixes epigraph objectives (``min z, z >= a_k.x``
             over dense rows, fhnw-binschedule0) where augmented Ruiz leaves the
-            variable huge in scaled units. Default ``1e-2``; ``0`` disables. See
-            ``scale_problem``.
+            variable huge in scaled units. Default ``0`` (disabled); pass e.g.
+            ``1e-2`` to enable. See ``scale_problem``.
         eq_projection_threshold: When set, after each epoch the unscaled equality
             residual is checked; if it exceeds this value the primal (and average)
             are projected onto the equality manifold ``A_eq x = b_eq`` via the
@@ -797,8 +805,17 @@ def solve(
         k_lo, k_hi = 1.0 / k_scale, k_scale
     else:
         k_lo, k_hi = 0.0, np.inf
-    if adaptive_eta is None or adaptive_eta < 0.0:
-        raise ValueError("adaptive_eta must be a float >= 0 (0.0 = auto seed)")
+    # "auto" (or 0.0) seeds eta from the scaled LP's augmented spectral norm,
+    # resolved after scaling below.
+    if isinstance(adaptive_eta, str):
+        if adaptive_eta != "auto":
+            raise ValueError(
+                f"adaptive_eta must be a float >= 0 or 'auto', got {adaptive_eta!r}"
+            )
+    elif adaptive_eta is None or adaptive_eta < 0.0:
+        raise ValueError("adaptive_eta must be a float >= 0 or 'auto' (0.0 = auto)")
+    elif adaptive_eta == 0.0:
+        adaptive_eta = "auto"
     halpern = update_mode == "halpern"
 
     if verbose:
@@ -842,9 +859,10 @@ def solve(
         lp = copy.copy(lp) if isinstance(lp, JaddleLP) else to_jaddle_sparse(lp)
 
     if adaptive_eta == "auto":
-        adaptive_eta = 1 / estimate_augmented_spectral_norm(lp)
-        print(f"Adaptive step size seed set to 1/||A||_2 = {adaptive_eta:.3e}")
-        print("----------------------------------------------")
+        adaptive_eta = 1 / float(estimate_augmented_spectral_norm(lp))
+        if verbose:
+            print(f"Adaptive step size seed set to 1/||A||_2 = {adaptive_eta:.3e}")
+            print("----------------------------------------------")
 
     # A user-supplied initial_solution is given in the LP's original (unscaled)
     # space, so it must be mapped into the scaled space the solver iterates in.

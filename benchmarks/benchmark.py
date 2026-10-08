@@ -161,7 +161,7 @@ def parse_args():
         "--update-mode",
         default="alternating",
         choices=["alternating", "pdhg", "halpern"],
-        help="Jaddle LP update_mode passed to jl.solve (default: pdhg).",
+        help="Jaddle LP update_mode passed to jl.solve (default: alternating).",
     )
     p.add_argument(
         "--jax-profile",
@@ -286,8 +286,9 @@ def run_jaddle(lp, tol, max_epochs, update_mode="pdhg", max_seconds=None):
         dual_feasibility_tolerance=tol,
         dual_gap_tolerance=tol,
         update_mode=update_mode,
-        iterations_per_epoch=64 * 20,
-        cost_col_floor=1e-2,
+        iterations_per_epoch=64,
+        average=False,
+        report_best=False,
     )
     wall_seconds = time.perf_counter() - t0
 
