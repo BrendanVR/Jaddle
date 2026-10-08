@@ -74,10 +74,28 @@ def configure_jax(jax_profile: Optional[str] = None):
 
     # Suppress INFO and WARNING logs from XLA/JAX
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-    os.environ.setdefault(
+    cache_dir = os.environ.setdefault(
         "JAX_COMPILATION_CACHE_DIR",
         os.path.expanduser("~/.cache/jaddle_jax"),
     )
+    if cache_dir:
+        # Persistent XLA compilation cache. The env var alone does nothing once
+        # jax is imported (it is read at import time), so set the live config.
+        # Cache every compile, not just the >=1 s default: a solve's ~30 small
+        # setup kernels each cost 10-60 ms to compile, and a re-run of the same
+        # instance (A/B sweeps) then skips all of them plus the ~2 s epoch-loop
+        # compile. Set JAX_COMPILATION_CACHE_DIR="" to disable.
+        jax.config.update("jax_compilation_cache_dir", cache_dir)
+        jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
+        # LRU cap at 10 GB (one instance's epoch loop is a few MB). JAX needs
+        # `filelock` for the cap and otherwise silently skips EVERY cache
+        # read/write, so only set it when available (else the cache is unbounded).
+        try:
+            import filelock  # noqa: F401
+
+            jax.config.update("jax_compilation_cache_max_size", 10 * 2**30)
+        except ImportError:
+            pass
 
     if PROFILE == "float64":
         # Double precision: enable x64 and use full-precision (highest) matmuls.
@@ -118,7 +136,7 @@ def configure_jax(jax_profile: Optional[str] = None):
         f"dtype={dtype}, "
         f"x64={os.environ.get('JAX_ENABLE_X64', 'default')}, "
         f"matmul_precision={os.environ.get('JAX_DEFAULT_MATMUL_PRECISION', 'default')}, "
-        f"cache={os.environ.get('JAX_COMPILATION_CACHE_DIR', 'disabled')}, "
+        f"cache={jax.config.jax_compilation_cache_dir or 'disabled'}, "
         f"xla_flags='{os.environ.get('XLA_FLAGS', '')}'"
     )
 

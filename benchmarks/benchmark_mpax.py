@@ -78,7 +78,13 @@ SGM_SHIFT_SECONDS = 10.0
 
 
 def parse_args():
-    p = make_parser("Jaddle vs MPAX LP benchmark.", "benchmark_mpax_results.csv")
+    # Jaddle's verbosity follows --verbose here unless set explicitly (None).
+    p = make_parser(
+        "Jaddle vs MPAX LP benchmark.",
+        "benchmark_mpax_results.csv",
+        jaddle_verbose=None,
+        jaddle_verbose_text="same as --verbose",
+    )
     p.add_argument(
         "--solvers",
         nargs="+",
@@ -124,9 +130,13 @@ def parse_args():
     p.add_argument(
         "--verbose",
         action="store_true",
-        help="Stream each solver's own progress log.",
+        help="Stream the solvers' progress logs: MPAX's, and Jaddle's unless "
+        "--no-jaddle-verbose is given.",
     )
-    return p.parse_args()
+    args = p.parse_args()
+    if args.jaddle_verbose is None:
+        args.jaddle_verbose = args.verbose
+    return args
 
 
 # %% [markdown]
@@ -209,7 +219,7 @@ def worker_main(config_path):
                     cfg["max_epochs"],
                     cfg["update_mode"],
                     cfg["max_seconds"],
-                    verbose=cfg["verbose"],
+                    verbose=cfg["jaddle_verbose"],
                 ),
             )
             sol = jax.block_until_ready(result["solution"])
@@ -236,7 +246,7 @@ def worker_main(config_path):
                 eps_abs=cfg["tol"],
                 eps_rel=cfg["tol"],
                 optimality_norm=float(cfg["mpax_norm"]),
-                verbose=cfg["verbose"],
+                verbose=cfg["mpax_verbose"],
             )
             if cfg["mpax_iteration_limit"]:
                 options["iteration_limit"] = cfg["mpax_iteration_limit"]
@@ -290,7 +300,8 @@ def run_worker(solver, lp_dir, args):
                 "mpax_algorithm": args.mpax_algorithm,
                 "mpax_norm": args.mpax_norm,
                 "mpax_iteration_limit": args.mpax_iteration_limit,
-                "verbose": args.verbose,
+                "jaddle_verbose": args.jaddle_verbose,
+                "mpax_verbose": args.verbose,
             },
             f,
         )
@@ -318,7 +329,8 @@ def run_worker(solver, lp_dir, args):
                 continue
             tail.append(line)
             del tail[:-40]
-            if args.verbose:
+            # Stream whichever solver log is on; nothing else reaches stdout.
+            if args.verbose or args.jaddle_verbose:
                 print("    " + line, end="", flush=True)
 
     reader = threading.Thread(target=pump, daemon=True)

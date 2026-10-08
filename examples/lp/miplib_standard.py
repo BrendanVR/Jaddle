@@ -10,6 +10,7 @@ import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 import highspy as hspy
+import numpy as np
 import jaddle.jaddle_optimisers as jo
 import jaddle.jaddle_linear as jl
 import jaddle.highs_helpers as hh
@@ -31,9 +32,9 @@ highs = hspy.Highs()
 highs.readModel(PATH_TO_MPS)  # path to MPS file
 
 # %%
-# Relax integrality
-for col in range(highs.numVariables):
-    highs.changeColIntegrality(col, hspy.HighsVarType.kContinuous)
+# Relax integrality (one batched call; a per-column loop is very slow on large models)
+n = highs.numVariables
+highs.changeColsIntegrality(n, np.arange(n, dtype=np.int32), np.zeros(n, dtype=np.uint8))
 
 # %%
 highs.setOptionValue("presolve", "off")

@@ -608,7 +608,7 @@ def solve(
     k_init=None,
     adaptive_eta="auto",
     restarts=False,
-    epochs_per_restart=10,
+    epochs_per_restart=None,
     restart_multiplier=1.0,
     restart_decay=0.2,
     iterations_per_epoch_decay=1.0,
@@ -735,8 +735,10 @@ def solve(
             KKT merit drops below ``restart_decay`` × the merit at the last
             restart (sufficient-progress restart) or the cycle-length cap is
             exhausted (no-progress restart).
-        epochs_per_restart: Length cap (epochs) of the first restart cycle
-            (default 10). Subsequent caps grow by ``restart_multiplier``.
+        epochs_per_restart: Length cap (epochs) of the first restart cycle, or
+            ``None`` (default) for no cap — restarts then fire only on the
+            sufficient-progress trigger. Subsequent caps grow by
+            ``restart_multiplier``.
         restart_multiplier: Geometric growth factor for cycle-length caps
             (default 1.0 = fixed length, 2.0 = doubling).
         restart_decay: Sufficient-progress threshold (default 0.2). A restart
@@ -1208,7 +1210,9 @@ def solve(
             total_weight=jnp.asarray(0.0),
             merit_at_last_restart=jnp.asarray(jnp.inf, _merit_dtype),
             epochs_since_restart=jnp.asarray(0),
-            cycle_cap=jnp.asarray(float(epochs_per_restart)),
+            cycle_cap=jnp.asarray(
+                jnp.inf if epochs_per_restart is None else float(epochs_per_restart)
+            ),
             ipe=jnp.asarray(iterations_per_epoch),
             done=jnp.asarray(False),
             log=jnp.zeros((_LOG_CAP, 5), _merit_dtype) if verbose else None,

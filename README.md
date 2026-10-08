@@ -268,7 +268,7 @@ the dual objective as in PDLP, so far-away finite bounds do not swamp the gap.
 | `update_mode` | `"alternating"` | Iteration scheme (see above). |
 | `iterations_per_epoch` | `256` | Iterations per compiled epoch. Metrics, logging and termination checks run between epochs. |
 | `max_epochs`, `max_seconds` | `None` | Iteration and wall-clock budgets. `max_seconds` includes setup and compilation. |
-| `restarts`, `epochs_per_restart` | `True`, `10` | Adaptive restarts and the length cap of a restart cycle. |
+| `restarts`, `epochs_per_restart` | `True`, `None` | Adaptive restarts and the length cap of a restart cycle (`None` = no cap). |
 | `restart_decay`, `necessary_decay` | `0.2`, `0.8` | Thresholds for the sufficient-progress and stalling restarts. |
 | `k_scale`, `k_theta`, `k_init` | `1e8`, `0.5`, `None` | Clamp band, smoothing and initial value for the primal weight. |
 | `ruiz_iterations`, `pc_iterations` | `10`, `1` | Number of preconditioning sweeps. |
@@ -377,7 +377,7 @@ their tolerances:
 | `iterations_per_epoch` | `1000` | Iterations per compiled epoch. |
 | `max_epochs`, `max_seconds` | `None` | Iteration and wall-clock budgets. |
 | `k_scale`, `k_theta`, `k_init` | `10.0`, `0.5`, `None` | Primal weight controls. `k_scale=None` disables the primal weight. |
-| `restarts`, `epochs_per_restart` | `False`, `10` | Adaptive restarts. |
+| `restarts`, `epochs_per_restart` | `False`, `None` | Adaptive restarts (`epochs_per_restart=None` = no cycle cap). |
 | `initial_solution`, `initial_opt_state` | `None` | Warm start. |
 
 `solve` returns a dictionary containing `solution` (a `SaddleState`),

@@ -111,6 +111,44 @@ class LP:
         return (dual_ineq * (self.A_ineq @ x - self.b_ineq)).sum()
 
 
+def _row_major_order(rows, cols, shape):
+    """Permutation putting the unique COO entries ``(rows, cols)`` in row-major
+    order, via scipy's O(nnz) CSR conversion (a counting sort) on the host."""
+    import scipy.sparse as sp
+
+    perm = sp.csr_matrix(
+        (np.arange(rows.size, dtype=np.int64), (rows, cols)), shape=shape
+    )
+    perm.sort_indices()
+    return perm.data
+
+
+def scipy_to_bcoo(A, dtype):
+    """Sorted, deduplicated BCOO of the scipy matrix ``A`` with ``dtype`` data.
+
+    Accepts any scipy sparse format. Sorting, deduplication and the dtype cast
+    all happen on the host, so building the device array compiles nothing; the
+    cast goes straight from the scipy width to ``dtype`` (float16 included).
+    """
+    import scipy.sparse as sp
+    import jax.experimental.sparse as _jsp
+
+    np_float = np.float64 if jnp.dtype(dtype).itemsize == 8 else np.float32
+    # sorted_indices() copies, so sum_duplicates() never touches the caller's A.
+    A = sp.csr_matrix(A, dtype=np_float).sorted_indices()
+    A.sum_duplicates()
+    rows = np.repeat(np.arange(A.shape[0], dtype=np.int32), np.diff(A.indptr))
+    indices = np.column_stack([rows, A.indices.astype(np.int32)])
+    # jax.device_put, not jnp.asarray: the latter compiles a per-shape
+    # jit(stage) for every numpy upload.
+    return _jsp.BCOO(
+        (jax.device_put(A.data.astype(jnp.dtype(dtype))), jax.device_put(indices)),
+        shape=A.shape,
+        indices_sorted=True,
+        unique_indices=True,
+    )
+
+
 class JaddleLP:
     def __init__(
         self,
@@ -139,29 +177,41 @@ class JaddleLP:
         # Aᵀ is stored as an explicit transposed BCOO (column-swapped indices)
         # rather than the lazy `self.A.T`, so `Aᵀ @ y` runs its own matvec
         # instead of the transposed-operand code path.
+        #
+        # JAX's BCOO matvec has a faster kernel for sorted+unique indices (and
+        # the unsorted path can't skip duplicate accumulation), so both are
+        # stored row-major sorted. The LP has no duplicate (row, col) entries,
+        # so unique_indices is safe to set. The sort is done on the HOST:
+        # BCOO.sort_indices() is a device lax.sort compiled per shape, which was
+        # ~2-3 s of every solve's setup (stp3d) for a permutation scipy's O(nnz)
+        # counting sort finds in milliseconds.
         import jax.experimental.sparse as _jsp
 
         self.n_eq = A_eq.shape[0]
-        A_bcoo = _jsp.bcoo_concatenate([A_eq, A_ineq], dimension=0)
-        A_T_bcoo = _jsp.BCOO(
-            (A_bcoo.data, A_bcoo.indices[:, ::-1]),
-            shape=A_bcoo.shape[::-1],
+        m, n = A_eq.shape[0] + A_ineq.shape[0], A_eq.shape[1]
+        eq_idx, ineq_idx = np.asarray(A_eq.indices), np.asarray(A_ineq.indices)
+        idx = np.concatenate([eq_idx, ineq_idx + np.array([self.n_eq, 0], eq_idx.dtype)])
+        data = np.concatenate([np.asarray(A_eq.data), np.asarray(A_ineq.data)])
+
+        # Stacking two row-sorted blocks (ineq rows offset below eq) is sorted.
+        if not (A_eq.indices_sorted and A_ineq.indices_sorted):
+            order = _row_major_order(idx[:, 0], idx[:, 1], (m, n))
+            idx, data = idx[order], data[order]
+        order_T = _row_major_order(idx[:, 1], idx[:, 0], (n, m))
+
+        def bcoo(d, i, shape):
+            return _jsp.BCOO(
+                (jax.device_put(d), jax.device_put(i)),
+                shape=shape,
+                indices_sorted=True,
+                unique_indices=True,
+            )
+
+        self.A = bcoo(data, idx, (m, n))
+        self.A_T = bcoo(
+            data[order_T], np.ascontiguousarray(idx[order_T][:, ::-1]), (n, m)
         )
-
-        # Column-swapping A's indices destroys row-major sort order, leaving A_T
-        # with indices_sorted=False/unique_indices=False. JAX's BCOO matvec has a
-        # faster kernel for sorted+unique indices (and the unsorted path can't
-        # skip duplicate accumulation), so sort A_T once at build time. The LP
-        # has no duplicate (row, col) entries, so unique_indices is safe to set.
-        A_bcoo = A_bcoo.sort_indices()
-        A_bcoo.unique_indices = True
-
-        A_T_bcoo = A_T_bcoo.sort_indices()
-        A_T_bcoo.unique_indices = True
-
-        self.A = A_bcoo
-        self.A_T = A_T_bcoo
-        self.b = jnp.concatenate([b_eq, b_ineq])
+        self.b = jax.device_put(np.concatenate([np.asarray(b_eq), np.asarray(b_ineq)]))
 
     @classmethod
     def from_scipy(cls, c, A_eq, b_eq, A_ineq, b_ineq, lower_bounds, upper_bounds):
@@ -174,27 +224,17 @@ class JaddleLP:
         the JAX-native entry point — callers (e.g. ``highs_to_standard_form_sparse``)
         no longer route through a scipy ``LP``.
         """
-        import jax.experimental.sparse as _jsp
         from jaddle.jaddle_optimisers import jaddle_dtype
 
         float_dtype = jaddle_dtype()
         if float_dtype == jnp.float64 and not jax.config.jax_enable_x64:
             float_dtype = jnp.float32
-        np_float = np.float64 if float_dtype == jnp.float64 else np.float32
-
-        def _to_bcoo(A):
-            A = A.astype(np_float).sorted_indices()
-            A.sum_duplicates()
-            bcoo = _jsp.BCOO.from_scipy_sparse(A.tocoo()).sort_indices()
-            return _jsp.BCOO(
-                (bcoo.data.astype(float_dtype), bcoo.indices), shape=bcoo.shape
-            )
 
         return cls(
             jnp.asarray(c, dtype=float_dtype),
-            _to_bcoo(A_eq),
+            scipy_to_bcoo(A_eq, float_dtype),
             jnp.asarray(b_eq, dtype=float_dtype),
-            _to_bcoo(A_ineq),
+            scipy_to_bcoo(A_ineq, float_dtype),
             jnp.asarray(b_ineq, dtype=float_dtype),
             jnp.asarray(lower_bounds, dtype=float_dtype),
             jnp.asarray(upper_bounds, dtype=float_dtype),
@@ -229,13 +269,14 @@ class JaddleLP:
 
     def initial_solution(self):
         """Default start point: the box-projected zero primal with zero duals
-        (the PDLP default)."""
+        (the PDLP default). Built on the host and uploaded, so it compiles
+        nothing."""
+        lb, ub = np.asarray(self.lower_bounds), np.asarray(self.upper_bounds)
+        dtype = jnp.result_type(float, lb.dtype)
         return SaddleState(
-            primal=optax.projections.projection_box(
-                jnp.zeros(self.num_variables()), self.lower_bounds, self.upper_bounds
-            ),
-            dual_ineq=jnp.zeros(self.num_ineq_constraints()),
-            dual_eq=jnp.zeros(self.num_eq_constraints()),
+            primal=jax.device_put(np.clip(np.zeros(lb.shape, dtype), lb, ub)),
+            dual_ineq=jax.device_put(np.zeros(self.num_ineq_constraints(), dtype)),
+            dual_eq=jax.device_put(np.zeros(self.num_eq_constraints(), dtype)),
         )
 
     def to_scipy(self) -> "LP":

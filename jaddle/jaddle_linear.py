@@ -10,7 +10,7 @@ import functools
 from typing import NamedTuple
 import time
 from scipy import sparse as sp
-from jaddle.jaddle_basic_types import LP, JaddleLP, SaddleState
+from jaddle.jaddle_basic_types import LP, JaddleLP, SaddleState, scipy_to_bcoo
 from scipy.sparse.linalg import gmres
 from jax.scipy.sparse.linalg import gmres
 import jaddle.jaddle_optimisers as jo
@@ -427,6 +427,28 @@ def _vector_norm(v, norm):
     return jnp.max(jnp.abs(v), initial=0.0)
 
 
+@functools.partial(jax.jit, static_argnames=("scale", "scaled_objective"))
+def _unscale_output(
+    output, col_scale, row_scale_ineq, row_scale_eq, c_max, *, scale, scaled_objective
+):
+    """Map the scaled-space solution back to true units (primal *= col_scale,
+    duals *= row_scale, then duals *= c_max), as ONE compile instead of an
+    eager per-op kernel each."""
+    if scale:
+        output = SaddleState(
+            primal=output.primal * col_scale,
+            dual_ineq=output.dual_ineq * row_scale_ineq,
+            dual_eq=output.dual_eq * row_scale_eq,
+        )
+    if scaled_objective:
+        output = SaddleState(
+            primal=output.primal,
+            dual_ineq=output.dual_ineq * c_max,
+            dual_eq=output.dual_eq * c_max,
+        )
+    return output
+
+
 def solve(
     lp: JaddleLP,
     max_epochs=None,
@@ -462,7 +484,7 @@ def solve(
     pc_iterations=1,
     cost_col_floor=0,
     restarts=True,
-    epochs_per_restart=10,
+    epochs_per_restart=None,
     restart_multiplier=1.0,
     restart_decay=0.2,
     necessary_decay=0.8,
@@ -548,8 +570,10 @@ def solve(
             no cap on how many fire; the triggers alone decide. Each restart
             resets the averaging (and the halpern anchor / lambda counter) while
             keeping the current iterate as a warm start.
-        epochs_per_restart: Length cap of the first restart cycle, expressed in
-            epochs AT THE DEFAULT ``iterations_per_epoch`` (default 10) but
+        epochs_per_restart: Length cap of the first restart cycle, or ``None``
+            (default) for no cap — restarts then fire only on the
+            sufficient-progress / stalling triggers. When set, expressed in
+            epochs AT THE DEFAULT ``iterations_per_epoch`` but
             internally converted to and tracked in ITERATIONS
             (``epochs_per_restart * iterations_per_epoch``), so the cycle-cap
             restart fires at the same point in the optimisation trajectory
@@ -821,15 +845,20 @@ def solve(
         dual_eq=initial_solution.dual_eq.astype(_state_dtype),
     )
 
-    row_scale_ineq = row_scale[len(lp.b_eq) :]
-    row_scale_eq = row_scale[: len(lp.b_eq)]
-
     # Convert to jax arrays for use inside jitted functions. Match the state
     # dtype so dividing by the scales doesn't upcast the state back out of the
-    # profile precision (numpy float64 scale * jax float16 -> float64).
-    jnp_row_scale_ineq = jnp.array(row_scale_ineq, dtype=_state_dtype)
-    jnp_row_scale_eq = jnp.array(row_scale_eq, dtype=_state_dtype)
-    col_scale = jnp.asarray(col_scale, dtype=_state_dtype)
+    # profile precision (numpy float64 scale * jax float16 -> float64). Sliced
+    # and cast on the host, then uploaded: each eager device slice/cast would
+    # compile its own per-shape kernel.
+    _row_scale_host = np.asarray(row_scale)
+    _state_np_dtype = jnp.dtype(_state_dtype)
+    jnp_row_scale_ineq = jax.device_put(
+        _row_scale_host[len(lp.b_eq) :].astype(_state_np_dtype)
+    )
+    jnp_row_scale_eq = jax.device_put(
+        _row_scale_host[: len(lp.b_eq)].astype(_state_np_dtype)
+    )
+    col_scale = jax.device_put(np.asarray(col_scale).astype(_state_np_dtype))
 
     # --- Vertex-biasing cost perturbation (Mangasarian tie-break) -------------
     # First-order saddle methods converge to the analytic centre of the optimal
@@ -1781,7 +1810,12 @@ def solve(
         # The cycle cap is tracked in ITERATIONS so `cycle_exhausted` fires at the
         # same point in the trajectory regardless of how iterations are chopped
         # into epochs; iterations_since_restart accumulates the ACTUAL count.
-        cycle_cap=jnp.asarray(float(epochs_per_restart) * float(iterations_per_epoch)),
+        # None = no cap: inf never exhausts and stays inf under restart_multiplier.
+        cycle_cap=jnp.asarray(
+            jnp.inf
+            if epochs_per_restart is None
+            else float(epochs_per_restart) * float(iterations_per_epoch)
+        ),
         merit_at_last_restart=jnp.asarray(jnp.inf, _merit_dtype),
         theta=jnp.asarray(theta_init),
         k_before_last_move=jnp.asarray(1.0, opt_state[0].dtype),
@@ -1968,19 +2002,15 @@ def solve(
         print(f"Objective: {float((c_true * c_max) @ output.primal):.5e}")
         print("----------------------------------------------")
 
-    if scale:
-        output = SaddleState(
-            primal=output.primal * col_scale,
-            dual_ineq=output.dual_ineq * jnp_row_scale_ineq,
-            dual_eq=output.dual_eq * jnp_row_scale_eq,
-        )
-
-    if scaled_objective:
-        output = SaddleState(
-            primal=output.primal,
-            dual_ineq=output.dual_ineq * c_max,
-            dual_eq=output.dual_eq * c_max,
-        )
+    output = _unscale_output(
+        output,
+        col_scale,
+        jnp_row_scale_ineq,
+        jnp_row_scale_eq,
+        c_max,
+        scale=bool(scale),
+        scaled_objective=bool(scaled_objective),
+    )
 
     # The internal solve time (epoch loop, incl. first-epoch XLA compile but
     # NOT the scaling / spectral-norm / sparse-setup phase before start_time).
@@ -2147,18 +2177,9 @@ def __pad_empty_blocks(lp):
 
 
 def __scipy_to_bcoo(A, dtype):
-    """Sorted, deduplicated BCOO of the scipy matrix ``A`` with ``dtype`` data.
-
-    Accepts any scipy sparse format. The scipy side is built at the nearest
-    scipy-supported width and only the on-device data is cast, so a float16
-    ``dtype`` lives in JAX alone.
-    """
-    np_float = np.float64 if jnp.dtype(dtype).itemsize == 8 else np.float32
-    # sorted_indices() copies, so sum_duplicates() never touches the caller's A.
-    A = sp.csr_matrix(A, dtype=np_float).sorted_indices()
-    A.sum_duplicates()
-    bcoo = jsp.BCOO.from_scipy_sparse(A.tocoo()).sort_indices()
-    return jsp.BCOO((bcoo.data.astype(dtype), bcoo.indices), shape=bcoo.shape)
+    """Sorted, deduplicated BCOO of the scipy matrix ``A`` with ``dtype`` data
+    (see ``jaddle_basic_types.scipy_to_bcoo``: built on the host, no compiles)."""
+    return scipy_to_bcoo(A, dtype)
 
 
 def __equilibrate(

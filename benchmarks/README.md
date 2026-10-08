@@ -87,6 +87,7 @@ tools/glop_presolve/build.sh   # downloads the matching OR-Tools C++ release int
 | `--skip-bigm-matrix` | off | Skip instances with matrix (row) big-M. |
 | `--skip-bigm-column` | off | Skip instances with column big-M. |
 | `--eliminate-defined-vars` | on | After presolve, substitute out variables defined by a dense equality row `z = Σ aⱼxⱼ` (see `jaddle.presolve.eliminate_defined_variables`). Use `--no-eliminate-defined-vars` to turn it off. |
+| `--jaddle-verbose` | on | Run Jaddle with `verbose=True`, printing its per-epoch log and restart messages. Use `--no-jaddle-verbose` to silence it; with no `--max-epochs` or `--max-seconds` budget either, each solve then runs as a single device call. |
 | `--csv PATH` | see table above | Where to write the results. |
 
 ### Options for a single harness
@@ -125,8 +126,9 @@ Three timings are reported for Jaddle:
 
 ## Convex A/B suites
 
-These have no command-line flags. Positional arguments select which configs
-or modes to run.
+Positional arguments select which configs or modes to run. The only flag is
+`--jaddle-verbose` (off by default), which shows Jaddle's own per-epoch log
+above each result line.
 
 ### `benchmark_convex.py`
 
@@ -152,6 +154,7 @@ Each run has a budget of 300 epochs × 200 iterations and uses tolerance `1e-6`.
 ```bash
 python benchmarks/benchmark_convex.py              # all configs
 python benchmarks/benchmark_convex.py eg_ad frb_ad # only these configs
+python benchmarks/benchmark_convex.py eg_ad --jaddle-verbose  # with Jaddle's log
 ```
 
 Each line of output gives convergence, epochs, solve time (excluding compile)

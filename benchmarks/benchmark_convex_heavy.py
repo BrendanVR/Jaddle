@@ -8,16 +8,19 @@ per-epoch cost against epochs-to-converge across update modes.
 Usage:
     python benchmarks/benchmark_convex_heavy.py                      # both modes
     python benchmarks/benchmark_convex_heavy.py forward_reflected    # one mode
+    python benchmarks/benchmark_convex_heavy.py --jaddle-verbose     # show solver logs
 """
 
+import argparse
 import io
-import sys
 import contextlib
 import numpy as np
 import jax
 import jax.numpy as jnp
 import jaddle.jaddle_convex as jc
 import jaddle.jaddle_optimisers as jo
+
+from benchmark import add_jaddle_verbose_flag
 
 jo.configure_jax("x64")
 print(jax.devices())
@@ -45,15 +48,24 @@ cp = jc.JaddleCP(2 * d, obj, lambda z: jnp.zeros(0), ineq,
                  -jnp.inf * jnp.ones(2 * d), jnp.inf * jnp.ones(2 * d))
 
 if __name__ == "__main__":
-    modes = sys.argv[1:] or ["extragradient", "forward_reflected"]
-    for mode in modes:
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("modes", nargs="*",
+                        help="Update modes to run (default: extragradient and "
+                        "forward_reflected).")
+    add_jaddle_verbose_flag(parser, default=False)
+    args = parser.parse_args()
+    for mode in args.modes or ["extragradient", "forward_reflected"]:
+        # Show Jaddle's own output only when verbose; otherwise keep the
+        # table clean.
+        quiet = contextlib.nullcontext() if args.jaddle_verbose else (
+            contextlib.redirect_stdout(io.StringIO()))
+        with quiet:
             out = jc.solve(cp, max_epochs=300, iterations_per_epoch=200, update_mode=mode,
                            adaptive_eta=0.5, primal_grad_norm_tolerance=1e-6,
                            primal_feasibility_tolerance=1e-6,
-                           complementarity_slack_tolerance=1e-6)
-        ep = int(buf.getvalue().split("Epochs to solution: ")[1].split()[0])
+                           complementarity_slack_tolerance=1e-6,
+                           verbose=args.jaddle_verbose)
+        ep = out["epochs"]
         print(f"{mode:18s} conv={out['converged']} epochs={ep} t={out['solve_seconds']:.2f}s "
               f"per-epoch={out['solve_seconds'] / ep:.3f}s "
               f"obj={float(obj(out['solution'].primal)):.8e}", flush=True)

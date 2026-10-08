@@ -29,6 +29,7 @@ import glob
 import time
 
 import highspy as hspy
+import numpy as np
 
 import jaddle.jaddle_optimisers as jo
 import jaddle.jaddle_linear as jl
@@ -46,6 +47,20 @@ from scan_bigm import is_bigm_cost, is_bigm_matrix, is_bigm_column
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DATA_DIR = os.path.join(REPO_ROOT, "data")
+
+
+def add_jaddle_verbose_flag(p, default, default_text="%(default)s"):
+    """Add the --jaddle-verbose / --no-jaddle-verbose flag every benchmark
+    script shares, with that script's default (`default_text` describes it in
+    --help when the default is not a plain boolean)."""
+    p.add_argument(
+        "--jaddle-verbose",
+        action=argparse.BooleanOptionalAction,
+        default=default,
+        help="Run Jaddle with verbose=True, printing its per-epoch log and "
+        "restart messages. With it off and no --max-epochs / --max-seconds "
+        f"budget, each solve runs as a single device call. (default: {default_text})",
+    )
 
 
 def parse_args():
@@ -170,6 +185,7 @@ def parse_args():
         help="JAX precision profile passed to jaddle_optimisers.configure_jax "
         "(default: float64).",
     )
+    add_jaddle_verbose_flag(p, default=True)
     return p.parse_args()
 
 
@@ -208,9 +224,12 @@ def load_relaxed_lp(
     highs = hspy.Highs()
     highs.readModel(path)
 
-    # Relax integrality so we solve the LP relaxation.
-    for col in range(highs.numVariables):
-        highs.changeColIntegrality(col, hspy.HighsVarType.kContinuous)
+    # Relax integrality so we solve the LP relaxation. One batched call: a
+    # per-column changeColIntegrality loop took ~110s on rwth-timetable.
+    n = highs.numVariables
+    highs.changeColsIntegrality(
+        n, np.arange(n, dtype=np.int32), np.zeros(n, dtype=np.uint8)
+    )
 
     highs.setOptionValue("output_flag", "true" if highs_verbose else "false")
 
@@ -270,10 +289,11 @@ def jaddle_solve_kwargs(tol, max_epochs, update_mode, max_seconds=None, verbose=
         dual_gap_tolerance=tol,
         update_mode=update_mode,
         iterations_per_epoch=64 * 10,
+        epochs_per_restart=10,
     )
 
 
-def run_jaddle(lp, tol, max_epochs, update_mode="pdhg", max_seconds=None):
+def run_jaddle(lp, tol, max_epochs, update_mode="pdhg", max_seconds=None, verbose=True):
     """Solve with Jaddle's saddle-point solver. Returns a dict of metrics.
 
     Three times are reported:
@@ -293,7 +313,8 @@ def run_jaddle(lp, tol, max_epochs, update_mode="pdhg", max_seconds=None):
 
     t0 = time.perf_counter()
     result = jl.solve(
-        lp, **jaddle_solve_kwargs(tol, max_epochs, update_mode, max_seconds)
+        lp,
+        **jaddle_solve_kwargs(tol, max_epochs, update_mode, max_seconds, verbose),
     )
     wall_seconds = time.perf_counter() - t0
 
@@ -401,6 +422,7 @@ def main():
                 args.max_epochs,
                 args.update_mode,
                 max_seconds=args.max_seconds,
+                verbose=args.jaddle_verbose,
             )
             # jaddle solves the presolved reduced problem (objective = c^T x);
             # add the presolve offset to compare against the full-problem opt_obj.

@@ -6,15 +6,18 @@ Runs every (problem, config) pair and prints convergence, epochs, solve time
 Usage:
     python benchmarks/benchmark_convex.py                 # all configs
     python benchmarks/benchmark_convex.py eg_ad frb_ad    # only these configs
+    python benchmarks/benchmark_convex.py eg_ad --jaddle-verbose  # show solver logs
 """
 
+import argparse
 import io
-import sys
 import contextlib
 import numpy as np
 import jax.numpy as jnp
 import jaddle.jaddle_convex as jc
 import jaddle.jaddle_optimisers as jo
+
+from benchmark import add_jaddle_verbose_flag
 
 jo.configure_jax("x64")
 rng = np.random.default_rng(0)
@@ -95,15 +98,26 @@ CONFIGS = {
 
 
 if __name__ == "__main__":
-    only = sys.argv[1:] or None
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("configs", nargs="*",
+                        help=f"Configs to run (default: all of {', '.join(CONFIGS)}).")
+    add_jaddle_verbose_flag(parser, default=False)
+    args = parser.parse_args()
+    unknown = sorted(set(args.configs) - set(CONFIGS))
+    if unknown:
+        parser.error(f"unknown config(s): {', '.join(unknown)}")
     for pname, cp in PROBLEMS.items():
         for cname, cfg in CONFIGS.items():
-            if only and cname not in only:
+            if args.configs and cname not in args.configs:
                 continue
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                out = jc.solve(cp, max_epochs=300, iterations_per_epoch=200, **TOL, **cfg)
-            ep = int(buf.getvalue().split("Epochs to solution: ")[1].split()[0])
+            # Show Jaddle's own output only when verbose; otherwise keep the
+            # table clean.
+            quiet = contextlib.nullcontext() if args.jaddle_verbose else (
+                contextlib.redirect_stdout(io.StringIO()))
+            with quiet:
+                out = jc.solve(cp, max_epochs=300, iterations_per_epoch=200,
+                               verbose=args.jaddle_verbose, **TOL, **cfg)
+            ep = out["epochs"]
             obj = float(cp.objective(out["solution"].primal))
             print(f"{pname:12s} {cname:10s} conv={str(out['converged']):5s} epochs={ep:4d} "
                   f"t={out['solve_seconds']:6.2f}s obj={obj:.8e}", flush=True)

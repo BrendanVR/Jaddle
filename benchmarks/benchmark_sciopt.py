@@ -26,11 +26,20 @@ import jaddle.jaddle_optimisers as jo
 import jaddle.presolve as presolve
 import jaddle.sciopt_helpers as sh
 
-from benchmark import DATA_DIR, REPO_ROOT, _fmt, discover_instances, run_jaddle
+from benchmark import (
+    DATA_DIR,
+    REPO_ROOT,
+    _fmt,
+    add_jaddle_verbose_flag,
+    discover_instances,
+    run_jaddle,
+)
 
 
-def make_parser(description, default_csv):
-    """Options shared by the external-presolve benchmarks (SCIP, glop)."""
+def make_parser(
+    description, default_csv, jaddle_verbose=True, jaddle_verbose_text="%(default)s"
+):
+    """Options shared by the external-presolve benchmarks (SCIP, glop, MPAX)."""
     p = argparse.ArgumentParser(description=description)
     p.add_argument(
         "--data-dir", default=DATA_DIR, help="Directory of .mps files to glob."
@@ -120,6 +129,7 @@ def make_parser(description, default_csv):
         help="JAX precision profile passed to jaddle_optimisers.configure_jax "
         "(default: float64).",
     )
+    add_jaddle_verbose_flag(p, jaddle_verbose, jaddle_verbose_text)
     return p
 
 
@@ -205,6 +215,7 @@ def run_benchmark(args, load, presolver):
                 args.max_epochs,
                 args.update_mode,
                 max_seconds=args.max_seconds,
+                verbose=args.jaddle_verbose,
             )
             # jaddle solves the presolved reduced problem (objective = c^T x);
             # add the presolve offset to report the full-problem objective.
