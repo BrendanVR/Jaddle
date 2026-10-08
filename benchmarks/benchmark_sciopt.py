@@ -107,7 +107,7 @@ def make_parser(description, default_csv):
     )
     p.add_argument(
         "--update-mode",
-        default="pdhg",
+        default="alternating",
         choices=["alternating", "pdhg", "halpern"],
         help="Jaddle LP update_mode passed to jl.solve (default: pdhg).",
     )

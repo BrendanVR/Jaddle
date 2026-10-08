@@ -510,18 +510,18 @@ def solve(
     dual_feasibility_tolerance=1e-3,
     dual_gap_tolerance=1e-3,
     dual_residual="pdlp",
-    termination_norm="inf",
-    restart_norm="inf",
+    termination_norm="l2",
+    restart_norm="l2",
     verbose=False,
     log_every=1,
     average=True,
     report_best=True,
-    update_mode="pdhg",
+    update_mode="alternating",
     k_scale=1e8,
     k_theta=0.5,
     k_init=None,
     k_update_per_epoch=False,
-    adaptive_eta=0.0,
+    adaptive_eta=1.0,
     scale=True,
     scaled_objective=True,
     scaled_rhs=True,
@@ -529,8 +529,8 @@ def solve(
     augmented_weight=1.0,
     ruiz_iterations=10,
     pc_iterations=1,
-    cost_col_floor=1e-2,
-    restarts=False,
+    cost_col_floor=0,
+    restarts=True,
     epochs_per_restart=10,
     restart_multiplier=1.0,
     restart_decay=0.2,
@@ -841,7 +841,7 @@ def solve(
         # shallow copy suffices.
         lp = copy.copy(lp) if isinstance(lp, JaddleLP) else to_jaddle_sparse(lp)
 
-    if adaptive_eta == 0.0:
+    if adaptive_eta == "auto":
         adaptive_eta = 1 / estimate_augmented_spectral_norm(lp)
         print(f"Adaptive step size seed set to 1/||A||_2 = {adaptive_eta:.3e}")
         print("----------------------------------------------")
@@ -1004,9 +1004,7 @@ def solve(
         # CSEs the duplicate reduction.
         def primal_residual(norm):
             if norm == "l2":
-                return jnp.sqrt(
-                    jnp.sum(ineq_violations**2) + jnp.sum(eq_violations**2)
-                )
+                return jnp.sqrt(jnp.sum(ineq_violations**2) + jnp.sum(eq_violations**2))
             return jnp.maximum(max_ineq_violation, max_eq_violation)
 
         constraint_bound = primal_residual(restart_norm)
@@ -2219,9 +2217,7 @@ def __pad_empty_blocks(lp):
         A_eq, b_eq = zero_row(A_eq), zero_rhs(b_eq)
     if A_ineq.shape[0] == 0:
         A_ineq, b_ineq = zero_row(A_ineq), zero_rhs(b_ineq)
-    return type(lp)(
-        lp.c, A_eq, b_eq, A_ineq, b_ineq, lp.lower_bounds, lp.upper_bounds
-    )
+    return type(lp)(lp.c, A_eq, b_eq, A_ineq, b_ineq, lp.lower_bounds, lp.upper_bounds)
 
 
 def __scipy_to_bcoo(A, dtype):
@@ -2360,9 +2356,7 @@ def __scale_problem_jax(
         # lift an L-inf max above a real entry, and an all-zero row/col still
         # hits the <= threshold -> 1.0 clamp.
         c_norm = __nonzero_or_one(jnp.max(jnp.abs(c), initial=0.0))
-        absdata = jnp.abs(
-            jnp.concatenate([a_data, b, augmented_weight * c / c_norm])
-        )
+        absdata = jnp.abs(jnp.concatenate([a_data, b, augmented_weight * c / c_norm]))
         row_idx = jnp.concatenate(
             [a_row, jnp.arange(m, dtype=a_row.dtype), jnp.full(n, m, a_row.dtype)]
         )
@@ -2377,7 +2371,14 @@ def __scale_problem_jax(
     ones_r = jnp.ones(n_rows, dtype=absdata.dtype)
     ones_c = jnp.ones(n_cols, dtype=absdata.dtype)
     row_scale, col_scale = __equilibrate(
-        absdata, row_idx, col_idx, ones_r, ones_c, ruiz_iter, True, clip_bounds,
+        absdata,
+        row_idx,
+        col_idx,
+        ones_r,
+        ones_c,
+        ruiz_iter,
+        True,
+        clip_bounds,
         threshold,
     )
 
@@ -2394,8 +2395,15 @@ def __scale_problem_jax(
         col_scale = col_scale.at[n].set(1.0)
 
     row_scale, col_scale = __equilibrate(
-        absdata, row_idx, col_idx, row_scale, col_scale, pc_iter, False,
-        clip_bounds, threshold,
+        absdata,
+        row_idx,
+        col_idx,
+        row_scale,
+        col_scale,
+        pc_iter,
+        False,
+        clip_bounds,
+        threshold,
     )
     dr, dc = row_scale[:m], col_scale[:n]
 
