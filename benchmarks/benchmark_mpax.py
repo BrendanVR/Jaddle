@@ -63,7 +63,7 @@ import jaddle.highs_helpers as hh
 import jaddle.presolve as presolve
 from jaddle.jaddle_basic_types import LP
 
-from benchmark import _fmt, discover_instances, load_relaxed_lp
+from benchmark import _fmt, discover_instances, presolved_lp
 from benchmark_sciopt import make_parser
 
 SOLVERS = ("jaddle", "mpax")
@@ -148,9 +148,7 @@ def load_lp(path, presolve_mode, eliminate_defined_vars):
     """Return (lp, offset, presolve_seconds) with lp a scipy-backed LP."""
     t0 = time.perf_counter()
     if presolve_mode == "highs":
-        lp, _, _, _, offset = load_relaxed_lp(
-            path, highs_solver="none", eliminate_defined_vars=eliminate_defined_vars
-        )
+        lp, offset = presolved_lp(path, eliminate_defined_vars=eliminate_defined_vars)
     else:
         highs = hspy.Highs()
         highs.setOptionValue("output_flag", False)

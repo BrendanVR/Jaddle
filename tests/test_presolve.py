@@ -9,6 +9,7 @@ import numpy as np
 import scipy.sparse as sp
 from scipy.optimize import linprog
 
+import jaddle.jaddle_linear as jl
 from jaddle.jaddle_basic_types import LP
 from jaddle.presolve import eliminate_defined_variables
 
@@ -44,6 +45,18 @@ def assert_equivalent(full, reduced, offset, postsolve):
     assert np.all(full.A_ineq @ x <= full.b_ineq + 1e-8)
     assert np.all(x >= full.lower_bounds - 1e-8)
     assert np.all(x <= full.upper_bounds + 1e-8)
+
+    # Duals: HiGHS's marginals are df/db, Jaddle's duals are -df/db.
+    y_eq = -red_res.eqlin.marginals if reduced.A_eq.shape[0] else np.zeros(0)
+    y_ineq = -red_res.ineqlin.marginals if reduced.A_ineq.shape[0] else np.zeros(0)
+    y_eq_full, y_ineq_full = postsolve.dual(y_eq, y_ineq)
+    assert y_eq_full.shape == full.b_eq.shape
+    assert y_ineq_full.shape == full.b_ineq.shape
+    cert = jl.evaluate_lp_certificate(
+        jl.to_jaddle_sparse(full), x, y_eq_full, y_ineq_full
+    )
+    assert float(cert["relative_dual_feasibility_residual"]) < 1e-8
+    assert float(cert["relative_gap"]) < 1e-8
 
 
 def test_objective_row_is_eliminated():
@@ -100,3 +113,23 @@ def test_nothing_to_eliminate():
     )
     reduced, offset, postsolve = eliminate_defined_variables(full)
     assert reduced is full and offset == 0.0 and postsolve is None
+
+
+def test_objective_chain_is_eliminated():
+    # Variables (z, N, x1, x2, x3): min z  s.t.  z = 2 N + x1,  N = x2 + x3,
+    # x1 + x2 + x3 >= 1, all >= 0. The first pass moves the cost from z onto
+    # N and x1, the second from N onto x2 and x3.
+    full = LP(
+        c=np.array([1.0, 0.0, 0.0, 0.0, 0.0]),
+        A_eq=sp.csc_matrix(
+            [[1.0, -2.0, -1.0, 0.0, 0.0], [0.0, 1.0, 0.0, -1.0, -1.0]]
+        ),
+        b_eq=np.zeros(2),
+        A_ineq=sp.csc_matrix([[0.0, 0.0, -1.0, -1.0, -1.0]]),
+        b_ineq=np.array([-1.0]),
+        lower_bounds=np.zeros(5),
+        upper_bounds=np.full(5, np.inf),
+    )
+    reduced, offset, postsolve = eliminate_defined_variables(full)
+    assert len(reduced.c) == 3 and reduced.A_eq.shape[0] == 0
+    assert_equivalent(full, reduced, offset, postsolve)

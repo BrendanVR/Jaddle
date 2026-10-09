@@ -35,13 +35,8 @@ import jaddle.jaddle_optimisers as jo
 import jaddle.jaddle_linear as jl
 import jaddle.highs_helpers as hh
 import jaddle.presolve as presolve
-from jaddle.jaddle_basic_types import JaddleLP, SaddleState
 
 import jax
-import jax.numpy as jnp
-import jax.experimental.sparse as jsp
-
-import optax
 
 from scan_bigm import is_bigm_cost, is_bigm_matrix, is_bigm_column
 
@@ -223,91 +218,71 @@ def parse_args():
     return p.parse_args()
 
 
-def load_relaxed_lp(
-    path,
-    highs_solver="simplex",
-    tol=1e-3,
-    highs_verbose=False,
-    highs_kkt_tolerance=None,
-    eliminate_defined_vars=True,
+def highs_reference(
+    path, highs_solver="simplex", tol=1e-3, highs_verbose=False, highs_kkt_tolerance=None
 ):
-    """Load an MPS file via HiGHS, relax integrality, solve for a trusted
-    reference objective with the requested HiGHS solver, and convert to Jaddle's
-    sparse standard form.
+    """Solve the LP relaxation with HiGHS for a trusted reference optimum.
 
     HiGHS is used here only as an objective *oracle* (ground-truth optimum), not
     as a speed competitor -- a same-class PDLP-vs-PDHG timing race is misleading
     because the two stop on different relative-gap criteria. An exact solver
     (``simplex`` / ``ipm``) is an unambiguous answer key for Jaddle's objective
-    gap; ``pdlp`` is available for a same-class comparison point.
-
-    ``highs_solver`` selects the HiGHS solver: ``simplex``/``ipm``/``pdlp``, or
-    ``none`` to skip the reference solve entirely (the exact solve can be
-    prohibitively slow on very large LPs); then ``opt_obj`` is returned as NaN
-    and ``highs_status`` as "skipped". The presolve + conversion still run, since
-    jaddle solves the presolved LP and needs its offset.
+    gap; ``pdlp`` is available for a same-class comparison point. ``none``
+    skips the solve (it can be prohibitively slow on very large LPs).
 
     ``highs_verbose`` enables HiGHS's own solve logging. ``highs_kkt_tolerance``
     overrides the KKT tolerance passed to HiGHS (defaults to ``tol``).
 
-    Returns (jaddle_lp, opt_obj, highs_status, highs_seconds, offset), where
-    `highs_seconds` is the wall time of the HiGHS reference solve (NaN when
-    skipped) and `offset` is the presolved model's constant objective offset (add
-    it to jaddle's c^T x to compare against the full-problem `opt_obj`).
+    Returns ``(opt_obj, highs_status, highs_seconds)``; NaN, "skipped", NaN
+    when skipped. ``highs_seconds`` times only ``run()``, the like-for-like
+    counterpart to Jaddle's solve-only timer.
     """
+    if highs_solver == "none":
+        return float("nan"), "skipped", float("nan")
     highs = hspy.Highs()
+    highs.setOptionValue("output_flag", "true" if highs_verbose else "false")
     highs.readModel(path)
+    relax_integrality(highs)
+    highs.setOptionValue("presolve", "on")
+    highs.setOptionValue("kkt_tolerance", tol if highs_kkt_tolerance is None else highs_kkt_tolerance)
+    highs.setOptionValue("solver", highs_solver)
+    t0 = time.perf_counter()
+    highs.run()
+    highs_seconds = time.perf_counter() - t0
+    return (
+        highs.getInfo().objective_function_value,
+        highs.modelStatusToString(highs.getModelStatus()),
+        highs_seconds,
+    )
 
-    # Relax integrality so we solve the LP relaxation. One batched call: a
-    # per-column changeColIntegrality loop took ~110s on rwth-timetable.
-    n = highs.numVariables
+
+def relax_integrality(highs):
+    # One batched call: a per-column changeColIntegrality loop took ~110s on
+    # rwth-timetable.
+    n = highs.getNumCol()
     highs.changeColsIntegrality(
         n, np.arange(n, dtype=np.int32), np.zeros(n, dtype=np.uint8)
     )
 
-    highs.setOptionValue("output_flag", "true" if highs_verbose else "false")
 
-    if highs_solver == "none":
-        opt_obj = float("nan")
-        highs_status = "skipped"
-        highs_seconds = float("nan")
-    else:
-        # Solve for the ground-truth objective with the requested HiGHS solver.
-        # Default tolerances. Time only the run() call (excl. read/relax), the
-        # like-for-like counterpart to jaddle's solve-only timer.
-        kkt_tol = tol if highs_kkt_tolerance is None else highs_kkt_tolerance
-        highs.setOptionValue("presolve", "on")
-        highs.setOptionValue("kkt_tolerance", kkt_tol)
-        highs.setOptionValue("solver", highs_solver)
-        t0 = time.perf_counter()
-        highs.run()
-        highs_seconds = time.perf_counter() - t0
-
-        info = highs.getInfo()
-        opt_obj = info.objective_function_value
-        highs_status = highs.modelStatusToString(highs.getModelStatus())
-
+def presolved_lp(path, eliminate_defined_vars=True):
+    """HiGHS-presolved LP relaxation in Jaddle's standard form, for harnesses
+    that hand the same reduced LP to several solvers (benchmark_mpax.py).
+    Returns ``(lp, offset)``: add ``offset`` to ``c^T x`` for the original
+    objective. No postsolve: ``jl.solve_with_presolve`` is the full pipeline.
+    """
+    highs = hspy.Highs()
+    highs.setOptionValue("output_flag", False)
+    highs.readModel(path)
+    relax_integrality(highs)
     highs.presolve()
     highs_lp = highs.getPresolvedLp()
     lp = hh.highs_to_standard_form_sparse(highs_lp)
-
-    if lp.A_ineq.shape == (0, 0) and lp.A_eq.shape == (0, 0):
-        raise ValueError(
-            f"Presolved LP {path} has no constraints (A_ineq and A_eq are empty)."
-        )
-
-    # Presolve folds eliminated variables' cost contributions into a constant
-    # objective offset that lives OUTSIDE the reduced `c` vector. The converter
-    # (highs_to_standard_form_sparse) reads only col_cost_, so jaddle's objective
-    # is c^T x on the reduced problem; HiGHS reports c^T x + offset_. We carry the
-    # offset out so the reported objective is comparable to the full-problem
-    # optimum `opt_obj`. The offset is a pure constant — it shifts the objective
-    # but not the argmin, so it stays a reporting concern and never enters solve().
     offset = float(highs_lp.offset_)
     if eliminate_defined_vars:
         lp, extra_offset, _ = presolve.eliminate_defined_variables(lp, verbose=True)
         offset += extra_offset
-    return lp, opt_obj, highs_status, highs_seconds, offset
+    return lp, offset
 
 
 def jaddle_solve_kwargs(
@@ -412,6 +387,74 @@ def run_jaddle(
     }
 
 
+def run_jaddle_presolved(
+    path,
+    tol,
+    max_epochs,
+    update_mode="pdhg",
+    max_seconds=None,
+    verbose=True,
+    cost_col_floor=0.0,
+    gap_tol=None,
+    polish=False,
+    eliminate_defined_vars=True,
+):
+    """Solve an instance file with ``jl.solve_with_presolve`` (HiGHS presolve,
+    optional defined-variable elimination, Jaddle, postsolve). Returns a dict
+    of metrics.
+
+    ``jaddle_converged`` is the reduced solve's certificate, as in earlier
+    sweeps (the 374/383 headline). ``jaddle_original_certified`` and the
+    ``jaddle_orig_*`` residuals judge the postsolved point on the LP as
+    given; the two differ when presolve rescales the problem (leo1,
+    proteindesign*: relative tolerances are not comparable across the
+    rescaling). ``jaddle_obj`` is the original objective, offset included.
+
+    Times: ``jaddle_solve_seconds`` / ``jaddle_corrected_seconds`` are the
+    reduced solve's iterate loop (as in ``run_jaddle``),
+    ``jaddle_presolve_seconds`` is HiGHS presolve, and
+    ``jaddle_wall_seconds`` the whole call, finishing solve included.
+    """
+    t0 = time.perf_counter()
+    result = jl.solve_with_presolve(
+        path,
+        eliminate_defined_vars=eliminate_defined_vars,
+        reduced_solver=jl.solve_with_polishing if polish else None,
+        **jaddle_solve_kwargs(
+            tol, max_epochs, update_mode, max_seconds, verbose, cost_col_floor, gap_tol
+        ),
+    )
+    wall_seconds = time.perf_counter() - t0
+    presolve_info = result["presolve"]
+    cert = result["certificate"] or {}
+    return {
+        "n_vars": presolve_info["cols"][0],
+        "n_cons": presolve_info["rows"][0],
+        "n_vars_presolved": presolve_info["cols"][1],
+        "n_cons_presolved": presolve_info["rows"][1],
+        "jaddle_obj": result["objective"],
+        "jaddle_converged": bool(result.get("reduced_converged", result["converged"])),
+        "jaddle_original_certified": bool(result["converged"]),
+        # "certificate" = full LP optimality cert met; "primal_stall" = the
+        # primal_stop heuristic fired (feasible but not certified optimal);
+        # "max_epochs" / "time_limit" = budget exhausted; "presolve_*" = HiGHS
+        # presolve settled the problem itself.
+        "jaddle_stop_reason": result["stop_reason"],
+        "jaddle_epochs": result["epochs"],
+        "jaddle_finish_epochs": result.get("finish", {}).get("epochs", 0),
+        "jaddle_solve_seconds": result.get("solve_seconds", 0.0),
+        "jaddle_corrected_seconds": result.get("corrected_seconds", 0.0),
+        "jaddle_presolve_seconds": presolve_info["seconds"],
+        "jaddle_wall_seconds": wall_seconds,
+        "jaddle_orig_pfr": cert.get("relative_primal_feasibility_residual", ""),
+        "jaddle_orig_dfr": cert.get("relative_dual_feasibility_residual", ""),
+        "jaddle_orig_gap": cert.get("relative_gap_abs", ""),
+        # Blank unless polish=True.
+        "jaddle_polished": result["polish"]["polished"] if polish and "polish" in result else "",
+        "jaddle_polish_attempts": result["polish"]["attempts"] if polish and "polish" in result else "",
+    }
+
+
 def rel_obj_gap(jaddle_obj, opt_obj):
     """Relative gap to the exact optimum |jaddle - opt| / (1 + |opt|),
     PDLP-convention normalisation."""
@@ -468,26 +511,22 @@ def main():
         print(f"=== {name} ({size_mb:.1f} MB) ===")
         row = {"problem": name, "size_mb": round(size_mb, 1)}
         try:
-            jaddle_lp, opt_obj, highs_status, highs_seconds, offset = load_relaxed_lp(
+            opt_obj, highs_status, highs_seconds = highs_reference(
                 path,
                 highs_solver=args.highs_solver,
                 tol=args.tol,
                 highs_verbose=args.highs_verbose,
                 highs_kkt_tolerance=args.highs_kkt_tolerance,
-                eliminate_defined_vars=args.eliminate_defined_vars,
             )
-
             row.update(
                 {
-                    "n_vars": int(jaddle_lp.num_variables()),
-                    "n_cons": int(jaddle_lp.num_constraints()),
                     "opt_obj": opt_obj,
                     "highs_status": highs_status,
                     "highs_solve_seconds": highs_seconds,
                 }
             )
-            jres = run_jaddle(
-                jaddle_lp,
+            jres = run_jaddle_presolved(
+                path,
                 args.tol,
                 args.max_epochs,
                 args.update_mode,
@@ -496,27 +535,30 @@ def main():
                 cost_col_floor=args.cost_col_floor,
                 gap_tol=args.gap_tol,
                 polish=args.polish,
+                eliminate_defined_vars=args.eliminate_defined_vars,
             )
-            # jaddle solves the presolved reduced problem (objective = c^T x);
-            # add the presolve offset to compare against the full-problem opt_obj.
-            jres["jaddle_obj"] += offset
             row.update(jres)
-            row["offset"] = offset
-            row["rel_obj_gap"] = rel_obj_gap(jres["jaddle_obj"], opt_obj)
+            row["rel_obj_gap"] = (
+                rel_obj_gap(jres["jaddle_obj"], opt_obj)
+                if jres["jaddle_obj"] is not None
+                else float("nan")
+            )
             row["error"] = ""
             highs_time_str = (
                 "skipped"
                 if args.highs_solver == "none"
                 else f"solve={highs_seconds:.2f}s"
             )
+            obj_str = "—" if jres["jaddle_obj"] is None else f"{jres['jaddle_obj']:.6g}"
             print(
                 f"  optimum (HiGHS {args.highs_solver}): {opt_obj:.6g} "
                 f"({highs_time_str})  |  "
-                f"Jaddle: obj={jres['jaddle_obj']:.6g} "
+                f"Jaddle: obj={obj_str} "
                 f"(solve={jres['jaddle_solve_seconds']:.2f}s, "
                 f"corrected={jres['jaddle_corrected_seconds']:.2f}s, "
                 f"wall={jres['jaddle_wall_seconds']:.2f}s, "
                 f"converged={jres['jaddle_converged']}, "
+                f"original_certified={jres['jaddle_original_certified']}, "
                 + (f"polished={jres['jaddle_polished']}, " if args.polish else "")
                 + f"rel_gap={row['rel_obj_gap']:.2e})"
             )
@@ -529,7 +571,6 @@ def main():
         # Drop JAX's in-memory trace/compile caches: every instance has new
         # shapes and closures, so nothing carries over, and keeping them grows
         # host RSS by ~100 MB per instance over a long sweep.
-        jaddle_lp = None
         jax.clear_caches()
         gc.collect()
         print()
@@ -544,18 +585,24 @@ CSV_FIELDS = [
     "size_mb",
     "n_vars",
     "n_cons",
+    "n_vars_presolved",
+    "n_cons_presolved",
     "opt_obj",
-    "offset",
     "highs_status",
     "highs_solve_seconds",
     "jaddle_obj",
     "jaddle_converged",
+    "jaddle_original_certified",
     "jaddle_stop_reason",
+    "jaddle_epochs",
+    "jaddle_finish_epochs",
     "jaddle_solve_seconds",
     "jaddle_corrected_seconds",
+    "jaddle_presolve_seconds",
     "jaddle_wall_seconds",
-    "jaddle_eq_res",
-    "jaddle_ineq_res",
+    "jaddle_orig_pfr",
+    "jaddle_orig_dfr",
+    "jaddle_orig_gap",
     "jaddle_polished",
     "jaddle_polish_attempts",
     "rel_obj_gap",
@@ -597,26 +644,28 @@ def print_markdown(rows, highs_solver="simplex"):
         "first-epoch XLA compile, excl. setup/scaling); corrected time amortises "
         "the one-off first-epoch compile out "
         "(`n·(solve−first)/(n−1)`); see `jaddle_wall_seconds` in the CSV for full "
-        "call time._\n"
+        "call time. Converged = certified on the presolved LP; Original certified = "
+        "the postsolved point certified on the LP as given._\n"
     )
     print(
         "| Problem | Vars | Cons | Optimum | HiGHS solve (s) | "
         "Jaddle obj | Jaddle solve (s) | Jaddle corrected (s) | "
-        "Converged | Stop | Rel. gap to opt |"
+        "Converged | Original certified | Stop | Rel. gap to opt |"
     )
-    print("|---|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|---:|")
+    print("|---|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|:---:|---:|")
     for r in rows:
         if r.get("error"):
-            print(f"| {r['problem']} | — | — | — | — | — | — | — | ⚠️ error | — | — |")
+            print(f"| {r['problem']} | — | — | — | — | — | — | — | ⚠️ error | — | — | — |")
             continue
         conv = "✅" if r.get("jaddle_converged") else "❌"
+        orig = "✅" if r.get("jaddle_original_certified") else "❌"
         print(
             f"| {r['problem']} | {_fmt(r.get('n_vars'), '{:d}')} | "
             f"{_fmt(r.get('n_cons'), '{:d}')} | {_fmt(r.get('opt_obj'))} | "
             f"{_fmt(r.get('highs_solve_seconds'), '{:.2f}')} | "
             f"{_fmt(r.get('jaddle_obj'))} | "
             f"{_fmt(r.get('jaddle_solve_seconds'), '{:.2f}')} | "
-            f"{_fmt(r.get('jaddle_corrected_seconds'), '{:.2f}')} | {conv} | "
+            f"{_fmt(r.get('jaddle_corrected_seconds'), '{:.2f}')} | {conv} | {orig} | "
             f"{r.get('jaddle_stop_reason') or '—'} | "
             f"{_fmt(r.get('rel_obj_gap'), '{:.2e}')} |"
         )

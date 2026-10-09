@@ -46,38 +46,24 @@ def rows_to_standard_form(c, A, row_lower, row_upper, lower_bounds, upper_bounds
     A_ineq x <= b_ineq. Returns: LP.
     """
     num_col = A.shape[1]
+    eq_rows, upper_rows, lower_rows = standard_form_row_map(row_lower, row_upper)
 
-    # Equality constraints: use a numeric tolerance and require finite bounds
-    eps = 1e-8
-    finite_lower_all = np.isfinite(row_lower)
-    finite_upper_all = np.isfinite(row_upper)
-    eq_mask = (
-        finite_lower_all & finite_upper_all & (np.abs(row_lower - row_upper) <= eps)
-    )
+    A = sp.csr_matrix(A)
+    A_eq = A[eq_rows].tocsc().astype(np.float64)
+    b_eq = row_lower[eq_rows].astype(np.float64)
 
-    A_eq = A[eq_mask, :].tocsc().astype(np.float64)
-    b_eq = row_lower[eq_mask].astype(np.float64)
-
-    # Inequality constraints (rows not treated as equalities)
-    ineq_mask = ~eq_mask
-    A_ineq_rows = A[ineq_mask, :]
-    row_lower_ineq = row_lower[ineq_mask]
-    row_upper_ineq = row_upper[ineq_mask]
-
-    finite_upper = np.isfinite(row_upper_ineq)
-    finite_lower = np.isfinite(row_lower_ineq)
-
-    # Build inequality matrices more efficiently
+    # Inequality rows: a.x <= upper for each finite upper bound, then
+    # -a.x <= -lower for each finite lower bound.
     matrices = []
     vectors = []
 
-    if finite_upper.any():
-        matrices.append(A_ineq_rows[finite_upper].tocsc().astype(np.float64))
-        vectors.append(row_upper_ineq[finite_upper].astype(np.float64))
+    if upper_rows.size:
+        matrices.append(A[upper_rows].tocsc().astype(np.float64))
+        vectors.append(row_upper[upper_rows].astype(np.float64))
 
-    if finite_lower.any():
-        matrices.append((-A_ineq_rows[finite_lower]).tocsc().astype(np.float64))
-        vectors.append((-row_lower_ineq[finite_lower]).astype(np.float64))
+    if lower_rows.size:
+        matrices.append((-A[lower_rows]).tocsc().astype(np.float64))
+        vectors.append((-row_lower[lower_rows]).astype(np.float64))
 
     if len(matrices) > 0:
         A_ineq = sp.vstack(matrices, format="csc")
@@ -88,3 +74,90 @@ def rows_to_standard_form(c, A, row_lower, row_upper, lower_bounds, upper_bounds
         b_ineq = np.empty(0, dtype=np.float64)
 
     return LP(c, A_eq, b_eq, A_ineq, b_ineq, lower_bounds, upper_bounds)
+
+
+def standard_form_row_map(row_lower, row_upper):
+    """Which rows of a row-bounded LP become which rows of
+    ``rows_to_standard_form``'s output: ``(eq_rows, upper_rows, lower_rows)``.
+    Rows with equal finite bounds (within 1e-8) are the equalities, in order;
+    the inequality rows are ``upper_rows`` (finite upper bound, ``a.x <=
+    upper``) followed by ``lower_rows`` (finite lower bound, ``-a.x <=
+    -lower``). A row free on both sides appears in none."""
+    row_lower = np.asarray(row_lower, dtype=np.float64)
+    row_upper = np.asarray(row_upper, dtype=np.float64)
+    eq_mask = (
+        np.isfinite(row_lower)
+        & np.isfinite(row_upper)
+        & (np.abs(row_lower - row_upper) <= 1e-8)
+    )
+    ineq = np.flatnonzero(~eq_mask)
+    return (
+        np.flatnonzero(eq_mask),
+        ineq[np.isfinite(row_upper[ineq])],
+        ineq[np.isfinite(row_lower[ineq])],
+    )
+
+
+def jaddle_duals_to_highs(dual_eq, dual_ineq, row_lower, row_upper):
+    """Row duals of a row-bounded LP from a Jaddle solution of its
+    ``rows_to_standard_form``. Jaddle's Lagrangian is ``cᵀx + yᵀ(Ax − b)``
+    with ``y >= 0`` on ``<=`` rows, HiGHS's reduced cost is ``c − Aᵀy``, so an
+    equality row's dual is ``−y_eq`` and an inequality row's is
+    ``y_lower − y_upper``. The column duals then equal Jaddle's reduced cost
+    ``c + Aᵀy``."""
+    eq_rows, upper_rows, lower_rows = standard_form_row_map(row_lower, row_upper)
+    dual_eq, dual_ineq = np.asarray(dual_eq), np.asarray(dual_ineq)
+    row_dual = np.zeros(len(row_lower))
+    row_dual[eq_rows] = -dual_eq[: eq_rows.size]
+    row_dual[upper_rows] -= dual_ineq[: upper_rows.size]
+    row_dual[lower_rows] += dual_ineq[upper_rows.size : upper_rows.size + lower_rows.size]
+    return row_dual
+
+
+def highs_duals_to_jaddle(row_dual, row_lower, row_upper):
+    """Inverse of ``jaddle_duals_to_highs``: ``(dual_eq, dual_ineq)`` for
+    ``rows_to_standard_form``'s rows. A two-sided row's HiGHS dual goes to the
+    side its sign says is active."""
+    eq_rows, upper_rows, lower_rows = standard_form_row_map(row_lower, row_upper)
+    row_dual = np.asarray(row_dual)
+    dual_ineq = np.concatenate(
+        [np.maximum(-row_dual[upper_rows], 0.0), np.maximum(row_dual[lower_rows], 0.0)]
+    )
+    return -row_dual[eq_rows], dual_ineq
+
+
+def jaddle_lp_to_highs(lp):
+    """A ``highspy.HighsLp`` for a Jaddle ``LP`` / ``JaddleLP``: the equality
+    rows (``b_eq <= a.x <= b_eq``) then the inequality rows (``a.x <=
+    b_ineq``). ``rows_to_standard_form`` maps it back to the same rows in the
+    same order."""
+    if isinstance(lp, JaddleLP):
+        A_eq = sp.csr_matrix(
+            (np.asarray(lp.A_eq.data), np.asarray(lp.A_eq.indices).T), shape=lp.A_eq.shape
+        )
+        A_ineq = sp.csr_matrix(
+            (np.asarray(lp.A_ineq.data), np.asarray(lp.A_ineq.indices).T),
+            shape=lp.A_ineq.shape,
+        )
+    else:
+        A_eq, A_ineq = sp.csr_matrix(lp.A_eq), sp.csr_matrix(lp.A_ineq)
+    b_eq = np.asarray(lp.b_eq, dtype=np.float64)
+    b_ineq = np.asarray(lp.b_ineq, dtype=np.float64)
+    A = sp.vstack([A_eq, A_ineq]).tocsc().astype(np.float64)
+    A.sort_indices()
+
+    out = hspy.HighsLp()
+    out.num_col_ = A.shape[1]
+    out.num_row_ = A.shape[0]
+    out.col_cost_ = np.asarray(lp.c, dtype=np.float64)
+    out.col_lower_ = np.asarray(lp.lower_bounds, dtype=np.float64)
+    out.col_upper_ = np.asarray(lp.upper_bounds, dtype=np.float64)
+    out.row_lower_ = np.concatenate([b_eq, np.full(b_ineq.shape, -np.inf)])
+    out.row_upper_ = np.concatenate([b_eq, b_ineq])
+    out.a_matrix_.format_ = hspy.MatrixFormat.kColwise
+    out.a_matrix_.start_ = A.indptr
+    out.a_matrix_.index_ = A.indices
+    out.a_matrix_.value_ = A.data
+    out.a_matrix_.num_col_ = A.shape[1]
+    out.a_matrix_.num_row_ = A.shape[0]
+    return out

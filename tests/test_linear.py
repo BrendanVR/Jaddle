@@ -611,3 +611,96 @@ def test_solution_vjp_rejects_optimal_face():
     np.testing.assert_allclose(x_fn(), [0.5, 0.5], atol=1e-6)
     with pytest.raises(Exception, match="not a nondegenerate vertex"):
         jax.grad(lambda v: x_fn(v).sum())(jl.to_jaddle_sparse(lp).values())
+
+
+PRESOLVE_TOL = dict(
+    primal_feasibility_tolerance=1e-8,
+    dual_feasibility_tolerance=1e-8,
+    dual_gap_tolerance=1e-8,
+)
+
+
+def reducible_lp():
+    # random_lp plus a fixed column (lower = upper = 0.5) that appears in the
+    # rows, and a singleton row x0 <= 0.7: HiGHS presolve removes both.
+    lp = random_lp()
+    rng = np.random.default_rng(5)
+    m_eq, m_ineq = lp.A_eq.shape[0], lp.A_ineq.shape[0]
+    fixed_eq = sp.csc_matrix(rng.standard_normal((m_eq, 1)))
+    fixed_ineq = sp.csc_matrix(rng.standard_normal((m_ineq, 1)))
+    singleton = sp.csc_matrix(([1.0], ([0], [0])), shape=(1, lp.c.shape[0] + 1))
+    return jl.LP(
+        c=np.append(lp.c, 1.0),
+        A_eq=sp.hstack([lp.A_eq, fixed_eq]).tocsc(),
+        b_eq=lp.b_eq + 0.5 * fixed_eq.toarray().ravel(),
+        A_ineq=sp.vstack([sp.hstack([lp.A_ineq, fixed_ineq]), singleton]).tocsc(),
+        b_ineq=np.append(lp.b_ineq + 0.5 * fixed_ineq.toarray().ravel(), 0.7),
+        lower_bounds=np.append(lp.lower_bounds, 0.5),
+        upper_bounds=np.append(lp.upper_bounds, 0.5),
+    )
+
+
+@pytest.mark.parametrize("make_lp", [random_lp, reducible_lp])
+def test_solve_with_presolve(make_lp):
+    lp = make_lp()
+    result = jl.solve_with_presolve(lp, **PRESOLVE_TOL)
+    if make_lp is reducible_lp:
+        assert result["presolve"]["status"] == "kReduced"
+    assert result["converged"]
+    ref = reference_objective(lp)
+    assert abs(result["objective"] - ref) / (1 + abs(ref)) < 1e-6
+    # The solution and certificate are for the LP as given, in its own rows.
+    s = result["solution"]
+    assert s.primal.shape == lp.c.shape
+    assert s.dual_eq.shape == lp.b_eq.shape
+    assert s.dual_ineq.shape == lp.b_ineq.shape
+    cert = solve_certificate(lp, s)
+    assert cert["relative_primal_feasibility_residual"] <= 1e-6
+    assert cert["relative_dual_feasibility_residual"] <= 1e-6
+
+
+def test_solve_with_presolve_reduced_to_empty():
+    result = jl.solve_with_presolve(toy_lp())
+    assert result["stop_reason"] == "presolve_solved"
+    assert result["converged"]
+    np.testing.assert_allclose(result["solution"].primal, [0.0, 4.0], atol=1e-9)
+
+
+def test_solve_with_presolve_detects_infeasibility():
+    lp = small_lp([1, 1], [[1, 1], [-1, -1]], [1, -3])
+    result = jl.solve_with_presolve(lp)
+    assert result["stop_reason"] == "presolve_infeasible"
+    assert not result["converged"]
+    assert result["solution"] is None
+
+
+def test_solve_with_presolve_reads_files(tmp_path):
+    import highspy
+
+    from jaddle.highs_helpers import jaddle_lp_to_highs
+
+    lp = reducible_lp()
+    highs = highspy.Highs()
+    highs.setOptionValue("output_flag", False)
+    highs.passModel(jaddle_lp_to_highs(lp))
+    path = str(tmp_path / "reducible.mps")
+    highs.writeModel(path)
+    result = jl.solve_with_presolve(path, **PRESOLVE_TOL)
+    assert result["converged"]
+    ref = reference_objective(lp)
+    assert abs(result["objective"] - ref) / (1 + abs(ref)) < 1e-6
+
+
+def test_warm_start_without_padding_rows():
+    # toy_lp has no equality rows; a warm start in its own row layout (no
+    # dual for the padding row solve() adds) must be accepted.
+    lp = toy_lp()
+    cold = solve(lp)
+    s = cold["solution"]
+    warm = solve(
+        lp,
+        initial_solution=jl.SaddleState(
+            primal=s.primal, dual_ineq=s.dual_ineq, dual_eq=np.zeros(0)
+        ),
+    )
+    assert warm["stop_reason"] == "certificate"

@@ -13,14 +13,25 @@ from jaddle.jaddle_basic_types import LP
 
 
 class DefinedVariablePostsolve:
-    """Recovers eliminated variables: ``x_full[J] = E @ x + const``."""
+    """Recovers eliminated variables, ``x_full[J] = E @ x + const``, and the
+    duals of the rows that defined them."""
 
-    def __init__(self, n_full, keep, elim, E, const):
+    def __init__(
+        self, n_full, keep, elim, E, const, rows, keep_rows, piv, c_elim, W,
+        lb_rows, ub_rows,
+    ):
         self.n_full = n_full
         self.keep = keep
         self.elim = elim
         self.E = E
         self.const = const
+        self.rows = rows  # the eliminated equality rows (one per variable)
+        self.keep_rows = keep_rows
+        self.piv = piv  # each variable's coefficient in its row
+        self.c_elim = c_elim
+        self.W = W  # the variables' columns in the inequality rows
+        self.lb_rows = lb_rows  # positions in `elim` given a lower-bound row
+        self.ub_rows = ub_rows  # ... and an upper-bound row
 
     def primal(self, x):
         x = np.asarray(x, dtype=np.float64)
@@ -29,6 +40,32 @@ class DefinedVariablePostsolve:
         # E is indexed by original columns and is zero on the eliminated ones.
         x_full[self.elim] = self.E @ x_full + self.const
         return x_full
+
+    def dual(self, dual_eq, dual_ineq):
+        """Map ``(dual_eq, dual_ineq)`` of the reduced LP to the LP before
+        elimination (Jaddle's convention: reduced cost ``c + Aᵀy``).
+
+        The inequality rows keep their duals; the bound rows added for an
+        eliminated ``z`` become its reduced cost ``r_z = y_lb − y_ub`` (0
+        without them). The row that defined ``z`` gets the dual that makes
+        ``z``'s own reduced cost ``r_z``:
+        ``y_row = (r_z − c_z − W_zᵀ y_ineq) / a_z``. Substituting this back
+        reproduces the reduced LP's reduced cost on every kept column, so the
+        mapped pair is exactly as feasible and optimal as the reduced one.
+        """
+        dual_eq = np.asarray(dual_eq, dtype=np.float64)
+        dual_ineq = np.asarray(dual_ineq, dtype=np.float64)
+        n_ineq = self.W.shape[0]
+        y_ineq = dual_ineq[:n_ineq]
+        n_lb = self.lb_rows.size
+        r_elim = np.zeros(self.elim.size)
+        r_elim[self.lb_rows] += dual_ineq[n_ineq : n_ineq + n_lb]
+        r_elim[self.ub_rows] -= dual_ineq[n_ineq + n_lb : n_ineq + n_lb + self.ub_rows.size]
+        y_rows = (r_elim - self.c_elim - self.W.T @ y_ineq) / self.piv
+        y_eq_full = np.zeros(self.keep_rows.size + self.rows.size)
+        y_eq_full[self.keep_rows] = dual_eq
+        y_eq_full[self.rows] = y_rows
+        return y_eq_full, y_ineq
 
 
 class ChainedPostsolve:
@@ -42,6 +79,11 @@ class ChainedPostsolve:
         for step in reversed(self.steps):
             x = step.primal(x)
         return x
+
+    def dual(self, dual_eq, dual_ineq):
+        for step in reversed(self.steps):
+            dual_eq, dual_ineq = step.dual(dual_eq, dual_ineq)
+        return dual_eq, dual_ineq
 
 
 def eliminate_defined_variables(
@@ -85,7 +127,8 @@ def eliminate_defined_variables(
     are capped at ``max_fill`` times the original nnz.
 
     Returns ``(reduced_lp, offset, postsolve)``; add ``offset`` to the reduced
-    objective. ``postsolve.primal(x)`` maps a reduced solution back. Returns
+    objective. ``postsolve.primal(x)`` maps a reduced solution back, and
+    ``postsolve.dual(dual_eq, dual_ineq)`` its duals. Returns
     ``(lp, 0.0, None)`` when nothing is eliminated.
     """
     budget = max_fill * (lp.A_eq.nnz + lp.A_ineq.nnz)
@@ -239,4 +282,18 @@ def _eliminate_pass(
             f"nnz {A_eq.nnz + A_ineq.nnz} -> "
             f"{reduced.A_eq.nnz + reduced.A_ineq.nnz}"
         )
-    return reduced, offset, DefinedVariablePostsolve(n, keep, cols, E, const), fill
+    postsolve = DefinedVariablePostsolve(
+        n,
+        keep,
+        cols,
+        E,
+        const,
+        rows=rows,
+        keep_rows=keep_rows,
+        piv=piv,
+        c_elim=c_J,
+        W=sp.csr_matrix(W),
+        lb_rows=np.flatnonzero(need_lb),
+        ub_rows=np.flatnonzero(need_ub),
+    )
+    return reduced, offset, postsolve, fill

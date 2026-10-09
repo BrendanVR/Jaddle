@@ -27,11 +27,17 @@ The PDLP papers' reference set is the 383-instance list from FirstOrderLp.jl
 
 ## LP harnesses
 
-All three harnesses run the same Jaddle solve, `run_jaddle` in `benchmark.py`:
-`jl.solve` with `iterations_per_epoch=64`, no averaging, and the primal,
-dual and gap tolerances all set to `--tol`. Each relaxation is presolved
-first, then handed to Jaddle. The presolve's constant objective offset is added
-back so that the reported objective refers to the full problem.
+All three harnesses run Jaddle with the same settings (`jaddle_solve_kwargs` in
+`benchmark.py`): `iterations_per_epoch=640`, `epochs_per_restart=10`, and the
+primal, dual and gap tolerances all set to `--tol`.
+
+`benchmark.py` hands each instance file to `jl.solve_with_presolve`: HiGHS
+presolve, the defined-variable elimination, Jaddle on the reduced LP, then
+postsolve of both the primal and the dual back to the original problem. The
+reported objective is the original one. `benchmark_sciopt.py` and
+`benchmark_glop.py` presolve with SCIP or glop, which offer no postsolve here,
+and solve the reduced LP with `run_jaddle`. They add the presolve's constant
+objective offset back so the reported objective refers to the full problem.
 
 | Script | Presolve | Reference optimum | Default CSV |
 |---|---|---|---|
@@ -111,7 +117,8 @@ Three timings are reported for Jaddle:
 - **`jaddle_corrected_seconds`**: the same, with the one-off compile amortised
   out: `n · (solve − first_epoch) / (n − 1)`. It estimates the runtime if
   every epoch had run at the warm rate.
-- **`jaddle_wall_seconds`**: the whole `jl.solve()` call.
+- **`jaddle_wall_seconds`**: the whole call. In `benchmark.py` that includes
+  presolve (`jaddle_presolve_seconds`), postsolve and any finishing solve.
 
 `jaddle_converged` can be true for more than one reason, so check
 `jaddle_stop_reason` alongside it:
@@ -121,9 +128,26 @@ Three timings are reported for Jaddle:
 | `certificate` | Full LP optimality certificate met (primal feasibility, dual feasibility and gap). |
 | `primal_stall` | Primal-stop heuristic fired: the point is feasible but not certified optimal. |
 | `max_epochs` / `time_limit` | Budget exhausted. |
+| `presolve_infeasible` / `presolve_solved` | HiGHS presolve settled the problem itself (`benchmark.py` only). |
+
+`jaddle_converged` means certified on the **presolved** LP, as in earlier
+sweeps. `benchmark.py` also judges the postsolved point on the LP as given:
+`jaddle_original_certified`, with that certificate's residuals in
+`jaddle_orig_pfr`, `jaddle_orig_dfr` and `jaddle_orig_gap`. When the point
+misses the original certificate, up to 50 epochs of `jl.solve` on the original
+LP, warm-started from it, try to finish (`jaddle_finish_epochs`). The two
+verdicts can disagree when presolve rescales the problem, because the
+tolerances are relative. leo1's presolve folds a row with 1e7 coefficients into
+the cost (‖c‖ 1 → 3e9): the objective is right, but the original's dual test
+fails. A certificate on a drastically rescaled reduced LP can also be false.
+On proteindesign122trx11p8 (‖c‖ 1 → 6e6 after elimination), one run
+"certified" the reduced LP after 13 epochs with an objective 7% above the
+optimum, and `jaddle_original_certified` was false.
 
 `benchmark.py` also reports `rel_obj_gap = |jaddle − opt| / (1 + |opt|)`
-(PDLP's normalisation) against the HiGHS optimum.
+(PDLP's normalisation) against the HiGHS optimum, and both the original and the
+presolved sizes (`n_vars`/`n_cons`, `n_vars_presolved`/`n_cons_presolved`,
+counted as HiGHS columns and rows).
 
 ## Convex A/B suites
 

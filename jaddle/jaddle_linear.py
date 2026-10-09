@@ -1851,6 +1851,24 @@ def solve(
     user_supplied_initial = initial_solution is not None
     if initial_solution is None:
         initial_solution = lp.initial_solution()
+    else:
+        # A warm start for the caller's LP has no dual for the zero row that
+        # __pad_empty_blocks gives an empty block; give it a zero dual.
+        def fit(dual, rows):
+            dual = jnp.asarray(dual)
+            if dual.shape[0] == rows:
+                return dual
+            if dual.shape[0] == 0 and rows == 1:
+                return jnp.zeros(1, dual.dtype)
+            raise ValueError(
+                f"initial_solution has {dual.shape[0]} duals for {rows} rows"
+            )
+
+        initial_solution = SaddleState(
+            primal=jnp.asarray(initial_solution.primal),
+            dual_ineq=fit(initial_solution.dual_ineq, lp.A_ineq.shape[0]),
+            dual_eq=fit(initial_solution.dual_eq, lp.A_eq.shape[0]),
+        )
 
     # lp.initial_solution() allocates with the JAX default float width (f32, or
     # f64 under x64), which mismatches the profile dtype the LP data carries
@@ -2720,6 +2738,291 @@ def make_solution(lp, active_tol=1e-6, **settings):
 
     x_fn.pattern = pattern
     return x_fn
+
+
+def solve_with_presolve(
+    model,
+    highs_options=None,
+    finish_epochs=50,
+    eliminate_defined_vars=False,
+    reduced_solver=None,
+    **solve_kwargs,
+):
+    """
+    Presolve with HiGHS, solve the reduced LP with ``solve()``, and map the
+    primal-dual solution back to the original problem with HiGHS's postsolve.
+
+    ``model`` is a path to a file HiGHS reads (MPS, LP, ...), a
+    ``highspy.Highs`` with a model loaded, a ``highspy.HighsLp``, or a Jaddle
+    ``LP`` / ``JaddleLP``. Integer variables are relaxed: Jaddle solves the
+    LP relaxation. ``highs_options`` (a dict) is applied to the HiGHS instance
+    that presolves; other keyword arguments go to ``solve()``.
+
+    ``eliminate_defined_vars=True`` also runs
+    ``presolve.eliminate_defined_variables`` on HiGHS's reduced LP (dense
+    rows defining an aggregate or hiding the objective, which HiGHS keeps but
+    which stall first-order methods: gmut-*, proteindesign*, radiation*). Its
+    own postsolve maps the primal and dual back before HiGHS's does.
+
+    ``reduced_solver`` replaces ``solve()`` for the reduced LP (e.g.
+    ``solve_with_polishing``); it is called with ``solve_kwargs`` and must
+    return ``solve()``'s result keys.
+
+    HiGHS's postsolve maps the duals as well as the primal values (no basis
+    is needed), so the returned point carries a certificate for the problem
+    as given. On neos-1593097 the postsolved pair certified on the original
+    LP at the reduced solve's 1e-8 tolerance, with the objective matching
+    HiGHS's optimum to 2e-10.
+
+    Postsolve rebuilds eliminated rows' and columns' duals from the reduced
+    ones, which is exact at a vertex but can enlarge a first-order solution's
+    small dual errors (neos-1593097 at 1e-6: some runs certified on the
+    original, one had dual residual 6.6e-5). When the postsolved point fails
+    the original certificate, up to ``finish_epochs`` epochs of ``solve()``
+    on the original LP, warm-started from it, finish the job (2 epochs on
+    neos-1593097, against 23 from cold); the finished point is kept only if
+    it certifies. ``finish_epochs=0`` disables this.
+
+    Returns ``solve()``'s dict for the reduced solve, with these keys
+    replaced or added:
+
+    * ``"solution"``: a ``SaddleState`` for the original LP in Jaddle's
+      standard form (``highs_helpers.rows_to_standard_form`` of the original
+      rows; for an ``LP`` input, exactly that LP's rows), or ``None`` when
+      presolve settled the problem as infeasible or unbounded.
+    * ``"objective"``: the original objective at that point, constant offset
+      included.
+    * ``"highs_solution"``: the same point in HiGHS's row form for the
+      original model, ``col_value``, ``col_dual``, ``row_value``, ``row_dual``.
+    * ``"finish"``: the finishing solve's ``epochs`` and whether it
+      ``certified`` (0 and False when it was not needed).
+    * ``"certificate"``: ``evaluate_lp_certificate`` of the original LP at
+      the postsolved point (l2 norm, PDLP dual residual, as ``solve()``
+      tests).
+    * ``"converged"``: whether that certificate meets the requested
+      tolerances, i.e. whether the point is certified for the problem as
+      given; ``"reduced_converged"`` is the reduced solve's own verdict and
+      ``"stop_reason"`` its reason for stopping.
+    * ``"presolve"``: HiGHS's presolve status and the sizes before and after.
+
+    The two verdicts can differ, because the tolerances are relative and
+    presolve can change the problem's scale. On leo1 presolve substitutes a
+    dense objective row (coefficients ~1e7) into the cost, so ‖c‖ grows from
+    1 to 3e9: the reduced solve certifies at 1e-6 with reduced costs ~10 in
+    absolute terms, which against the original ‖c‖ = 1 is a relative dual
+    residual of ~50. The objective still matches HiGHS's optimum to ~1e-8;
+    only the dual certificate fails on the original.
+    * ``"stop_reason"``: also ``"presolve_infeasible"`` or
+      ``"presolve_unbounded_or_infeasible"`` when presolve decides the problem
+      (then ``"converged"`` is False), and ``"presolve_solved"`` when it reduces
+      the problem to nothing.
+    """
+    import highspy
+    from jaddle import highs_helpers as hh
+
+    highs = model if isinstance(model, highspy.Highs) else highspy.Highs()
+    highs.setOptionValue("output_flag", False)
+    for key, value in (highs_options or {}).items():
+        highs.setOptionValue(key, value)
+    if isinstance(model, str):
+        status = highs.readModel(model)
+        if status == highspy.HighsStatus.kError:
+            raise ValueError(f"HiGHS could not read {model!r}")
+    elif isinstance(model, highspy.HighsLp):
+        highs.passModel(model)
+    elif isinstance(model, (LP, JaddleLP)):
+        highs.passModel(hh.jaddle_lp_to_highs(model))
+    elif not isinstance(model, highspy.Highs):
+        raise TypeError(f"unsupported model type {type(model).__name__}")
+    n = highs.getNumCol()
+    if n:
+        highs.changeColsIntegrality(
+            n, np.arange(n, dtype=np.int32), np.zeros(n, dtype=np.uint8)
+        )
+    original = highs.getLp()
+
+    start = time.time()
+    highs.presolve()
+    presolve_seconds = time.time() - start
+    presolve_status = highs.getModelPresolveStatus()
+    PS = highspy.HighsPresolveStatus
+    if presolve_status in (PS.kNullError, PS.kOptionsError):
+        raise RuntimeError(f"HiGHS presolve failed: {presolve_status.name}")
+    reduced = highs.getPresolvedLp()
+    presolve = {
+        "status": presolve_status.name,
+        "rows": (original.num_row_, reduced.num_row_),
+        "cols": (original.num_col_, reduced.num_col_),
+        "seconds": presolve_seconds,
+    }
+
+    lp_original = hh.highs_to_standard_form_sparse(original)
+    if presolve_status in (PS.kInfeasible, PS.kUnboundedOrInfeasible):
+        return {
+            "solution": None,
+            "converged": False,
+            "stop_reason": (
+                "presolve_infeasible"
+                if presolve_status == PS.kInfeasible
+                else "presolve_unbounded_or_infeasible"
+            ),
+            "objective": None,
+            "highs_solution": None,
+            "certificate": None,
+            "presolve": presolve,
+            "epochs": 0,
+        }
+
+    if presolve_status == PS.kReducedToEmpty:
+        result = {"converged": True, "stop_reason": "presolve_solved", "epochs": 0}
+        reduced_solution = highspy.HighsSolution()
+        reduced_solution.value_valid = True
+        reduced_solution.dual_valid = True
+    else:
+        lp_reduced = hh.highs_to_standard_form_sparse(reduced)
+        lp_solved, elimination = lp_reduced, None
+        if eliminate_defined_vars:
+            from jaddle import presolve as jaddle_presolve
+
+            lp_solved, _, elimination = jaddle_presolve.eliminate_defined_variables(
+                lp_reduced
+            )
+        result = (reduced_solver or solve)(lp_solved, **solve_kwargs)
+        s = result["solution"]
+        x = np.asarray(s.primal, dtype=np.float64)
+        # solve() may have padded an empty block with one zero row; that row
+        # is not one of the solved LP's rows.
+        y_eq = np.asarray(s.dual_eq, dtype=np.float64)[: lp_solved.A_eq.shape[0]]
+        y_ineq = np.asarray(s.dual_ineq, dtype=np.float64)[: lp_solved.A_ineq.shape[0]]
+        if elimination is not None:
+            x = elimination.primal(x)
+            y_eq, y_ineq = elimination.dual(y_eq, y_ineq)
+        presolve["eliminated_defined_vars"] = (
+            0 if elimination is None else lp_reduced.c.shape[0] - lp_solved.c.shape[0]
+        )
+        A = sp.csc_matrix(
+            (
+                reduced.a_matrix_.value_,
+                reduced.a_matrix_.index_,
+                reduced.a_matrix_.start_,
+            ),
+            shape=(reduced.num_row_, reduced.num_col_),
+        )
+        row_dual = hh.jaddle_duals_to_highs(
+            y_eq, y_ineq, np.asarray(reduced.row_lower_), np.asarray(reduced.row_upper_)
+        )
+        reduced_solution = highspy.HighsSolution()
+        reduced_solution.col_value = x
+        reduced_solution.row_value = A @ x
+        reduced_solution.row_dual = row_dual
+        reduced_solution.col_dual = np.asarray(reduced.col_cost_) - A.T @ row_dual
+        reduced_solution.value_valid = True
+        reduced_solution.dual_valid = True
+
+    if highs.postsolve(reduced_solution) == highspy.HighsStatus.kError:
+        raise RuntimeError("HiGHS postsolve failed")
+    full = highs.getSolution()
+    highs_solution = {
+        "col_value": np.asarray(full.col_value),
+        "col_dual": np.asarray(full.col_dual),
+        "row_value": np.asarray(full.row_value),
+        "row_dual": np.asarray(full.row_dual),
+    }
+    dual_eq, dual_ineq = hh.highs_duals_to_jaddle(
+        highs_solution["row_dual"],
+        np.asarray(original.row_lower_),
+        np.asarray(original.row_upper_),
+    )
+    solution = SaddleState(
+        primal=jnp.asarray(highs_solution["col_value"]),
+        dual_ineq=jnp.asarray(dual_ineq),
+        dual_eq=jnp.asarray(dual_eq),
+    )
+    lp_check = __pad_empty_blocks(to_jaddle_sparse(lp_original))
+
+    def original_certificate(state):
+        # The point padded to lp_check's rows (an empty block has one zero row).
+        cert = evaluate_lp_certificate(
+            lp_check,
+            state.primal,
+            jnp.zeros(lp_check.n_eq).at[: state.dual_eq.size].set(state.dual_eq),
+            jnp.zeros(lp_check.A_ineq.shape[0])
+            .at[: state.dual_ineq.size]
+            .set(state.dual_ineq),
+            norm=solve_kwargs.get("termination_norm", "l2"),
+            dual_residual=solve_kwargs.get("dual_residual", "pdlp"),
+        )
+        cert = {key: float(value) for key, value in cert.items()}
+        # Judged with solve()'s test, on the problem as given.
+        certified = (
+            cert["relative_primal_feasibility_residual"]
+            <= solve_kwargs.get("primal_feasibility_tolerance", 1e-3)
+            and cert["relative_dual_feasibility_residual"]
+            <= solve_kwargs.get("dual_feasibility_tolerance", 1e-3)
+            and np.isfinite(cert["duality_gap"])
+            and cert["relative_gap_abs"]
+            <= solve_kwargs.get("dual_gap_tolerance", 1e-3)
+        )
+        return cert, bool(certified)
+
+    certificate, original_certified = original_certificate(solution)
+    finish = {"epochs": 0, "certified": False}
+    if not original_certified and finish_epochs:
+        finish_kwargs = dict(solve_kwargs)
+        if solve_kwargs.get("max_seconds") is not None:
+            spent = time.time() - start
+            finish_kwargs["max_seconds"] = max(solve_kwargs["max_seconds"] - spent, 1e-6)
+        finished = solve(
+            lp_original,
+            initial_solution=solution,
+            **{**finish_kwargs, "max_epochs": int(finish_epochs)},
+        )
+        finish["epochs"] = finished["epochs"]
+        f = finished["solution"]
+        # Drop the zero row solve() pads an empty block with.
+        f = SaddleState(
+            primal=f.primal,
+            dual_ineq=f.dual_ineq[: lp_original.A_ineq.shape[0]],
+            dual_eq=f.dual_eq[: lp_original.A_eq.shape[0]],
+        )
+        finished_cert, finished_certified = original_certificate(f)
+        if finished_certified:
+            finish["certified"] = True
+            solution, certificate, original_certified = f, finished_cert, True
+            # The same point in HiGHS's row form.
+            A_orig = sp.csc_matrix(
+                (
+                    original.a_matrix_.value_,
+                    original.a_matrix_.index_,
+                    original.a_matrix_.start_,
+                ),
+                shape=(original.num_row_, original.num_col_),
+            )
+            x = np.asarray(f.primal, dtype=np.float64)
+            row_dual = hh.jaddle_duals_to_highs(
+                np.asarray(f.dual_eq),
+                np.asarray(f.dual_ineq),
+                np.asarray(original.row_lower_),
+                np.asarray(original.row_upper_),
+            )
+            highs_solution = {
+                "col_value": x,
+                "col_dual": np.asarray(original.col_cost_) - A_orig.T @ row_dual,
+                "row_value": A_orig @ x,
+                "row_dual": row_dual,
+            }
+    result.update(
+        solution=solution,
+        converged=original_certified,
+        reduced_converged=bool(result["converged"]),
+        objective=float(np.asarray(original.col_cost_) @ np.asarray(solution.primal))
+        + float(original.offset_),
+        highs_solution=highs_solution,
+        certificate=certificate,
+        presolve=presolve,
+        finish=finish,
+    )
+    return result
 
 
 # %%

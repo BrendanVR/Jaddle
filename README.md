@@ -335,10 +335,24 @@ tests.
 
 ### Supporting tools
 
-- **Presolve.** `jaddle.presolve.eliminate_defined_variables` substitutes out
-  variables defined by dense equality rows (`z = Σ aⱼxⱼ`). Rows of this kind
-  hide objective structure from the scaling and can stall first-order methods.
-  External presolve is available through HiGHS, SCIP and glop.
+- **Presolve and postsolve.** `jl.solve_with_presolve(model, **options)`
+  presolves with HiGHS, solves the reduced LP, and maps the primal *and* dual
+  solution back with HiGHS's postsolve. `model` can be an MPS/LP file path, a
+  HiGHS model or a Jaddle `LP`. The result is certified on the problem as
+  given: `converged` reports the original LP's certificate, and
+  `reduced_converged` the reduced solve's. Postsolve can enlarge a first-order
+  solution's small dual errors, so when the postsolved point misses the
+  certificate, a short warm-started solve of the original LP finishes it
+  (`finish_epochs`, default 50; one epoch on neos-1593097). The two verdicts
+  can still disagree when presolve rescales the problem drastically. On leo1
+  it folds a row with 1e7 coefficients into the cost, so a reduced solve
+  certified at 1e-6 has a correct objective but fails the original's dual
+  test. Presolve can also settle a problem outright:
+  `stop_reason="presolve_infeasible"` or `"presolve_solved"`.
+- **Defined-variable elimination.** `jaddle.presolve.eliminate_defined_variables`
+  substitutes out variables defined by dense equality rows (`z = Σ aⱼxⱼ`).
+  Rows of this kind hide objective structure from the scaling and can stall
+  first-order methods. It maps primal values back, but not duals.
 - **Certification.** `jl.evaluate_lp_certificate` reports the relative primal,
   dual and gap residuals of any primal–dual pair independently of a solve.
 - **Feasibility polishing.** `jl.solve_with_polishing` is `jl.solve` with
