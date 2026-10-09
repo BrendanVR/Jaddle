@@ -159,3 +159,194 @@ def test_warm_start():
         initial_opt_state=loose["opt_state"],
     )
     assert_certified(lp, tight, reference_objective(lp))
+
+
+def solve_certificate(lp, sol):
+    """The certificate solve() terminates on (l2 norm, PDLP dual residual)."""
+    # solve() gives an empty constraint class one zero row, and its duals.
+    padded = getattr(jl, "__pad_empty_blocks")(jl.to_jaddle_sparse(lp))
+    cert = jl.evaluate_lp_certificate(
+        padded,
+        sol.primal,
+        sol.dual_eq,
+        sol.dual_ineq,
+        norm="l2",
+        dual_residual="pdlp",
+    )
+    return {k: float(v) for k, v in cert.items()}
+
+
+def test_certificate_matches_solve():
+    lp = random_lp()
+    cert = solve_certificate(lp, solve(lp)["solution"])
+    assert cert["relative_primal_feasibility_residual"] <= TOL
+    assert cert["relative_dual_feasibility_residual"] <= TOL
+    assert cert["relative_gap_abs"] <= TOL
+
+
+def test_warm_start_from_optimum_stays_put():
+    # A certified point must certify again after one epoch from it. The duals
+    # were once warm-started off by the objective scale c_max.
+    lp = random_lp()
+    sol = solve(lp)["solution"]
+    again = solve(lp, initial_solution=sol, max_epochs=1, iterations_per_epoch=8)
+    assert again["stop_reason"] == "certificate"
+    y = np.concatenate([sol.dual_eq, sol.dual_ineq])
+    y_again = np.concatenate([again["solution"].dual_eq, again["solution"].dual_ineq])
+    assert np.linalg.norm(y_again - y) <= 1e-3 * (1 + np.linalg.norm(y))
+
+
+def perturbed_optimum(seed=0, size=1e-3):
+    lp = random_lp()
+    sol = solve(lp)["solution"]
+    rng = np.random.default_rng(seed)
+
+    def noise(v):
+        return v + size * rng.standard_normal(v.shape)
+
+    return lp, sol, noise
+
+
+def test_primal_polish_restores_feasibility():
+    lp, sol, noise = perturbed_optimum()
+    bad = jl.SaddleState(
+        primal=noise(sol.primal), dual_ineq=sol.dual_ineq, dual_eq=sol.dual_eq
+    )
+    before = solve_certificate(lp, bad)["relative_primal_feasibility_residual"]
+    x = jl.primal_polish(jl.to_jaddle_sparse(lp), bad)
+    polished = jl.SaddleState(primal=x, dual_ineq=sol.dual_ineq, dual_eq=sol.dual_eq)
+    after = solve_certificate(lp, polished)["relative_primal_feasibility_residual"]
+    assert after < 1e-2 * before
+
+
+def test_dual_polish_restores_feasibility():
+    lp, sol, noise = perturbed_optimum()
+    bad = jl.SaddleState(
+        primal=sol.primal, dual_ineq=noise(sol.dual_ineq), dual_eq=noise(sol.dual_eq)
+    )
+    before = solve_certificate(lp, bad)["relative_dual_feasibility_residual"]
+    dual_eq, dual_ineq = jl.dual_polish(jl.to_jaddle_sparse(lp), bad)
+    polished = jl.SaddleState(primal=sol.primal, dual_ineq=dual_ineq, dual_eq=dual_eq)
+    after = solve_certificate(lp, polished)["relative_dual_feasibility_residual"]
+    assert after < 1e-2 * before
+    # A feasibility projection, not a jump across the dual feasible set.
+    y = np.concatenate([sol.dual_eq, sol.dual_ineq])
+    moved = np.linalg.norm(np.concatenate([dual_eq, dual_ineq]) - y)
+    perturbation = np.linalg.norm(np.concatenate([bad.dual_eq, bad.dual_ineq]) - y)
+    assert moved <= perturbation
+
+
+@pytest.mark.parametrize("make_lp", [toy_lp, random_lp])
+def test_solve_with_polishing(make_lp):
+    # Tight feasibility, loose gap; polish from the first epoch on.
+    lp = make_lp()
+    result = jl.solve_with_polishing(
+        lp,
+        tol=1e-9,
+        dual_gap_tolerance=1e-4,
+        first_polish_epoch=1,
+        iterations_per_epoch=16,
+        max_epochs=2000,
+    )
+    assert result["stop_reason"] == "certificate"
+    assert set(result["polish"]) == {"attempts", "epochs", "polished"}
+    cert = solve_certificate(lp, result["solution"])
+    assert cert["relative_primal_feasibility_residual"] <= 1e-9
+    assert cert["relative_dual_feasibility_residual"] <= 1e-9
+    assert cert["relative_gap_abs"] <= 1e-4
+    ref = reference_objective(lp)
+    assert abs(cert["objective"] - ref) / (1 + abs(ref)) < 1e-3
+
+
+def small_lp(c, A_ineq=None, b_ineq=None, A_eq=None, b_eq=None, ub=None):
+    n = len(c)
+
+    def block(A):
+        return sp.csc_matrix(np.array(A, float)) if A is not None else sp.csc_matrix((0, n))
+
+    def rhs(b):
+        return np.array(b, float) if b is not None else np.zeros(0)
+
+    return jl.LP(
+        c=np.array(c, float),
+        A_eq=block(A_eq),
+        b_eq=rhs(b_eq),
+        A_ineq=block(A_ineq),
+        b_ineq=rhs(b_ineq),
+        lower_bounds=np.zeros(n),
+        upper_bounds=np.full(n, np.inf) if ub is None else np.array(ub, float),
+    )
+
+
+def contradictory_random_lp():
+    # A random feasible LP plus the pair a.x <= 0 and a.x >= 1.
+    lp = random_lp(seed=4)
+    a = sp.csc_matrix(np.random.default_rng(3).standard_normal(lp.c.shape[0]))
+    return jl.LP(
+        c=lp.c,
+        A_eq=lp.A_eq,
+        b_eq=lp.b_eq,
+        A_ineq=sp.vstack([lp.A_ineq, a, -a]).tocsc(),
+        b_ineq=np.concatenate([lp.b_ineq, [0.0, -1.0]]),
+        lower_bounds=lp.lower_bounds,
+        upper_bounds=lp.upper_bounds,
+    )
+
+
+@pytest.mark.parametrize(
+    "lp, status",
+    [
+        (small_lp([1, 1], [[1, 1], [-1, -1]], [1, -3]), "primal_infeasible"),
+        (small_lp([1], [[-1]], [-2], ub=[1]), "primal_infeasible"),
+        (small_lp([1, 1], A_eq=[[1, 1], [1, 1]], b_eq=[1, 2]), "primal_infeasible"),
+        (contradictory_random_lp(), "primal_infeasible"),
+        (small_lp([-1, 0], [[1, -1]], [1]), "dual_infeasible"),
+        (random_lp(), "optimal"),
+        (toy_lp(), "optimal"),
+    ],
+)
+def test_detect_infeasibility(lp, status):
+    result = jl.detect_infeasibility(lp, max_epochs=2000)
+    assert result["status"] == status
+    if status == "optimal":
+        return
+    # The returned rays certify in their own right.
+    cert = jl.evaluate_infeasibility_certificate(
+        getattr(jl, "__pad_empty_blocks")(jl.to_jaddle_sparse(lp)),
+        result["primal_ray"],
+        result["dual_ray_eq"],
+        result["dual_ray_ineq"],
+    )
+    key = (
+        "primal_infeasibility_ratio"
+        if status == "primal_infeasible"
+        else "dual_infeasibility_ratio"
+    )
+    assert float(cert[key]) <= 1e-8
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_detect_infeasibility_no_false_positive(seed):
+    lp = random_lp(seed=seed, m_eq=seed % 4, m_ineq=10 + seed, n=20 + 2 * seed)
+    result = jl.detect_infeasibility(lp, max_epochs=300, first_check_epoch=1)
+    assert result["status"] in ("optimal", "undetermined")
+
+
+def test_infeasibility_certificate_ignores_rounding():
+    # A zero dual ray must not certify, whatever the rounding in its objective.
+    lp = jl.to_jaddle_sparse(random_lp())
+    y_eq = np.zeros(lp.n_eq)
+    y_ineq = np.full(lp.A_ineq.shape[0], 1e-300)
+    cert = jl.evaluate_infeasibility_certificate(
+        lp, np.zeros(lp.c.shape[0]), y_eq, y_ineq
+    )
+    assert float(cert["primal_infeasibility_ratio"]) == np.inf
+    assert float(cert["dual_infeasibility_ratio"]) == np.inf
+
+
+def test_solve_with_polishing_epoch_budget():
+    result = jl.solve_with_polishing(
+        random_lp(), tol=1e-12, first_polish_epoch=1, max_epochs=3
+    )
+    assert result["stop_reason"] == "max_epochs"
+    assert result["epochs"] == 3

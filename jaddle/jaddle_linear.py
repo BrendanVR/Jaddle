@@ -885,12 +885,14 @@ def solve(
         lp.c = lp.c + (vertex_bias * c_scale_mag) * r
 
     if user_supplied_initial:
-        # Map the user's original-space solution into scaled space (the inverse
-        # of the output unscaling: primal *= col_scale, dual *= row_scale).
+        # Map the user's original-space solution into scaled space: the exact
+        # inverse of _unscale_output (primal *= col_scale, dual *= row_scale *
+        # c_max). c_max is 1 unless the objective was normalised; leaving it
+        # out warm-started every dual off by that factor.
         initial_solution = SaddleState(
             primal=initial_solution.primal / col_scale,
-            dual_ineq=initial_solution.dual_ineq / jnp_row_scale_ineq,
-            dual_eq=initial_solution.dual_eq / jnp_row_scale_eq,
+            dual_ineq=initial_solution.dual_ineq / (jnp_row_scale_ineq * c_max),
+            dual_eq=initial_solution.dual_eq / (jnp_row_scale_eq * c_max),
         )
 
     dual_feasibility_threshold = (
@@ -2792,7 +2794,9 @@ def build_dual_feasibility_lp(lp: JaddleLP) -> JaddleLP:
     return zeroed
 
 
-def evaluate_lp_certificate(lp: JaddleLP, primal, dual_eq, dual_ineq):
+def evaluate_lp_certificate(
+    lp: JaddleLP, primal, dual_eq, dual_ineq, norm="inf", dual_residual="projected"
+):
     """
     Standalone, TRUE-units reimplementation of `solve()`'s internal
     `compute_epoch_metrics`/`relative_gap` (jaddle_linear.py ~1458), for judging
@@ -2809,9 +2813,24 @@ def evaluate_lp_certificate(lp: JaddleLP, primal, dual_eq, dual_ineq):
     `dual_ineq` are already in true (unscaled) units — the case here, since
     `solve()` always returns `result["solution"]` unscaled back to true units.
 
+    ``norm`` (``"inf"`` or ``"l2"``) and ``dual_residual`` (``"projected"`` or
+    ``"pdlp"``) select the residual norm and reduced-cost split exactly as
+    ``solve()``'s ``termination_norm`` / ``dual_residual`` do. The defaults keep
+    this function's historical ∞-norm / projected certificate; pass
+    ``norm="l2", dual_residual="pdlp"`` to reproduce ``solve()``'s default
+    stopping test, which gates the gap on ``relative_gap_abs``.
+
     Returns a dict: ``objective``, ``dual_objective``, ``duality_gap``,
-    ``relative_gap``, ``primal_feasibility_residual``, ``dual_feasibility_residual``.
+    ``relative_gap``, ``relative_gap_abs`` (the no-cancellation gap ``solve()``
+    terminates on), ``primal_feasibility_residual``,
+    ``dual_feasibility_residual`` and their ``relative_*`` forms.
     """
+    if norm not in ("inf", "l2"):
+        raise ValueError(f"norm must be 'inf' or 'l2', got {norm!r}")
+    if dual_residual not in ("pdlp", "projected"):
+        raise ValueError(
+            f"dual_residual must be 'pdlp' or 'projected', got {dual_residual!r}"
+        )
     dual = jnp.concatenate([dual_eq, dual_ineq])
     Ax = lp.A @ primal
     reduced_cost = lp.c + lp.A_T @ dual
@@ -2831,41 +2850,55 @@ def evaluate_lp_certificate(lp: JaddleLP, primal, dual_eq, dual_ineq):
 
     lower_term = reduced_cost * lower_bounds
     upper_term = reduced_cost * upper_bounds
-    box_infimum = jnp.where(
-        has_both_bounds,
-        jnp.minimum(lower_term, upper_term),
-        jnp.where(
-            has_only_lower, lower_term, jnp.where(has_only_upper, upper_term, 0.0)
-        ),
-    )
-
-    proj_box = projection_box(primal - reduced_cost, lower_bounds, upper_bounds)
-    dual_feasibility_violation = jnp.where(
-        has_both_bounds,
-        jnp.abs(primal - proj_box),
-        jnp.where(
-            has_only_lower,
-            jnp.maximum(-reduced_cost, 0.0),
+    if dual_residual == "pdlp":
+        # Same absorption rule as solve()'s compute_epoch_metrics: a reduced
+        # cost is absorbed by a finite bound of the matching sign only when the
+        # primal sits near that bound, else it is a dual residual.
+        lb_ok = finite_lower & (jnp.abs(primal - lower_bounds) <= jnp.abs(primal))
+        ub_ok = finite_upper & (jnp.abs(primal - upper_bounds) <= jnp.abs(primal))
+        absorb_lower = (reduced_cost > 0.0) & lb_ok
+        absorb_upper = (reduced_cost < 0.0) & ub_ok
+        box_infimum = jnp.where(
+            absorb_lower, lower_term, jnp.where(absorb_upper, upper_term, 0.0)
+        )
+        dual_feasibility_violation = jnp.where(
+            absorb_lower | absorb_upper, 0.0, jnp.abs(reduced_cost)
+        )
+    else:
+        box_infimum = jnp.where(
+            has_both_bounds,
+            jnp.minimum(lower_term, upper_term),
             jnp.where(
-                has_only_upper,
-                jnp.maximum(reduced_cost, 0.0),
-                jnp.abs(reduced_cost),
+                has_only_lower, lower_term, jnp.where(has_only_upper, upper_term, 0.0)
             ),
-        ),
-    )
-    dual_feasibility_residual = jnp.max(dual_feasibility_violation, initial=0.0)
+        )
+        proj_box = projection_box(primal - reduced_cost, lower_bounds, upper_bounds)
+        dual_feasibility_violation = jnp.where(
+            has_both_bounds,
+            jnp.abs(primal - proj_box),
+            jnp.where(
+                has_only_lower,
+                jnp.maximum(-reduced_cost, 0.0),
+                jnp.where(
+                    has_only_upper,
+                    jnp.maximum(reduced_cost, 0.0),
+                    jnp.abs(reduced_cost),
+                ),
+            ),
+        )
+    dual_feasibility_residual = _vector_norm(dual_feasibility_violation, norm)
 
     ineq_violations = jnp.maximum(grad_dual_ineq, 0.0)
     eq_violations = jnp.abs(grad_dual_eq)
-    primal_feasibility_residual = jnp.maximum(
-        jnp.max(ineq_violations, initial=0.0), jnp.max(eq_violations, initial=0.0)
+    primal_feasibility_residual = _vector_norm(
+        jnp.concatenate([eq_violations, ineq_violations]), norm
     )
 
     relative_primal_feasibility_residual = primal_feasibility_residual / (
-        1.0 + jnp.max(jnp.abs(lp.b), initial=0.0)
+        1.0 + _vector_norm(lp.b, norm)
     )
     relative_dual_feasibility_residual = dual_feasibility_residual / (
-        1.0 + jnp.max(jnp.abs(lp.c), initial=0.0)
+        1.0 + _vector_norm(lp.c, norm)
     )
 
     gap_bound_comp = reduced_cost @ primal - jnp.sum(box_infimum)
@@ -2874,15 +2907,18 @@ def evaluate_lp_certificate(lp: JaddleLP, primal, dual_eq, dual_ineq):
     duality_gap = gap_bound_comp + gap_ineq_comp + gap_eq_comp
 
     dual_objective = objective_value - duality_gap
-    relative_gap = jnp.abs(duality_gap) / (
-        1.0 + jnp.abs(objective_value) + jnp.abs(dual_objective)
-    )
+    gap_denom = 1.0 + jnp.abs(objective_value) + jnp.abs(dual_objective)
+    relative_gap = jnp.abs(duality_gap) / gap_denom
+    relative_gap_abs = (
+        jnp.abs(gap_bound_comp) + jnp.abs(gap_ineq_comp) + jnp.abs(gap_eq_comp)
+    ) / gap_denom
 
     return {
         "objective": objective_value,
         "dual_objective": dual_objective,
         "duality_gap": duality_gap,
         "relative_gap": relative_gap,
+        "relative_gap_abs": relative_gap_abs,
         "primal_feasibility_residual": primal_feasibility_residual,
         "dual_feasibility_residual": dual_feasibility_residual,
         "relative_primal_feasibility_residual": relative_primal_feasibility_residual,
@@ -2989,51 +3025,107 @@ def solve_dual_feasibility(
 # %%
 
 
+def _with_vectors(lp: JaddleLP, c=None, b_eq=None, b_ineq=None, lower=None, upper=None):
+    """Shallow copy of ``lp`` with some of its vectors replaced. The constraint
+    matrices (and their sorted BCOO forms) are shared, not rebuilt."""
+    out = copy.copy(lp)
+    if c is not None:
+        out.c = c
+    if b_eq is not None:
+        out.b_eq = b_eq
+    if b_ineq is not None:
+        out.b_ineq = b_ineq
+    if lower is not None:
+        out.lower_bounds = lower
+    if upper is not None:
+        out.upper_bounds = upper
+    out.b = jnp.concatenate([out.b_eq, out.b_ineq])
+    return out
+
+
+def primal_feasibility_lp(lp: JaddleLP) -> JaddleLP:
+    """The primal feasibility problem (Eq. 6 of Applegate et al.,
+    arXiv:2501.07018): ``lp`` with its objective set to zero."""
+    return _with_vectors(lp, c=jnp.zeros_like(lp.c))
+
+
+def homogenised_dual_lp(lp: JaddleLP, primal=None) -> JaddleLP:
+    """The LP whose saddle solve yields a dual-feasible point of ``lp`` (Eq. 7
+    of Applegate et al., arXiv:2501.07018, in PDLP's form): ``b = 0`` and
+    bounds homogenised to 0 or ±inf. Its optimal primal is 0, and its dual
+    optima ``y`` are exactly those whose reduced cost ``c + Aᵀy`` every kept
+    bound absorbs.
+
+    Without ``primal`` every finite bound is kept (PDLP). A boxed variable
+    then becomes fixed at 0 and absorbs a reduced cost of either sign, which
+    ``solve()``'s ``dual_residual="pdlp"`` certificate does not accept unless
+    x is near the matching bound: measured on a random LP, a dual polished
+    this way went from DFR 1.5e-3 to 7.7e-2. With ``primal`` a bound is kept
+    only where that certificate would absorb at ``primal`` (finite and
+    ``|x - bound| <= |x|``), so a dual optimum has zero DFR at ``primal``."""
+    lower, upper = lp.lower_bounds, lp.upper_bounds
+    keep_lower, keep_upper = jnp.isfinite(lower), jnp.isfinite(upper)
+    if primal is not None:
+        keep_lower &= jnp.abs(primal - lower) <= jnp.abs(primal)
+        keep_upper &= jnp.abs(primal - upper) <= jnp.abs(primal)
+    return _with_vectors(
+        lp,
+        b_eq=jnp.zeros_like(lp.b_eq),
+        b_ineq=jnp.zeros_like(lp.b_ineq),
+        lower=jnp.where(keep_lower, 0.0, -jnp.inf).astype(lower.dtype),
+        upper=jnp.where(keep_upper, 0.0, jnp.inf).astype(upper.dtype),
+    )
+
+
+def _primal_polish_solve(lp: JaddleLP, warm_start: SaddleState, **kwargs):
+    # Optimal dual of a zero-objective problem is 0, so start the dual there.
+    # k_init is left to the ||c||/||b|| derivation: c = 0 sends it to the low
+    # clamp, i.e. a large primal step and no objective force — what a
+    # feasibility projection wants (seeding the main solve's learned k left
+    # mzzv11's 2-epoch feasibility problem unconverged at 20 epochs).
+    kwargs.setdefault("max_epochs", 1)
+    init = SaddleState(
+        primal=warm_start.primal,
+        dual_ineq=jnp.zeros_like(warm_start.dual_ineq),
+        dual_eq=jnp.zeros_like(warm_start.dual_eq),
+    )
+    return solve(primal_feasibility_lp(lp), initial_solution=init, **kwargs)
+
+
+def _dual_polish_solve(lp: JaddleLP, warm_start: SaddleState, **kwargs):
+    # Mirror image: the homogenised problem's optimal primal is 0. Its bounds
+    # follow the warm start's primal (see homogenised_dual_lp).
+    kwargs.setdefault("max_epochs", 1)
+    init = SaddleState(
+        primal=jnp.zeros_like(warm_start.primal),
+        dual_ineq=warm_start.dual_ineq,
+        dual_eq=warm_start.dual_eq,
+    )
+    return solve(
+        homogenised_dual_lp(lp, warm_start.primal), initial_solution=init, **kwargs
+    )
+
+
 def primal_polish(
     lp: JaddleLP,
     warm_start: SaddleState,
     **kwargs,
 ):
     """
-    Runs Algorithm 4 step 2 (Applegate et al., arXiv:2501.07018): PDHG on the
-    primal feasibility problem (their Eq. 6), warm-started from `warm_start`.
+    Algorithm 4's primal step (Applegate et al., arXiv:2501.07018): a short
+    ``solve()`` of the primal feasibility problem (``c = 0``) warm-started at
+    ``warm_start.primal`` with a zero dual. Returns the polished primal.
 
-    Since Eq. 6 has a zero objective, its dual has no notion of "the" solution
-    — an unconstrained solve wanders freely through the feasible set and can
-    drift arbitrarily far from `warm_start` (measured on stp3d: 8+ iterations
-    already destroys the polish, since gradient steps toward feasibility can
-    move a long way in objective terms while barely moving the residual on an
-    underdetermined problem). The paper's fix is to cap this to a short burst
-    (`k/8` iterations, `k` = outer solve's iteration count so far) rather than
-    solving to convergence — `max_iters` here plays that role, passed through
-    as `iterations_per_epoch` with a single epoch so it caps the actual PDHG
-    iteration count, not an epoch count (whose default iteration budget of
-    256 is far too long for this warm-start use).
+    The zero objective leaves the solver free to wander anywhere in the
+    feasible set, so this must be a short burst from a point that is already
+    nearly feasible and nearly optimal — not a solve to convergence. The burst
+    is ``max_epochs`` epochs (default 1) of ``iterations_per_epoch``; PDLP uses
+    an eighth of the main solve's iterations so far. Other keyword arguments
+    go to ``solve()``.
     """
-    initial_solution = SaddleState(
-        primal=warm_start.primal,
-        dual_ineq=jnp.zeros_like(warm_start.dual_ineq),
-        dual_eq=jnp.zeros_like(warm_start.dual_eq),
-    )
-
-    lp_feasible = JaddleLP(
-        c=jnp.zeros_like(lp.c),
-        A_ineq=lp.A_ineq,
-        b_ineq=lp.b_ineq,
-        A_eq=lp.A_eq,
-        b_eq=lp.b_eq,
-        lower_bounds=lp.lower_bounds,
-        upper_bounds=lp.upper_bounds,
-    )
-
-    kwargs.setdefault("max_epochs", 1)
-    kwargs.setdefault("iterations_per_epoch", 8)
-
-    return solve(
-        lp_feasible,
-        initial_solution=initial_solution,
-        **kwargs,
-    )["solution"].primal
+    if not isinstance(lp, JaddleLP):
+        lp = to_jaddle_sparse(lp)
+    return _primal_polish_solve(lp, warm_start, **kwargs)["solution"].primal
 
 
 def dual_polish(
@@ -3042,112 +3134,645 @@ def dual_polish(
     **kwargs,
 ):
     """
-    Runs Algorithm 4 step 3: PDHG on the dual feasibility problem (Eq. 7),
-    warm-started from `warm_start`. See `primal_polish`'s docstring for why
-    `max_iters` (a short capped burst, not a full solve) is essential here —
-    the exact same unconstrained-drift failure mode was measured on stp3d:
-    dual_polish warm-started from a near-optimal y (relative_gap 2.3e-4)
-    degraded to relative_gap ~1.0 after just 8 iterations of unconstrained
-    PDHG on Eq. 7, because the dual feasibility problem's zero objective gives
-    the solver no reason to stay near the warm start.
+    Algorithm 4's dual step: a short ``solve()`` of the homogenised problem
+    (``b = 0``, bounds moved to 0 or ±inf; see ``homogenised_dual_lp``)
+    warm-started at the dual of ``warm_start`` with a zero primal. Returns the
+    polished ``(dual_eq, dual_ineq)``. Same burst semantics as
+    ``primal_polish``.
+
+    The homogenised bounds are chosen from ``warm_start.primal``: only bounds
+    the primal is near can absorb a reduced cost, matching ``solve()``'s
+    default ``dual_residual="pdlp"`` certificate. Pair the result with that
+    same primal.
     """
+    if not isinstance(lp, JaddleLP):
+        lp = to_jaddle_sparse(lp)
+    sol = _dual_polish_solve(lp, warm_start, **kwargs)["solution"]
+    return sol.dual_eq, sol.dual_ineq
 
-    kwargs.setdefault("max_epochs", 1)
-    kwargs.setdefault("iterations_per_epoch", 1)
 
-    result = solve_dual_feasibility(
-        lp,
-        initial_dual_eq=warm_start.dual_eq,
-        initial_dual_ineq=warm_start.dual_ineq,
-        **kwargs,
-    )
-
-    return result["dual_eq"], result["dual_ineq"]
+# Main-solve arguments that must not reach the polishing sub-solves: they
+# describe the main problem's start point, objective or heuristic stop.
+_POLISH_DROPPED_KWARGS = frozenset(
+    {
+        "initial_solution",
+        "initial_opt_state",
+        "k_init",
+        "reference_objective",
+        "primal_stop",
+        "primal_stop_window",
+        "primal_stop_obj_tol",
+        "vertex_bias",
+        "vertex_bias_seed",
+    }
+)
 
 
 def solve_with_polishing(
     lp: JaddleLP,
-    max_rounds: int = 5,
-    max_epochs=None,
     tol=1e-6,
+    primal_feasibility_tolerance=None,
+    dual_feasibility_tolerance=None,
+    dual_gap_tolerance=None,
+    max_epochs=None,
+    max_seconds=None,
+    first_polish_epoch=16,
+    polish_fraction=0.125,
     **kwargs,
 ):
+    """
+    ``solve()`` with PDLP feasibility polishing (Applegate et al.,
+    arXiv:2501.07018, Algorithm 4).
 
-    if kwargs.get("verbose", False):
-        print("Solving original problem...")
+    First-order LP solvers often close the duality gap well before the primal
+    and dual residuals reach a tight tolerance. Polishing targets that tail.
+    The main solve runs in chunks whose total length doubles (``first_polish_epoch``,
+    then 2×, 4×, … epochs). After each chunk that ends uncertified with the
+    gap already within ``dual_gap_tolerance``, each side that is still
+    infeasible is polished by a short sub-solve of ``polish_fraction`` times
+    the main epochs so far:
 
-    # primal_polish/dual_polish/evaluate_lp_certificate all require a JaddleLP
-    # (BCOO blocks) — solve() itself accepts a scipy-backed LP too and converts
-    # it internally, but that conversion is local to solve() and never visible
-    # here. Normalise once so the polishing loop below always has BCOO to work
-    # with, regardless of which form the caller passed in.
+    * primal: ``primal_polish`` (``c = 0``) from the current primal;
+    * dual: ``dual_polish`` (homogenised ``b = 0`` problem) from the current dual.
+
+    The recombined pair is checked against the same certificate ``solve()``
+    uses; if it passes it is returned, otherwise it is discarded and the main
+    solve resumes from its own (unpolished) point, so polishing never makes the
+    result worse. Polishing costs at most about ``2 * polish_fraction`` of the
+    main solve's epochs.
+
+    Polishing is a finishing tool. It cannot rescue a solve that is stuck far
+    from tolerance: a feasibility sub-solve warm-started there inherits the
+    stall, and a cold-started feasible point ignores the objective.
+
+    Each chunk boundary is a warm restart (``initial_solution`` /
+    ``initial_opt_state`` carry the point, ``k`` and ``eta``; the averaging
+    resets), and each ``solve()`` call repeats the scaling setup.
+
+    Args:
+        tol: Default for the three tolerances below.
+        primal_feasibility_tolerance, dual_feasibility_tolerance,
+            dual_gap_tolerance: As in ``solve()``; ``None`` means ``tol``. Set
+            the gap tolerance looser than the feasibility ones to get PDLP's
+            "feasible, approximately optimal" mode.
+        max_epochs: Main-solve epoch budget across all chunks (polishing
+            epochs are not counted). ``None`` = no limit.
+        max_seconds: Wall-clock budget for the whole call, polishing included.
+        first_polish_epoch: Length of the first main chunk, i.e. the earliest
+            epoch at which polishing can fire.
+        polish_fraction: Per-side polishing budget as a fraction of the main
+            epochs so far (PDLP: 1/8).
+        **kwargs: Passed to ``solve()``. The sub-solves get them too, except
+            the start point, ``k_init``, ``vertex_bias``, ``primal_stop`` and
+            ``reference_objective``.
+
+    Returns:
+        ``solve()``'s result dict, with ``"epochs"`` summed over the main
+        chunks, ``"solve_seconds"`` and ``"corrected_seconds"`` set to the
+        whole call's wall time, and a ``"polish"`` dict: ``attempts``,
+        ``epochs`` (sub-solve epochs, both sides) and ``polished`` (whether the
+        returned point came from polishing).
+    """
+    entry_time = time.time()
     if not isinstance(lp, JaddleLP):
         lp = to_jaddle_sparse(lp)
+    # solve() pads an empty constraint class with a zero row and returns duals
+    # of that padded size; pad here so the certificate below sees the same LP.
+    lp = __pad_empty_blocks(lp)
+    if first_polish_epoch < 1:
+        raise ValueError("first_polish_epoch must be >= 1")
+    if not 0.0 < polish_fraction:
+        raise ValueError("polish_fraction must be > 0")
 
-    rounds = 0
-    # First, solve the original problem
-    result = solve(
-        lp,
-        primal_feasibility_tolerance=tol,
-        dual_feasibility_tolerance=tol,
-        dual_gap_tolerance=tol,
-        max_epochs=max_epochs,
-        **kwargs,
-    )
+    tolerances = {
+        "primal_feasibility_tolerance": (
+            tol if primal_feasibility_tolerance is None else primal_feasibility_tolerance
+        ),
+        "dual_feasibility_tolerance": (
+            tol if dual_feasibility_tolerance is None else dual_feasibility_tolerance
+        ),
+        "dual_gap_tolerance": tol if dual_gap_tolerance is None else dual_gap_tolerance,
+    }
+    p_tol = tolerances["primal_feasibility_tolerance"]
+    d_tol = tolerances["dual_feasibility_tolerance"]
+    g_tol = tolerances["dual_gap_tolerance"]
+    # Judge points with solve()'s own stopping test.
+    cert_options = {
+        "norm": kwargs.get("termination_norm", "l2"),
+        "dual_residual": kwargs.get("dual_residual", "pdlp"),
+    }
+    verbose = kwargs.get("verbose", False)
+    sub_kwargs = {k: v for k, v in kwargs.items() if k not in _POLISH_DROPPED_KWARGS}
+    state = kwargs.pop("initial_solution", None)
+    opt_state = kwargs.pop("initial_opt_state", None)
 
-    # If the solver converged, perform primal and dual polishing
-    while not result["converged"] and rounds <= max_rounds:
-        rounds += 1
+    def seconds_left():
+        if max_seconds is None:
+            return None
+        return max_seconds - (time.time() - entry_time)
 
-        if kwargs.get("verbose", False):
-            print(f"Polishing round {rounds}...")
-        polished_primal = primal_polish(
-            lp,
-            warm_start=result["solution"],
-            **kwargs,
-        )
+    main_epochs = 0
+    polish_epochs = 0
+    attempts = 0
+    polished = False
+    chunk = int(first_polish_epoch)
+    result = None
 
-        solution = SaddleState(
-            primal=polished_primal,
-            dual_ineq=result["solution"].dual_ineq,
-            dual_eq=result["solution"].dual_eq,
-        )
-
-        lp_cert = evaluate_lp_certificate(
-            lp,
-            polished_primal,
-            result["solution"].dual_eq,
-            result["solution"].dual_ineq,
-        )
-
-        if kwargs.get("verbose", False):
-            print(
-                f"Relative primal feasibility residual: {lp_cert['relative_primal_feasibility_residual']}"
-            )
-            print(
-                f"Relative dual feasibility residual: {lp_cert['relative_dual_feasibility_residual']}"
-            )
-            print(f"Relative gap: {lp_cert['relative_gap']}")
-
-        if (
-            lp_cert["relative_gap"] < tol
-            and lp_cert["relative_primal_feasibility_residual"] < tol
-            and lp_cert["relative_dual_feasibility_residual"] < tol
-        ):
-            if kwargs.get("verbose", False):
-                print("Polished solution is feasible and optimal. Stopping polishing.")
-            break
-
-        if kwargs.get("verbose", False):
-            print(f"Re-solving with polished solution as warm start...")
-
+    while True:
+        if max_epochs is not None:
+            chunk = min(chunk, int(max_epochs) - main_epochs)
+        left = seconds_left()
+        if left is not None and left <= 0:
+            if result is not None:
+                result["stop_reason"] = "time_limit"
+                break
+            left = 1e-6  # spent before the first chunk: solve() reports it
         result = solve(
             lp,
-            initial_solution=solution,
-            primal_feasibility_tolerance=tol,
-            dual_feasibility_tolerance=tol,
-            dual_gap_tolerance=tol,
-            max_epochs=max_epochs,
+            max_epochs=chunk,
+            max_seconds=left,
+            initial_solution=state,
+            initial_opt_state=opt_state,
+            **tolerances,
             **kwargs,
         )
+        main_epochs += result["epochs"]
+        state, opt_state = result["solution"], result["opt_state"]
+        # Anything but an exhausted chunk (certified, primal_stall, time limit,
+        # interrupted) ends the solve, as does the overall epoch budget.
+        if result["stop_reason"] != "max_epochs" or (
+            max_epochs is not None and main_epochs >= max_epochs
+        ):
+            break
+
+        cert = evaluate_lp_certificate(
+            lp, state.primal, state.dual_eq, state.dual_ineq, **cert_options
+        )
+        # PDLP polishes only once the gap has closed: polishing does not
+        # improve the gap, so an earlier candidate cannot certify.
+        if float(cert["relative_gap_abs"]) <= g_tol:
+            attempts += 1
+            budget = max(1, int(np.ceil(polish_fraction * main_epochs)))
+            if verbose:
+                print(
+                    f"Feasibility polish {attempts} after {main_epochs} epochs "
+                    f"(PFR {float(cert['relative_primal_feasibility_residual']):.2e}, "
+                    f"DFR {float(cert['relative_dual_feasibility_residual']):.2e}), "
+                    f"{budget} epochs per side"
+                )
+            primal = state.primal
+            dual_eq, dual_ineq = state.dual_eq, state.dual_ineq
+            interrupted = False
+            current = cert
+            for side, residual, limit in (
+                ("primal", "relative_primal_feasibility_residual", p_tol),
+                ("dual", "relative_dual_feasibility_residual", d_tol),
+            ):
+                left = seconds_left()
+                if float(current[residual]) <= limit or (
+                    left is not None and left <= 0
+                ):
+                    continue
+                polish_solve = (
+                    _primal_polish_solve if side == "primal" else _dual_polish_solve
+                )
+                # The dual side runs second and homogenises its bounds at the
+                # already-polished primal, the one it will be paired with.
+                sub = polish_solve(
+                    lp,
+                    SaddleState(
+                        primal=primal, dual_ineq=state.dual_ineq, dual_eq=state.dual_eq
+                    ),
+                    **{
+                        **sub_kwargs,
+                        **tolerances,
+                        "max_epochs": budget,
+                        "max_seconds": left,
+                    },
+                )
+                polish_epochs += sub["epochs"]
+                if sub["stop_reason"] == "interrupted":
+                    interrupted = True
+                    break
+                if side == "primal":
+                    primal = sub["solution"].primal
+                    # Moving x changes which bounds absorb reduced costs, so
+                    # re-test the dual side at the polished primal.
+                    current = evaluate_lp_certificate(
+                        lp, primal, dual_eq, dual_ineq, **cert_options
+                    )
+                else:
+                    dual_eq = sub["solution"].dual_eq
+                    dual_ineq = sub["solution"].dual_ineq
+            if interrupted:
+                result["stop_reason"] = "interrupted"
+                break
+
+            candidate = evaluate_lp_certificate(
+                lp, primal, dual_eq, dual_ineq, **cert_options
+            )
+            if (
+                float(candidate["relative_primal_feasibility_residual"]) <= p_tol
+                and float(candidate["relative_dual_feasibility_residual"]) <= d_tol
+                and bool(jnp.isfinite(candidate["duality_gap"]))
+                and float(candidate["relative_gap_abs"]) <= g_tol
+            ):
+                if verbose:
+                    print("Polished point is certified.")
+                polished = True
+                result["solution"] = SaddleState(
+                    primal=primal, dual_ineq=dual_ineq, dual_eq=dual_eq
+                )
+                result["converged"] = True
+                result["stop_reason"] = "certificate"
+                break
+            if verbose:
+                print(
+                    "Polished point not certified "
+                    f"(PFR {float(candidate['relative_primal_feasibility_residual']):.2e}, "
+                    f"DFR {float(candidate['relative_dual_feasibility_residual']):.2e}, "
+                    f"gap {float(candidate['relative_gap_abs']):.2e}); resuming."
+                )
+
+        # Double the main solve's total length.
+        chunk = main_epochs
+
+    wall = time.time() - entry_time
+    result["epochs"] = main_epochs
+    result["solve_seconds"] = wall
+    result["corrected_seconds"] = wall
+    result["polish"] = {
+        "attempts": attempts,
+        "epochs": polish_epochs,
+        "polished": polished,
+    }
     return result
+
+
+# %%
+
+
+def _project_rays(lp: JaddleLP, primal_ray, dual_ray_eq, dual_ray_ineq):
+    """Project candidate rays onto the cones a certificate needs: the primal
+    ray onto the recession cone of the bounds (d_j >= 0 under a finite lower
+    bound, <= 0 under a finite upper one, so boxed variables get 0) and the
+    inequality part of the dual ray onto y >= 0. A certificate for the
+    projected ray is a certificate, so projecting only discards noise."""
+    d = jnp.where(jnp.isfinite(lp.lower_bounds), jnp.maximum(primal_ray, 0.0), primal_ray)
+    d = jnp.where(jnp.isfinite(lp.upper_bounds), jnp.minimum(d, 0.0), d)
+    return d, dual_ray_eq, jnp.maximum(dual_ray_ineq, 0.0)
+
+
+def evaluate_infeasibility_certificate(
+    lp: JaddleLP, primal_ray, dual_ray_eq, dual_ray_ineq
+):
+    """
+    PDLP's infeasibility tests (Applegate et al., "Infeasibility detection
+    with primal-dual hybrid gradient for large-scale linear programming",
+    2021) for candidate rays, in true units and ∞-norms. The rays are first
+    projected onto their cones (see ``_project_rays``); both tests are
+    invariant to the rays' scale.
+
+    Primal infeasibility (Farkas): a dual ray ``y`` (``y_ineq >= 0``) with
+    ``q = Aᵀy`` and dual ray objective ``F = Σ_j inf_{l_j<=x_j<=u_j} q_j x_j
+    − bᵀy``, where only the components of ``q`` some finite bound absorbs
+    count towards the infimum and the rest are its infeasibility. If the
+    infeasibility were 0 and ``F > 0``, every x in the box would have
+    ``yᵀ(Ax − b) > 0``, which no feasible x can. The test is
+    ``F > 0`` and ``infeasibility / F <= tol``; it then holds for no LP with a
+    feasible point of ‖x‖₁ < 1/tol.
+
+    Dual infeasibility (the primal is unbounded if feasible): a primal ray
+    ``d`` in the bounds' recession cone with ``cᵀd < 0`` and infeasibility
+    ``max(‖A_eq d‖∞, ‖max(A_ineq d, 0)‖∞)``. The test is ``cᵀd < 0`` and
+    ``infeasibility / (−cᵀd) <= tol``; it then holds for no LP with a dual
+    feasible point of ‖y‖₁ < 1/tol.
+
+    A ray objective counts as positive (negative) only when it exceeds
+    ``1000·eps`` times the sum of the magnitudes it is computed from, so
+    rounding noise in a ray with zero infeasibility cannot certify.
+
+    Returns a dict: ``dual_ray_objective``, ``dual_ray_infeasibility``,
+    ``primal_infeasibility_ratio`` (the Farkas test's ratio, ``inf`` unless
+    ``F > 0``), ``primal_ray_objective``, ``primal_ray_infeasibility`` and
+    ``dual_infeasibility_ratio`` (``inf`` unless ``cᵀd < 0``).
+    """
+    d, y_eq, y_ineq = _project_rays(lp, primal_ray, dual_ray_eq, dual_ray_ineq)
+    finite_lower = jnp.isfinite(lp.lower_bounds)
+    finite_upper = jnp.isfinite(lp.upper_bounds)
+    lower = jnp.where(finite_lower, lp.lower_bounds, 0.0)
+    upper = jnp.where(finite_upper, lp.upper_bounds, 0.0)
+
+    # Farkas ray. A positive q_j is bounded below only by a finite lower
+    # bound, a negative one only by a finite upper bound.
+    y = jnp.concatenate([y_eq, y_ineq])
+    q = lp.A_T @ y
+    absorb_lower = (q > 0.0) & finite_lower
+    absorb_upper = (q < 0.0) & finite_upper
+    box_infimum = jnp.where(
+        absorb_lower, q * lower, jnp.where(absorb_upper, q * upper, 0.0)
+    )
+    dual_ray_objective = jnp.sum(box_infimum) - lp.b @ y
+    dual_ray_infeasibility = jnp.max(
+        jnp.where(absorb_lower | absorb_upper, 0.0, jnp.abs(q)), initial=0.0
+    )
+    # An objective within rounding of zero is no evidence: a ray with zero
+    # infeasibility would otherwise certify on noise alone.
+    noise = 1e3 * jnp.finfo(q.dtype).eps
+    dual_significant = dual_ray_objective > noise * (
+        jnp.sum(jnp.abs(box_infimum)) + jnp.abs(lp.b) @ jnp.abs(y)
+    )
+    primal_infeasibility_ratio = jnp.where(
+        dual_significant,
+        dual_ray_infeasibility
+        / jnp.where(dual_significant, dual_ray_objective, 1.0),
+        jnp.inf,
+    )
+
+    # Unbounded ray.
+    Ad = lp.A @ d
+    primal_ray_objective = lp.c @ d
+    primal_ray_infeasibility = jnp.maximum(
+        jnp.max(jnp.abs(Ad[: lp.n_eq]), initial=0.0),
+        jnp.max(jnp.maximum(Ad[lp.n_eq :], 0.0), initial=0.0),
+    )
+    primal_significant = -primal_ray_objective > noise * (jnp.abs(lp.c) @ jnp.abs(d))
+    dual_infeasibility_ratio = jnp.where(
+        primal_significant,
+        primal_ray_infeasibility
+        / jnp.where(primal_significant, -primal_ray_objective, 1.0),
+        jnp.inf,
+    )
+
+    return {
+        "dual_ray_objective": dual_ray_objective,
+        "dual_ray_infeasibility": dual_ray_infeasibility,
+        "primal_infeasibility_ratio": primal_infeasibility_ratio,
+        "primal_ray_objective": primal_ray_objective,
+        "primal_ray_infeasibility": primal_ray_infeasibility,
+        "dual_infeasibility_ratio": dual_infeasibility_ratio,
+    }
+
+
+def _min_norm_correction(M, rhs, iter_lim=2000):
+    """Minimum-norm δ with M δ = rhs (least squares if inconsistent). The
+    iteration cap bounds the cost of a check on a large LP; an unconverged
+    correction just fails the certificate test that follows."""
+    from scipy.sparse.linalg import lsqr
+
+    if M.shape[0] == 0 or M.shape[1] == 0:
+        return np.zeros(M.shape[1])
+    return lsqr(M, rhs, atol=1e-15, btol=1e-15, iter_lim=iter_lim)[0]
+
+
+def _refine_rays(A, n_eq, lower, upper, d, y_eq, y_ineq):
+    """
+    Remove the small infeasibility of nearly-certifying rays while keeping
+    their sign pattern, on the host with scipy.
+
+    Farkas ray: the components of ``q = Aᵀy`` no bound absorbs are set to 0
+    exactly by the minimum-norm change to the rows ``y`` already uses
+    (equality rows, and inequality rows with ``y > 0``). Unbounded ray: the
+    equality rows and the violated inequality rows of ``A d`` are set to 0 by
+    the minimum-norm change to the columns ``d`` already moves (plus free
+    columns). PDHG's iterate differences reach the right pattern long before
+    their infeasibility falls to a tight tolerance (it decays like 1/k), so
+    this turns an early, rough ray into a certificate.
+    The result must still be checked with ``evaluate_infeasibility_certificate``.
+    """
+    finite_lower, finite_upper = np.isfinite(lower), np.isfinite(upper)
+
+    y = np.concatenate([y_eq, y_ineq])
+    q = A.T @ y
+    absorbed = ((q > 0) & finite_lower) | ((q < 0) & finite_upper)
+    cols = np.flatnonzero(~absorbed & (q != 0))
+    rows = np.concatenate([np.arange(n_eq), n_eq + np.flatnonzero(y_ineq > 0)])
+    if cols.size:
+        y = y.copy()
+        y[rows] += _min_norm_correction(A[rows][:, cols].T.tocsr(), -q[cols])
+
+    Ad = A @ d
+    rows = np.concatenate(
+        [np.arange(n_eq), n_eq + np.flatnonzero(Ad[n_eq:] > 0)]
+    )
+    cols = np.flatnonzero((d != 0) | (~finite_lower & ~finite_upper))
+    if rows.size:
+        d = d.copy()
+        d[cols] += _min_norm_correction(A[rows][:, cols].tocsr(), -Ad[rows])
+
+    return d, y[:n_eq], y[n_eq:]
+
+
+def detect_infeasibility(
+    lp: JaddleLP,
+    tol=1e-8,
+    max_epochs=None,
+    max_seconds=None,
+    first_check_epoch=4,
+    refine=True,
+    **kwargs,
+):
+    """
+    Detect an infeasible or unbounded LP the PDLP way: on such a problem the
+    PDHG iterates diverge, and their per-iteration difference converges to a
+    direction (the infimal displacement vector) whose dual part is a Farkas
+    ray when the primal is infeasible and whose primal part is an unbounded
+    ray when the dual is infeasible.
+
+    ``solve()`` runs in chunks whose total length doubles (``first_check_epoch``,
+    then 2×, 4×, … epochs), each warm-started from the last iterate with its
+    step-size state. After each chunk, the difference between the chunk's end
+    and start points is tested with ``evaluate_infeasibility_certificate``
+    against ``tol``. If ``solve()`` certifies optimality instead, the LP is
+    feasible and bounded.
+
+    The raw difference converges slowly: its infeasibility ratio falls like
+    1/iterations (measured on a random LP with a contradictory row pair: 1e-4
+    after ~100 epochs, still ~1e-6 after 4000). Its sign pattern settles much
+    earlier, so with ``refine=True`` (default) a ray that fails the test is
+    corrected by ``_refine_rays`` (a minimum-norm least-squares fix on the
+    host, with scipy) and re-tested; on that LP the refined ray certified to
+    1e-14 from 64 epochs.
+
+    The certificates are sound up to scale: a primal-infeasibility result
+    rules out any feasible point with ‖x‖₁ < 1/tol, a dual-infeasibility
+    result any dual feasible point with ‖y‖₁ < 1/tol (see
+    ``evaluate_infeasibility_certificate``). Run in float64 for tight
+    ``tol``.
+
+    The solve keeps ``solve()``'s restarted averaging and ``k`` rebalancing
+    (PDLP detects on restarted PDHG too) but sets ``report_best=False``, since
+    a best-merit point can freeze on a diverging trajectory. Measured on six
+    netlib ``infeas`` problems (30 s each): last-iterate PDHG with restarts
+    off and ``k`` frozen detected none; restarted averaging detected bgdbg1
+    and reactor; adding ``k`` rebalancing (these defaults) also detected box1
+    and ex72a, and left forest6 at 2.5e-8.
+
+    Args:
+        tol: Relative tolerance for both infeasibility tests (PDLP's default
+            is 1e-8).
+        max_epochs: Epoch budget across all chunks. ``None`` = no limit.
+        max_seconds: Wall-clock budget for the whole call.
+        first_check_epoch: Length of the first chunk, i.e. the earliest check.
+        refine: Try the least-squares ray refinement when the raw ray fails.
+        **kwargs: Passed to ``solve()``, including its optimality tolerances,
+            which decide the ``"optimal"`` outcome. They default to ``tol``
+            (not ``solve()``'s 1e-3), so an almost-feasible LP is not
+            reported optimal.
+
+    Returns:
+        dict with
+            * ``"status"``: ``"primal_infeasible"``, ``"dual_infeasible"``,
+              ``"optimal"`` (``solve()`` certified optimality) or
+              ``"undetermined"`` (budget spent, interrupted, or ``solve()``
+              stopped on ``primal_stop``). When both tests pass,
+              ``"primal_infeasible"`` wins.
+            * ``"primal_ray"``, ``"dual_ray_eq"``, ``"dual_ray_ineq"``: the last
+              candidate rays, projected onto their cones and scaled to unit
+              ∞-norm (``None`` before the first check).
+            * ``"certificate"``: ``evaluate_infeasibility_certificate``'s dict
+              for those rays, as floats (``None`` before the first check).
+            * ``"epochs"``, ``"seconds"``: epochs run and the whole call's wall
+              time.
+            * ``"result"``: the last ``solve()`` result.
+    """
+    entry_time = time.time()
+    if not isinstance(lp, JaddleLP):
+        lp = to_jaddle_sparse(lp)
+    lp = __pad_empty_blocks(lp)
+    if first_check_epoch < 1:
+        raise ValueError("first_check_epoch must be >= 1")
+    for key, value in (
+        ("report_best", False),
+        # "optimal" must be as strict as an infeasibility claim: at solve()'s
+        # default 1e-3, netlib's almost-feasible cplex2 certified as optimal.
+        ("primal_feasibility_tolerance", tol),
+        ("dual_feasibility_tolerance", tol),
+        ("dual_gap_tolerance", tol),
+    ):
+        kwargs.setdefault(key, value)
+    verbose = kwargs.get("verbose", False)
+
+    state = kwargs.pop("initial_solution", None)
+    if state is None:
+        state = lp.initial_solution()
+    opt_state = kwargs.pop("initial_opt_state", None)
+
+    if refine:
+        A_host = __convert_to_scipy(lp.A).tocsr()
+        lower_host = np.asarray(lp.lower_bounds)
+        upper_host = np.asarray(lp.upper_bounds)
+
+    def check(d, y_eq, y_ineq):
+        # The rays scaled to unit ∞-norm (the dual ray as a whole), and their
+        # certificate as floats.
+        cert = {
+            key: float(value)
+            for key, value in evaluate_infeasibility_certificate(
+                lp, d, y_eq, y_ineq
+            ).items()
+        }
+        d_scale = float(jnp.max(jnp.abs(d), initial=0.0))
+        y_scale = float(
+            jnp.max(jnp.abs(jnp.concatenate([y_eq, y_ineq])), initial=0.0)
+        )
+        rays = (
+            d / d_scale if d_scale > 0.0 else d,
+            y_eq / y_scale if y_scale > 0.0 else y_eq,
+            y_ineq / y_scale if y_scale > 0.0 else y_ineq,
+        )
+        return rays, cert
+
+    def passes(cert):
+        return (
+            cert["primal_infeasibility_ratio"] <= tol
+            or cert["dual_infeasibility_ratio"] <= tol
+        )
+
+    status = "undetermined"
+    rays = (None, None, None)
+    cert = None
+    epochs = 0
+    chunk = int(first_check_epoch)
+    result = None
+
+    while True:
+        if max_epochs is not None:
+            chunk = min(chunk, int(max_epochs) - epochs)
+        left = None
+        if max_seconds is not None:
+            left = max_seconds - (time.time() - entry_time)
+            if left <= 0:
+                if result is not None:
+                    break
+                left = 1e-6  # spent before the first chunk: solve() reports it
+        result = solve(
+            lp,
+            max_epochs=chunk,
+            max_seconds=left,
+            initial_solution=state,
+            initial_opt_state=opt_state,
+            **kwargs,
+        )
+        epochs += result["epochs"]
+        new = result["solution"]
+        if result["stop_reason"] == "certificate":
+            status = "optimal"
+            break
+        if result["stop_reason"] not in ("max_epochs", "time_limit"):
+            break  # interrupted, or primal_stop's heuristic stop
+
+        candidate = _project_rays(
+            lp,
+            new.primal - state.primal,
+            new.dual_eq - state.dual_eq,
+            new.dual_ineq - state.dual_ineq,
+        )
+        rays, cert = check(*candidate)
+        if verbose:
+            print(
+                f"Infeasibility check after {epochs} epochs: primal-infeasibility "
+                f"ratio {cert['primal_infeasibility_ratio']:.2e}, "
+                f"dual-infeasibility ratio {cert['dual_infeasibility_ratio']:.2e}"
+            )
+        if refine and not passes(cert):
+            refined = _refine_rays(
+                A_host, lp.n_eq, lower_host, upper_host,
+                *(np.asarray(v) for v in candidate),
+            )
+            refined_rays, refined_cert = check(
+                *_project_rays(lp, *(jnp.asarray(v, lp.c.dtype) for v in refined))
+            )
+            if verbose:
+                print(
+                    "  refined: primal-infeasibility ratio "
+                    f"{refined_cert['primal_infeasibility_ratio']:.2e}, "
+                    "dual-infeasibility ratio "
+                    f"{refined_cert['dual_infeasibility_ratio']:.2e}"
+                )
+            if passes(refined_cert):
+                rays, cert = refined_rays, refined_cert
+        if cert["primal_infeasibility_ratio"] <= tol:
+            status = "primal_infeasible"
+            break
+        if cert["dual_infeasibility_ratio"] <= tol:
+            status = "dual_infeasible"
+            break
+        if result["stop_reason"] == "time_limit" or (
+            max_epochs is not None and epochs >= max_epochs
+        ):
+            break
+
+        state, opt_state = new, result["opt_state"]
+        chunk = epochs  # double the total length
+
+    return {
+        "status": status,
+        "primal_ray": rays[0],
+        "dual_ray_eq": rays[1],
+        "dual_ray_ineq": rays[2],
+        "certificate": cert,
+        "epochs": epochs,
+        "seconds": time.time() - entry_time,
+        "result": result,
+    }

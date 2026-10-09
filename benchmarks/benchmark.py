@@ -76,6 +76,25 @@ def add_cost_col_floor_flag(p):
     )
 
 
+def add_polish_flags(p):
+    """Add the --gap-tol and --polish flags (feasibility polishing A/Bs)."""
+    p.add_argument(
+        "--gap-tol",
+        type=float,
+        default=None,
+        help="Relative duality-gap tolerance for Jaddle (default: same as --tol). "
+        "Set it looser than --tol for a tight-feasibility / loose-gap "
+        "certificate, the regime where --polish pays off.",
+    )
+    p.add_argument(
+        "--polish",
+        action="store_true",
+        help="Solve with jl.solve_with_polishing (PDLP feasibility polishing) "
+        "instead of jl.solve. Polishing fires only once the gap is within "
+        "--gap-tol, so with --gap-tol equal to --tol it rarely changes anything.",
+    )
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Jaddle vs HiGHS-PDLP LP benchmark.")
     p.add_argument(
@@ -199,6 +218,7 @@ def parse_args():
         "(default: float64).",
     )
     add_cost_col_floor_flag(p)
+    add_polish_flags(p)
     add_jaddle_verbose_flag(p, default=True)
     return p.parse_args()
 
@@ -291,10 +311,17 @@ def load_relaxed_lp(
 
 
 def jaddle_solve_kwargs(
-    tol, max_epochs, update_mode, max_seconds=None, verbose=True, cost_col_floor=0.0
+    tol,
+    max_epochs,
+    update_mode,
+    max_seconds=None,
+    verbose=True,
+    cost_col_floor=0.0,
+    gap_tol=None,
 ):
     """The ``jl.solve`` settings every benchmark harness uses, so all of them
-    (and benchmark_mpax.py's Jaddle arm) run the same configuration."""
+    (and benchmark_mpax.py's Jaddle arm) run the same configuration.
+    ``gap_tol`` (default: ``tol``) sets the duality-gap tolerance alone."""
     return dict(
         max_epochs=max_epochs,
         max_seconds=max_seconds,
@@ -302,7 +329,7 @@ def jaddle_solve_kwargs(
         log_every=10,
         primal_feasibility_tolerance=tol,
         dual_feasibility_tolerance=tol,
-        dual_gap_tolerance=tol,
+        dual_gap_tolerance=tol if gap_tol is None else gap_tol,
         update_mode=update_mode,
         iterations_per_epoch=64 * 10,
         epochs_per_restart=10,
@@ -318,8 +345,15 @@ def run_jaddle(
     max_seconds=None,
     verbose=True,
     cost_col_floor=0.0,
+    gap_tol=None,
+    polish=False,
 ):
     """Solve with Jaddle's saddle-point solver. Returns a dict of metrics.
+
+    ``polish=True`` solves with ``jl.solve_with_polishing`` instead of
+    ``jl.solve``; its solve time is then the whole call's wall time (no
+    compile amortisation) and ``jaddle_polished`` records whether the returned
+    point came from polishing.
 
     Three times are reported:
       * ``jaddle_solve_seconds`` -- the solver's internal iterate-loop time
@@ -337,10 +371,11 @@ def run_jaddle(
     jl.lp_summary_statistics(lp)
 
     t0 = time.perf_counter()
-    result = jl.solve(
+    solve = jl.solve_with_polishing if polish else jl.solve
+    result = solve(
         lp,
         **jaddle_solve_kwargs(
-            tol, max_epochs, update_mode, max_seconds, verbose, cost_col_floor
+            tol, max_epochs, update_mode, max_seconds, verbose, cost_col_floor, gap_tol
         ),
     )
     wall_seconds = time.perf_counter() - t0
@@ -371,6 +406,9 @@ def run_jaddle(
         "jaddle_wall_seconds": wall_seconds,
         "jaddle_eq_res": eq_res,
         "jaddle_ineq_res": ineq_res,
+        # Blank unless polish=True.
+        "jaddle_polished": result["polish"]["polished"] if polish else "",
+        "jaddle_polish_attempts": result["polish"]["attempts"] if polish else "",
     }
 
 
@@ -419,7 +457,12 @@ def main():
         )
         return
 
-    print(f"Running {len(instances)} instance(s) at tol={args.tol:g}\n")
+    gap_text = "" if args.gap_tol is None else f", gap_tol={args.gap_tol:g}"
+    polish_text = ", feasibility polishing" if args.polish else ""
+    print(
+        f"Running {len(instances)} instance(s) at tol={args.tol:g}"
+        f"{gap_text}{polish_text}\n"
+    )
     rows = []
     for name, path, size_mb in instances:
         print(f"=== {name} ({size_mb:.1f} MB) ===")
@@ -451,6 +494,8 @@ def main():
                 max_seconds=args.max_seconds,
                 verbose=args.jaddle_verbose,
                 cost_col_floor=args.cost_col_floor,
+                gap_tol=args.gap_tol,
+                polish=args.polish,
             )
             # jaddle solves the presolved reduced problem (objective = c^T x);
             # add the presolve offset to compare against the full-problem opt_obj.
@@ -472,7 +517,8 @@ def main():
                 f"corrected={jres['jaddle_corrected_seconds']:.2f}s, "
                 f"wall={jres['jaddle_wall_seconds']:.2f}s, "
                 f"converged={jres['jaddle_converged']}, "
-                f"rel_gap={row['rel_obj_gap']:.2e})"
+                + (f"polished={jres['jaddle_polished']}, " if args.polish else "")
+                + f"rel_gap={row['rel_obj_gap']:.2e})"
             )
         except Exception as exc:  # keep the run going if one instance blows up
             row["error"] = repr(exc)
@@ -510,6 +556,8 @@ CSV_FIELDS = [
     "jaddle_wall_seconds",
     "jaddle_eq_res",
     "jaddle_ineq_res",
+    "jaddle_polished",
+    "jaddle_polish_attempts",
     "rel_obj_gap",
     "error",
 ]

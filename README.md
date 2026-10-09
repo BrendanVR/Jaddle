@@ -298,8 +298,18 @@ the dual objective as in PDLP, so far-away finite bounds do not swamp the gap.
   External presolve is available through HiGHS, SCIP and glop.
 - **Certification.** `jl.evaluate_lp_certificate` reports the relative primal,
   dual and gap residuals of any primal–dual pair independently of a solve.
-- **Polishing.** `jl.solve_with_polishing`, `jl.primal_polish` and
-  `jl.dual_polish` refine a near-optimal point towards a tighter certificate.
+- **Feasibility polishing.** `jl.solve_with_polishing` is `jl.solve` with
+  PDLP-style feasibility polishing: once the gap has closed, short zero-objective
+  (`jl.primal_polish`) and zero-RHS (`jl.dual_polish`) sub-solves push the
+  residuals down, and the polished pair is returned only if it certifies. It
+  pays off when feasibility is tighter than the gap, e.g. `tol=1e-8,
+  dual_gap_tolerance=1e-4`: on stp3d (float64) that certifies in 24 s, where a
+  plain solve is still at PFR 5e-6 after 150 s.
+- **Infeasibility detection.** `jl.detect_infeasibility` classifies an LP as
+  `"primal_infeasible"`, `"dual_infeasible"` (unbounded if feasible),
+  `"optimal"` or `"undetermined"` the PDLP way: diverging iterates give a
+  candidate Farkas or unbounded ray, refined by a small least-squares fix and
+  checked with `jl.evaluate_infeasibility_certificate`.
 - **Diagnostics.** `jl.lp_summary_statistics` prints the problem dimensions and
   coefficient ranges, which is the first thing to check when an instance
   misbehaves.
