@@ -2472,7 +2472,7 @@ def solve_batch(lp, values, **settings):
     return jax.jit(jax.vmap(solve_fn, in_axes=(axes,)))(values)
 
 
-def make_optimal_value(lp, **settings):
+def make_optimal_value(lp, return_solution=False, **settings):
     """
     The LP's optimal value as a differentiable function of its numbers.
 
@@ -2492,8 +2492,16 @@ def make_optimal_value(lp, **settings):
     At a degenerate optimum ``z*`` is not differentiable and this returns one
     element of the subdifferential, the one at the solution found. The
     gradient is only as accurate as the solve: use tight tolerances, and check
-    ``make_solver``'s ``converged`` when it matters. Works under ``jit`` and
-    ``vmap``.
+    ``converged`` when it matters. Works under ``jit`` and ``vmap``.
+
+    Every call is a fresh solve, and separate solves differ slightly (on a GPU
+    even identical ones; and where the optimal duals are not unique, as on
+    stp3d, by more than the tolerance). To compare the gradient with the
+    solution it came from, pass ``return_solution=True``: ``value_fn`` then
+    returns ``(z*, SolveCoreResult)`` from one solve, for use with
+    ``jax.grad(value_fn, has_aux=True)`` or
+    ``jax.value_and_grad(value_fn, has_aux=True)``. Its duals include the
+    zero row ``solve()`` adds to an empty constraint block.
     """
     solve_fn = make_solver(lp, **settings)
     pattern = solve_fn.pattern
@@ -2501,12 +2509,14 @@ def make_optimal_value(lp, **settings):
     ineq_rows, ineq_cols = pattern.A_ineq.indices[:, 0], pattern.A_ineq.indices[:, 1]
     base_values = pattern.values()
 
-    def forward(values):
+    # The solve runs once, outside the custom derivative; `value_at` turns
+    # its solution into z* and, in the backward pass, into the gradient. So
+    # the gradient always belongs to the solution the caller can get back.
+    def value_at_forward(values, solution):
         padded = _pad_values(values, pattern)
-        solution = solve_fn(padded).solution
         return padded.c @ solution.primal, (values, padded, solution)
 
-    def backward(residuals, g):
+    def value_at_backward(residuals, g):
         values, padded, solution = residuals
         x, y_eq, y_ineq = solution.primal, solution.dual_eq, solution.dual_ineq
         reduced_cost = padded.c + pattern.with_values(padded).A_T @ jnp.concatenate(
@@ -2528,16 +2538,26 @@ def make_optimal_value(lp, **settings):
             lower_bounds=jnp.where(finite_lower, jnp.maximum(reduced_cost, 0.0), 0.0),
             upper_bounds=jnp.where(finite_upper, jnp.minimum(reduced_cost, 0.0), 0.0),
         )
-        return (jax.tree.map(lambda t, v: (g * t).astype(jnp.asarray(v).dtype), grad, values),)
+        grad_values = jax.tree.map(
+            lambda t, v: (g * t).astype(jnp.asarray(v).dtype), grad, values
+        )
+        # The solution is treated as fixed: no gradient flows into the solve.
+        return grad_values, jax.tree.map(jnp.zeros_like, solution)
 
     @jax.custom_vjp
-    def value(values):
-        return forward(values)[0]
+    def value_at(values, solution):
+        return value_at_forward(values, solution)[0]
 
-    value.defvjp(forward, backward)
+    value_at.defvjp(value_at_forward, value_at_backward)
 
     def value_fn(values=None):
-        return value(base_values if values is None else values)
+        values = base_values if values is None else values
+        result = solve_fn(
+            jax.tree.map(jax.lax.stop_gradient, _pad_values(values, pattern))
+        )
+        solution = jax.tree.map(jax.lax.stop_gradient, result.solution)
+        z = value_at(values, solution)
+        return (z, result) if return_solution else z
 
     value_fn.pattern = pattern
     return value_fn

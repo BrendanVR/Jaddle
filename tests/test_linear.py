@@ -704,3 +704,17 @@ def test_warm_start_without_padding_rows():
         ),
     )
     assert warm["stop_reason"] == "certificate"
+
+
+def test_optimal_value_returns_its_own_solution():
+    # With return_solution=True the gradient and the solution come from one
+    # solve, so they agree exactly: dz*/dc = x*, dz*/db = -y*.
+    lp = jl.to_jaddle_sparse(random_lp())
+    value_fn = jl.make_optimal_value(lp, return_solution=True, **PRESOLVE_TOL)
+    (z, result), grads = jax.value_and_grad(value_fn, has_aux=True)(lp.values())
+    s = result.solution
+    assert bool(result.converged)
+    np.testing.assert_array_equal(grads.c, s.primal)
+    np.testing.assert_array_equal(grads.b_eq, -s.dual_eq)
+    np.testing.assert_array_equal(grads.b_ineq, -s.dual_ineq)
+    assert float(z) == float(lp.c @ s.primal)

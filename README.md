@@ -450,6 +450,42 @@ their tolerances:
 `solve` returns a dictionary containing `solution` (a `SaddleState`),
 `converged`, `stop_reason`, `opt_state` and `solve_seconds`.
 
+### Batched and differentiable solves
+
+For a family of problems, write a function `build_cp(params)` that returns
+an ordinary `JaddleCP` whose functions close over `params`. `params` can be
+any pytree: data, weights, right-hand sides or bounds. Then:
+
+```python
+def build_cp(params):
+    a, s = params
+    return jc.JaddleCP(
+        num_variables=n,
+        objective=lambda x: jnp.sum((x - a) ** 2),
+        constraints_eq=lambda x: jnp.array([jnp.sum(x) - s]),
+        constraints_ineq=lambda x: jnp.zeros(0),
+        lower_bounds=jnp.zeros(n), upper_bounds=jnp.full(n, jnp.inf),
+    )
+
+solve_fn = jax.jit(jc.make_solver(build_cp, max_epochs=500))
+result = solve_fn((a, 1.0))                       # SolveCoreResult
+batch = jax.vmap(solve_fn)((a_batch, s_batch))    # many problems at once
+
+value_fn = jc.make_optimal_value(build_cp)
+grad_a, grad_s = jax.grad(value_fn)((a, 1.0))     # dz*/dparams
+x_fn = jc.make_solution(build_cp)                 # differentiable x*(params)
+```
+
+`make_solver` runs `solve()`'s algorithm with the same options, but without
+logging or a time limit. `make_optimal_value` differentiates the Lagrangian at
+the solution with respect to `params` (the envelope theorem), so it needs no
+differentiation through the iterations. `make_solution` implicitly
+differentiates the KKT conditions on the active set, matrix-free with GMRES.
+That needs a nondegenerate solution and a strictly convex objective (or at
+least a nonsingular KKT system); where the system can't be solved, the
+gradient is NaN. Both are checked against closed forms and finite differences
+in the tests.
+
 ## Numerical precision
 
 Call `jaddle.jaddle_optimisers.configure_jax(profile)` before creating any

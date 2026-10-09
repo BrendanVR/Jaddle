@@ -587,198 +587,9 @@ def _make_epoch_fn(
     return run_epoch
 
 
-def solve(
-    cp: JaddleCP,
-    optimiser=None,
-    max_epochs=None,
-    max_seconds=None,
-    initial_solution=None,
-    initial_opt_state=None,
-    iterations_per_epoch=int(1e3),
-    primal_grad_norm_tolerance=1e-2,
-    primal_feasibility_tolerance=1e-3,
-    complementarity_slack_tolerance=1e-3,
-    weight_function=lambda _: 1.0,
-    verbose=False,
-    log_every=1,
-    average=False,
-    update_mode="extragradient",
-    k_scale=10.0,
-    k_theta=0.5,
-    k_init=None,
-    adaptive_eta="auto",
-    restarts=False,
-    epochs_per_restart=None,
-    restart_multiplier=1.0,
-    restart_decay=0.2,
-    iterations_per_epoch_decay=1.0,
-    iterations_per_epoch_min=100,
-    precompile=True,
-):
-    """
-    Solve a convex saddle-point problem via saddle-point optimisation.
-
-    Runs primal descent / dual ascent on the Lagrangian
-    ``f(x) + λᵀg(x) + μᵀh(x)`` (``λ >= 0``), with the primal projected onto the
-    box ``[lower_bounds, upper_bounds]``; all gradients come from ``jax.grad``.
-    Iterations run in compiled epochs of ``iterations_per_epoch`` steps. After
-    each epoch the convergence test is evaluated, and the solve stops once all
-    three of the following are within tolerance:
-
-    * stationarity, ``‖x - proj(x - ∇ₓL)‖∞ <= primal_grad_norm_tolerance``;
-    * primal feasibility, the largest violation ``max(g(x)⁺, |h(x)|) <=
-      primal_feasibility_tolerance``;
-    * complementary slackness, ``max|λ ⊙ g(x)| / (1 + |f(x)|) <=
-      complementarity_slack_tolerance``.
-
-    The epoch loop runs on the device: each call into JAX executes a chunk of
-    many epochs, including the metrics, convergence test and restart logic, with
-    no host synchronisation between them. Python regains control between chunks
-    (sized to take about a second) to enforce ``max_epochs`` / ``max_seconds``,
-    print the verbose log and handle Ctrl-C; with ``verbose=True`` the per-epoch
-    ``Time`` is the average over the epoch's chunk. When ``verbose``,
-    ``max_epochs`` and ``max_seconds`` are all unset, the whole solve runs as a
-    single device call (only an ``iterations_per_epoch_decay`` restart, which
-    changes the compiled epoch length, returns to Python); Ctrl-C then takes
-    effect only once the call returns.
-
-    Args:
-        optimiser: Optax ``GradientTransformation`` for the primal and dual
-            players (build one with
-            ``jaddle_optimisers.create_saddle_optimiser``, or use a ready-made
-            one such as ``jo.gd`` or ``jo.optimistic_gd``). It drives the steps
-            whenever the adaptive step is off: always in ``"alternating"``
-            mode, and in ``"extragradient"`` mode when ``adaptive_eta=None``.
-            Passing one makes ``adaptive_eta="auto"`` resolve to ``None``.
-            ``None`` (default) uses plain gradient descent, ``jo.gd(0.5)``.
-        max_epochs: Epoch budget (default ``None`` = no limit). The solve stops
-            with ``stop_reason="max_epochs"`` once it is reached.
-        max_seconds: Wall-clock budget in seconds (default ``None`` = no limit).
-            Measured from entry into ``solve()``, so setup and ``precompile``
-            count against it. Checked between chunks of epochs, and each chunk is
-            sized from the measured epoch time to fit the remaining budget; once
-            the budget is spent the current point is returned with
-            ``stop_reason="time_limit"``. The solve can overrun by about one
-            epoch (shrink ``iterations_per_epoch`` for a tighter cutoff).
-        initial_solution: Starting ``SaddleState`` (default ``None`` = zeros
-            for the primal and both duals), e.g. the ``"solution"`` of a
-            previous solve.
-        initial_opt_state: Starting step-size / optimiser state (default
-            ``None`` = fresh), e.g. the ``"opt_state"`` of a previous solve.
-            Pass it together with ``initial_solution`` to resume a solve.
-        iterations_per_epoch: Iterations per compiled epoch (default 1000).
-            Convergence, budgets, logging and restarts are checked between
-            epochs, so smaller values react faster at some per-epoch cost.
-        primal_grad_norm_tolerance: Stationarity tolerance (default 1e-2); see
-            the convergence test above.
-        primal_feasibility_tolerance: Constraint-violation tolerance (default
-            1e-3).
-        complementarity_slack_tolerance: Relative complementary-slackness
-            tolerance (default 1e-3).
-        weight_function: Weight ``w(i)`` given to iterate ``i`` in the running
-            average (default uniform, ``lambda _: 1.0``; see also
-            ``jaddle_optimisers.tail_average``). Only used when
-            ``average=True``.
-        verbose: Print per-epoch progress (default ``False``).
-        log_every: With ``verbose``, print every this many epochs (default 1).
-        average: Report and test convergence on the weighted running average
-            of the iterates rather than the last iterate (default ``False``);
-            restarts then resume from whichever of the two has the better merit. Averaging helps non-contractive schemes such as
-            ``"alternating"``; the adaptive schemes converge in the last iterate.
-        update_mode: Selects the stepping scheme (single source of truth):
-            ``"extragradient"`` (default; Korpelevich two-call),
-            ``"alternating"`` (primal step, then dual step at the new primal) or
-            ``"forward_reflected"`` (Malitsky-Tam forward-reflected-backward:
-            one gradient evaluation per iteration; requires ``adaptive_eta``).
-        k_scale: Primal-weight (k) scaling control. ``None`` disables it;
-            otherwise a float sets a symmetric clamp band ``[1/k_scale,
-            k_scale]`` for ``k`` (default ``10`` → ``[0.1, 10]``). When enabled —
-            orthogonal to ``update_mode``, so it composes with every scheme
-            — a primal weight ``k`` rescales the primal/dual gradients by
-            ``(1/k, k)`` before each ``opt_update``, making the dual/primal step
-            ratio ``k**2``. ``k`` is initialised from ``k_init`` and rebalanced
-            at each restart (PDLP-style) from primal-vs-dual iterate movement; it
-            is constant within an epoch (not adapted per iteration). Tuned by
-            ``k_theta``/``k_scale`` and ``k_init``.
-        k_theta: Smoothing coefficient for the log-space primal-weight update at
-            each restart (default 0.5 = geometric mean of the movement-based
-            target and the current weight, matching PDLP). Smaller = slower
-            adaptation. Only used when ``k_scale`` is set.
-        k_init: Initial primal weight ``k``. ``None`` (default) initialises it to
-            the PDLP heuristic ``||c|| / ||b||`` (objective vs RHS norms), where
-            ``c = grad(objective)(0)`` and ``b = -[c_eq(0); c_ineq(0)]``. Pass a
-            float to override (``1.0`` = symmetric steps). Only used when
-            ``k_scale`` is set.
-        adaptive_eta: Enables a per-iteration adaptive step size with a
-            Malitsky-Tam local-Lipschitz line search. ``"auto"`` (default)
-            enables it with seed ``1.0`` when ``update_mode`` supports it,
-            ``k_scale`` is set and no ``optimiser`` was passed (otherwise it
-            behaves like ``None``; ``forward_reflected`` always enables it — the
-            seed barely matters, the line search corrects it within a few
-            iterations). ``None`` keeps the optimiser's fixed learning rate.
-            A float seeds a single scalar
-            base step ``eta`` driving the primal step ``tau = eta / k`` and dual
-            step ``sigma = eta * k``. The extragradient look-ahead and corrector
-            already evaluate the gradient twice, so the local Lipschitz estimate
-            ``L_hat = ‖g_half - g‖_w / ‖z_half - z‖_w`` (the k-weighted norm)
-            comes free; the step is admissible while ``eta · L_hat <= 1/sqrt2``,
-            and ``eta`` is rejected + shrunk if the trial overshot, then advanced
-            with a two-sided guard. Only supported with ``update_mode`` in
-            ``('extragradient', 'forward_reflected')`` (the contractive schemes
-            here) and requires ``k_scale`` (the primal weight k). The learned
-            ``eta`` is carried across restarts. The optimiser's learning rate is
-            bypassed in the hot loop.
-        restarts: Enable adaptive warm restarts (default ``False``). There is
-            no cap on how many fire; the triggers alone decide. Each restart
-            resets the optimiser momentum and averaging while keeping the
-            current iterate as a warm start. A restart fires when the normalised
-            KKT merit drops below ``restart_decay`` × the merit at the last
-            restart (sufficient-progress restart) or the cycle-length cap is
-            exhausted (no-progress restart).
-        epochs_per_restart: Length cap (epochs) of the first restart cycle, or
-            ``None`` (default) for no cap — restarts then fire only on the
-            sufficient-progress trigger. Subsequent caps grow by
-            ``restart_multiplier``.
-        restart_multiplier: Geometric growth factor for cycle-length caps
-            (default 1.0 = fixed length, 2.0 = doubling).
-        restart_decay: Sufficient-progress threshold (default 0.2). A restart
-            fires early when the merit drops below this fraction of the merit at
-            the last restart.
-        iterations_per_epoch_decay: Multiplicative decay applied to
-            ``iterations_per_epoch`` after each restart (default 1.0 = no
-            decay). Values < 1 shrink the epoch length at each restart to spend
-            more time checking convergence.
-        iterations_per_epoch_min: Floor for the decayed epoch length (default
-            100). Only used when ``iterations_per_epoch_decay < 1``.
-        precompile: Compile the device loop before the timed loop starts
-            (default ``True``), so ``"solve_seconds"`` measures iteration time
-            rather than XLA compilation. The compile still counts against
-            ``max_seconds``. A restart that changes ``iterations_per_epoch``
-            compiles a new loop inside the timed region.
-
-    Returns:
-        dict: The solution together with diagnostics. Keys:
-            * ``"solution"``: the ``SaddleState`` (primal/dual iterate).
-            * ``"converged"``: ``bool``, whether the solve met the convergence
-              criteria (``False`` if the epoch / time budget was exhausted or the
-              solve was interrupted).
-            * ``"stop_reason"``: ``str``, why the solve terminated:
-              ``"converged"``, ``"max_epochs"``, ``"time_limit"`` (``max_seconds``
-              exhausted) or ``"interrupted"`` (KeyboardInterrupt).
-            * ``"opt_state"``: the final optimiser state, for warm-starting a
-              subsequent solve via ``initial_opt_state``.
-            * ``"solve_seconds"``: ``float`` wall time of the epoch loop,
-              excluding setup. With ``precompile=True`` (default) it also
-              excludes XLA compilation; with ``precompile=False`` it includes
-              the first-epoch compile.
-            * ``"epochs"``: ``int``, number of epochs run.
-    """
-
-    # max_seconds is a wall-clock budget for the whole call, setup included.
-    solve_entry_time = time.time()
-    if max_seconds is not None and max_seconds <= 0:
-        raise ValueError("max_seconds must be > 0 (or None for no limit)")
-
+def _check_settings(optimiser, adaptive_eta, update_mode, k_scale):
+    """Resolve and validate the settings ``solve()`` and ``make_solver`` share.
+    Returns ``(optimiser, adaptive_eta, adaptive_step, k_scaling, k_lo, k_hi)``."""
     if adaptive_eta == "auto":
         if update_mode == "forward_reflected" or (
             update_mode in _ADAPTIVE_MODES and k_scale is not None and optimiser is None
@@ -789,12 +600,6 @@ def solve(
 
     if optimiser is None:
         optimiser = jo.gd(1 / 2)
-
-    if log_every < 1:
-        raise ValueError("log_every must be >= 1")
-
-    if verbose:
-        print("----------------------------------------------")
 
     valid_update_modes = ["alternating", "extragradient", "forward_reflected"]
     if update_mode not in valid_update_modes:
@@ -822,11 +627,47 @@ def solve(
         k_lo, k_hi = 1.0 / k_scale, k_scale
     else:
         k_lo, k_hi = None, None
+    return optimiser, adaptive_eta, adaptive_step, k_scaling, k_lo, k_hi
 
-    if verbose:
-        print("====Starting Solve====")
-        print("----------------------------------------------")
 
+def _device_solver(
+    cp,
+    *,
+    optimiser,
+    initial_solution,
+    initial_opt_state,
+    iterations_per_epoch,
+    primal_grad_norm_tolerance,
+    primal_feasibility_tolerance,
+    complementarity_slack_tolerance,
+    weight_function,
+    verbose,
+    log_every,
+    average,
+    update_mode,
+    k_scaling,
+    k_lo,
+    k_hi,
+    k_theta,
+    k_init,
+    adaptive_eta,
+    adaptive_step,
+    restarts,
+    epochs_per_restart,
+    restart_multiplier,
+    restart_decay,
+    iterations_per_epoch_decay,
+    iterations_per_epoch_min,
+):
+    """The device side of ``solve()`` for one problem: the jitted epoch loop
+    (iterations, metrics, convergence test, restarts and the primal weight)
+    and its initial state. ``cp``'s functions may close over traced values, so
+    this also runs inside ``jit`` / ``vmap`` / ``grad`` (``make_solver``).
+
+    Returns ``(build_chunk, carry)``: ``build_chunk(ipe)`` gives the jitted
+    ``run_chunk(carry, n_epochs)`` for an epoch length, and ``carry`` is the
+    initial loop state.
+    """
     def projection_primal(primal_state):
         return projection_box(primal_state, cp.lower_bounds, cp.upper_bounds)
 
@@ -952,7 +793,8 @@ def solve(
         c, b = jax.jit(_k_init_fn)(zero)
         norm_c2 = jnp.vdot(c, c) + 1e-60
         norm_b2 = jnp.vdot(b, b) + 1e-60
-        k_init = float(jnp.clip(jnp.sqrt(norm_c2 / norm_b2), k_lo, k_hi))
+        # Kept on the device (no float()) so this runs under jit / vmap.
+        k_init = jnp.clip(jnp.sqrt(norm_c2 / norm_b2), k_lo, k_hi)
     elif k_init is None:
         k_init = 1.0
 
@@ -1221,6 +1063,243 @@ def solve(
             n_evt=jnp.asarray(0),
         )
     )
+    return _build_chunk, carry
+
+
+def solve(
+    cp: JaddleCP,
+    optimiser=None,
+    max_epochs=None,
+    max_seconds=None,
+    initial_solution=None,
+    initial_opt_state=None,
+    iterations_per_epoch=int(1e3),
+    primal_grad_norm_tolerance=1e-2,
+    primal_feasibility_tolerance=1e-3,
+    complementarity_slack_tolerance=1e-3,
+    weight_function=lambda _: 1.0,
+    verbose=False,
+    log_every=1,
+    average=False,
+    update_mode="extragradient",
+    k_scale=10.0,
+    k_theta=0.5,
+    k_init=None,
+    adaptive_eta="auto",
+    restarts=False,
+    epochs_per_restart=None,
+    restart_multiplier=1.0,
+    restart_decay=0.2,
+    iterations_per_epoch_decay=1.0,
+    iterations_per_epoch_min=100,
+    precompile=True,
+):
+    """
+    Solve a convex saddle-point problem via saddle-point optimisation.
+
+    Runs primal descent / dual ascent on the Lagrangian
+    ``f(x) + λᵀg(x) + μᵀh(x)`` (``λ >= 0``), with the primal projected onto the
+    box ``[lower_bounds, upper_bounds]``; all gradients come from ``jax.grad``.
+    Iterations run in compiled epochs of ``iterations_per_epoch`` steps. After
+    each epoch the convergence test is evaluated, and the solve stops once all
+    three of the following are within tolerance:
+
+    * stationarity, ``‖x - proj(x - ∇ₓL)‖∞ <= primal_grad_norm_tolerance``;
+    * primal feasibility, the largest violation ``max(g(x)⁺, |h(x)|) <=
+      primal_feasibility_tolerance``;
+    * complementary slackness, ``max|λ ⊙ g(x)| / (1 + |f(x)|) <=
+      complementarity_slack_tolerance``.
+
+    The epoch loop runs on the device: each call into JAX executes a chunk of
+    many epochs, including the metrics, convergence test and restart logic, with
+    no host synchronisation between them. Python regains control between chunks
+    (sized to take about a second) to enforce ``max_epochs`` / ``max_seconds``,
+    print the verbose log and handle Ctrl-C; with ``verbose=True`` the per-epoch
+    ``Time`` is the average over the epoch's chunk. When ``verbose``,
+    ``max_epochs`` and ``max_seconds`` are all unset, the whole solve runs as a
+    single device call (only an ``iterations_per_epoch_decay`` restart, which
+    changes the compiled epoch length, returns to Python); Ctrl-C then takes
+    effect only once the call returns.
+
+    Args:
+        optimiser: Optax ``GradientTransformation`` for the primal and dual
+            players (build one with
+            ``jaddle_optimisers.create_saddle_optimiser``, or use a ready-made
+            one such as ``jo.gd`` or ``jo.optimistic_gd``). It drives the steps
+            whenever the adaptive step is off: always in ``"alternating"``
+            mode, and in ``"extragradient"`` mode when ``adaptive_eta=None``.
+            Passing one makes ``adaptive_eta="auto"`` resolve to ``None``.
+            ``None`` (default) uses plain gradient descent, ``jo.gd(0.5)``.
+        max_epochs: Epoch budget (default ``None`` = no limit). The solve stops
+            with ``stop_reason="max_epochs"`` once it is reached.
+        max_seconds: Wall-clock budget in seconds (default ``None`` = no limit).
+            Measured from entry into ``solve()``, so setup and ``precompile``
+            count against it. Checked between chunks of epochs, and each chunk is
+            sized from the measured epoch time to fit the remaining budget; once
+            the budget is spent the current point is returned with
+            ``stop_reason="time_limit"``. The solve can overrun by about one
+            epoch (shrink ``iterations_per_epoch`` for a tighter cutoff).
+        initial_solution: Starting ``SaddleState`` (default ``None`` = zeros
+            for the primal and both duals), e.g. the ``"solution"`` of a
+            previous solve.
+        initial_opt_state: Starting step-size / optimiser state (default
+            ``None`` = fresh), e.g. the ``"opt_state"`` of a previous solve.
+            Pass it together with ``initial_solution`` to resume a solve.
+        iterations_per_epoch: Iterations per compiled epoch (default 1000).
+            Convergence, budgets, logging and restarts are checked between
+            epochs, so smaller values react faster at some per-epoch cost.
+        primal_grad_norm_tolerance: Stationarity tolerance (default 1e-2); see
+            the convergence test above.
+        primal_feasibility_tolerance: Constraint-violation tolerance (default
+            1e-3).
+        complementarity_slack_tolerance: Relative complementary-slackness
+            tolerance (default 1e-3).
+        weight_function: Weight ``w(i)`` given to iterate ``i`` in the running
+            average (default uniform, ``lambda _: 1.0``; see also
+            ``jaddle_optimisers.tail_average``). Only used when
+            ``average=True``.
+        verbose: Print per-epoch progress (default ``False``).
+        log_every: With ``verbose``, print every this many epochs (default 1).
+        average: Report and test convergence on the weighted running average
+            of the iterates rather than the last iterate (default ``False``);
+            restarts then resume from whichever of the two has the better merit. Averaging helps non-contractive schemes such as
+            ``"alternating"``; the adaptive schemes converge in the last iterate.
+        update_mode: Selects the stepping scheme (single source of truth):
+            ``"extragradient"`` (default; Korpelevich two-call),
+            ``"alternating"`` (primal step, then dual step at the new primal) or
+            ``"forward_reflected"`` (Malitsky-Tam forward-reflected-backward:
+            one gradient evaluation per iteration; requires ``adaptive_eta``).
+        k_scale: Primal-weight (k) scaling control. ``None`` disables it;
+            otherwise a float sets a symmetric clamp band ``[1/k_scale,
+            k_scale]`` for ``k`` (default ``10`` → ``[0.1, 10]``). When enabled —
+            orthogonal to ``update_mode``, so it composes with every scheme
+            — a primal weight ``k`` rescales the primal/dual gradients by
+            ``(1/k, k)`` before each ``opt_update``, making the dual/primal step
+            ratio ``k**2``. ``k`` is initialised from ``k_init`` and rebalanced
+            at each restart (PDLP-style) from primal-vs-dual iterate movement; it
+            is constant within an epoch (not adapted per iteration). Tuned by
+            ``k_theta``/``k_scale`` and ``k_init``.
+        k_theta: Smoothing coefficient for the log-space primal-weight update at
+            each restart (default 0.5 = geometric mean of the movement-based
+            target and the current weight, matching PDLP). Smaller = slower
+            adaptation. Only used when ``k_scale`` is set.
+        k_init: Initial primal weight ``k``. ``None`` (default) initialises it to
+            the PDLP heuristic ``||c|| / ||b||`` (objective vs RHS norms), where
+            ``c = grad(objective)(0)`` and ``b = -[c_eq(0); c_ineq(0)]``. Pass a
+            float to override (``1.0`` = symmetric steps). Only used when
+            ``k_scale`` is set.
+        adaptive_eta: Enables a per-iteration adaptive step size with a
+            Malitsky-Tam local-Lipschitz line search. ``"auto"`` (default)
+            enables it with seed ``1.0`` when ``update_mode`` supports it,
+            ``k_scale`` is set and no ``optimiser`` was passed (otherwise it
+            behaves like ``None``; ``forward_reflected`` always enables it — the
+            seed barely matters, the line search corrects it within a few
+            iterations). ``None`` keeps the optimiser's fixed learning rate.
+            A float seeds a single scalar
+            base step ``eta`` driving the primal step ``tau = eta / k`` and dual
+            step ``sigma = eta * k``. The extragradient look-ahead and corrector
+            already evaluate the gradient twice, so the local Lipschitz estimate
+            ``L_hat = ‖g_half - g‖_w / ‖z_half - z‖_w`` (the k-weighted norm)
+            comes free; the step is admissible while ``eta · L_hat <= 1/sqrt2``,
+            and ``eta`` is rejected + shrunk if the trial overshot, then advanced
+            with a two-sided guard. Only supported with ``update_mode`` in
+            ``('extragradient', 'forward_reflected')`` (the contractive schemes
+            here) and requires ``k_scale`` (the primal weight k). The learned
+            ``eta`` is carried across restarts. The optimiser's learning rate is
+            bypassed in the hot loop.
+        restarts: Enable adaptive warm restarts (default ``False``). There is
+            no cap on how many fire; the triggers alone decide. Each restart
+            resets the optimiser momentum and averaging while keeping the
+            current iterate as a warm start. A restart fires when the normalised
+            KKT merit drops below ``restart_decay`` × the merit at the last
+            restart (sufficient-progress restart) or the cycle-length cap is
+            exhausted (no-progress restart).
+        epochs_per_restart: Length cap (epochs) of the first restart cycle, or
+            ``None`` (default) for no cap — restarts then fire only on the
+            sufficient-progress trigger. Subsequent caps grow by
+            ``restart_multiplier``.
+        restart_multiplier: Geometric growth factor for cycle-length caps
+            (default 1.0 = fixed length, 2.0 = doubling).
+        restart_decay: Sufficient-progress threshold (default 0.2). A restart
+            fires early when the merit drops below this fraction of the merit at
+            the last restart.
+        iterations_per_epoch_decay: Multiplicative decay applied to
+            ``iterations_per_epoch`` after each restart (default 1.0 = no
+            decay). Values < 1 shrink the epoch length at each restart to spend
+            more time checking convergence.
+        iterations_per_epoch_min: Floor for the decayed epoch length (default
+            100). Only used when ``iterations_per_epoch_decay < 1``.
+        precompile: Compile the device loop before the timed loop starts
+            (default ``True``), so ``"solve_seconds"`` measures iteration time
+            rather than XLA compilation. The compile still counts against
+            ``max_seconds``. A restart that changes ``iterations_per_epoch``
+            compiles a new loop inside the timed region.
+
+    Returns:
+        dict: The solution together with diagnostics. Keys:
+            * ``"solution"``: the ``SaddleState`` (primal/dual iterate).
+            * ``"converged"``: ``bool``, whether the solve met the convergence
+              criteria (``False`` if the epoch / time budget was exhausted or the
+              solve was interrupted).
+            * ``"stop_reason"``: ``str``, why the solve terminated:
+              ``"converged"``, ``"max_epochs"``, ``"time_limit"`` (``max_seconds``
+              exhausted) or ``"interrupted"`` (KeyboardInterrupt).
+            * ``"opt_state"``: the final optimiser state, for warm-starting a
+              subsequent solve via ``initial_opt_state``.
+            * ``"solve_seconds"``: ``float`` wall time of the epoch loop,
+              excluding setup. With ``precompile=True`` (default) it also
+              excludes XLA compilation; with ``precompile=False`` it includes
+              the first-epoch compile.
+            * ``"epochs"``: ``int``, number of epochs run.
+    """
+
+    # max_seconds is a wall-clock budget for the whole call, setup included.
+    solve_entry_time = time.time()
+    if max_seconds is not None and max_seconds <= 0:
+        raise ValueError("max_seconds must be > 0 (or None for no limit)")
+
+    if log_every < 1:
+        raise ValueError("log_every must be >= 1")
+
+    if verbose:
+        print("----------------------------------------------")
+
+    optimiser, adaptive_eta, adaptive_step, k_scaling, k_lo, k_hi = _check_settings(
+        optimiser, adaptive_eta, update_mode, k_scale
+    )
+
+    if verbose:
+        print("====Starting Solve====")
+        print("----------------------------------------------")
+
+    _build_chunk, carry = _device_solver(
+        cp,
+        optimiser=optimiser,
+        initial_solution=initial_solution,
+        initial_opt_state=initial_opt_state,
+        iterations_per_epoch=iterations_per_epoch,
+        primal_grad_norm_tolerance=primal_grad_norm_tolerance,
+        primal_feasibility_tolerance=primal_feasibility_tolerance,
+        complementarity_slack_tolerance=complementarity_slack_tolerance,
+        weight_function=weight_function,
+        verbose=verbose,
+        log_every=log_every,
+        average=average,
+        update_mode=update_mode,
+        k_scaling=k_scaling,
+        k_lo=k_lo,
+        k_hi=k_hi,
+        k_theta=k_theta,
+        k_init=k_init,
+        adaptive_eta=adaptive_eta,
+        adaptive_step=adaptive_step,
+        restarts=restarts,
+        epochs_per_restart=epochs_per_restart,
+        restart_multiplier=restart_multiplier,
+        restart_decay=restart_decay,
+        iterations_per_epoch_decay=iterations_per_epoch_decay,
+        iterations_per_epoch_min=iterations_per_epoch_min,
+    )
 
     def _epochs_arg(n):
         # Same type on every call, so the (possibly AOT-compiled) chunk accepts it.
@@ -1369,3 +1448,282 @@ def solve(
 
 
 # %%
+
+
+class SolveCoreResult(NamedTuple):
+    """What a ``make_solver`` function returns; every field is a JAX array, so
+    results batch under ``vmap``. ``solution`` is the reported point (the
+    average when ``average=True``, else the last iterate), ``converged``
+    whether the convergence test passed, and ``epochs`` the epochs run."""
+
+    solution: SaddleState
+    converged: jnp.ndarray
+    epochs: jnp.ndarray
+
+
+def make_solver(
+    build_cp,
+    max_epochs=None,
+    optimiser=None,
+    iterations_per_epoch=int(1e3),
+    primal_grad_norm_tolerance=1e-2,
+    primal_feasibility_tolerance=1e-3,
+    complementarity_slack_tolerance=1e-3,
+    weight_function=lambda _: 1.0,
+    average=False,
+    update_mode="extragradient",
+    k_scale=10.0,
+    k_theta=0.5,
+    k_init=None,
+    adaptive_eta="auto",
+    restarts=False,
+    epochs_per_restart=None,
+    restart_multiplier=1.0,
+    restart_decay=0.2,
+    iterations_per_epoch_min=100,
+):
+    """
+    Build a pure-JAX solve function for a family of convex problems.
+
+    ``build_cp(params)`` returns an ordinary ``JaddleCP`` whose functions
+    close over ``params`` (any pytree: data, weights, right-hand sides,
+    bounds). ``make_solver`` returns ``solve_fn(params, initial_solution=None)
+    -> SolveCoreResult``. The whole solve is traceable, so ``solve_fn`` can be
+    ``jax.jit``-ed and ``jax.vmap``-ed over a batch of ``params`` whose
+    problems share their shapes::
+
+        def build_cp(a):
+            return JaddleCP(n, objective=lambda x: jnp.sum((x - a) ** 2), ...)
+
+        solve_fn = jax.jit(make_solver(build_cp, max_epochs=300))
+        result = solve_fn(a)
+        batch = jax.vmap(solve_fn)(a_batch)
+
+    The algorithm is ``solve()``'s, with the same arguments and defaults.
+    Called directly, a solve reproduces ``solve()`` exactly; under an outer
+    ``jax.jit`` XLA fuses the whole solve into one program and may round
+    differently (measured: 1e-16 to 1e-14, at most 1e-6 after the adaptive
+    step amplified it, same epoch counts). What needs the host is not
+    available: no ``verbose`` log, no ``max_seconds``, and the epoch length
+    never changes during a solve (no ``iterations_per_epoch_decay``;
+    ``iterations_per_epoch_min`` is capped at ``iterations_per_epoch``).
+    ``max_epochs=None`` runs until the convergence test passes, so set a budget
+    when that may not happen. Batched members iterate in lockstep until the
+    last one stops (finished members are frozen).
+    """
+    optimiser, adaptive_eta, adaptive_step, k_scaling, k_lo, k_hi = _check_settings(
+        optimiser, adaptive_eta, update_mode, k_scale
+    )
+    n_epochs = _UNBOUNDED_EPOCHS if not max_epochs else int(max_epochs)
+
+    def solve_fn(params, initial_solution=None):
+        cp = build_cp(params)
+        build_chunk, carry = _device_solver(
+            cp,
+            optimiser=optimiser,
+            initial_solution=initial_solution,
+            initial_opt_state=None,
+            iterations_per_epoch=iterations_per_epoch,
+            primal_grad_norm_tolerance=primal_grad_norm_tolerance,
+            primal_feasibility_tolerance=primal_feasibility_tolerance,
+            complementarity_slack_tolerance=complementarity_slack_tolerance,
+            weight_function=weight_function,
+            verbose=False,
+            log_every=1,
+            average=average,
+            update_mode=update_mode,
+            k_scaling=k_scaling,
+            k_lo=k_lo,
+            k_hi=k_hi,
+            k_theta=k_theta,
+            k_init=k_init,
+            adaptive_eta=adaptive_eta,
+            adaptive_step=adaptive_step,
+            restarts=restarts,
+            epochs_per_restart=epochs_per_restart,
+            restart_multiplier=restart_multiplier,
+            restart_decay=restart_decay,
+            iterations_per_epoch_decay=1.0,
+            iterations_per_epoch_min=min(iterations_per_epoch_min, iterations_per_epoch),
+        )
+        carry = build_chunk(iterations_per_epoch)(
+            carry, jnp.asarray(n_epochs, carry["count"].dtype)
+        )
+        return SolveCoreResult(
+            solution=carry["avg"] if average else carry["state"],
+            converged=carry["done"],
+            epochs=carry["count"],
+        )
+
+    return solve_fn
+
+
+def make_optimal_value(build_cp, return_solution=False, **settings):
+    """
+    The optimal value ``z*(params) = min f(x; params)`` of a family of convex
+    problems, as a differentiable function of ``params``.
+
+    ``build_cp`` is as in ``make_solver`` (``settings`` are its options).
+    Returns ``value_fn(params) -> z*``. Its gradient comes from the envelope
+    theorem, with no differentiation through the iterations: with the
+    solution ``(x*, λ*, μ*)`` held fixed,
+
+        ∂z*/∂params = ∂/∂params [ f(x*) + λ*ᵀ g(x*) + μ*ᵀ h(x*)
+                                  + ν_lᵀ lower − ν_uᵀ upper ],
+
+    differentiated through ``build_cp``, so data, weights, right-hand sides
+    and bounds can all depend on ``params``. The bound multipliers come from
+    the stationarity residual ``r = ∇ₓL`` at the solution: ``ν_l = max(r, 0)``
+    on finite lower bounds and ``ν_u = max(−r, 0)`` on finite upper bounds.
+
+    Exact where the optimal multipliers are unique; elsewhere ``z*`` has a
+    kink and this is the subgradient at the solution found. Only as accurate
+    as the solve: use tight tolerances. Works under ``jit`` and ``vmap``.
+
+    ``return_solution=True`` makes ``value_fn`` return ``(z*,
+    SolveCoreResult)`` from the same solve, for ``jax.grad(value_fn,
+    has_aux=True)``: each call is a fresh solve, and separate solves differ
+    slightly.
+    """
+    solve_fn = make_solver(build_cp, **settings)
+
+    def lagrangian(params, solution, nu_lower, nu_upper):
+        cp = build_cp(params)
+        x = solution.primal
+        lower, upper = jnp.asarray(cp.lower_bounds), jnp.asarray(cp.upper_bounds)
+        return (
+            cp.objective(x)
+            + solution.dual_ineq @ cp.constraints_ineq(x)
+            + solution.dual_eq @ cp.constraints_eq(x)
+            + nu_lower @ jnp.where(jnp.isfinite(lower), lower, 0.0)
+            - nu_upper @ jnp.where(jnp.isfinite(upper), upper, 0.0)
+        )
+
+    def value_at_forward(params, solution):
+        return build_cp(params).objective(solution.primal), (params, solution)
+
+    def value_at_backward(residuals, g):
+        params, solution = residuals
+        cp = build_cp(params)
+        # Bound multipliers from the stationarity residual r = ∇ₓL.
+        r = jax.grad(
+            lambda x: cp.objective(x)
+            + solution.dual_ineq @ cp.constraints_ineq(x)
+            + solution.dual_eq @ cp.constraints_eq(x)
+        )(solution.primal)
+        lower, upper = jnp.asarray(cp.lower_bounds), jnp.asarray(cp.upper_bounds)
+        nu_lower = jnp.where(jnp.isfinite(lower), jnp.maximum(r, 0.0), 0.0)
+        nu_upper = jnp.where(jnp.isfinite(upper), jnp.maximum(-r, 0.0), 0.0)
+        _, vjp = jax.vjp(lambda p: lagrangian(p, solution, nu_lower, nu_upper), params)
+        (grad_params,) = vjp(g)
+        # The solution is treated as fixed: no gradient flows into the solve.
+        return grad_params, jax.tree.map(jnp.zeros_like, solution)
+
+    @jax.custom_vjp
+    def value_at(params, solution):
+        return value_at_forward(params, solution)[0]
+
+    value_at.defvjp(value_at_forward, value_at_backward)
+
+    def value_fn(params):
+        result = solve_fn(jax.tree.map(jax.lax.stop_gradient, params))
+        solution = jax.tree.map(jax.lax.stop_gradient, result.solution)
+        z = value_at(params, solution)
+        return (z, result) if return_solution else z
+
+    return value_fn
+
+
+def make_solution(build_cp, active_tol=1e-6, gmres_tol=1e-10, **settings):
+    """
+    The solution ``x*(params)`` of a family of convex problems, differentiable
+    by implicit differentiation of the KKT conditions on the active set.
+
+    ``build_cp`` and ``settings`` are as in ``make_solver``. Returns
+    ``x_fn(params) -> x*``. At the solution the active set is frozen:
+    variables within ``active_tol`` (relative) of a finite bound, and
+    inequality rows with ``g(x*) >= -active_tol``. The KKT conditions then form
+    a square system ``F(x, μ, λ; params) = 0``: stationarity ``∇ₓL = 0`` on
+    the free variables, ``x = bound(params)`` on the bound ones, ``h(x) = 0``,
+    ``g(x) = 0`` on the active rows and ``λ = 0`` on the inactive ones. A VJP
+    solves ``(∂F/∂z)ᵀ w = (g, 0, 0)`` matrix-free with GMRES (using
+    ``jax.vjp``, so all on the device and fine under ``vmap``) and returns
+    ``−(∂F/∂params)ᵀ w``.
+
+    This needs a nondegenerate solution: strict complementarity, independent
+    active constraints, and a Hessian of the Lagrangian positive definite on
+    their null space (e.g. a strictly convex objective). Where GMRES cannot
+    solve the system to ``gmres_tol`` (relative residual), the gradient is
+    returned as NaN rather than silently wrong: a jitted function cannot raise.
+    Solve to tolerances well below ``active_tol``.
+    """
+    from jax.scipy.sparse.linalg import gmres
+
+    solve_fn = make_solver(build_cp, **settings)
+
+    def kkt(z, params, masks):
+        x, mu, lam = z
+        free, at_lower, active = masks
+        cp = build_cp(params)
+        lower, upper = jnp.asarray(cp.lower_bounds), jnp.asarray(cp.upper_bounds)
+
+        def lag(x):
+            return (
+                cp.objective(x)
+                + lam @ cp.constraints_ineq(x)
+                + mu @ cp.constraints_eq(x)
+            )
+
+        bound = jnp.where(at_lower, lower, upper)
+        bound = jnp.where(jnp.isfinite(bound), bound, 0.0)
+        return (
+            jnp.where(free, jax.grad(lag)(x), x - bound),
+            cp.constraints_eq(x),
+            jnp.where(active, cp.constraints_ineq(x), lam),
+        )
+
+    def forward(params):
+        solution = solve_fn(jax.tree.map(jax.lax.stop_gradient, params)).solution
+        return solution.primal, (params, solution)
+
+    def backward(residuals, g):
+        params, solution = residuals
+        cp = build_cp(params)
+        x = solution.primal
+        lower, upper = jnp.asarray(cp.lower_bounds), jnp.asarray(cp.upper_bounds)
+        at_lower = jnp.isfinite(lower) & (
+            jnp.abs(x - lower) <= active_tol * (1 + jnp.abs(lower))
+        )
+        at_upper = (
+            jnp.isfinite(upper)
+            & (jnp.abs(x - upper) <= active_tol * (1 + jnp.abs(upper)))
+            & ~at_lower
+        )
+        g_ineq = cp.constraints_ineq(x)
+        active = g_ineq >= -active_tol * (1 + jnp.abs(g_ineq))
+        masks = (~(at_lower | at_upper), at_lower, active)
+        z = (x, solution.dual_eq, solution.dual_ineq)
+
+        _, vjp_z = jax.vjp(lambda zz: kkt(zz, params, masks), z)
+        rhs = (g, jnp.zeros_like(solution.dual_eq), jnp.zeros_like(solution.dual_ineq))
+
+        def transpose_jacobian(w):
+            return vjp_z(w)[0]
+
+        w, _ = gmres(transpose_jacobian, rhs, tol=gmres_tol, atol=0.0, restart=50, maxiter=50)
+        residual = jax.tree.map(lambda a, b: a - b, transpose_jacobian(w), rhs)
+        flat_norm = lambda t: jnp.sqrt(sum(jnp.vdot(a, a) for a in jax.tree.leaves(t)))
+        ok = flat_norm(residual) <= 1e3 * gmres_tol * (1 + flat_norm(rhs))
+
+        _, vjp_params = jax.vjp(lambda p: kkt(z, p, masks), params)
+        (grad_params,) = vjp_params(w)
+        return (
+            jax.tree.map(lambda t: jnp.where(ok, -t, jnp.nan), grad_params),
+        )
+
+    @jax.custom_vjp
+    def solution_map(params):
+        return forward(params)[0]
+
+    solution_map.defvjp(forward, backward)
+    return solution_map
