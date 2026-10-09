@@ -16,6 +16,21 @@ class SaddleState(NamedTuple):
     dual_eq: jnp.ndarray
 
 
+class LPValues(NamedTuple):
+    """The numbers of an LP ``min cᵀx s.t. A_eq x = b_eq, A_ineq x <= b_ineq,
+    lower <= x <= upper`` on a fixed sparsity pattern: the constraint
+    matrices' stored nonzeros (in their BCOO order) plus the vectors. A pytree,
+    so it can be batched with ``vmap`` and differentiated."""
+
+    c: jnp.ndarray
+    A_eq_data: jnp.ndarray
+    b_eq: jnp.ndarray
+    A_ineq_data: jnp.ndarray
+    b_ineq: jnp.ndarray
+    lower_bounds: jnp.ndarray
+    upper_bounds: jnp.ndarray
+
+
 class JaddleCP:
     def __init__(
         self,
@@ -194,10 +209,14 @@ class JaddleLP:
         data = np.concatenate([np.asarray(A_eq.data), np.asarray(A_ineq.data)])
 
         # Stacking two row-sorted blocks (ineq rows offset below eq) is sorted.
+        order = None
         if not (A_eq.indices_sorted and A_ineq.indices_sorted):
             order = _row_major_order(idx[:, 0], idx[:, 1], (m, n))
             idx, data = idx[order], data[order]
         order_T = _row_major_order(idx[:, 1], idx[:, 0], (n, m))
+        # The permutations depend only on the sparsity pattern; `with_values`
+        # reuses them to rebuild A and Aᵀ from new values without host work.
+        self._order, self._order_T = order, order_T
 
         def bcoo(d, i, shape):
             return _jsp.BCOO(
@@ -239,6 +258,52 @@ class JaddleLP:
             jnp.asarray(lower_bounds, dtype=float_dtype),
             jnp.asarray(upper_bounds, dtype=float_dtype),
         )
+
+    def values(self):
+        """The LP's numbers as an ``LPValues`` pytree (the sparsity pattern
+        stays with the ``JaddleLP``)."""
+        return LPValues(
+            c=self.c,
+            A_eq_data=self.A_eq.data,
+            b_eq=self.b_eq,
+            A_ineq_data=self.A_ineq.data,
+            b_ineq=self.b_ineq,
+            lower_bounds=self.lower_bounds,
+            upper_bounds=self.upper_bounds,
+        )
+
+    def with_values(self, values):
+        """A ``JaddleLP`` with this one's sparsity pattern and new numbers.
+
+        Pure JAX (gathers with the permutations saved at construction, no
+        host-side sorting), so it works on traced values under ``jit``,
+        ``vmap`` and ``grad``.
+        """
+        import jax.experimental.sparse as _jsp
+
+        def bcoo(data, like):
+            return _jsp.BCOO(
+                (data, like.indices),
+                shape=like.shape,
+                indices_sorted=like.indices_sorted,
+                unique_indices=like.unique_indices,
+            )
+
+        out = object.__new__(type(self))
+        out.c = values.c
+        out.b_eq, out.b_ineq = values.b_eq, values.b_ineq
+        out.lower_bounds, out.upper_bounds = values.lower_bounds, values.upper_bounds
+        out.A_eq = bcoo(values.A_eq_data, self.A_eq)
+        out.A_ineq = bcoo(values.A_ineq_data, self.A_ineq)
+        out.n_eq = self.n_eq
+        out._order, out._order_T = self._order, self._order_T
+        data = jnp.concatenate([values.A_eq_data, values.A_ineq_data])
+        if self._order is not None:
+            data = data[self._order]
+        out.A = bcoo(data, self.A)
+        out.A_T = bcoo(data[self._order_T], self.A_T)
+        out.b = jnp.concatenate([values.b_eq, values.b_ineq])
+        return out
 
     def objective(self, x):
         return self.c @ x

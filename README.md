@@ -56,6 +56,9 @@ the constraint functions. Gradients of the Lagrangian with respect to the
 primal and dual variables come from `jax.grad`, so users never derive,
 implement or debug a gradient by hand. Any function JAX can trace can be used
 as an objective or constraint, from a least-squares loss to a neural network.
+LP solves are differentiable in turn: the optimal value and solution can be
+differentiated with respect to the LP's data, and solves batch with `vmap`
+(see [Batched and differentiable solves](#batched-and-differentiable-solves)).
 
 **Composable optimisation primitives.** The convex solver builds on
 [Optax](https://github.com/google-deepmind/optax). It uses Optax's projection
@@ -289,6 +292,46 @@ the dual objective as in PDLP, so far-away finite bounds do not swamp the gap.
 | `solve_seconds` | Time spent in the iteration loop, including the first-epoch compile. |
 | `corrected_seconds` | Iteration-loop time with the one-off compile amortised out. |
 | `epochs` | Number of epochs run. |
+
+### Batched and differentiable solves
+
+`jl.make_solver(lp, **options)` turns `solve()` into a pure JAX function of
+the LP's numbers. It takes the same options and reproduces `solve()` exactly,
+but it has no logging, time limit or `vertex_bias`. The numbers travel as a
+`jl.LPValues` pytree: the cost, the stored nonzeros of `A_eq` and `A_ineq` on
+`lp`'s sparsity pattern, the right-hand sides and the bounds
+(`jaddle_lp.values()` extracts them, `jaddle_lp.with_values(v)` puts them
+back). The function can be jitted, batched with `jax.vmap` and differentiated:
+
+```python
+values = jl.to_jaddle_sparse(lp).values()
+solve_fn = jl.make_solver(lp, max_epochs=1000)
+result = jax.jit(solve_fn)(values)       # SolveCoreResult: solution, converged, ...
+
+costs = values.c * (1 + 0.1 * jax.random.normal(key, (32,) + values.c.shape))
+batch = jl.solve_batch(lp, values._replace(c=costs))   # 32 solves at once
+```
+
+In a batch the cost, right-hand sides, bounds and matrix values can all vary;
+any field without a batch axis is shared. Each member is scaled as `solve()`
+would scale it, and finished members wait for the slowest. Members are not
+bit-identical to separate solves, because XLA rounds batched reductions
+slightly differently, but each certifies to the requested tolerance.
+
+Three functions differentiate through a solve:
+
+| Function | Differentiates | How |
+|---|---|---|
+| `jl.make_optimal_value` | the optimal value `z*` w.r.t. every number | envelope theorem: `∂z*/∂c = x*`, `∂z*/∂b = −y*`, `∂z*/∂A_ij = y*_i x*_j`, and the reduced costs for the bounds |
+| `jl.make_solution` | `x*` w.r.t. `b`, `A` and the bounds | implicit differentiation of the active constraints at a nondegenerate vertex (raises an error elsewhere) |
+| `jl.make_perturbed_solution` | a smoothed `x*` w.r.t. `c` | perturbed optimizer: averages solves at `c + σZ`, batched |
+
+An LP's solution is piecewise constant in its cost, so `dx*/dc` is zero
+almost everywhere. That's why the smoothed, perturbed version exists for
+learning costs. On degenerate LPs a first-order method can return a point
+inside an optimal face, where `make_solution`'s derivative is undefined.
+All three are checked against finite differences of HiGHS solutions in the
+tests.
 
 ### Supporting tools
 

@@ -10,7 +10,7 @@ import functools
 from typing import NamedTuple
 import time
 from scipy import sparse as sp
-from jaddle.jaddle_basic_types import LP, JaddleLP, SaddleState, scipy_to_bcoo
+from jaddle.jaddle_basic_types import LP, JaddleLP, LPValues, SaddleState, scipy_to_bcoo
 from scipy.sparse.linalg import gmres
 from jax.scipy.sparse.linalg import gmres
 import jaddle.jaddle_optimisers as jo
@@ -449,300 +449,12 @@ def _unscale_output(
     return output
 
 
-def solve(
-    lp: JaddleLP,
-    max_epochs=None,
-    max_seconds=None,
-    initial_solution=None,
-    initial_opt_state=None,
-    iterations_per_epoch=256,
-    dual_damping_ineq=0.0,
-    dual_damping_eq=0.0,
-    primal_damping=0.0,
-    primal_feasibility_tolerance=1e-3,
-    dual_feasibility_tolerance=1e-3,
-    dual_gap_tolerance=1e-3,
-    dual_residual="pdlp",
-    termination_norm="l2",
-    restart_norm="l2",
-    verbose=False,
-    log_every=1,
-    average=True,
-    report_best=True,
-    update_mode="alternating",
-    k_scale=1e8,
-    k_theta=0.5,
-    k_init=None,
-    k_update_per_epoch=False,
-    adaptive_eta=1.0,
-    scale=True,
-    scaled_objective=True,
-    scaled_rhs=True,
-    scaled_augmented=True,
-    augmented_weight=1.0,
-    ruiz_iterations=10,
-    pc_iterations=1,
-    cost_col_floor=0,
-    restarts=True,
-    epochs_per_restart=None,
-    restart_multiplier=1.0,
-    restart_decay=0.2,
-    necessary_decay=0.8,
-    primal_stop=False,
-    primal_stop_window=5,
-    primal_stop_obj_tol=1e-4,
-    halpern_reanchor_per_epoch=False,
-    iterations_per_epoch_decay=1.0,
-    iterations_per_epoch_min=100,
-    restart_check_every="auto",
-    vertex_bias=0.0,
-    vertex_bias_seed=0,
-    reference_objective=None,
+def _check_settings(
+    dual_residual, termination_norm, restart_norm, update_mode, k_scale, adaptive_eta
 ):
-    """
-    Solve a linear program via saddle-point optimisation.
-
-    Termination uses the standard LP optimality certificate, all tested
-    RELATIVELY (PDLP/HiGHS convention): primal feasibility
-    (``primal_feasibility_tolerance``, normalised by 1+‖b‖), dual feasibility
-    (``dual_feasibility_tolerance``, normalised by 1+‖c‖), and a finite duality
-    gap within ``dual_gap_tolerance`` (normalised by 1+|primal_obj|+|dual_obj|,
-    the PDLP/cuPDLP convention, so RDG is directly comparable to PDLP).
-
-    Every update_mode is cuPDLP-style adaptive PDHG: plain projected
-    primal-descent / dual-ascent steps with a per-iteration line-searched step
-    size ``eta`` and a primal weight ``k`` (no optimiser plug-in).
-
-    Adaptive restarts (PDLP-style) accelerate ill-conditioned problems. A
-    restart resets the averaging (and the halpern anchor) while keeping the current
-    iterate as a warm start, which prevents the saddle iteration from settling
-    into slow rotational orbits. A restart fires when either the normalised KKT
-    merit decays past ``restart_decay`` of its value at the last restart
-    (sufficient-progress restart) or the current cycle reaches its length cap
-    (no-progress restart). On by default; disable with ``restarts=False``.
-
-    The epoch loop runs on the device: each call into JAX executes a chunk of
-    many epochs, including the metrics, convergence test and restart logic, with
-    no host synchronisation between them. Python regains control between
-    chunks (sized to take about a second) to enforce ``max_epochs`` /
-    ``max_seconds``, print the verbose log and handle Ctrl-C. With
-    ``verbose=True`` the per-epoch ``Time`` is therefore the average over the
-    epoch's chunk. When ``verbose``, ``max_epochs`` and ``max_seconds`` are all
-    unset, nothing needs the host between epochs, so the whole solve runs as a
-    single device call (only an ``iterations_per_epoch_decay`` restart, which
-    changes the compiled epoch length, returns to Python). In that mode Ctrl-C
-    takes effect only once the call returns, and ``"corrected_seconds"`` equals
-    ``"solve_seconds"``.
-
-    Args:
-        max_seconds: Wall-clock budget in seconds (default ``None`` = no limit).
-            Measured from entry into ``solve()``, so scaling / setup and the
-            first-epoch XLA compile count against it. Checked between chunks
-            of epochs, and each chunk is sized from the measured epoch time to
-            fit the remaining budget; once the budget is spent the current
-            point is returned with ``stop_reason="time_limit"``. The solve can
-            overrun by about one epoch (shrink ``iterations_per_epoch`` for a
-            tighter cutoff).
-        dual_residual: How reduced costs split between the dual residual (DFR)
-            and the dual objective (hence the gap). ``"pdlp"`` (default) follows
-            PDLP with ``handle_some_primal_gradients_on_finite_bounds_as_residuals``:
-            rᵢ > 0 is absorbed by a finite lower bound and rᵢ < 0 by a finite
-            upper bound when xᵢ is near it (|xᵢ - bound| <= |xᵢ|), adding rᵢ·bound
-            to the dual objective; every other component is a residual |rᵢ|.
-            Complementarity errors on boxed variables therefore show in the gap,
-            and far finite bounds (e.g. [0, 1e6] boxes) can't swamp the dual
-            objective. ``"projected"`` is the older per-variable projected-gradient
-            residual |x - proj(x - r)| for boxed variables, with every finite bound
-            always in the dual objective.
-        termination_norm: Norm used for the primal / dual feasibility
-            stopping tests (and the printed PFR / DFR): ``"l2"`` (default)
-            tests ‖r_p‖₂/(1+‖b‖₂) and ‖r_d‖₂/(1+‖c‖₂), the cuPDLP-C / PDLP
-            default, for like-for-like comparisons; ``"inf"`` tests
-            ‖r_p‖∞/(1+‖b‖∞) and ‖r_d‖∞/(1+‖c‖∞). Termination only: the restart merit
-            follows ``restart_norm``, so changing this alone leaves the iterate
-            trajectory unchanged and only moves the epoch at which it stops.
-        restart_norm: Norm (``"l2"`` default, or ``"inf"``) for the primal /
-            dual feasibility terms of the restart KKT merit and the
-            dual-infeasible ``still_improving`` cycle-cap guard, normalised by
-            1+‖b‖ / 1+‖c‖ in the same norm. ``"l2"`` matches cuPDLP-C's restart
-            criterion. Unlike ``termination_norm`` this changes the trajectory.
-        restarts: Enable adaptive warm restarts (default ``True``). There is
-            no cap on how many fire; the triggers alone decide. Each restart
-            resets the averaging (and the halpern anchor / lambda counter) while
-            keeping the current iterate as a warm start.
-        epochs_per_restart: Length cap of the first restart cycle, or ``None``
-            (default) for no cap — restarts then fire only on the
-            sufficient-progress / stalling triggers. When set, expressed in
-            epochs AT THE DEFAULT ``iterations_per_epoch`` but
-            internally converted to and tracked in ITERATIONS
-            (``epochs_per_restart * iterations_per_epoch``), so the cycle-cap
-            restart fires at the same point in the optimisation trajectory
-            regardless of ``iterations_per_epoch``. This matters because a
-            restart is destructive (it wipes the PDHG averaging): tying the cap to a raw epoch count made the
-            restart cadence an accident of how the iteration budget was chopped
-            into epochs — e.g. on momentum1, ``iterations_per_epoch=1000``
-            triggered a cap-exhaustion restart at 10,000 iterations while still
-            dual-infeasible, wiping out a trajectory that would otherwise have
-            converged smoothly, while ``iterations_per_epoch=10000`` reached
-            full convergence in under 100,000 iterations before the same cap
-            ever fired. Subsequent cycle caps grow by ``restart_multiplier``.
-        restart_multiplier: Geometric growth factor for cycle-length caps
-            (default 1.0 = fixed length, 2.0 = doubling).
-        restart_decay: Sufficient-progress threshold (default 0.2; cuPDLP
-            β_sufficient). A restart fires when the KKT merit drops below
-            ``restart_decay`` times its value at the last restart.
-        necessary_decay: Necessary-decay threshold for the cuPDLP "stalling"
-            restart condition (default 0.8; cuPDLP β_necessary). A restart also
-            fires when the merit has decayed below ``necessary_decay`` times its
-            cycle-start value AND has risen versus the previous epoch (rotational
-            turnaround). Must be > ``restart_decay`` to be meaningful.
-        update_mode: Selects the per-iterate stepping scheme. One of:
-            * ``"alternating"`` (default): primal step, then a dual step at the
-              new primal x^{k+1} (Gauss–Seidel / alternating GDA, no
-              extrapolation). Not contractive in general; relies on
-              averaging/restarts.
-            * ``"pdhg"``: Chambolle–Pock PDHG (primal step then dual step on
-              the extrapolated primal x_bar = 2x^{k+1} − x^k).
-            * ``"halpern"``: restarted Halpern-anchored PDHG. Each iterate is the
-              adaptive PDHG step T(z) blended back toward an anchor z_0:
-              ``z_{k+1} = lambda_k z_0 + (1−lambda_k) T(z_k)``, ``lambda_k =
-              1/(k+1)`` (cycle-local k). The anchor z_0 and lambda counter reset
-              to the current iterate at each restart, giving last-iterate
-              acceleration. Best paired with ``restarts=True``.
-        k_scale: Clamp band ``[1/k_scale, k_scale]`` for the primal weight ``k``
-            (default ``1e8``); ``None`` leaves ``k`` unclamped. The primal and
-            dual steps are ``eta / k`` and ``eta * k``, so the dual/primal step
-            ratio is ``k**2``. ``k`` is initialised from ``k_init`` and rebalanced
-            at each restart (PDLP-style) from primal-vs-dual iterate movement; it
-            is constant within an epoch (not adapted per iteration). Tuned by
-            ``k_theta``/``k_scale`` and ``k_init``.
-        k_init: Initial primal weight ``k``. ``None`` (default) initialises it to
-            the PDLP heuristic ``||c|| / ||b||`` (objective vs RHS norms, in the
-            scaled space the solver iterates in). Pass a float to override
-            (``1.0`` = symmetric steps, the PC/Ruiz-scaled baseline).
-        k_update_per_epoch: When ``True``, the primal weight ``k`` is
-            rebalanced at every epoch boundary (not only at restarts) using the
-            primal-vs-dual iterate movement over the just-finished epoch — same
-            log-space geometric-mean blend (``k_theta``) and ``[1/k_scale,
-            k_scale]`` clamp as the restart rebalance. Unlike a restart it does
-            NOT reset averaging or (for halpern) re-anchor ``z_0`` / reset
-            ``eta``; only ``k`` changes, so the step split tracks the local
-            primal/dual progress within a restart cycle.
-            ``False`` (default, the PDLP convention) keeps k frozen between
-            restarts: under a wide ``k_scale`` clamp the per-epoch update let k
-            run away on mzzv11 (k→1e8, gap 0.94).
-        adaptive_eta: Seed for the cuPDLP-style per-iteration adaptive step
-            ``eta``, which drives the primal step ``tau = eta / k`` and dual step
-            ``sigma = eta * k``. Each iteration takes a trial step, forms the
-            largest admissible step from the interaction term
-            ``(y^{k+1}-y^k)ᵀ A (x^{k+1}-x^k)``, and rejects + shrinks ``eta`` if
-            the trial overshot; ``eta`` is then advanced with a two-sided guard.
-            A float > 0 sets the seed directly (default ``1.0``, a natural scale
-            once Ruiz/PC scaling has brought ``||A||`` to O(1)); ``"auto"`` (or
-            ``0.0``) seeds it at ``1/||[[A,b],[c,0]]||_2`` of the scaled LP,
-            estimated by power iteration. The line search corrects a poor seed
-            within a few iterations. The learned ``eta`` is carried across restarts.
-        k_theta: Smoothing coefficient for the log-space primal-weight update at
-            each restart / epoch. A float fixes it (default ``0.5``, as in PDLP;
-            smaller = slower adaptation).
-            ``"adaptive"`` sets it from data as a trust region on log k:
-            starting at 0.5, each restart doubles theta (capped at 1) if the
-            restart merit fell over the cycle since the previous k move, else
-            halves it (floored at 0.05) and reverts k to its value before that
-            move. The movement ratio alone can't tell a correct k move from a
-            runaway (mzzv11's per-epoch runaway was monotone), but the merit can.
-            Epochs to certify, restart-only vs fixed 0.5: barwon 41 vs 166,
-            binschedule2 39 vs 61, plus gains on stp3d and mzzv11. It was the
-            default briefly, but fixed 0.5 proved safer across instances
-            (hgms30 ratchets k under ``"adaptive"``).
-        primal_stop: Opt-in, dual-free termination (default ``False``). When
-            ``True``, termination ignores the dual certificate entirely and stops
-            on **primal feasibility** (``constraint_bound`` within
-            ``primal_feasibility_tolerance``) **and** an **objective stall**. This
-            is a heuristic, not an optimality certificate — it trades the dual's
-            mathematical optimality guarantee for robust termination on problems
-            where the dual is junk. The duality gap and dual residuals are still
-            computed and reported as diagnostics, just not used to gate.
-        primal_stop_window: Number of recent epochs over which the objective
-            stall is measured (default 5). Only used when ``primal_stop=True``.
-        primal_stop_obj_tol: Relative-change threshold for the objective stall:
-            stop when ``|obj_now - obj_{window ago}| / (1 + |obj_now|)`` falls
-            below this (default 1e-4). Only used when ``primal_stop=True``.
-        halpern_reanchor_per_epoch: Opt-in (default ``False``, ``"halpern"`` only).
-            When ``True``, re-anchor ``z_0`` to the current iterate and reset the
-            ``lambda_k = 1/(k+1)`` counter at **every** epoch boundary, not only at
-            restarts — i.e. each epoch starts a fresh Halpern cycle. This re-warms
-            ``lambda`` toward 1/2 each epoch (strong pull to the cycle-start point)
-            instead of letting it decay across the whole restart cycle. Note an
-            epoch is a fixed iteration chunk, not a progress-driven boundary, so
-            this re-anchors on a schedule rather than on convergence; it can help
-            on rotation-limited problems but discards the long-horizon anchor that
-            gives Halpern its last-iterate acceleration. Both ``eta`` and ``k`` are
-            left to their usual per-epoch handling. No effect unless
-            ``update_mode="halpern"``. On an epoch where a real restart fires, the
-            restart's own re-anchor takes precedence (no double re-anchor).
-        cost_col_floor: Scaling floor for cost-pinned columns: a costed column
-            whose largest scaled matrix entry is below it is rescaled so that
-            entry becomes 1. Fixes epigraph objectives (``min z, z >= a_k.x``
-            over dense rows, fhnw-binschedule0) where augmented Ruiz leaves the
-            variable huge in scaled units. Default ``0`` (disabled); pass e.g.
-            ``1e-2`` to enable. See ``scale_problem``.
-        restart_check_every: Evaluate the restart merit every this many
-            iterations inside an epoch and end the epoch early once the
-            sufficient-progress test (``restart_decay``) would fire, so restarts
-            aren't delayed to the epoch boundary. Costs ~2 matvec pairs per check.
-            Also exits on the condition-(ii) stall (merit within
-            ``necessary_decay`` of the last restart and rising chunk-to-chunk).
-            Epoch lengths round down to a multiple of it. Default ``"auto"``
-            (a tenth of the current epoch length); ``None`` checks only at epoch
-            boundaries.
-        reference_objective: True optimal objective value ``z*`` from a reference
-            solver, in the ORIGINAL problem's units. Purely diagnostic: when
-            supplied and ``verbose=True``, each epoch also logs the true relative
-            objective error ``|cᵀx − z*| / (1 + |z*|)`` (``OBJERR``) alongside the
-            reported relative duality gap (``RDG``). The gap is gated by the dual
-            (it is a complementarity sum that carries the dual's lag), so the
-            primal typically reaches optimality well before the gap closes;
-            comparing ``OBJERR`` against ``RDG`` quantifies how much of the gap is
-            dual lag versus genuine primal suboptimality. Does not affect
-            termination — convergence still uses the full LP certificate.
-
-    Returns:
-        dict: The solution together with diagnostics. Keys:
-            * ``"solution"``: the ``SaddleState`` (primal/dual iterate), unscaled
-              back to the original problem's units.
-            * ``"converged"``: ``bool``, whether the solve terminated by meeting
-              the LP optimality certificate or a ``primal_stop`` heuristic stop
-              (see ``"stop_reason"`` to disambiguate).
-            * ``"opt_state"``: the final step-size state ``(k, eta)`` (plus the
-              anchor for halpern), for warm-starting a subsequent solve via
-              ``initial_opt_state``.
-            * ``"stop_reason"``: ``str`` recording *why* the solve terminated:
-              ``"certificate"`` (full LP optimality certificate met),
-              ``"primal_stall"`` (the ``primal_stop`` heuristic fired — feasible
-              but not certified optimal, so the objective may be suboptimal even
-              though ``"converged"`` is ``True``), ``"max_epochs"`` (epoch budget
-              exhausted), ``"time_limit"`` (``max_seconds`` exhausted), or
-              ``"interrupted"`` (KeyboardInterrupt).
-            * ``"solve_seconds"``: ``float`` wall time of the epoch loop (incl. the
-              first-epoch XLA compile but not the scaling / sparse-setup phase).
-            * ``"corrected_seconds"``: ``float`` steady-state runtime with the
-              one-off first-epoch XLA compile amortised out:
-              ``n * (solve_seconds - first_epoch_seconds) / (n - 1)`` where ``n``
-              is the epoch count. Falls back to ``solve_seconds`` when it can't be
-              formed (fewer than two epochs, or a single-call solve).
-            * ``"epochs"``: ``int``, number of epochs run.
-    """
-
-    # max_seconds is a wall-clock budget for the whole call, setup included.
-    solve_entry_time = time.time()
-    if max_seconds is not None and max_seconds <= 0:
-        raise ValueError("max_seconds must be > 0 (or None for no limit)")
-
-    lp = __pad_empty_blocks(lp)
-
-    if log_every < 1:
-        raise ValueError("log_every must be >= 1")
+    """Validate the settings ``solve()`` and ``make_solver`` share. Returns
+    ``(k_lo, k_hi, adaptive_eta, halpern)``, with ``adaptive_eta`` either a
+    float or ``"auto"`` (resolved after scaling)."""
     if dual_residual not in ("pdlp", "projected"):
         raise ValueError(
             f"dual_residual must be 'pdlp' or 'projected', got {dual_residual!r}"
@@ -753,9 +465,6 @@ def solve(
         )
     if restart_norm not in ("inf", "l2"):
         raise ValueError(f"restart_norm must be 'inf' or 'l2', got {restart_norm!r}")
-
-    if verbose:
-        print("----------------------------------------------")
 
     valid_update_modes = ["pdhg", "alternating", "halpern"]
     if update_mode not in valid_update_modes:
@@ -768,7 +477,7 @@ def solve(
     else:
         k_lo, k_hi = 0.0, np.inf
     # "auto" (or 0.0) seeds eta from the scaled LP's augmented spectral norm,
-    # resolved after scaling below.
+    # resolved after scaling.
     if isinstance(adaptive_eta, str):
         if adaptive_eta != "auto":
             raise ValueError(
@@ -778,123 +487,69 @@ def solve(
         raise ValueError("adaptive_eta must be a float >= 0 or 'auto' (0.0 = auto)")
     elif adaptive_eta == 0.0:
         adaptive_eta = "auto"
-    halpern = update_mode == "halpern"
+    return k_lo, k_hi, adaptive_eta, update_mode == "halpern"
 
-    if verbose:
-        print("====Starting Solve====")
-        print("----------------------------------------------")
 
-    # solve() takes a JaddleLP (the JAX-native, device-side representation) or a
-    # raw scipy LP (e.g. hand-built in examples). scale_problem() accepts either
-    # and runs on device, returning the JaddleLP the solver iterates on.
-    if scale:
-        # Augmented Ruiz: equilibrate [[A,b],[c,0]] so cost and RHS information also
-        # drive the equilibration. Conditions the constraint (esp. equality) block
-        # better on cost/RHS-dominated problems (momentum1: A-only Ruiz froze the
-        # primal at a far-from-optimal point; augmented converges in ~15 epochs).
-        # A-only Ruiz (scale_problem(augmented=False)) is available as a knob but is
-        # not the default — it broke both momentum1 and boeing once the relative
-        # convergence test + true-units norm fixes were in place. PC then applies
-        # its single Pock-Chambolle finishing pass.
-        lp, row_scale, col_scale, c_max = scale_problem(
-            lp,
-            scaled_objective=scaled_objective,
-            scaled_rhs=scaled_rhs,
-            augmented=scaled_augmented,
-            augmented_weight=augmented_weight,
-            ruiz_iter=ruiz_iterations,
-            pc_iter=pc_iterations,
-            cost_col_floor=cost_col_floor,
-        )
+def _device_solver(
+    lp,
+    *,
+    c_true,
+    c_max,
+    col_scale,
+    jnp_row_scale_ineq,
+    jnp_row_scale_eq,
+    initial_solution,
+    initial_opt_state,
+    k_init,
+    k_lo,
+    k_hi,
+    adaptive_eta,
+    halpern,
+    vertex_bias,
+    primal_damping,
+    dual_damping_ineq,
+    dual_damping_eq,
+    primal_feasibility_tolerance,
+    dual_feasibility_tolerance,
+    dual_gap_tolerance,
+    dual_residual,
+    termination_norm,
+    restart_norm,
+    verbose,
+    log_every,
+    average,
+    report_best,
+    update_mode,
+    k_theta,
+    k_update_per_epoch,
+    iterations_per_epoch,
+    restarts,
+    epochs_per_restart,
+    restart_multiplier,
+    restart_decay,
+    necessary_decay,
+    primal_stop,
+    primal_stop_window,
+    primal_stop_obj_tol,
+    halpern_reanchor_per_epoch,
+    iterations_per_epoch_decay,
+    iterations_per_epoch_min,
+    restart_check_every,
+    reference_objective,
+):
+    """The device side of ``solve()``: everything that runs inside its jitted
+    epoch loop, built for one scaled problem.
 
-        if verbose:
-            print("Applied combined Ruiz + PC scaling to the LP.")
-            print("----------------------------------------------")
+    ``lp`` is the scaled ``JaddleLP``; ``c_true`` the (scaled) cost the metrics
+    report when ``vertex_bias`` perturbs ``lp.c``; ``c_max``, ``col_scale`` and
+    the row scales map residuals back to true units; ``initial_solution`` is
+    in scaled space. The remaining arguments are ``solve()``'s settings.
 
-    else:
-        row_scale = np.ones(lp.A_eq.shape[0] + lp.A_ineq.shape[0])
-        col_scale = np.ones(lp.c.shape[0])
-        c_max = 1.0
-        # solve() reassigns lp.c below (vertex_bias, c_max unscaling), so never
-        # iterate on the caller's JaddleLP itself. Its arrays are immutable, so a
-        # shallow copy suffices.
-        lp = copy.copy(lp) if isinstance(lp, JaddleLP) else to_jaddle_sparse(lp)
-
-    if adaptive_eta == "auto":
-        adaptive_eta = 1 / float(estimate_augmented_spectral_norm(lp))
-        if verbose:
-            print(f"Adaptive step size seed set to 1/||A||_2 = {adaptive_eta:.3e}")
-            print("----------------------------------------------")
-
-    # A user-supplied initial_solution is given in the LP's original (unscaled)
-    # space, so it must be mapped into the scaled space the solver iterates in.
-    # The default from lp.initial_solution() is already built from the scaled lp
-    # and must NOT be rescaled again.
-    user_supplied_initial = initial_solution is not None
-    if initial_solution is None:
-        initial_solution = lp.initial_solution()
-
-    # lp.initial_solution() allocates with the JAX default float width (f32, or
-    # f64 under x64), which mismatches the profile dtype the LP data carries
-    # (e.g. float16). Cast the state to match so the solve runs end-to-end in
-    # the active precision instead of silently upcasting.
-    _state_dtype = lp.c.dtype
-    initial_solution = SaddleState(
-        primal=initial_solution.primal.astype(_state_dtype),
-        dual_ineq=initial_solution.dual_ineq.astype(_state_dtype),
-        dual_eq=initial_solution.dual_eq.astype(_state_dtype),
-    )
-
-    # Convert to jax arrays for use inside jitted functions. Match the state
-    # dtype so dividing by the scales doesn't upcast the state back out of the
-    # profile precision (numpy float64 scale * jax float16 -> float64). Sliced
-    # and cast on the host, then uploaded: each eager device slice/cast would
-    # compile its own per-shape kernel.
-    _row_scale_host = np.asarray(row_scale)
-    _state_np_dtype = jnp.dtype(_state_dtype)
-    jnp_row_scale_ineq = jax.device_put(
-        _row_scale_host[len(lp.b_eq) :].astype(_state_np_dtype)
-    )
-    jnp_row_scale_eq = jax.device_put(
-        _row_scale_host[: len(lp.b_eq)].astype(_state_np_dtype)
-    )
-    col_scale = jax.device_put(np.asarray(col_scale).astype(_state_np_dtype))
-
-    # --- Vertex-biasing cost perturbation (Mangasarian tie-break) -------------
-    # First-order saddle methods converge to the analytic centre of the optimal
-    # FACE — the maximally-interior optimum — which is the worst possible warm
-    # start for a vertex crossover (degenerate LPs then have far more "interior"
-    # variables than rows; see [[crossover-polish]]). Adding a small perturbation
-    # `c ← c + vertex_bias·r` to the cost used by the DYNAMICS breaks ties on the
-    # optimal face so the solver settles on a unique VERTEX; for vertex_bias below
-    # the LP's optimal-partition threshold that vertex is an exact optimal vertex
-    # of the original problem. The convergence METRICS keep the TRUE cost
-    # (`c_true` below), so we stop when the iterate is near-optimal for the real
-    # LP while being pulled toward a vertex — and polish/crossover run against the
-    # true cost too. Default 0.0 = off (unchanged behaviour).
-    c_true = lp.c
-    if vertex_bias:
-        rng = np.random.default_rng(vertex_bias_seed)
-        # Per-variable perturbation, scaled by |c| magnitude so the relative tilt
-        # is uniform; deterministic given the seed. Sign random so it tilts each
-        # variable toward whichever bound the face allows.
-        r = jnp.asarray(
-            rng.standard_normal(lp.c.shape[0]).astype(np.float64), dtype=lp.c.dtype
-        )
-        c_scale_mag = float(jnp.max(jnp.abs(lp.c))) + 1e-30
-        lp.c = lp.c + (vertex_bias * c_scale_mag) * r
-
-    if user_supplied_initial:
-        # Map the user's original-space solution into scaled space: the exact
-        # inverse of _unscale_output (primal *= col_scale, dual *= row_scale *
-        # c_max). c_max is 1 unless the objective was normalised; leaving it
-        # out warm-started every dual off by that factor.
-        initial_solution = SaddleState(
-            primal=initial_solution.primal / col_scale,
-            dual_ineq=initial_solution.dual_ineq / (jnp_row_scale_ineq * c_max),
-            dual_eq=initial_solution.dual_eq / (jnp_row_scale_eq * c_max),
-        )
-
+    Returns ``(build_chunk, carry, print_epoch_metrics, adaptive_theta,
+    chunk_target_seconds)``: ``build_chunk(ipe)`` gives the jitted
+    ``run_chunk(carry, n_epochs)`` for an epoch length, ``carry`` is the
+    initial loop state, and the rest serve ``solve()``'s host loop.
+    """
     dual_feasibility_threshold = (
         float(dual_feasibility_tolerance)
         if dual_feasibility_tolerance is not None
@@ -1247,9 +902,10 @@ def solve(
     # ratio in the right order of magnitude before iteration 1 instead of
     # starting symmetric.
     if k_init is None:
-        norm_c = float(jnp.linalg.norm(lp.c)) + 1e-30
-        norm_b = float(jnp.linalg.norm(lp.b)) + 1e-30
-        k_init = float(np.clip(norm_c / norm_b, k_lo, k_hi))
+        # Kept on the device (no float()) so this runs under jit / vmap.
+        norm_c = jnp.linalg.norm(lp.c) + 1e-30
+        norm_b = jnp.linalg.norm(lp.b) + 1e-30
+        k_init = jnp.clip(norm_c / norm_b, k_lo, k_hi)
 
     if initial_opt_state is not None:
         opt_state = initial_opt_state
@@ -1290,10 +946,10 @@ def solve(
     # termination_* pair normalises the stopping test / printed PFR, DFR.
     _b_true = lp.b / _row_scale_all
     _c_true = lp.c / col_scale
-    b_norm = float(_vector_norm(_b_true, restart_norm))
-    c_norm = float(_vector_norm(_c_true, restart_norm))
-    termination_b_norm = float(_vector_norm(_b_true, termination_norm))
-    termination_c_norm = float(_vector_norm(_c_true, termination_norm))
+    b_norm = _vector_norm(_b_true, restart_norm)
+    c_norm = _vector_norm(_c_true, restart_norm)
+    termination_b_norm = _vector_norm(_b_true, termination_norm)
+    termination_c_norm = _vector_norm(_c_true, termination_norm)
 
     def kkt_merit(
         constraint_bound,
@@ -1342,8 +998,8 @@ def solve(
         # way `converged()` tests them — so the logged values match the stopping
         # criterion (an absolute DFR of 2e-2 can be a relative 5e-4 that passes).
         # RDG is already relative (÷(1+|obj|)).
-        relative_pfr = termination_pfr / (1.0 + termination_b_norm)
-        relative_dfr = termination_dfr / (1.0 + termination_c_norm)
+        relative_pfr = termination_pfr / (1.0 + float(termination_b_norm))
+        relative_dfr = termination_dfr / (1.0 + float(termination_c_norm))
         # RDGABS: the no-cancellation companion to RDG (see relative_gap_abs).
         # `converged()` requires RDGABS <= dual_gap_tolerance; without printing
         # it a run can show PFR/DFR/RDG all comfortably inside tolerance yet
@@ -1837,6 +1493,478 @@ def solve(
         n_evt=jnp.asarray(0),
     )
     carry = _strong(carry)
+    return _build_chunk, carry, print_epoch_metrics, adaptive_theta, _CHUNK_TARGET_SECONDS
+
+
+def solve(
+    lp: JaddleLP,
+    max_epochs=None,
+    max_seconds=None,
+    initial_solution=None,
+    initial_opt_state=None,
+    iterations_per_epoch=256,
+    dual_damping_ineq=0.0,
+    dual_damping_eq=0.0,
+    primal_damping=0.0,
+    primal_feasibility_tolerance=1e-3,
+    dual_feasibility_tolerance=1e-3,
+    dual_gap_tolerance=1e-3,
+    dual_residual="pdlp",
+    termination_norm="l2",
+    restart_norm="l2",
+    verbose=False,
+    log_every=1,
+    average=True,
+    report_best=True,
+    update_mode="alternating",
+    k_scale=1e8,
+    k_theta=0.5,
+    k_init=None,
+    k_update_per_epoch=False,
+    adaptive_eta=1.0,
+    scale=True,
+    scaled_objective=True,
+    scaled_rhs=True,
+    scaled_augmented=True,
+    augmented_weight=1.0,
+    ruiz_iterations=10,
+    pc_iterations=1,
+    cost_col_floor=0,
+    restarts=True,
+    epochs_per_restart=None,
+    restart_multiplier=1.0,
+    restart_decay=0.2,
+    necessary_decay=0.8,
+    primal_stop=False,
+    primal_stop_window=5,
+    primal_stop_obj_tol=1e-4,
+    halpern_reanchor_per_epoch=False,
+    iterations_per_epoch_decay=1.0,
+    iterations_per_epoch_min=100,
+    restart_check_every="auto",
+    vertex_bias=0.0,
+    vertex_bias_seed=0,
+    reference_objective=None,
+):
+    """
+    Solve a linear program via saddle-point optimisation.
+
+    Termination uses the standard LP optimality certificate, all tested
+    RELATIVELY (PDLP/HiGHS convention): primal feasibility
+    (``primal_feasibility_tolerance``, normalised by 1+‖b‖), dual feasibility
+    (``dual_feasibility_tolerance``, normalised by 1+‖c‖), and a finite duality
+    gap within ``dual_gap_tolerance`` (normalised by 1+|primal_obj|+|dual_obj|,
+    the PDLP/cuPDLP convention, so RDG is directly comparable to PDLP).
+
+    Every update_mode is cuPDLP-style adaptive PDHG: plain projected
+    primal-descent / dual-ascent steps with a per-iteration line-searched step
+    size ``eta`` and a primal weight ``k`` (no optimiser plug-in).
+
+    Adaptive restarts (PDLP-style) accelerate ill-conditioned problems. A
+    restart resets the averaging (and the halpern anchor) while keeping the current
+    iterate as a warm start, which prevents the saddle iteration from settling
+    into slow rotational orbits. A restart fires when either the normalised KKT
+    merit decays past ``restart_decay`` of its value at the last restart
+    (sufficient-progress restart) or the current cycle reaches its length cap
+    (no-progress restart). On by default; disable with ``restarts=False``.
+
+    The epoch loop runs on the device: each call into JAX executes a chunk of
+    many epochs, including the metrics, convergence test and restart logic, with
+    no host synchronisation between them. Python regains control between
+    chunks (sized to take about a second) to enforce ``max_epochs`` /
+    ``max_seconds``, print the verbose log and handle Ctrl-C. With
+    ``verbose=True`` the per-epoch ``Time`` is therefore the average over the
+    epoch's chunk. When ``verbose``, ``max_epochs`` and ``max_seconds`` are all
+    unset, nothing needs the host between epochs, so the whole solve runs as a
+    single device call (only an ``iterations_per_epoch_decay`` restart, which
+    changes the compiled epoch length, returns to Python). In that mode Ctrl-C
+    takes effect only once the call returns, and ``"corrected_seconds"`` equals
+    ``"solve_seconds"``.
+
+    Args:
+        max_seconds: Wall-clock budget in seconds (default ``None`` = no limit).
+            Measured from entry into ``solve()``, so scaling / setup and the
+            first-epoch XLA compile count against it. Checked between chunks
+            of epochs, and each chunk is sized from the measured epoch time to
+            fit the remaining budget; once the budget is spent the current
+            point is returned with ``stop_reason="time_limit"``. The solve can
+            overrun by about one epoch (shrink ``iterations_per_epoch`` for a
+            tighter cutoff).
+        dual_residual: How reduced costs split between the dual residual (DFR)
+            and the dual objective (hence the gap). ``"pdlp"`` (default) follows
+            PDLP with ``handle_some_primal_gradients_on_finite_bounds_as_residuals``:
+            rᵢ > 0 is absorbed by a finite lower bound and rᵢ < 0 by a finite
+            upper bound when xᵢ is near it (|xᵢ - bound| <= |xᵢ|), adding rᵢ·bound
+            to the dual objective; every other component is a residual |rᵢ|.
+            Complementarity errors on boxed variables therefore show in the gap,
+            and far finite bounds (e.g. [0, 1e6] boxes) can't swamp the dual
+            objective. ``"projected"`` is the older per-variable projected-gradient
+            residual |x - proj(x - r)| for boxed variables, with every finite bound
+            always in the dual objective.
+        termination_norm: Norm used for the primal / dual feasibility
+            stopping tests (and the printed PFR / DFR): ``"l2"`` (default)
+            tests ‖r_p‖₂/(1+‖b‖₂) and ‖r_d‖₂/(1+‖c‖₂), the cuPDLP-C / PDLP
+            default, for like-for-like comparisons; ``"inf"`` tests
+            ‖r_p‖∞/(1+‖b‖∞) and ‖r_d‖∞/(1+‖c‖∞). Termination only: the restart merit
+            follows ``restart_norm``, so changing this alone leaves the iterate
+            trajectory unchanged and only moves the epoch at which it stops.
+        restart_norm: Norm (``"l2"`` default, or ``"inf"``) for the primal /
+            dual feasibility terms of the restart KKT merit and the
+            dual-infeasible ``still_improving`` cycle-cap guard, normalised by
+            1+‖b‖ / 1+‖c‖ in the same norm. ``"l2"`` matches cuPDLP-C's restart
+            criterion. Unlike ``termination_norm`` this changes the trajectory.
+        restarts: Enable adaptive warm restarts (default ``True``). There is
+            no cap on how many fire; the triggers alone decide. Each restart
+            resets the averaging (and the halpern anchor / lambda counter) while
+            keeping the current iterate as a warm start.
+        epochs_per_restart: Length cap of the first restart cycle, or ``None``
+            (default) for no cap — restarts then fire only on the
+            sufficient-progress / stalling triggers. When set, expressed in
+            epochs AT THE DEFAULT ``iterations_per_epoch`` but
+            internally converted to and tracked in ITERATIONS
+            (``epochs_per_restart * iterations_per_epoch``), so the cycle-cap
+            restart fires at the same point in the optimisation trajectory
+            regardless of ``iterations_per_epoch``. This matters because a
+            restart is destructive (it wipes the PDHG averaging): tying the cap to a raw epoch count made the
+            restart cadence an accident of how the iteration budget was chopped
+            into epochs — e.g. on momentum1, ``iterations_per_epoch=1000``
+            triggered a cap-exhaustion restart at 10,000 iterations while still
+            dual-infeasible, wiping out a trajectory that would otherwise have
+            converged smoothly, while ``iterations_per_epoch=10000`` reached
+            full convergence in under 100,000 iterations before the same cap
+            ever fired. Subsequent cycle caps grow by ``restart_multiplier``.
+        restart_multiplier: Geometric growth factor for cycle-length caps
+            (default 1.0 = fixed length, 2.0 = doubling).
+        restart_decay: Sufficient-progress threshold (default 0.2; cuPDLP
+            β_sufficient). A restart fires when the KKT merit drops below
+            ``restart_decay`` times its value at the last restart.
+        necessary_decay: Necessary-decay threshold for the cuPDLP "stalling"
+            restart condition (default 0.8; cuPDLP β_necessary). A restart also
+            fires when the merit has decayed below ``necessary_decay`` times its
+            cycle-start value AND has risen versus the previous epoch (rotational
+            turnaround). Must be > ``restart_decay`` to be meaningful.
+        update_mode: Selects the per-iterate stepping scheme. One of:
+            * ``"alternating"`` (default): primal step, then a dual step at the
+              new primal x^{k+1} (Gauss–Seidel / alternating GDA, no
+              extrapolation). Not contractive in general; relies on
+              averaging/restarts.
+            * ``"pdhg"``: Chambolle–Pock PDHG (primal step then dual step on
+              the extrapolated primal x_bar = 2x^{k+1} − x^k).
+            * ``"halpern"``: restarted Halpern-anchored PDHG. Each iterate is the
+              adaptive PDHG step T(z) blended back toward an anchor z_0:
+              ``z_{k+1} = lambda_k z_0 + (1−lambda_k) T(z_k)``, ``lambda_k =
+              1/(k+1)`` (cycle-local k). The anchor z_0 and lambda counter reset
+              to the current iterate at each restart, giving last-iterate
+              acceleration. Best paired with ``restarts=True``.
+        k_scale: Clamp band ``[1/k_scale, k_scale]`` for the primal weight ``k``
+            (default ``1e8``); ``None`` leaves ``k`` unclamped. The primal and
+            dual steps are ``eta / k`` and ``eta * k``, so the dual/primal step
+            ratio is ``k**2``. ``k`` is initialised from ``k_init`` and rebalanced
+            at each restart (PDLP-style) from primal-vs-dual iterate movement; it
+            is constant within an epoch (not adapted per iteration). Tuned by
+            ``k_theta``/``k_scale`` and ``k_init``.
+        k_init: Initial primal weight ``k``. ``None`` (default) initialises it to
+            the PDLP heuristic ``||c|| / ||b||`` (objective vs RHS norms, in the
+            scaled space the solver iterates in). Pass a float to override
+            (``1.0`` = symmetric steps, the PC/Ruiz-scaled baseline).
+        k_update_per_epoch: When ``True``, the primal weight ``k`` is
+            rebalanced at every epoch boundary (not only at restarts) using the
+            primal-vs-dual iterate movement over the just-finished epoch — same
+            log-space geometric-mean blend (``k_theta``) and ``[1/k_scale,
+            k_scale]`` clamp as the restart rebalance. Unlike a restart it does
+            NOT reset averaging or (for halpern) re-anchor ``z_0`` / reset
+            ``eta``; only ``k`` changes, so the step split tracks the local
+            primal/dual progress within a restart cycle.
+            ``False`` (default, the PDLP convention) keeps k frozen between
+            restarts: under a wide ``k_scale`` clamp the per-epoch update let k
+            run away on mzzv11 (k→1e8, gap 0.94).
+        adaptive_eta: Seed for the cuPDLP-style per-iteration adaptive step
+            ``eta``, which drives the primal step ``tau = eta / k`` and dual step
+            ``sigma = eta * k``. Each iteration takes a trial step, forms the
+            largest admissible step from the interaction term
+            ``(y^{k+1}-y^k)ᵀ A (x^{k+1}-x^k)``, and rejects + shrinks ``eta`` if
+            the trial overshot; ``eta`` is then advanced with a two-sided guard.
+            A float > 0 sets the seed directly (default ``1.0``, a natural scale
+            once Ruiz/PC scaling has brought ``||A||`` to O(1)); ``"auto"`` (or
+            ``0.0``) seeds it at ``1/||[[A,b],[c,0]]||_2`` of the scaled LP,
+            estimated by power iteration. The line search corrects a poor seed
+            within a few iterations. The learned ``eta`` is carried across restarts.
+        k_theta: Smoothing coefficient for the log-space primal-weight update at
+            each restart / epoch. A float fixes it (default ``0.5``, as in PDLP;
+            smaller = slower adaptation).
+            ``"adaptive"`` sets it from data as a trust region on log k:
+            starting at 0.5, each restart doubles theta (capped at 1) if the
+            restart merit fell over the cycle since the previous k move, else
+            halves it (floored at 0.05) and reverts k to its value before that
+            move. The movement ratio alone can't tell a correct k move from a
+            runaway (mzzv11's per-epoch runaway was monotone), but the merit can.
+            Epochs to certify, restart-only vs fixed 0.5: barwon 41 vs 166,
+            binschedule2 39 vs 61, plus gains on stp3d and mzzv11. It was the
+            default briefly, but fixed 0.5 proved safer across instances
+            (hgms30 ratchets k under ``"adaptive"``).
+        primal_stop: Opt-in, dual-free termination (default ``False``). When
+            ``True``, termination ignores the dual certificate entirely and stops
+            on **primal feasibility** (``constraint_bound`` within
+            ``primal_feasibility_tolerance``) **and** an **objective stall**. This
+            is a heuristic, not an optimality certificate — it trades the dual's
+            mathematical optimality guarantee for robust termination on problems
+            where the dual is junk. The duality gap and dual residuals are still
+            computed and reported as diagnostics, just not used to gate.
+        primal_stop_window: Number of recent epochs over which the objective
+            stall is measured (default 5). Only used when ``primal_stop=True``.
+        primal_stop_obj_tol: Relative-change threshold for the objective stall:
+            stop when ``|obj_now - obj_{window ago}| / (1 + |obj_now|)`` falls
+            below this (default 1e-4). Only used when ``primal_stop=True``.
+        halpern_reanchor_per_epoch: Opt-in (default ``False``, ``"halpern"`` only).
+            When ``True``, re-anchor ``z_0`` to the current iterate and reset the
+            ``lambda_k = 1/(k+1)`` counter at **every** epoch boundary, not only at
+            restarts — i.e. each epoch starts a fresh Halpern cycle. This re-warms
+            ``lambda`` toward 1/2 each epoch (strong pull to the cycle-start point)
+            instead of letting it decay across the whole restart cycle. Note an
+            epoch is a fixed iteration chunk, not a progress-driven boundary, so
+            this re-anchors on a schedule rather than on convergence; it can help
+            on rotation-limited problems but discards the long-horizon anchor that
+            gives Halpern its last-iterate acceleration. Both ``eta`` and ``k`` are
+            left to their usual per-epoch handling. No effect unless
+            ``update_mode="halpern"``. On an epoch where a real restart fires, the
+            restart's own re-anchor takes precedence (no double re-anchor).
+        cost_col_floor: Scaling floor for cost-pinned columns: a costed column
+            whose largest scaled matrix entry is below it is rescaled so that
+            entry becomes 1. Fixes epigraph objectives (``min z, z >= a_k.x``
+            over dense rows, fhnw-binschedule0) where augmented Ruiz leaves the
+            variable huge in scaled units. Default ``0`` (disabled); pass e.g.
+            ``1e-2`` to enable. See ``scale_problem``.
+        restart_check_every: Evaluate the restart merit every this many
+            iterations inside an epoch and end the epoch early once the
+            sufficient-progress test (``restart_decay``) would fire, so restarts
+            aren't delayed to the epoch boundary. Costs ~2 matvec pairs per check.
+            Also exits on the condition-(ii) stall (merit within
+            ``necessary_decay`` of the last restart and rising chunk-to-chunk).
+            Epoch lengths round down to a multiple of it. Default ``"auto"``
+            (a tenth of the current epoch length); ``None`` checks only at epoch
+            boundaries.
+        reference_objective: True optimal objective value ``z*`` from a reference
+            solver, in the ORIGINAL problem's units. Purely diagnostic: when
+            supplied and ``verbose=True``, each epoch also logs the true relative
+            objective error ``|cᵀx − z*| / (1 + |z*|)`` (``OBJERR``) alongside the
+            reported relative duality gap (``RDG``). The gap is gated by the dual
+            (it is a complementarity sum that carries the dual's lag), so the
+            primal typically reaches optimality well before the gap closes;
+            comparing ``OBJERR`` against ``RDG`` quantifies how much of the gap is
+            dual lag versus genuine primal suboptimality. Does not affect
+            termination — convergence still uses the full LP certificate.
+
+    Returns:
+        dict: The solution together with diagnostics. Keys:
+            * ``"solution"``: the ``SaddleState`` (primal/dual iterate), unscaled
+              back to the original problem's units.
+            * ``"converged"``: ``bool``, whether the solve terminated by meeting
+              the LP optimality certificate or a ``primal_stop`` heuristic stop
+              (see ``"stop_reason"`` to disambiguate).
+            * ``"opt_state"``: the final step-size state ``(k, eta)`` (plus the
+              anchor for halpern), for warm-starting a subsequent solve via
+              ``initial_opt_state``.
+            * ``"stop_reason"``: ``str`` recording *why* the solve terminated:
+              ``"certificate"`` (full LP optimality certificate met),
+              ``"primal_stall"`` (the ``primal_stop`` heuristic fired — feasible
+              but not certified optimal, so the objective may be suboptimal even
+              though ``"converged"`` is ``True``), ``"max_epochs"`` (epoch budget
+              exhausted), ``"time_limit"`` (``max_seconds`` exhausted), or
+              ``"interrupted"`` (KeyboardInterrupt).
+            * ``"solve_seconds"``: ``float`` wall time of the epoch loop (incl. the
+              first-epoch XLA compile but not the scaling / sparse-setup phase).
+            * ``"corrected_seconds"``: ``float`` steady-state runtime with the
+              one-off first-epoch XLA compile amortised out:
+              ``n * (solve_seconds - first_epoch_seconds) / (n - 1)`` where ``n``
+              is the epoch count. Falls back to ``solve_seconds`` when it can't be
+              formed (fewer than two epochs, or a single-call solve).
+            * ``"epochs"``: ``int``, number of epochs run.
+    """
+
+    # max_seconds is a wall-clock budget for the whole call, setup included.
+    solve_entry_time = time.time()
+    if max_seconds is not None and max_seconds <= 0:
+        raise ValueError("max_seconds must be > 0 (or None for no limit)")
+
+    lp = __pad_empty_blocks(lp)
+
+    if log_every < 1:
+        raise ValueError("log_every must be >= 1")
+
+    if verbose:
+        print("----------------------------------------------")
+
+    k_lo, k_hi, adaptive_eta, halpern = _check_settings(
+        dual_residual, termination_norm, restart_norm, update_mode, k_scale, adaptive_eta
+    )
+
+    if verbose:
+        print("====Starting Solve====")
+        print("----------------------------------------------")
+
+    # solve() takes a JaddleLP (the JAX-native, device-side representation) or a
+    # raw scipy LP (e.g. hand-built in examples). scale_problem() accepts either
+    # and runs on device, returning the JaddleLP the solver iterates on.
+    if scale:
+        # Augmented Ruiz: equilibrate [[A,b],[c,0]] so cost and RHS information also
+        # drive the equilibration. Conditions the constraint (esp. equality) block
+        # better on cost/RHS-dominated problems (momentum1: A-only Ruiz froze the
+        # primal at a far-from-optimal point; augmented converges in ~15 epochs).
+        # A-only Ruiz (scale_problem(augmented=False)) is available as a knob but is
+        # not the default — it broke both momentum1 and boeing once the relative
+        # convergence test + true-units norm fixes were in place. PC then applies
+        # its single Pock-Chambolle finishing pass.
+        lp, row_scale, col_scale, c_max = scale_problem(
+            lp,
+            scaled_objective=scaled_objective,
+            scaled_rhs=scaled_rhs,
+            augmented=scaled_augmented,
+            augmented_weight=augmented_weight,
+            ruiz_iter=ruiz_iterations,
+            pc_iter=pc_iterations,
+            cost_col_floor=cost_col_floor,
+        )
+
+        if verbose:
+            print("Applied combined Ruiz + PC scaling to the LP.")
+            print("----------------------------------------------")
+
+    else:
+        row_scale = np.ones(lp.A_eq.shape[0] + lp.A_ineq.shape[0])
+        col_scale = np.ones(lp.c.shape[0])
+        c_max = 1.0
+        # solve() reassigns lp.c below (vertex_bias, c_max unscaling), so never
+        # iterate on the caller's JaddleLP itself. Its arrays are immutable, so a
+        # shallow copy suffices.
+        lp = copy.copy(lp) if isinstance(lp, JaddleLP) else to_jaddle_sparse(lp)
+
+    if adaptive_eta == "auto":
+        adaptive_eta = 1 / float(estimate_augmented_spectral_norm(lp))
+        if verbose:
+            print(f"Adaptive step size seed set to 1/||A||_2 = {adaptive_eta:.3e}")
+            print("----------------------------------------------")
+
+    # A user-supplied initial_solution is given in the LP's original (unscaled)
+    # space, so it must be mapped into the scaled space the solver iterates in.
+    # The default from lp.initial_solution() is already built from the scaled lp
+    # and must NOT be rescaled again.
+    user_supplied_initial = initial_solution is not None
+    if initial_solution is None:
+        initial_solution = lp.initial_solution()
+
+    # lp.initial_solution() allocates with the JAX default float width (f32, or
+    # f64 under x64), which mismatches the profile dtype the LP data carries
+    # (e.g. float16). Cast the state to match so the solve runs end-to-end in
+    # the active precision instead of silently upcasting.
+    _state_dtype = lp.c.dtype
+    initial_solution = SaddleState(
+        primal=initial_solution.primal.astype(_state_dtype),
+        dual_ineq=initial_solution.dual_ineq.astype(_state_dtype),
+        dual_eq=initial_solution.dual_eq.astype(_state_dtype),
+    )
+
+    # Convert to jax arrays for use inside jitted functions. Match the state
+    # dtype so dividing by the scales doesn't upcast the state back out of the
+    # profile precision (numpy float64 scale * jax float16 -> float64). Sliced
+    # and cast on the host, then uploaded: each eager device slice/cast would
+    # compile its own per-shape kernel.
+    _row_scale_host = np.asarray(row_scale)
+    _state_np_dtype = jnp.dtype(_state_dtype)
+    jnp_row_scale_ineq = jax.device_put(
+        _row_scale_host[len(lp.b_eq) :].astype(_state_np_dtype)
+    )
+    jnp_row_scale_eq = jax.device_put(
+        _row_scale_host[: len(lp.b_eq)].astype(_state_np_dtype)
+    )
+    col_scale = jax.device_put(np.asarray(col_scale).astype(_state_np_dtype))
+
+    # --- Vertex-biasing cost perturbation (Mangasarian tie-break) -------------
+    # First-order saddle methods converge to the analytic centre of the optimal
+    # FACE — the maximally-interior optimum — which is the worst possible warm
+    # start for a vertex crossover (degenerate LPs then have far more "interior"
+    # variables than rows; see [[crossover-polish]]). Adding a small perturbation
+    # `c ← c + vertex_bias·r` to the cost used by the DYNAMICS breaks ties on the
+    # optimal face so the solver settles on a unique VERTEX; for vertex_bias below
+    # the LP's optimal-partition threshold that vertex is an exact optimal vertex
+    # of the original problem. The convergence METRICS keep the TRUE cost
+    # (`c_true` below), so we stop when the iterate is near-optimal for the real
+    # LP while being pulled toward a vertex — and polish/crossover run against the
+    # true cost too. Default 0.0 = off (unchanged behaviour).
+    c_true = lp.c
+    if vertex_bias:
+        rng = np.random.default_rng(vertex_bias_seed)
+        # Per-variable perturbation, scaled by |c| magnitude so the relative tilt
+        # is uniform; deterministic given the seed. Sign random so it tilts each
+        # variable toward whichever bound the face allows.
+        r = jnp.asarray(
+            rng.standard_normal(lp.c.shape[0]).astype(np.float64), dtype=lp.c.dtype
+        )
+        c_scale_mag = float(jnp.max(jnp.abs(lp.c))) + 1e-30
+        lp.c = lp.c + (vertex_bias * c_scale_mag) * r
+
+    if user_supplied_initial:
+        # Map the user's original-space solution into scaled space: the exact
+        # inverse of _unscale_output (primal *= col_scale, dual *= row_scale *
+        # c_max). c_max is 1 unless the objective was normalised; leaving it
+        # out warm-started every dual off by that factor.
+        initial_solution = SaddleState(
+            primal=initial_solution.primal / col_scale,
+            dual_ineq=initial_solution.dual_ineq / (jnp_row_scale_ineq * c_max),
+            dual_eq=initial_solution.dual_eq / (jnp_row_scale_eq * c_max),
+        )
+
+    (
+        _build_chunk,
+        carry,
+        print_epoch_metrics,
+        adaptive_theta,
+        _CHUNK_TARGET_SECONDS,
+    ) = _device_solver(
+        lp,
+        c_true=c_true,
+        c_max=c_max,
+        col_scale=col_scale,
+        jnp_row_scale_ineq=jnp_row_scale_ineq,
+        jnp_row_scale_eq=jnp_row_scale_eq,
+        initial_solution=initial_solution,
+        initial_opt_state=initial_opt_state,
+        k_init=k_init,
+        k_lo=k_lo,
+        k_hi=k_hi,
+        adaptive_eta=adaptive_eta,
+        halpern=halpern,
+        vertex_bias=vertex_bias,
+        primal_damping=primal_damping,
+        dual_damping_ineq=dual_damping_ineq,
+        dual_damping_eq=dual_damping_eq,
+        primal_feasibility_tolerance=primal_feasibility_tolerance,
+        dual_feasibility_tolerance=dual_feasibility_tolerance,
+        dual_gap_tolerance=dual_gap_tolerance,
+        dual_residual=dual_residual,
+        termination_norm=termination_norm,
+        restart_norm=restart_norm,
+        verbose=verbose,
+        log_every=log_every,
+        average=average,
+        report_best=report_best,
+        update_mode=update_mode,
+        k_theta=k_theta,
+        k_update_per_epoch=k_update_per_epoch,
+        iterations_per_epoch=iterations_per_epoch,
+        restarts=restarts,
+        epochs_per_restart=epochs_per_restart,
+        restart_multiplier=restart_multiplier,
+        restart_decay=restart_decay,
+        necessary_decay=necessary_decay,
+        primal_stop=primal_stop,
+        primal_stop_window=primal_stop_window,
+        primal_stop_obj_tol=primal_stop_obj_tol,
+        halpern_reanchor_per_epoch=halpern_reanchor_per_epoch,
+        iterations_per_epoch_decay=iterations_per_epoch_decay,
+        iterations_per_epoch_min=iterations_per_epoch_min,
+        restart_check_every=restart_check_every,
+        reference_objective=reference_objective,
+    )
 
     chunk_fns = {}
     count = 0
@@ -2040,6 +2168,558 @@ def solve(
         "corrected_seconds": corrected_seconds,
         "epochs": count,
     }
+
+
+class SolveCoreResult(NamedTuple):
+    """What a ``make_solver`` function returns; every field is a JAX array, so
+    results batch under ``vmap``.
+
+    ``solution`` is the reported point in true units (as in ``solve()``),
+    ``converged`` whether the LP certificate (or ``primal_stop``) fired,
+    ``stop_code`` 1 for the certificate, 2 for ``primal_stop`` and 0 for the
+    epoch budget, and ``epochs`` the epochs run."""
+
+    solution: SaddleState
+    converged: jnp.ndarray
+    stop_code: jnp.ndarray
+    epochs: jnp.ndarray
+
+
+def make_solver(
+    lp,
+    max_epochs=None,
+    iterations_per_epoch=256,
+    dual_damping_ineq=0.0,
+    dual_damping_eq=0.0,
+    primal_damping=0.0,
+    primal_feasibility_tolerance=1e-3,
+    dual_feasibility_tolerance=1e-3,
+    dual_gap_tolerance=1e-3,
+    dual_residual="pdlp",
+    termination_norm="l2",
+    restart_norm="l2",
+    average=True,
+    report_best=True,
+    update_mode="alternating",
+    k_scale=1e8,
+    k_theta=0.5,
+    k_init=None,
+    k_update_per_epoch=False,
+    adaptive_eta=1.0,
+    scale=True,
+    scaled_objective=True,
+    scaled_rhs=True,
+    scaled_augmented=True,
+    augmented_weight=1.0,
+    ruiz_iterations=10,
+    pc_iterations=1,
+    cost_col_floor=0,
+    restarts=True,
+    epochs_per_restart=None,
+    restart_multiplier=1.0,
+    restart_decay=0.2,
+    necessary_decay=0.8,
+    primal_stop=False,
+    primal_stop_window=5,
+    primal_stop_obj_tol=1e-4,
+    halpern_reanchor_per_epoch=False,
+    iterations_per_epoch_min=100,
+    restart_check_every="auto",
+):
+    """
+    Build a pure-JAX solve function for LPs with ``lp``'s sparsity pattern.
+
+    Returns ``solve_fn(values=None, initial_solution=None) -> SolveCoreResult``.
+    ``values`` is an ``LPValues`` (``lp.values()`` when omitted): the cost,
+    the constraint matrices' stored nonzeros in ``lp``'s BCOO order, the
+    right-hand sides and the bounds. ``initial_solution`` is an optional warm
+    start in true units. The whole solve (scaling, the epoch loop to the
+    certificate or ``max_epochs``, unscaling) is traceable, so ``solve_fn``
+    can be ``jax.jit``-ed and ``jax.vmap``-ed over a batch of values.
+
+    The algorithm is ``solve()``'s, with the same arguments and defaults, and
+    a single solve reproduces ``solve()`` exactly. What needs the host is not
+    available: no ``verbose`` log, no ``max_seconds``, no ``vertex_bias``,
+    and the epoch length never changes during a solve (no
+    ``iterations_per_epoch_decay``; ``iterations_per_epoch_min`` is capped at
+    ``iterations_per_epoch``). ``max_epochs=None`` runs to the certificate,
+    which never comes on an infeasible LP: set a budget when that can happen.
+    """
+    if not isinstance(lp, JaddleLP):
+        lp = to_jaddle_sparse(lp)
+    pattern = __pad_empty_blocks(lp)
+    k_lo, k_hi, adaptive_eta_setting, halpern = _check_settings(
+        dual_residual, termination_norm, restart_norm, update_mode, k_scale, adaptive_eta
+    )
+    float_dtype, compute_dtype = __profile_dtypes()
+    n_eq = pattern.n_eq
+    n_epochs = _UNBOUNDED_EPOCHS if not max_epochs else int(max_epochs)
+    base_values = pattern.values()
+
+    def solve_fn(values=None, initial_solution=None):
+        v = base_values if values is None else _pad_values(values, pattern)
+        if scale:
+            dr, dc, eq_data, ineq_data, c, b_eq, b_ineq, lb, ub, c_max = (
+                __scale_problem_jax(
+                    jnp.asarray(v.A_eq_data, compute_dtype),
+                    pattern.A_eq.indices,
+                    jnp.asarray(v.A_ineq_data, compute_dtype),
+                    pattern.A_ineq.indices,
+                    jnp.asarray(v.c, compute_dtype),
+                    jnp.asarray(v.b_eq, compute_dtype),
+                    jnp.asarray(v.b_ineq, compute_dtype),
+                    jnp.asarray(v.lower_bounds, compute_dtype),
+                    jnp.asarray(v.upper_bounds, compute_dtype),
+                    1e-8,
+                    augmented_weight,
+                    cost_col_floor,
+                    ruiz_iter=ruiz_iterations,
+                    pc_iter=pc_iterations,
+                    clip_bounds=(1e-6, 1e6),
+                    augmented=scaled_augmented,
+                    scaled_objective=scaled_objective,
+                    scaled_rhs=scaled_rhs,
+                )
+            )
+            scaled = pattern.with_values(
+                LPValues(
+                    *(
+                        x.astype(float_dtype)
+                        for x in (c, eq_data, b_eq, ineq_data, b_ineq, lb, ub)
+                    )
+                )
+            )
+        else:
+            scaled = pattern.with_values(v)
+            dr = jnp.ones(scaled.b.shape[0], scaled.c.dtype)
+            dc = jnp.ones(scaled.c.shape[0], scaled.c.dtype)
+            c_max = jnp.ones((), scaled.c.dtype)
+
+        eta = adaptive_eta_setting
+        if eta == "auto":
+            eta = 1 / estimate_augmented_spectral_norm(scaled)
+
+        state_dtype = scaled.c.dtype
+        row_scale_eq = dr[:n_eq].astype(state_dtype)
+        row_scale_ineq = dr[n_eq:].astype(state_dtype)
+        col_scale = dc.astype(state_dtype)
+        c_max = jnp.asarray(c_max, state_dtype)
+        if initial_solution is None:
+            # lp.initial_solution(), on the device: the box-projected zero.
+            start = SaddleState(
+                primal=jnp.clip(
+                    jnp.zeros_like(scaled.c), scaled.lower_bounds, scaled.upper_bounds
+                ),
+                dual_ineq=jnp.zeros(scaled.b.shape[0] - n_eq, state_dtype),
+                dual_eq=jnp.zeros(n_eq, state_dtype),
+            )
+        else:
+            start = SaddleState(
+                primal=initial_solution.primal.astype(state_dtype) / col_scale,
+                dual_ineq=initial_solution.dual_ineq.astype(state_dtype)
+                / (row_scale_ineq * c_max),
+                dual_eq=initial_solution.dual_eq.astype(state_dtype)
+                / (row_scale_eq * c_max),
+            )
+
+        build_chunk, carry, *_ = _device_solver(
+            scaled,
+            c_true=scaled.c,
+            c_max=c_max,
+            col_scale=col_scale,
+            jnp_row_scale_ineq=row_scale_ineq,
+            jnp_row_scale_eq=row_scale_eq,
+            initial_solution=start,
+            initial_opt_state=None,
+            k_init=k_init,
+            k_lo=k_lo,
+            k_hi=k_hi,
+            adaptive_eta=eta,
+            halpern=halpern,
+            vertex_bias=0.0,
+            primal_damping=primal_damping,
+            dual_damping_ineq=dual_damping_ineq,
+            dual_damping_eq=dual_damping_eq,
+            primal_feasibility_tolerance=primal_feasibility_tolerance,
+            dual_feasibility_tolerance=dual_feasibility_tolerance,
+            dual_gap_tolerance=dual_gap_tolerance,
+            dual_residual=dual_residual,
+            termination_norm=termination_norm,
+            restart_norm=restart_norm,
+            verbose=False,
+            log_every=1,
+            average=average,
+            report_best=report_best,
+            update_mode=update_mode,
+            k_theta=k_theta,
+            k_update_per_epoch=k_update_per_epoch,
+            iterations_per_epoch=iterations_per_epoch,
+            restarts=restarts,
+            epochs_per_restart=epochs_per_restart,
+            restart_multiplier=restart_multiplier,
+            restart_decay=restart_decay,
+            necessary_decay=necessary_decay,
+            primal_stop=primal_stop,
+            primal_stop_window=primal_stop_window,
+            primal_stop_obj_tol=primal_stop_obj_tol,
+            halpern_reanchor_per_epoch=halpern_reanchor_per_epoch,
+            iterations_per_epoch_decay=1.0,
+            iterations_per_epoch_min=min(iterations_per_epoch_min, iterations_per_epoch),
+            restart_check_every=restart_check_every,
+            reference_objective=None,
+        )
+        carry = build_chunk(iterations_per_epoch)(carry, n_epochs)
+
+        if report_best and average:
+            output = _select_state(carry["used_avg"], carry["avg"], carry["state"])
+        elif average:
+            output = carry["avg"]
+        else:
+            output = carry["state"]
+        output = _unscale_output(
+            output,
+            col_scale,
+            row_scale_ineq,
+            row_scale_eq,
+            c_max,
+            scale=bool(scale),
+            scaled_objective=bool(scaled_objective),
+        )
+        stop_code = carry["stop_code"]
+        return SolveCoreResult(
+            solution=output,
+            converged=stop_code > 0,
+            stop_code=stop_code,
+            epochs=carry["count"],
+        )
+
+    solve_fn.pattern = pattern
+    return solve_fn
+
+
+def _select_state(pred, a, b):
+    return jax.tree.map(lambda x, y: jnp.where(pred, x, y), a, b)
+
+
+def _pad_values(values, pattern):
+    """Give an empty equality / inequality block the single zero row that
+    ``__pad_empty_blocks`` adds to the pattern, so values taken from the
+    original (unpadded) LP fit. Works on batched values too (the row is
+    appended along the last axis)."""
+
+    def pad(b, rows):
+        if b.shape[-1] == 0 and rows == 1:
+            return jnp.zeros(b.shape[:-1] + (1,), b.dtype)
+        return b
+
+    return values._replace(
+        b_eq=pad(values.b_eq, pattern.n_eq),
+        b_ineq=pad(values.b_ineq, pattern.A_ineq.shape[0]),
+    )
+
+
+def solve_batch(lp, values, **settings):
+    """
+    Solve a batch of LPs sharing ``lp``'s sparsity pattern: ``jax.vmap`` of
+    ``make_solver(lp, **settings)``, jitted.
+
+    ``values`` is an ``LPValues`` whose fields carry a leading batch axis;
+    a field given without one (e.g. bounds shared by every member) is
+    broadcast. Each member is scaled on its own, exactly as ``solve()`` would.
+    Members iterate in lockstep until the last one stops (a finished member
+    is frozen), so one hard member sets the batch's run time; ``max_epochs``
+    bounds it.
+
+    Batched members are not bit-identical to separate solves: XLA rounds
+    batched reductions slightly differently, and the adaptive step size
+    amplifies that over the iterations. Each member still certifies to the
+    requested tolerance.
+
+    Each call re-traces and compiles. To solve many batches of the same shape,
+    jit ``jax.vmap(make_solver(lp, **settings))`` once and reuse it.
+
+    Returns a ``SolveCoreResult`` with a leading batch axis on every field.
+    """
+    solve_fn = make_solver(lp, **settings)
+    values = LPValues(*(jnp.asarray(v) for v in values))
+    # A field is batched when it has one more axis than the LP's own field.
+    axes = LPValues(
+        *(
+            0 if v.ndim == r.ndim + 1 else None
+            for v, r in zip(values, solve_fn.pattern.values())
+        )
+    )
+    if all(a is None for a in axes):
+        raise ValueError("solve_batch: no field of `values` has a batch axis")
+    return jax.jit(jax.vmap(solve_fn, in_axes=(axes,)))(values)
+
+
+def make_optimal_value(lp, **settings):
+    """
+    The LP's optimal value as a differentiable function of its numbers.
+
+    Returns ``value_fn(values) -> z*``, the objective ``cᵀx*`` of the solution
+    ``make_solver(lp, **settings)`` finds for ``values`` (an ``LPValues``; ``lp``'s
+    own when omitted). Its gradient comes from the envelope theorem, read off
+    the primal-dual solution ``(x*, y*)`` with no differentiation through the
+    iterations. With Jaddle's Lagrangian ``cᵀx + yᵀ(Ax − b)`` (``y_ineq >= 0``)
+    and reduced cost ``r = c + Aᵀy*``:
+
+    * ``∂z*/∂c = x*``, ``∂z*/∂b = −y*``;
+    * ``∂z*/∂A_ij = y*_i x*_j`` on the stored nonzeros;
+    * ``∂z*/∂lower_j = max(r_j, 0)`` and ``∂z*/∂upper_j = min(r_j, 0)`` where
+      the bound is finite, else 0.
+
+    These are exact where the optimal primal and dual solutions are unique.
+    At a degenerate optimum ``z*`` is not differentiable and this returns one
+    element of the subdifferential, the one at the solution found. The
+    gradient is only as accurate as the solve: use tight tolerances, and check
+    ``make_solver``'s ``converged`` when it matters. Works under ``jit`` and
+    ``vmap``.
+    """
+    solve_fn = make_solver(lp, **settings)
+    pattern = solve_fn.pattern
+    eq_rows, eq_cols = pattern.A_eq.indices[:, 0], pattern.A_eq.indices[:, 1]
+    ineq_rows, ineq_cols = pattern.A_ineq.indices[:, 0], pattern.A_ineq.indices[:, 1]
+    base_values = pattern.values()
+
+    def forward(values):
+        padded = _pad_values(values, pattern)
+        solution = solve_fn(padded).solution
+        return padded.c @ solution.primal, (values, padded, solution)
+
+    def backward(residuals, g):
+        values, padded, solution = residuals
+        x, y_eq, y_ineq = solution.primal, solution.dual_eq, solution.dual_ineq
+        reduced_cost = padded.c + pattern.with_values(padded).A_T @ jnp.concatenate(
+            [y_eq, y_ineq]
+        )
+        finite_lower = jnp.isfinite(padded.lower_bounds)
+        finite_upper = jnp.isfinite(padded.upper_bounds)
+
+        def unpad(grad_b, original):
+            # The padded zero row is not one of the caller's values.
+            return grad_b[..., : original.shape[-1]]
+
+        grad = LPValues(
+            c=x,
+            A_eq_data=y_eq[eq_rows] * x[eq_cols],
+            b_eq=unpad(-y_eq, values.b_eq),
+            A_ineq_data=y_ineq[ineq_rows] * x[ineq_cols],
+            b_ineq=unpad(-y_ineq, values.b_ineq),
+            lower_bounds=jnp.where(finite_lower, jnp.maximum(reduced_cost, 0.0), 0.0),
+            upper_bounds=jnp.where(finite_upper, jnp.minimum(reduced_cost, 0.0), 0.0),
+        )
+        return (jax.tree.map(lambda t, v: (g * t).astype(jnp.asarray(v).dtype), grad, values),)
+
+    @jax.custom_vjp
+    def value(values):
+        return forward(values)[0]
+
+    value.defvjp(forward, backward)
+
+    def value_fn(values=None):
+        return value(base_values if values is None else values)
+
+    value_fn.pattern = pattern
+    return value_fn
+
+
+def make_perturbed_solution(
+    lp, sigma=0.1, num_samples=16, antithetic=True, **settings
+):
+    """
+    A smoothed, differentiable solution map ``c -> x*_σ(c)`` (the perturbed
+    optimizer of Berthet et al., "Learning with Differentiable Perturbed
+    Optimizers", 2020).
+
+    An LP's solution is piecewise constant in its cost, so ``dx*/dc`` is zero
+    almost everywhere. The perturbed solution ``x*_σ(c) = E[x*(c + σZ)]``
+    (``Z`` standard normal) is smooth, and its Jacobian has the unbiased
+    estimate ``E[x*(c + σZ) Zᵀ] / σ``. Both are estimated from
+    ``num_samples`` solves, run as one batch with ``vmap``.
+
+    Returns ``x_fn(c, key, values=None)``: ``c`` is the cost to perturb (its
+    gradient is the only one computed), ``key`` a ``jax.random`` key, and
+    ``values`` the LP's other numbers (``lp``'s own when omitted). With
+    ``antithetic=True`` the samples come in ``±Z`` pairs, which cancels the
+    estimate's odd-order noise (``num_samples`` must then be even). ``sigma``
+    is in the units of ``c``: larger is smoother and more biased.
+
+    The samples are solved to ``settings``' tolerances; a sample that does not
+    converge within ``max_epochs`` still contributes its last point. The
+    feasible region must be bounded: a perturbed cost can otherwise make a
+    sample unbounded (measured: on ``min 3x₁ + 2x₂, x₁ + x₂ >= 4, x >= 0``
+    samples with ``c₂ + σZ₂ < 0`` drove the mean of ``x₂`` to ~500).
+    """
+    if num_samples < 1 or (antithetic and num_samples % 2):
+        raise ValueError(
+            "num_samples must be >= 1, and even when antithetic=True"
+        )
+    if sigma <= 0:
+        raise ValueError("sigma must be > 0")
+    solve_fn = make_solver(lp, **settings)
+    pattern = solve_fn.pattern
+    batched = jax.vmap(
+        lambda c, v: solve_fn(v._replace(c=c)).solution.primal, in_axes=(0, None)
+    )
+
+    def noise(key, c):
+        if antithetic:
+            half = jax.random.normal(key, (num_samples // 2,) + c.shape, c.dtype)
+            return jnp.concatenate([half, -half])
+        return jax.random.normal(key, (num_samples,) + c.shape, c.dtype)
+
+    def forward(c, key, values):
+        z = noise(key, c)
+        xs = batched(c + sigma * z, values)
+        return xs.mean(axis=0), (xs, z)
+
+    def backward(residuals, g):
+        xs, z = residuals
+        # gᵀ J = E[(g · x*(c + σZ)) Z] / σ. No gradient for the key or the
+        # LP's other numbers.
+        grad_c = jnp.mean((xs @ g)[:, None] * z, axis=0) / sigma
+        return grad_c, None, None
+
+    @jax.custom_vjp
+    def perturbed(c, key, values):
+        return forward(c, key, values)[0]
+
+    perturbed.defvjp(forward, backward)
+
+    def x_fn(c, key, values=None):
+        v = pattern.values() if values is None else _pad_values(values, pattern)
+        return perturbed(jnp.asarray(c, v.c.dtype), key, v)
+
+    x_fn.pattern = pattern
+    return x_fn
+
+
+def make_solution(lp, active_tol=1e-6, **settings):
+    """
+    The LP's solution ``x*`` as a function of its numbers, differentiable by
+    implicit differentiation of the active constraints.
+
+    Returns ``x_fn(values=None) -> x*`` (``values`` an ``LPValues``, ``lp``'s
+    own when omitted). At a nondegenerate vertex the active constraints
+    determine ``x*``: the equality rows and the inequality rows within
+    ``active_tol`` of tight, restricted to the variables not within
+    ``active_tol`` of a bound, form a square matrix ``M``. A VJP solves
+    ``Mᵀλ = g`` once and gives
+
+    * ``b``: ``λ`` on the active rows, 0 elsewhere;
+    * ``A_ij``: ``−λ_i x*_j``;
+    * the bound each variable sits at: ``(g − Aᵀλ)_j``;
+    * ``c``: 0. An LP's solution is piecewise constant in its cost, so this is
+      exact but rarely useful; ``make_perturbed_solution`` gives a smoothed
+      ``dx*/dc``.
+
+    ``active_tol`` is relative (``|x − bound| <= active_tol·(1 + |bound|)``,
+    likewise for row slacks), so solve to tolerances well below it. The
+    derivative is undefined unless the solution is a nondegenerate vertex;
+    the VJP fails when the active set is not square (a degenerate vertex, or
+    a point inside an optimal face, which first-order methods often return on
+    degenerate LPs) or ``M`` is singular. The ``ValueError`` explaining which
+    is raised in a host callback, so JAX surfaces it wrapped in a
+    ``JaxRuntimeError`` whose message contains the original. The solve
+    of ``Mᵀλ = g`` runs on the host with scipy (``jax.pure_callback``), so
+    under ``vmap`` the members' VJPs run one after another.
+    """
+    import scipy.sparse.linalg as spla
+
+    solve_fn = make_solver(lp, **settings)
+    pattern = solve_fn.pattern
+    n_eq = pattern.n_eq
+    m, n = pattern.A.shape
+    a_rows = np.asarray(pattern.A.indices[:, 0])
+    a_cols = np.asarray(pattern.A.indices[:, 1])
+    # A row with no stored entries (e.g. the 0 = 0 row padding an empty
+    # block) never constrains x, so it is never active.
+    row_has_entries = jnp.asarray(np.bincount(a_rows, minlength=m) > 0)
+    eq_rows, eq_cols = pattern.A_eq.indices[:, 0], pattern.A_eq.indices[:, 1]
+    ineq_rows, ineq_cols = pattern.A_ineq.indices[:, 0], pattern.A_ineq.indices[:, 1]
+
+    def host_lambda(a_data, basic, active_rows, g):
+        basic = np.asarray(basic, bool)
+        active_rows = np.asarray(active_rows, bool)
+        n_basic, n_active = int(basic.sum()), int(active_rows.sum())
+        if n_basic != n_active:
+            raise ValueError(
+                "make_solution: the solution is not a nondegenerate vertex "
+                f"({n_basic} variables off their bounds, {n_active} active rows), "
+                "so dx*/dθ is undefined there. Solve to tighter tolerances, "
+                "adjust active_tol, or use make_perturbed_solution."
+            )
+        lam = np.zeros(m, np.asarray(g).dtype)
+        if n_basic:
+            A = sp.csr_matrix((np.asarray(a_data), (a_rows, a_cols)), shape=(m, n))
+            M = A[np.flatnonzero(active_rows)][:, np.flatnonzero(basic)].tocsc()
+            try:
+                lam_active = spla.splu(M.T.tocsc()).solve(np.asarray(g)[basic])
+            except RuntimeError as exc:
+                raise ValueError(
+                    "make_solution: the active-constraint matrix is singular"
+                ) from exc
+            lam[active_rows] = lam_active
+        return lam
+
+    def forward(values):
+        padded = _pad_values(values, pattern)
+        x = solve_fn(padded).solution.primal
+        return x, (values, padded, x)
+
+    def backward(residuals, g):
+        values, padded, x = residuals
+        lp_v = pattern.with_values(padded)
+        lower, upper = padded.lower_bounds, padded.upper_bounds
+        at_lower = jnp.isfinite(lower) & (
+            jnp.abs(x - lower) <= active_tol * (1 + jnp.abs(lower))
+        )
+        at_upper = (
+            jnp.isfinite(upper)
+            & (jnp.abs(x - upper) <= active_tol * (1 + jnp.abs(upper)))
+            & ~at_lower
+        )
+        basic = ~(at_lower | at_upper)
+        slack = lp_v.A @ x - lp_v.b
+        active_rows = row_has_entries & (
+            (jnp.arange(m) < n_eq)
+            | (jnp.abs(slack) <= active_tol * (1 + jnp.abs(lp_v.b)))
+        )
+        lam = jax.pure_callback(
+            host_lambda,
+            jax.ShapeDtypeStruct((m,), x.dtype),
+            lp_v.A.data,
+            basic,
+            active_rows,
+            g,
+            vmap_method="sequential",
+        )
+        w = g - lp_v.A_T @ lam
+        lam_eq, lam_ineq = lam[:n_eq], lam[n_eq:]
+        grad = LPValues(
+            c=jnp.zeros_like(x),
+            A_eq_data=-lam_eq[eq_rows] * x[eq_cols],
+            b_eq=lam_eq[..., : values.b_eq.shape[-1]],
+            A_ineq_data=-lam_ineq[ineq_rows] * x[ineq_cols],
+            b_ineq=lam_ineq[..., : values.b_ineq.shape[-1]],
+            lower_bounds=jnp.where(at_lower, w, 0.0),
+            upper_bounds=jnp.where(at_upper, w, 0.0),
+        )
+        return (jax.tree.map(lambda t, v: t.astype(jnp.asarray(v).dtype), grad, values),)
+
+    @jax.custom_vjp
+    def solution(values):
+        return forward(values)[0]
+
+    solution.defvjp(forward, backward)
+
+    def x_fn(values=None):
+        return solution(pattern.values() if values is None else values)
+
+    x_fn.pattern = pattern
+    return x_fn
 
 
 # %%

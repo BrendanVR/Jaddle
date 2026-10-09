@@ -1,5 +1,7 @@
 """Tests for the LP solver, jaddle.jaddle_linear."""
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 import scipy.sparse as sp
@@ -350,3 +352,262 @@ def test_solve_with_polishing_epoch_budget():
     )
     assert result["stop_reason"] == "max_epochs"
     assert result["epochs"] == 3
+
+
+@pytest.mark.parametrize(
+    "options",
+    [{}, {"update_mode": "pdhg"}, {"update_mode": "halpern"}, {"scale": False}],
+)
+def test_make_solver_matches_solve(options):
+    # One traced solve reproduces solve() exactly (CPU, float64).
+    lp = random_lp()
+    tolerances = dict(
+        primal_feasibility_tolerance=TOL,
+        dual_feasibility_tolerance=TOL,
+        dual_gap_tolerance=TOL,
+    )
+    reference = jl.solve(lp, **tolerances, **options)
+    result = jax.jit(jl.make_solver(lp, **tolerances, **options))()
+    assert int(result.epochs) == reference["epochs"]
+    for a, b in zip(result.solution, reference["solution"]):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+
+def test_make_solver_vmap_batch():
+    # Batch over the cost, matrix values and right-hand sides: every member
+    # certifies and matches HiGHS. (Members are not bit-identical to separate
+    # solves: XLA rounds batched reductions differently, and the adaptive
+    # steps amplify it.)
+    lp = jl.to_jaddle_sparse(random_lp())
+    base = lp.values()
+    rng = np.random.default_rng(0)
+    size = 4
+
+    def jitter(v):
+        return v * (1 + 0.1 * rng.uniform(-1, 1, (size,) + v.shape))
+
+    batch = jl.LPValues(
+        c=jitter(base.c),
+        A_eq_data=jitter(base.A_eq_data),
+        b_eq=jitter(base.b_eq),
+        A_ineq_data=jitter(base.A_ineq_data),
+        b_ineq=jitter(base.b_ineq),
+        lower_bounds=np.broadcast_to(base.lower_bounds, (size,) + base.lower_bounds.shape),
+        upper_bounds=np.broadcast_to(base.upper_bounds, (size,) + base.upper_bounds.shape),
+    )
+    solve_fn = jl.make_solver(
+        lp,
+        primal_feasibility_tolerance=TOL,
+        dual_feasibility_tolerance=TOL,
+        dual_gap_tolerance=TOL,
+    )
+    result = jax.jit(jax.vmap(solve_fn))(batch)
+    assert np.asarray(result.converged).all()
+    for i in range(size):
+        member = lp.with_values(jax.tree.map(lambda a: a[i], batch))
+        member_lp = jl.LP(
+            c=np.asarray(member.c),
+            A_eq=getattr(jl, "__convert_to_scipy")(member.A_eq),
+            b_eq=np.asarray(member.b_eq),
+            A_ineq=getattr(jl, "__convert_to_scipy")(member.A_ineq),
+            b_ineq=np.asarray(member.b_ineq),
+            lower_bounds=np.asarray(member.lower_bounds),
+            upper_bounds=np.asarray(member.upper_bounds),
+        )
+        ref = reference_objective(member_lp)
+        obj = float(member.c @ result.solution.primal[i])
+        assert abs(obj - ref) / (1 + abs(ref)) < 10 * TOL
+
+
+def test_solve_batch_broadcasts_shared_fields():
+    # Only c and b_ineq batched; matrices, b_eq and bounds shared.
+    lp = random_lp()
+    base = jl.to_jaddle_sparse(lp).values()
+    costs = np.stack([np.asarray(base.c) * s for s in (1.0, 1.1, 0.9)])
+    rhs = np.stack([np.asarray(base.b_ineq) + d for d in (0.0, 0.05, 0.1)])
+    result = jl.solve_batch(
+        lp,
+        base._replace(c=costs, b_ineq=rhs),
+        primal_feasibility_tolerance=TOL,
+        dual_feasibility_tolerance=TOL,
+        dual_gap_tolerance=TOL,
+    )
+    assert result.solution.primal.shape == (3, base.c.shape[0])
+    assert np.asarray(result.converged).all()
+    for i in range(3):
+        member = jl.LP(
+            c=costs[i],
+            A_eq=lp.A_eq,
+            b_eq=lp.b_eq,
+            A_ineq=lp.A_ineq,
+            b_ineq=rhs[i],
+            lower_bounds=lp.lower_bounds,
+            upper_bounds=lp.upper_bounds,
+        )
+        ref = reference_objective(member)
+        obj = float(costs[i] @ result.solution.primal[i])
+        assert abs(obj - ref) / (1 + abs(ref)) < 10 * TOL
+
+
+def test_solve_batch_accepts_unpadded_values():
+    # toy_lp has no equality rows; its own values() must fit the padded pattern.
+    lp = toy_lp()
+    base = jl.to_jaddle_sparse(lp).values()
+    result = jl.solve_batch(lp, base._replace(c=np.stack([base.c, 2 * base.c])))
+    assert np.asarray(result.converged).all()
+
+
+def test_optimal_value_gradient_matches_finite_differences():
+    tight = dict(
+        primal_feasibility_tolerance=1e-10,
+        dual_feasibility_tolerance=1e-10,
+        dual_gap_tolerance=1e-10,
+    )
+    lp = random_lp()
+    jlp = jl.to_jaddle_sparse(lp)
+    values = jlp.values()
+    value_fn = jl.make_optimal_value(jlp, **tight)
+    assert abs(float(value_fn(values)) - reference_objective(lp)) < 1e-8
+    grad = jax.grad(value_fn)(values)
+    to_scipy = getattr(jl, "__convert_to_scipy")
+
+    def highs_value(v):
+        m = jlp.with_values(v)
+        return reference_objective(
+            jl.LP(
+                np.asarray(m.c),
+                to_scipy(m.A_eq),
+                np.asarray(m.b_eq),
+                to_scipy(m.A_ineq),
+                np.asarray(m.b_ineq),
+                np.asarray(m.lower_bounds),
+                np.asarray(m.upper_bounds),
+            )
+        )
+
+    # The value is piecewise linear, so a small central difference that keeps
+    # the optimal basis is exact. Check each field's largest entry.
+    h = 1e-5
+    for field in jl.LPValues._fields:
+        g = np.asarray(getattr(grad, field))
+        k = int(np.argmax(np.abs(g)))
+        arr = np.asarray(getattr(values, field))
+        if not np.isfinite(arr[k]):
+            continue
+
+        def bumped(d):
+            a = arr.copy()
+            a[k] += d
+            return values._replace(**{field: a})
+
+        fd = (highs_value(bumped(h)) - highs_value(bumped(-h))) / (2 * h)
+        assert abs(fd - g[k]) <= 1e-6 * (1 + abs(fd)), field
+
+
+def test_optimal_value_gradient_vmaps():
+    lp = jl.to_jaddle_sparse(random_lp())
+    base = lp.values()
+    value_fn = jl.make_optimal_value(
+        lp,
+        primal_feasibility_tolerance=TOL,
+        dual_feasibility_tolerance=TOL,
+        dual_gap_tolerance=TOL,
+    )
+    costs = np.stack([np.asarray(base.c), 1.2 * np.asarray(base.c)])
+    grads = jax.vmap(jax.grad(lambda c: value_fn(base._replace(c=c))))(costs)
+    # dz*/dc = x*: each row is that member's optimal primal.
+    for i in range(2):
+        x = jl.make_solver(
+            lp,
+            primal_feasibility_tolerance=TOL,
+            dual_feasibility_tolerance=TOL,
+            dual_gap_tolerance=TOL,
+        )(base._replace(c=costs[i])).solution.primal
+        np.testing.assert_allclose(grads[i], x, atol=1e-4)
+
+
+def test_perturbed_solution_matches_closed_form():
+    # min c.x over {x1 + x2 = 4, x >= 0}: x1* = 4 [c1 < c2], so the perturbed
+    # solution is x1 = 4 Φ((c2 - c1) / (σ√2)), with a closed-form derivative.
+    from scipy.stats import norm
+
+    lp = small_lp([3, 2], A_eq=[[1, 1]], b_eq=[4])
+    sigma = 1.0
+    x_fn = jl.make_perturbed_solution(
+        lp,
+        sigma=sigma,
+        num_samples=2048,
+        primal_feasibility_tolerance=1e-6,
+        dual_feasibility_tolerance=1e-6,
+        dual_gap_tolerance=1e-6,
+        max_epochs=200,
+    )
+    c = np.array([3.0, 2.0])
+    key = jax.random.PRNGKey(0)
+    d = (c[1] - c[0]) / (sigma * np.sqrt(2))
+    x1 = 4 * norm.cdf(d)
+    dx1 = 4 * norm.pdf(d) / (sigma * np.sqrt(2))
+    x = jax.jit(x_fn)(c, key)
+    jac = jax.jit(jax.jacrev(x_fn))(c, key)
+    np.testing.assert_allclose(x, [x1, 4 - x1], atol=0.05)
+    np.testing.assert_allclose(jac[0], [-dx1, dx1], atol=0.1)
+
+
+def test_solution_vjp_matches_finite_differences():
+    tight = dict(
+        primal_feasibility_tolerance=1e-11,
+        dual_feasibility_tolerance=1e-11,
+        dual_gap_tolerance=1e-11,
+    )
+    lp = jl.to_jaddle_sparse(random_lp())
+    values = lp.values()
+    to_scipy = getattr(jl, "__convert_to_scipy")
+
+    def highs_x(v):
+        m = lp.with_values(v)
+        res = linprog(
+            np.asarray(m.c),
+            A_ub=to_scipy(m.A_ineq),
+            b_ub=np.asarray(m.b_ineq),
+            A_eq=to_scipy(m.A_eq),
+            b_eq=np.asarray(m.b_eq),
+            bounds=[
+                (lo, None if np.isinf(hi) else hi)
+                for lo, hi in zip(np.asarray(m.lower_bounds), np.asarray(m.upper_bounds))
+            ],
+            method="highs-ds",
+        )
+        return res.x
+
+    x_fn = jl.make_solution(lp, **tight)
+    g = np.random.default_rng(1).standard_normal(values.c.shape[0])
+    vjp = jax.grad(lambda v: jnp.dot(x_fn(v), g))(values)
+    assert not np.any(np.asarray(vjp.c))  # x* is piecewise constant in c
+    h = 1e-6
+    for field in jl.LPValues._fields[1:]:
+        gv = np.asarray(getattr(vjp, field))
+        k = int(np.argmax(np.abs(gv)))
+        arr = np.asarray(getattr(values, field))
+
+        def bumped(d):
+            a = arr.copy()
+            a[k] += d
+            return values._replace(**{field: a})
+
+        fd = g @ (highs_x(bumped(h)) - highs_x(bumped(-h))) / (2 * h)
+        assert abs(fd - gv[k]) <= 1e-6 * (1 + abs(fd)), field
+
+
+def test_solution_vjp_rejects_optimal_face():
+    # Every point of x1 + x2 = 1, x >= 0 is optimal; PDHG returns its middle,
+    # where dx*/dθ is undefined.
+    lp = small_lp([1, 1], [[-1, -1]], [-1])
+    x_fn = jl.make_solution(
+        lp,
+        primal_feasibility_tolerance=1e-10,
+        dual_feasibility_tolerance=1e-10,
+        dual_gap_tolerance=1e-10,
+    )
+    np.testing.assert_allclose(x_fn(), [0.5, 0.5], atol=1e-6)
+    with pytest.raises(Exception, match="not a nondegenerate vertex"):
+        jax.grad(lambda v: x_fn(v).sum())(jl.to_jaddle_sparse(lp).values())
