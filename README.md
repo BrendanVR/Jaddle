@@ -98,8 +98,6 @@ can be combined, for example `pip install "jaddle[cuda12,examples]"`:
 | Extra | Installs | Used for |
 |---|---|---|
 | `cuda12`, `cuda13` | CUDA-enabled JAX | GPU execution. Choose the extra that matches your CUDA driver; see the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) for TPU and other platforms. |
-| `scip` | `pyscipopt` | Reading and presolving MPS files with SCIP (`jaddle.sciopt_helpers`) |
-| `glop` | `ortools` | Presolving with OR-Tools glop (`jaddle.glop_helpers`). Also requires building the helper with `tools/glop_presolve/build.sh`. |
 | `examples` | `matplotlib`, `scikit-learn` | The convex examples |
 | `test` | `pytest` | Running the test suite |
 | `dev` | `examples`, `test`, `build`, `twine` | Development and packaging |
@@ -191,9 +189,7 @@ subject to  A_eq   x  = b_eq
 
 where bounds may be infinite. Problems can be built directly from NumPy and
 SciPy sparse arrays with `jl.LP`. They can also be converted from MPS files
-through HiGHS (`highs_helpers.highs_to_standard_form_sparse`), SCIP
-(`sciopt_helpers.scip_to_standard_form_sparse`) or OR-Tools glop
-(`glop_helpers.glop_presolve`). Internally, constraint matrices are stored as
+through HiGHS (`highs_helpers.highs_to_standard_form_sparse`). Internally, constraint matrices are stored as
 JAX `BCOO` sparse arrays.
 
 The solver seeks a saddle point of the Lagrangian
@@ -522,10 +518,9 @@ these results are described in [`benchmarks/README.md`](https://github.com/Brend
 | [`jaddle/jaddle_basic_types.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_basic_types.py) | `SaddleState`, `JaddleCP`, `LP` and `JaddleLP` |
 | [`jaddle/jaddle_optimisers.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_optimisers.py) | Precision profiles and Optax saddle-point optimisers |
 | [`jaddle/presolve.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/presolve.py) | Defined-variable elimination and postsolve |
-| [`jaddle/highs_helpers.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/highs_helpers.py), [`sciopt_helpers.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/sciopt_helpers.py), [`glop_helpers.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/glop_helpers.py) | Converters and presolve interfaces for HiGHS, SCIP and OR-Tools glop |
+| [`jaddle/highs_helpers.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/highs_helpers.py) | HiGHS converters and presolve interface |
 | [`examples/`](https://github.com/BrendanVR/Jaddle/blob/main/examples/README.md) | Worked LP and convex examples |
 | [`benchmarks/`](https://github.com/BrendanVR/Jaddle/blob/main/benchmarks/README.md) | MIPLIB and convex benchmark harnesses |
-| [`tools/glop_presolve/`](https://github.com/BrendanVR/Jaddle/tree/main/tools/glop_presolve) | C++ helper exposing glop's presolver |
 | [`tests/`](https://github.com/BrendanVR/Jaddle/tree/main/tests) | Test suite (`pytest`) |
 
 ## License

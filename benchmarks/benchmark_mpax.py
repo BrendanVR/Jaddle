@@ -46,6 +46,7 @@ if not _IS_WORKER:
     os.environ["JAX_PLATFORMS"] = "cpu"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
+import argparse
 import csv
 import importlib.util
 import json
@@ -63,8 +64,15 @@ import jaddle.highs_helpers as hh
 import jaddle.presolve as presolve
 from jaddle.jaddle_basic_types import LP
 
-from benchmark import _fmt, discover_instances, presolved_lp
-from benchmark_sciopt import make_parser
+from benchmark import (
+    DATA_DIR,
+    REPO_ROOT,
+    _fmt,
+    add_cost_col_floor_flag,
+    add_jaddle_verbose_flag,
+    discover_instances,
+    presolved_lp,
+)
 
 SOLVERS = ("jaddle", "mpax")
 # A Jaddle solve may overrun max_seconds by up to one epoch before stopping
@@ -78,13 +86,98 @@ SGM_SHIFT_SECONDS = 10.0
 
 
 def parse_args():
-    # Jaddle's verbosity follows --verbose here unless set explicitly (None).
-    p = make_parser(
-        "Jaddle vs MPAX LP benchmark.",
-        "benchmark_mpax_results.csv",
-        jaddle_verbose=None,
-        jaddle_verbose_text="same as --verbose",
+    p = argparse.ArgumentParser(description="Jaddle vs MPAX LP benchmark.")
+    p.add_argument(
+        "--data-dir", default=DATA_DIR, help="Directory of .mps files to glob."
     )
+    p.add_argument(
+        "--only",
+        nargs="*",
+        default=None,
+        help="Problem names (without .mps) to restrict to. Default: all in data-dir.",
+    )
+    p.add_argument(
+        "--max-mb",
+        type=float,
+        default=None,
+        help="Skip .mps files larger than this many MB (default: no limit; huge "
+        "instances can OOM or run for very long).",
+    )
+    p.add_argument(
+        "--min-mb",
+        type=float,
+        default=0.0,
+        help="Skip .mps files smaller than this many MB (default 0; raise to "
+        "target larger LPs only).",
+    )
+    p.add_argument(
+        "--tol",
+        type=float,
+        default=1e-3,
+        help="Relative optimality tolerance for Jaddle (default 1e-3).",
+    )
+    p.add_argument(
+        "--max-epochs",
+        type=int,
+        default=None,
+        help="Cap Jaddle epochs (None = run to convergence).",
+    )
+    p.add_argument(
+        "--max-seconds",
+        type=float,
+        default=None,
+        help="Per-instance Jaddle wall-clock budget in seconds, incl. scaling/"
+        "setup and XLA compile (None = no limit). Checked at epoch boundaries, "
+        "so a solve can overrun by up to one epoch.",
+    )
+    p.add_argument(
+        "--csv",
+        default=os.path.join(REPO_ROOT, "benchmark_mpax_results.csv"),
+        help="Path to write CSV results.",
+    )
+    p.add_argument(
+        "--skip-bigm",
+        action="store_true",
+        help="Skip instances with a big-M / penalty COST structure. See "
+        "benchmarks/scan_bigm.py.",
+    )
+    p.add_argument(
+        "--skip-bigm-matrix",
+        action="store_true",
+        help="Skip instances with a big-M / penalty MATRIX structure. See "
+        "benchmarks/scan_bigm.py.",
+    )
+    p.add_argument(
+        "--skip-bigm-column",
+        action="store_true",
+        help="Skip instances with a big-M / penalty COLUMN structure. See "
+        "benchmarks/scan_bigm.py.",
+    )
+    p.add_argument(
+        "--eliminate-defined-vars",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="After presolve, substitute out variables defined by a dense "
+        "equality row (z = sum_j a_j x_j, e.g. gmut-*). On by default; "
+        "--no-eliminate-defined-vars disables it. See "
+        "jaddle.presolve.eliminate_defined_variables.",
+    )
+    p.add_argument(
+        "--update-mode",
+        default="alternating",
+        choices=["alternating", "pdhg", "halpern"],
+        help="Jaddle LP update_mode passed to jl.solve (default: alternating).",
+    )
+    p.add_argument(
+        "--jax-profile",
+        default="float64",
+        choices=["float64", "float32", "float16"],
+        help="JAX precision profile passed to jaddle_optimisers.configure_jax "
+        "(default: float64).",
+    )
+    add_cost_col_floor_flag(p)
+    # Jaddle's verbosity follows --verbose here unless set explicitly (None).
+    add_jaddle_verbose_flag(p, None, "same as --verbose")
     p.add_argument(
         "--solvers",
         nargs="+",

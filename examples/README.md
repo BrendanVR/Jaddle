@@ -21,7 +21,6 @@ python examples/lp/intro_example.py
 |---|---|---|
 | [`intro_example.py`](lp/intro_example.py) | The smallest end-to-end LP: build an `LP` from NumPy/SciPy arrays, call `jl.solve`, and read off the primal solution and objective. | — |
 | [`miplib_standard.py`](lp/miplib_standard.py) | Load a MIPLIB instance with HiGHS, relax integrality, convert it to Jaddle's sparse standard form with `highs_to_standard_form_sparse`, and solve it. | `highspy`, a MIPLIB `.mps` file |
-| [`miplib_standard_sciopt.py`](lp/miplib_standard_sciopt.py) | The same workflow using PySCIPOpt: read the relaxed model, run SCIP's presolve, convert with `scip_to_standard_form_sparse`, and add the presolve objective offset back to the reported objective. | `pyscipopt`, a MIPLIB `.mps` file |
 
 ### `intro_example.py`
 
@@ -38,19 +37,15 @@ l ≤ x ≤ u`, so the `≥` constraint is negated to become `-x1 - x2 ≤ -4`. 
 example runs on CPU because the problem is tiny. The expected answer is
 `x = (0, 4)` with objective `8`.
 
-### MIPLIB examples
+### `miplib_standard.py`
 
 The MPS files are **not** shipped with Jaddle. Download the instances you want
 from the [MIPLIB website](https://miplib.zib.de/) and put the `.mps` files in
-`data/` at the repo root. Both scripts read `data/<PROBLEM_NAME>.mps`; edit
-`PROBLEM_NAME` (or `PATH_TO_MPS`) at the top of the file to change instance.
+`data/` at the repo root. The script reads `data/<PROBLEM_NAME>.mps` (default
+`app1-2`, no presolve, `float64`); edit `PROBLEM_NAME` (or `PATH_TO_MPS`) at the
+top of the file to change instance.
 
-| Script | Default instance | Presolve | Precision |
-|---|---|---|---|
-| `miplib_standard.py` | `app1-2` | none | `float64` |
-| `miplib_standard_sciopt.py` | `stp3d` | SCIP | `float64` |
-
-Both scripts call `jl.lp_summary_statistics(lp)` before solving, which prints
+The script calls `jl.lp_summary_statistics(lp)` before solving, which prints
 the problem size and coefficient ranges. This is a good first check when an
 instance misbehaves. A GPU is strongly recommended for these.
 

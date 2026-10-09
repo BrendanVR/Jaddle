@@ -10,12 +10,10 @@ import matplotlib.pyplot as plt
 import jaddle.jaddle_convex as jc
 import jaddle.jaddle_optimisers as jo
 
-jo.configure_jax("float32")
-
 # %% [markdown]
 # ## Generate Synthetic Data
 # We will create synthetic data that follows a cubic relationship with some added noise.
-n = 5000
+n = 1000
 x = np.linspace(-1, 1, n)
 y = x**3
 y += 0.15 * np.random.randn(n)  # add noise

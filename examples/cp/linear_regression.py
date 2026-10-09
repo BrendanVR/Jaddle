@@ -1,7 +1,6 @@
 # %% [markdown]
 # # Linear Regression with Random Fourier Features
 # This notebook demonstrates how to perform linear regression using Random Fourier Features (RFF) to approximate a non-linear function. We will use Jaddle's convex optimization framework to solve the regression problem with L2 regularization.
-import optax
 import numpy as np
 import jax.numpy as jnp
 import jaddle.jaddle_convex as jc
@@ -22,7 +21,7 @@ y = 3 * np.sin(X) + 2 * np.cos(5 * X) + np.random.normal(0, 0.5, n_samples)
 # %%
 # Apply Random Fourier Features
 gamma = 10.0
-rbf_sampler = RBFSampler(gamma=gamma, n_components=500, random_state=42)
+rbf_sampler = RBFSampler(gamma=gamma, n_components=1000, random_state=42)
 X_transformed = rbf_sampler.fit_transform(X.reshape(-1, 1))
 
 # Convert to JAX arrays
@@ -38,7 +37,7 @@ def objective(w):
 
 
 def constraints_ineq(w):
-    return jnp.array([jnp.dot(w, w) - 100.0])  # L2 norm constraint (||w||^2 <= 100)
+    return jnp.array([jnp.dot(w, w) - 200.0])  # L2 norm constraint (||w||^2 <= 100)
 
 
 def constraints_eq(w):

@@ -4,13 +4,14 @@ Scripts for measuring Jaddle's solvers. They come in three kinds:
 
 | Kind | Scripts | Purpose |
 |---|---|---|
-| **LP harnesses** | [`benchmark.py`](benchmark.py), [`benchmark_sciopt.py`](benchmark_sciopt.py), [`benchmark_glop.py`](benchmark_glop.py) | Solve the LP relaxations of a directory of MIPLIB instances with `jaddle_linear.solve`, then write a CSV and a README-ready markdown table. They differ only in the presolver used, and in whether a reference optimum is computed. |
+| **LP harnesses** | [`benchmark.py`](benchmark.py), [`benchmark_mpax.py`](benchmark_mpax.py) | Solve the LP relaxations of a directory of MIPLIB instances with `jaddle_linear.solve`, then write a CSV and a README-ready markdown table. `benchmark_mpax.py` also runs [MPAX](https://github.com/MIT-Lu-Lab/MPAX) on the same presolved LPs for a head-to-head comparison. |
 | **Convex A/B suites** | [`benchmark_convex.py`](benchmark_convex.py), [`benchmark_convex_heavy.py`](benchmark_convex_heavy.py) | Compare `jaddle_convex.solve` configurations (update mode, adaptive step, restarts) on synthetic convex problems. |
 | **Instance diagnostics** | [`scan_bigm.py`](scan_bigm.py) | Flag MPS instances whose big-M structure is known to stall saddle-point solvers. The LP harnesses use it to skip those instances. |
 
 Run every script from the repo root as `python benchmarks/<script>.py`. The
-scripts import from each other (`benchmark_sciopt` imports `run_jaddle` from
-`benchmark`, and all the LP harnesses import the detectors from `scan_bigm`).
+scripts import from each other (`benchmark_mpax` imports its presolve and
+instance discovery from `benchmark`, and both LP harnesses import the detectors
+from `scan_bigm`).
 Python resolves these imports because it puts the script's own directory on
 `sys.path`.
 
@@ -27,23 +28,24 @@ The PDLP papers' reference set is the 383-instance list from FirstOrderLp.jl
 
 ## LP harnesses
 
-All three harnesses run Jaddle with the same settings (`jaddle_solve_kwargs` in
+Both harnesses run Jaddle with the same settings (`jaddle_solve_kwargs` in
 `benchmark.py`): `iterations_per_epoch=640`, `epochs_per_restart=10`, and the
 primal, dual and gap tolerances all set to `--tol`.
 
 `benchmark.py` hands each instance file to `jl.solve_with_presolve`: HiGHS
 presolve, the defined-variable elimination, Jaddle on the reduced LP, then
 postsolve of both the primal and the dual back to the original problem. The
-reported objective is the original one. `benchmark_sciopt.py` and
-`benchmark_glop.py` presolve with SCIP or glop, which offer no postsolve here,
-and solve the reduced LP with `run_jaddle`. They add the presolve's constant
-objective offset back so the reported objective refers to the full problem.
+reported objective is the original one. `benchmark_mpax.py` presolves each
+instance once (HiGHS plus the defined-variable elimination, or nothing with
+`--presolve none`), hands the identical reduced LP to both solvers in separate
+worker processes with the whole GPU, and re-checks every returned primal-dual
+pair with `jl.evaluate_lp_certificate` in the original units. Its header
+comment lists the remaining fairness choices.
 
 | Script | Presolve | Reference optimum | Default CSV |
 |---|---|---|---|
 | `benchmark.py` | HiGHS | Yes. A HiGHS solve (`simplex` by default) is used as a ground-truth objective oracle, and the relative gap to it is reported. | `benchmark_results.csv` |
-| `benchmark_sciopt.py` | SCIP (PySCIPOpt) | No | `benchmark_sciopt_results.csv` |
-| `benchmark_glop.py` | OR-Tools glop (PDLP's presolver and settings) | No | `benchmark_glop_results.csv` |
+| `benchmark_mpax.py` | HiGHS, or none | No. Both solvers are judged by the shared certificate re-check instead. | `benchmark_mpax_results.csv` |
 
 CSVs are written to the repo root. `benchmark.py` rewrites its CSV after every
 instance, so a crash partway through a sweep keeps the results so far. It also
@@ -65,19 +67,12 @@ python benchmarks/benchmark.py --tol 1e-4 --max-seconds 600
 # Jaddle only: skip the HiGHS reference solve (much faster on large LPs)
 python benchmarks/benchmark.py --highs-solver none
 
-# The same sweep with a different presolver
-python benchmarks/benchmark_sciopt.py --max-mb 50
-python benchmarks/benchmark_glop.py --skip-bigm --skip-bigm-column
+# Jaddle vs MPAX (needs `pip install mpax`)
+python benchmarks/benchmark_mpax.py --tol 1e-4 --max-seconds 600
+python benchmarks/benchmark_mpax.py --presolve none --no-eliminate-defined-vars
 ```
 
-`benchmark_glop.py` needs a small C++ helper, because the OR-Tools Python
-bindings don't expose glop's presolver. Build it once:
-
-```bash
-tools/glop_presolve/build.sh   # downloads the matching OR-Tools C++ release into third_party/
-```
-
-### Options shared by all three harnesses
+### Options shared by both harnesses
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -104,8 +99,13 @@ tools/glop_presolve/build.sh   # downloads the matching OR-Tools C++ release int
 | `benchmark.py` | `--highs-solver {simplex,ipm,pdlp,none}` | Solver for the reference optimum. Use `none` to skip it, in which case `rel_obj_gap` is NaN. The reference solve often takes longer than Jaddle's, so skip it for A/B runs if you already know the optima. |
 | `benchmark.py` | `--highs-kkt-tolerance X` | KKT tolerance for the reference solve (defaults to `--tol`). |
 | `benchmark.py` | `--highs-verbose` | Show HiGHS's own log. |
-| `benchmark_sciopt.py` | `--scip-verbose` | Show SCIP's presolve log. |
-| `benchmark_glop.py` | `--glop-verbose` | Show glop's presolve log. |
+| `benchmark_mpax.py` | `--solvers {jaddle,mpax} ...` | Run only some of the solvers (default: both). |
+| `benchmark_mpax.py` | `--presolve {highs,none}` | Presolve applied before both solvers. `none` solves the raw relaxation, as in the PDLP and MPAX papers. |
+| `benchmark_mpax.py` | `--mpax-algorithm {r2hpdhg,rapdhg}` | MPAX solver (default `r2hpdhg`). |
+| `benchmark_mpax.py` | `--mpax-norm {2,inf}` | Norm for MPAX's termination residuals (default `2`, matching Jaddle). |
+| `benchmark_mpax.py` | `--mpax-iteration-limit N` | Optional MPAX iteration cap. |
+| `benchmark_mpax.py` | `--startup-timeout S` | Seconds a worker may take to start and load the LP (default `600`). |
+| `benchmark_mpax.py` | `--verbose` | Stream both solvers' progress logs. `--jaddle-verbose` follows it unless set explicitly. |
 
 ### Reading the output
 
@@ -228,8 +228,8 @@ options will skip.
 
 ## Tips
 
-- **A/B comparisons:** pass `--highs-solver none` to `benchmark.py`, or use
-  the SCIP or glop harness, so the reference solve doesn't dominate wall time.
+- **A/B comparisons:** pass `--highs-solver none` to `benchmark.py` so the
+  reference solve doesn't dominate wall time.
 - **GPU nondeterminism:** identical GPU runs can differ by several epochs,
   because scatter-add order varies. Repeat both arms before trusting a small
   difference in epoch counts.

@@ -42,7 +42,7 @@ lp = jl.LP(
 
 # %% [markdown]
 # ## Solving the LP Problem
-solution = jl.solve(lp, verbose=True)["solution"]
+solution = jl.solve(lp, dual_gap_tolerance=1e-6)["solution"]
 # %%
 print(f"x1 = {solution.primal[0]:.4f}, x2 = {solution.primal[1]:.4f}")
 print(f"Optimal objective value: {lp.objective(solution.primal):.4f}")

@@ -8,8 +8,6 @@
 .vscode
 *.csv
 /useful_stuff/third_party
-/tools/glop_presolve/build
-/third_party
 /dist
 .pytest_cache
 __pycache__
