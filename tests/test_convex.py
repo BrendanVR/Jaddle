@@ -249,3 +249,114 @@ def test_solution_vjp_is_nan_when_undefined():
     np.testing.assert_allclose(grad_sum, 0.0, atol=1e-9)
     grad = jax.grad(lambda c: x_fn(c)[0])(jnp.array([1.0, 1.0]))
     assert np.all(np.isnan(np.asarray(grad)))
+
+
+QP_TOLS = dict(
+    primal_feasibility_tolerance=1e-7,
+    dual_feasibility_tolerance=1e-7,
+    dual_gap_tolerance=1e-7,
+)
+
+
+def simplex_qp(n=50, seed=0):
+    # simplex_problem as matrices: sum (x - a)^2 = ½ xᵀ(2I)x - 2aᵀx + const.
+    a = np.random.default_rng(seed).standard_normal(n)
+    qp = dict(
+        Q=2.0 * np.eye(n),
+        c=-2.0 * a,
+        A_eq=np.ones((1, n)),
+        b_eq=np.ones(1),
+        lower_bounds=np.zeros(n),
+    )
+    return qp, project_onto_simplex(a)
+
+
+def solve_qp(qp, **kwargs):
+    kwargs.setdefault("max_epochs", 300)
+    return jc.quadratic_program(**qp, iterations_per_epoch=200, **QP_TOLS, **kwargs)
+
+
+def assert_qp_certified(result, tol=2e-7):
+    assert result["converged"]
+    # The certificate is recomputed from the unscaled matrices.
+    cert = result["certificate"]
+    assert cert["relative_primal_feasibility_residual"] <= tol
+    assert cert["relative_dual_feasibility_residual"] <= tol
+    assert cert["relative_gap"] <= tol
+
+
+@pytest.mark.parametrize("scaled", [True, False])
+def test_quadratic_program(scaled):
+    qp, expected = simplex_qp()
+    options = {} if scaled else dict(ruiz_iterations=0, pc_iterations=0)
+    result = solve_qp(qp, **options)
+    assert_qp_certified(result)
+    s = result["solution"]
+    np.testing.assert_allclose(s.primal, expected, atol=1e-5)
+    assert s.dual_eq.shape == (1,)
+    assert s.dual_ineq.shape == (0,)
+    objective = float(expected @ expected + qp["c"] @ expected)
+    assert abs(result["objective"] - objective) <= 1e-5 * (1 + abs(objective))
+
+
+def test_quadratic_program_inequality_rows():
+    # Box-constrained isotonic regression, with sparse inequality rows.
+    import scipy.sparse as sp
+
+    n = 60
+    y = np.linspace(-1, 1, n) ** 3 + 0.15 * np.random.default_rng(0).standard_normal(n)
+    difference = sp.diags([np.ones(n - 1), -np.ones(n - 1)], [0, 1], shape=(n - 1, n))
+    result = solve_qp(
+        dict(
+            Q=2.0 * sp.identity(n),
+            c=-2.0 * y,
+            A_ineq=difference,
+            b_ineq=np.zeros(n - 1),
+            lower_bounds=-np.ones(n),
+            upper_bounds=np.ones(n),
+        )
+    )
+    assert_qp_certified(result)
+    np.testing.assert_allclose(
+        result["solution"].primal, isotonic_fit(y, -1.0, 1.0), atol=1e-4
+    )
+
+
+def test_quadratic_program_is_scale_invariant():
+    # The same problem in variables x = S z, with its row rescaled: unusable
+    # as given, and the scaling recovers it, duals included.
+    qp, expected = simplex_qp()
+    reference = solve_qp(qp)
+    rng = np.random.default_rng(1)
+    s = 10.0 ** rng.uniform(-2, 2, expected.size)
+    row = 1e3
+    rescaled = dict(
+        Q=qp["Q"] * np.outer(s, s),
+        c=qp["c"] * s,
+        A_eq=row * qp["A_eq"] * s,
+        b_eq=row * qp["b_eq"],
+        lower_bounds=qp["lower_bounds"] / s,
+    )
+    result = solve_qp(rescaled)
+    assert_qp_certified(result)
+    np.testing.assert_allclose(s * result["solution"].primal, expected, atol=1e-5)
+    np.testing.assert_allclose(
+        row * result["solution"].dual_eq, reference["solution"].dual_eq, atol=1e-4
+    )
+    unscaled = solve_qp(rescaled, ruiz_iterations=0, pc_iterations=0, max_epochs=20)
+    assert not unscaled["converged"]
+
+
+def test_quadratic_program_warm_start():
+    qp, _ = simplex_qp()
+    cold = solve_qp(qp)
+    warm = solve_qp(
+        qp, initial_solution=cold["solution"], initial_opt_state=cold["opt_state"]
+    )
+    assert_qp_certified(warm)
+    assert warm["epochs"] == 1
+
+
+def test_quadratic_program_rejects_asymmetric_Q():
+    with pytest.raises(ValueError, match="symmetric"):
+        jc.quadratic_program(Q=np.array([[1.0, 1.0], [0.0, 1.0]]), c=np.zeros(2))

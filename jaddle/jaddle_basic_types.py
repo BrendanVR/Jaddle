@@ -41,6 +41,7 @@ class JaddleCP:
         lower_bounds,
         upper_bounds,
         dual_bound=None,
+        residuals=None,
     ):
         self.num_variables = num_variables
         self.objective = objective
@@ -49,6 +50,10 @@ class JaddleCP:
         self.lower_bounds = lower_bounds
         self.upper_bounds = upper_bounds
         self.dual_bound = dual_bound
+        # Optional ``residuals(state) -> (stationarity, feasibility,
+        # complementarity)``: replaces the three quantities the solver tests
+        # for convergence, for a problem with a better certificate of its own.
+        self.residuals = residuals
 
     def initial_primal_solution(self):
         return jnp.zeros(self.num_variables)

@@ -492,6 +492,53 @@ least a nonsingular KKT system); where the system can't be solved, the
 gradient is NaN. Both are checked against closed forms and finite differences
 in the tests.
 
+### Quadratic programs
+
+`solve` sees a problem only through its functions, so it cannot scale one. For
+a quadratic program the matrices are known, and `jc.quadratic_program` uses
+them:
+
+```python
+result = jc.quadratic_program(
+    Q, c,                       # minimise ½ xᵀQx + cᵀx
+    A_eq=A_eq, b_eq=b_eq,       # A_eq x = b_eq
+    A_ineq=A_ineq, b_ineq=b_ineq,  # A_ineq x <= b_ineq
+    lower_bounds=l, upper_bounds=u,
+)
+x = result["solution"].primal
+```
+
+`Q` is symmetric positive semidefinite, the matrices are NumPy arrays or SciPy
+sparse matrices, and any constraint block or bound can be left out. The
+function equilibrates the KKT matrix `[[Q, Aᵀ], [A, 0]]` symmetrically with
+Ruiz and Pock–Chambolle sweeps (`ruiz_iterations`, `pc_iterations`, as in the
+LP solver), solves the scaled problem with `solve`, and maps the solution and
+its duals back. Other keyword arguments go to `solve`.
+
+It stops on the LP solver's certificate, in the problem's own units whatever
+the scaling: `primal_feasibility_tolerance`, `dual_feasibility_tolerance` and
+`dual_gap_tolerance` (default `1e-3`) bound the relative primal residual, dual
+residual and duality gap. `result["certificate"]` reports the three,
+recomputed from the unscaled matrices.
+
+Scaling is what makes badly scaled problems solvable. On synthetic QPs with
+200 variables and 80 constraint rows, at a tolerance of `1e-6` with 200
+iterations per epoch:
+
+| Problem | As given | Scaled |
+|---|---|---|
+| `Q` with condition number 10 | 1 epoch | 1 epoch |
+| `Q` with condition number 1e4 | 29% from the optimum after 200 epochs | 16 epochs |
+| Condition number 10, variables and rows rescaled by up to 1e±2 | 30% from the optimum after 200 epochs | 1 epoch |
+
+In the second row the variable scales come out nearly uniform, so the gain is
+from balancing `Q`'s entries (up to 1.7e3) against `A`'s (up to 3.7), which
+the primal weight alone does not do.
+
+The stopping test is supplied through `JaddleCP`'s optional `residuals`
+argument, a function of the solver state that returns the three quantities
+`solve` tests. Any problem with a better certificate of its own can use it.
+
 ## Numerical precision
 
 Call `jaddle.jaddle_optimisers.configure_jax(profile)` before creating any
