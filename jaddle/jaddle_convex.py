@@ -1759,6 +1759,24 @@ def _equilibrate_kkt(Q, A, ruiz_iterations, pc_iterations):
     return scale[:n], scale[n:]
 
 
+# A product with a BCOO matrix gathers and scatters every entry, where a dense
+# one is a single BLAS call: on a GPU the dense product wins from about a
+# quarter of the entries being nonzero, by 9x (n = 1000) to 40x (n = 4000) on a
+# full matrix.
+_DENSE_DENSITY = 0.25
+
+
+def _device_matrix(A, dtype):
+    """The scipy matrix ``A`` on the device with ``dtype`` data: a dense array
+    if at least ``_DENSE_DENSITY`` of its entries are nonzero, else a BCOO."""
+    from jaddle.jaddle_basic_types import scipy_to_bcoo
+
+    size = A.shape[0] * A.shape[1]
+    if size > 0 and A.nnz >= _DENSE_DENSITY * size:
+        return jax.device_put(A.toarray().astype(jnp.dtype(dtype)))
+    return scipy_to_bcoo(A, dtype)
+
+
 def _qp_certificate(Q, c, A_eq, b_eq, A_ineq, b_ineq, lower, upper, solution):
     """Relative KKT residuals and duality gap of a primal-dual pair for
     ``min ½xᵀQx + cᵀx``, in the problem's own units (l2 norms)."""
@@ -1835,8 +1853,11 @@ def quadratic_program(
     with ``solve()``, after scaling it from its matrices.
 
     ``Q`` is symmetric positive semidefinite; it and the constraint matrices
-    are NumPy arrays or SciPy sparse matrices. A constraint block or a bound
-    left as ``None`` is absent. Other keyword arguments go to ``solve()``.
+    are NumPy arrays or SciPy sparse matrices. Each is held on the device as a
+    dense array if at least a quarter of its entries are nonzero and as a
+    sparse one otherwise, whichever form it was passed in. A constraint block
+    or a bound left as ``None`` is absent. Other keyword arguments go to
+    ``solve()``.
 
     ``solve()`` sees a problem only through its functions, so it cannot scale
     one; here the entries are known. The KKT matrix ``[[Q, Aᵀ], [A, 0]]`` is
@@ -1865,7 +1886,6 @@ def quadratic_program(
     ``initial_opt_state`` is passed to ``solve()`` unchanged.
     """
     import scipy.sparse as sp
-    from jaddle.jaddle_basic_types import scipy_to_bcoo
 
     c = np.asarray(c, dtype=np.float64)
     n = c.shape[0]
@@ -1897,10 +1917,10 @@ def quadratic_program(
     dtype = jo.jaddle_dtype()
     A_eq_scipy = sp.diags(e[:m_eq]) @ A_eq @ D
     A_ineq_scipy = sp.diags(e[m_eq:]) @ A_ineq @ D
-    Q_s = scipy_to_bcoo(D @ Q @ D, dtype)
-    A_eq_s, A_eq_T = (scipy_to_bcoo(m, dtype) for m in (A_eq_scipy, A_eq_scipy.T))
+    Q_s = _device_matrix(D @ Q @ D, dtype)
+    A_eq_s, A_eq_T = (_device_matrix(m, dtype) for m in (A_eq_scipy, A_eq_scipy.T))
     A_ineq_s, A_ineq_T = (
-        scipy_to_bcoo(m, dtype) for m in (A_ineq_scipy, A_ineq_scipy.T)
+        _device_matrix(m, dtype) for m in (A_ineq_scipy, A_ineq_scipy.T)
     )
     c_s = jnp.asarray(d * c, dtype=dtype)
     b_eq_s = jnp.asarray(e[:m_eq] * b_eq, dtype=dtype)

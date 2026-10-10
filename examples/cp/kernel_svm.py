@@ -9,6 +9,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import jaddle.jaddle_convex as jc
 import jaddle.jaddle_optimisers as jo
+from sklearn.svm import SVC
+import time
 
 jo.configure_jax("float64")
 
@@ -16,7 +18,7 @@ jo.configure_jax("float64")
 # ## Generate Synthetic Data
 # Two interleaved half-moons, one per class, with labels `y` in {-1, +1}.
 rng = np.random.default_rng(0)
-n = 500
+n = 1000
 theta = rng.uniform(0, np.pi, n // 2)
 upper_moon = np.column_stack([np.cos(theta), np.sin(theta)])
 lower_moon = np.column_stack([1 - np.cos(theta), 0.5 - np.sin(theta)])
@@ -41,7 +43,7 @@ def rbf_kernel(A, B, gamma):
     return np.exp(-gamma * squared_distances)
 
 
-C = 1.0
+C = 10.0
 gamma = 2.0
 Q = np.outer(y, y) * rbf_kernel(X, X, gamma)
 
@@ -61,6 +63,14 @@ result = jc.quadratic_program(
 alpha = np.asarray(result["solution"].primal)
 # The intercept is the multiplier of the constraint yᵀα = 0.
 intercept = float(result["solution"].dual_eq[0])
+
+# %%
+start_time = time.time()
+sklearn_svm = SVC(kernel="rbf", C=C, gamma=gamma)
+sklearn_svm.fit(X, y)
+end_time = time.time()
+print("Sklearn SVM training time:", end_time - start_time)
+print("Sklearn SVM training accuracy:", sklearn_svm.score(X, y))
 
 
 # %% [markdown]

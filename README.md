@@ -509,7 +509,10 @@ x = result["solution"].primal
 ```
 
 `Q` is symmetric positive semidefinite, the matrices are NumPy arrays or SciPy
-sparse matrices, and any constraint block or bound can be left out. The
+sparse matrices, and any constraint block or bound can be left out. Each
+matrix is held on the device as a dense array if at least a quarter of its
+entries are nonzero and as a sparse one otherwise, so a full `Q` (a kernel
+matrix, say) costs one dense product per gradient. The
 function equilibrates the KKT matrix `[[Q, Aᵀ], [A, 0]]` symmetrically with
 Ruiz and Pock–Chambolle sweeps (`ruiz_iterations`, `pc_iterations`, as in the
 LP solver), solves the scaled problem with `solve`, and maps the solution and

@@ -1,10 +1,13 @@
 """Tests for the convex solver, jaddle.jaddle_convex."""
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental.sparse import BCOO
 
 import jaddle.jaddle_convex as jc
+import jaddle.jaddle_optimisers as jo
 
 TOLS = dict(
     primal_grad_norm_tolerance=1e-6,
@@ -355,6 +358,40 @@ def test_quadratic_program_warm_start():
     )
     assert_qp_certified(warm)
     assert warm["epochs"] == 1
+
+
+def test_quadratic_program_dense_and_sparse_storage_agree(monkeypatch):
+    # A full Q is held as a dense array, a sparse one as a BCOO; forcing the
+    # full one through the BCOO path gives the same solution.
+    import scipy.sparse as sp
+
+    n = 40
+    rng = np.random.default_rng(0)
+    factor = rng.standard_normal((n, n))
+    qp = dict(
+        Q=factor @ factor.T / n + np.eye(n),
+        c=rng.standard_normal(n),
+        A_eq=np.ones((1, n)),
+        b_eq=np.ones(1),
+        lower_bounds=np.zeros(n),
+        upper_bounds=np.ones(n),
+    )
+    dtype = jo.jaddle_dtype()
+    assert isinstance(jc._device_matrix(sp.csr_matrix(qp["Q"]), dtype), jax.Array)
+    assert isinstance(jc._device_matrix(sp.identity(n, format="csr"), dtype), BCOO)
+    assert isinstance(jc._device_matrix(sp.csr_matrix((0, n)), dtype), BCOO)
+
+    dense = solve_qp(qp)
+    monkeypatch.setattr(jc, "_DENSE_DENSITY", np.inf)
+    sparse = solve_qp(qp)
+    assert_qp_certified(dense)
+    assert_qp_certified(sparse)
+    np.testing.assert_allclose(
+        dense["solution"].primal, sparse["solution"].primal, atol=1e-5
+    )
+    np.testing.assert_allclose(
+        dense["solution"].dual_eq, sparse["solution"].dual_eq, atol=1e-5
+    )
 
 
 def test_quadratic_program_rejects_asymmetric_Q():
