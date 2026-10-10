@@ -21,6 +21,7 @@ python examples/lp/intro_example.py
 |---|---|---|
 | [`intro_example.py`](lp/intro_example.py) | The smallest end-to-end LP: build an `LP` from NumPy/SciPy arrays, call `jl.solve`, and read off the primal solution and objective. | — |
 | [`miplib_standard.py`](lp/miplib_standard.py) | Load a MIPLIB instance with HiGHS, relax integrality, convert it to Jaddle's sparse standard form with `highs_to_standard_form_sparse`, and solve it. | `highspy`, a MIPLIB `.mps` file |
+| [`battery_sizing.py`](lp/battery_sizing.py) | Batched, differentiable solves: size a battery by gradient descent, where each step solves 32 daily operating LPs at once with `jax.vmap` and differentiates their optimal costs with `jl.make_optimal_value`. Checks the result against one large LP solved by HiGHS and plots the design's convergence and a day's schedule. | `matplotlib` |
 
 ### `intro_example.py`
 
@@ -49,6 +50,21 @@ The script calls `jl.lp_summary_statistics(lp)` before solving, which prints
 the problem size and coefficient ranges. This is a good first check when an
 instance misbehaves. A GPU is strongly recommended for these.
 
+### `battery_sizing.py`
+
+A site with solar panels buys a battery of some energy capacity (kWh) and
+power rating (kW). Operating it for a day at least cost is an LP, and the
+size appears only in that LP's upper bounds. The example minimises the
+battery's daily cost plus the average optimal operating cost over 32 scenario
+days, each with its own prices, demand and solar output.
+
+The gradient of an LP's optimal value with respect to a bound is the reduced
+cost there, so `jax.grad` of the batched `jl.make_optimal_value` gives the
+design's gradient without differentiating through the solver. Forty Adam steps
+bring the daily cost from $6.02 with no battery to $3.51, within 0.1% of the
+exact optimum from HiGHS (14.2 kWh against 14.7 kWh; the cost is flat near
+the optimum). It takes about 35 seconds on a CPU.
+
 ## Convex programs (`cp/`)
 
 A convex program is defined by a `JaddleCP`: a JAX-traceable objective, a
@@ -59,9 +75,12 @@ residuals (`≤ 0`), and box bounds. Jaddle differentiates them automatically.
 |---|---|---|
 | [`isotonic_regression.py`](cp/isotonic_regression.py) | Fit a non-decreasing sequence to noisy cubic data: a least-squares objective with `n-1` ordering inequalities `y[i] - y[i+1] ≤ 0` and box bounds `[-1, 1]`. Plots the fit and prints the maximum constraint violation. | `matplotlib` |
 | [`linear_regression.py`](cp/linear_regression.py) | Non-linear regression with Random Fourier Features: mean-squared error over RBF features, subject to a nonlinear norm-ball constraint `‖w‖² ≤ 200`, with unbounded variables. Plots predictions against the data. | `matplotlib`, `scikit-learn` |
+| [`kernel_svm.py`](cp/kernel_svm.py) | Train an RBF-kernel support vector machine on two interleaved half-moons. The SVM dual is a quadratic program, solved with `jc.quadratic_program`; the intercept is read off the equality constraint's dual. Plots the decision boundary, margins and support vectors. | `matplotlib` |
 
-Both examples use `jc.solve(cp)` with its default settings, so they are a good
-starting template: replace the objective and constraint functions with your own.
+The first two examples use `jc.solve(cp)` with its default settings, so they
+are a good starting template: replace the objective and constraint functions
+with your own. `kernel_svm.py` is the template for a problem you can write
+down as matrices.
 
 ## Precision
 
