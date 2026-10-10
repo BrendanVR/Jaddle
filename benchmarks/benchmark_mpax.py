@@ -16,8 +16,11 @@
 #   `1 + max(|p|, |d|)`, Jaddle by `1 + |p| + |d|`.
 # * **Shared verification.** Every returned primal-dual pair is re-checked with
 #   `jaddle_linear.evaluate_lp_certificate` in the original units, so neither
-#   solver is judged only by its own stopping test. "Verified" means all three
-#   relative residuals are within `--tol` (plus 1% to absorb rounding).
+#   solver is judged only by its own stopping test. The re-check uses the L2
+#   norm and the PDLP dual residual, the form both solvers stop on by default
+#   (with `--mpax-norm inf` MPAX stops on a different norm than it is checked
+#   in). "Verified" means all three relative residuals are within `--tol`
+#   (plus 1% to absorb rounding).
 # * **Same timing.** Each solve runs in its own worker process with the whole
 #   GPU. The clock starts once the worker has loaded the LP and covers scaling,
 #   XLA compilation and iteration for both solvers. MPAX has no time limit of
@@ -315,7 +318,11 @@ def worker_main(config_path):
                 ),
             )
             sol = jax.block_until_ready(result["solution"])
-            x, y_eq, y_ineq = sol.primal, sol.dual_eq, sol.dual_ineq
+            # solve() pads an empty block with one zero row; that row is not
+            # one of the LP's rows.
+            x = sol.primal
+            y_eq = sol.dual_eq[: lp.A_eq.shape[0]]
+            y_ineq = sol.dual_ineq[: lp.A_ineq.shape[0]]
             out["status"] = result["stop_reason"]
             out["claims_optimal"] = result["stop_reason"] == "certificate"
             out["epochs"] = int(result["epochs"])
@@ -361,6 +368,8 @@ def worker_main(config_path):
             jax.numpy.asarray(x),
             jax.numpy.asarray(y_eq),
             jax.numpy.asarray(y_ineq),
+            norm="l2",
+            dual_residual="pdlp",
         )
         out["objective"] = float(cert["objective"])
         out["rel_primal"] = float(cert["relative_primal_feasibility_residual"])
