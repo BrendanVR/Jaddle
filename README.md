@@ -272,7 +272,7 @@ the dual objective as in PDLP, so far-away finite bounds do not swamp the gap.
 | `k_scale`, `k_theta`, `k_init` | `1e8`, `0.5`, `None` | Clamp band, smoothing and initial value for the primal weight. |
 | `ruiz_iterations`, `pc_iterations` | `10`, `1` | Number of preconditioning sweeps. |
 | `initial_solution`, `initial_opt_state` | `None` | Warm start from a previous solve's `solution` and `opt_state`. |
-| `vertex_bias` | `0.0` | Small cost perturbation that steers the solver to a vertex of the optimal face rather than its interior. Useful before crossover. |
+| `vertex_bias` | `0.0` | Small cost perturbation that steers the solver to a vertex of the optimal face rather than its interior. Useful before `jl.crossover`. |
 | `verbose`, `log_every` | `False`, `1` | Per-epoch progress logging. |
 
 ### Results
@@ -345,6 +345,16 @@ tests.
   certified at 1e-6 has a correct objective but fails the original's dual
   test. Presolve can also settle a problem outright:
   `stop_reason="presolve_infeasible"` or `"presolve_solved"`.
+- **Crossover.** `jl.crossover(lp, solution)` takes a first-order solution to
+  a vertex: an optimal basic solution with its basis, computed by HiGHS.
+  The point is first snapped to an exactly complementary primal–dual pair,
+  which HiGHS's crossover requires, and the simplex method then repairs the
+  basis, so the answer is exact however loose the starting solution. On
+  mzzv11 (presolved, solved to `1e-4`) the points of two solves needed 125
+  and 6,077 repair pivots, 0.1 s and 1.2 s for the whole call, where HiGHS's
+  simplex needs 47,774 pivots and 20 s from cold. `jl.solve_with_presolve(model, run_crossover=True)` runs it on the
+  reduced LP and lets HiGHS's postsolve carry the basis back to the original
+  model.
 - **Defined-variable elimination.** `jaddle.presolve.eliminate_defined_variables`
   substitutes out variables defined by dense equality rows (`z = Σ aⱼxⱼ`).
   Rows of this kind hide objective structure from the scaling and can stall

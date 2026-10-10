@@ -2766,6 +2766,7 @@ def solve_with_presolve(
     finish_epochs=50,
     eliminate_defined_vars=False,
     reduced_solver=None,
+    run_crossover=False,
     **solve_kwargs,
 ):
     """
@@ -2802,6 +2803,17 @@ def solve_with_presolve(
     on the original LP, warm-started from it, finish the job (2 epochs on
     neos-1593097, against 23 from cold); the finished point is kept only if
     it certifies. ``finish_epochs=0`` disables this.
+
+    ``run_crossover=True`` returns a vertex instead: ``crossover()`` takes
+    the reduced solve's point to an optimal basic solution of the reduced
+    LP, and HiGHS's postsolve carries that solution and its basis back to
+    the original LP, repairing the basis with the simplex method where it
+    has to. The result gains ``"basis"``, the ``highspy.HighsBasis`` of the
+    original model (``None`` if HiGHS has no valid one), and ``"crossover"``,
+    ``crossover()``'s statistics plus ``"postsolve_simplex_iterations"``
+    (``None`` when presolve left nothing to cross over).
+    ``highs_options`` applies to the crossover too, and no finishing solve
+    runs, since it would leave the vertex.
 
     Returns ``solve()``'s dict for the reduced solve, with these keys
     replaced or added:
@@ -2893,11 +2905,16 @@ def solve_with_presolve(
             "epochs": 0,
         }
 
+    crossed, reduced_basis = None, None
     if presolve_status == PS.kReducedToEmpty:
         result = {"converged": True, "stop_reason": "presolve_solved", "epochs": 0}
         reduced_solution = highspy.HighsSolution()
         reduced_solution.value_valid = True
         reduced_solution.dual_valid = True
+        if run_crossover:
+            # Nothing is left to cross over; postsolve builds the basis.
+            reduced_basis = highspy.HighsBasis()
+            reduced_basis.valid = True
     else:
         lp_reduced = hh.highs_to_standard_form_sparse(reduced)
         lp_solved, elimination = lp_reduced, None
@@ -2920,6 +2937,23 @@ def solve_with_presolve(
         presolve["eliminated_defined_vars"] = (
             0 if elimination is None else lp_reduced.c.shape[0] - lp_solved.c.shape[0]
         )
+        if run_crossover:
+            crossed = crossover(
+                lp_reduced,
+                SaddleState(primal=x, dual_ineq=y_ineq, dual_eq=y_eq),
+                highs_options=highs_options,
+            )
+            v = crossed.pop("solution")
+            del crossed["objective"]  # the reduced LP's, without its offset
+            x = np.asarray(v.primal, dtype=np.float64)
+            y_eq = np.asarray(v.dual_eq, dtype=np.float64)
+            y_ineq = np.asarray(v.dual_ineq, dtype=np.float64)
+            if crossed["basis"] is not None:
+                reduced_basis = hh.standard_form_basis_to_highs(
+                    crossed.pop("basis"),
+                    np.asarray(reduced.row_lower_),
+                    np.asarray(reduced.row_upper_),
+                )
         A = sp.csc_matrix(
             (
                 reduced.a_matrix_.value_,
@@ -2939,9 +2973,21 @@ def solve_with_presolve(
         reduced_solution.value_valid = True
         reduced_solution.dual_valid = True
 
-    if highs.postsolve(reduced_solution) == highspy.HighsStatus.kError:
+    if reduced_basis is None:
+        postsolve_status = highs.postsolve(reduced_solution)
+    else:
+        postsolve_status = highs.postsolve(reduced_solution, reduced_basis)
+    if postsolve_status == highspy.HighsStatus.kError:
         raise RuntimeError("HiGHS postsolve failed")
     full = highs.getSolution()
+    if run_crossover:
+        if crossed is not None:
+            crossed.pop("basis", None)
+            crossed["postsolve_simplex_iterations"] = max(
+                int(highs.getInfo().simplex_iteration_count), 0
+            )
+        basis = highs.getBasis()
+        result.update(crossover=crossed, basis=basis if basis.valid else None)
     highs_solution = {
         "col_value": np.asarray(full.col_value),
         "col_dual": np.asarray(full.col_dual),
@@ -2987,7 +3033,7 @@ def solve_with_presolve(
 
     certificate, original_certified = original_certificate(solution)
     finish = {"epochs": 0, "certified": False}
-    if not original_certified and finish_epochs:
+    if not original_certified and finish_epochs and not run_crossover:
         finish_kwargs = dict(solve_kwargs)
         if solve_kwargs.get("max_seconds") is not None:
             spent = time.time() - start
@@ -3043,6 +3089,142 @@ def solve_with_presolve(
         finish=finish,
     )
     return result
+
+
+def crossover(lp, solution, highs_options=None):
+    """
+    Cross a first-order solution over to a vertex: an optimal basic solution
+    of ``lp`` with its basis, computed by HiGHS from ``solution``.
+
+    ``lp`` is a Jaddle ``LP`` / ``JaddleLP`` and ``solution`` a ``SaddleState``
+    for its rows, e.g. ``solve()``'s. ``highs_options`` (a dict) is applied to
+    the HiGHS instance, e.g. ``{"time_limit": 60}``.
+
+    HiGHS's crossover only starts from an exactly complementary pair, which a
+    first-order solution never is, so the point is snapped first. A variable
+    is put on a bound when its reduced cost points there and exceeds its
+    distance from the bound, and its reduced cost is zeroed otherwise. An
+    inequality row is active when its dual exceeds its slack, and its dual is
+    zeroed otherwise. Rows cannot be snapped, so the crossover runs on a copy
+    of the LP whose active rows have their right-hand side moved onto the
+    snapped point, and the simplex method then repairs the resulting basis on
+    the LP as given. That copy is what keeps the duals in play. On mzzv11
+    (HiGHS-presolved, solved to 1e-4) the points of two solves needed 125
+    and 6077 repair pivots (0.1 s and 1.2 s for the whole call), against
+    29970 and 11761 when rows with any slack lose their dual, 44947 and
+    56926 from the primal alone, and 47774 (20 s) for HiGHS's simplex from
+    cold. The pivot count varies that much between runs of the same solve.
+
+    HiGHS's crossover (1.14) reads past the end of the starting point on a
+    model with two-sided or free rows, so it is always called on Jaddle's
+    standard form, which has neither.
+
+    The simplex repair makes the answer exact whatever the quality of
+    ``solution``; a looser solution just costs more pivots. If HiGHS rejects
+    the starting point the simplex method runs from cold.
+
+    Returns a dict:
+
+    * ``"solution"``: a ``SaddleState`` at the vertex, or ``solution``
+      unchanged if HiGHS stopped without a primal-dual solution.
+    * ``"objective"``: ``cᵀx`` there.
+    * ``"converged"``: whether HiGHS proved the vertex optimal; ``"status"``
+      is its model status (``"kOptimal"``, ``"kTimeLimit"``, ...).
+    * ``"basis"``: the ``highspy.HighsBasis`` for
+      ``highs_helpers.jaddle_lp_to_highs(lp)`` (the equality rows, then the
+      inequality rows), or ``None`` without a valid one.
+    * ``"crossover_status"``: HiGHS's verdict on the crossover itself
+      (``"kOk"``, ``"kWarning"`` for an imprecise basic solution, ``"kError"``).
+    * ``"pushes"``, ``"simplex_iterations"``: crossover pushes and repair
+      pivots; ``"seconds"``: the time taken.
+    """
+    import highspy
+    from jaddle import highs_helpers as hh
+
+    start = time.time()
+    model = hh.jaddle_lp_to_highs(lp)
+    m_eq = lp.A_eq.shape[0]
+    m_ineq = model.num_row_ - m_eq
+    A = sp.csc_matrix(
+        (model.a_matrix_.value_, model.a_matrix_.index_, model.a_matrix_.start_),
+        shape=(model.num_row_, model.num_col_),
+    ).tocsr()
+    c = np.asarray(model.col_cost_)
+    lower, upper = np.asarray(model.col_lower_), np.asarray(model.col_upper_)
+    b = np.asarray(model.row_upper_)
+
+    # solve() may have padded an empty block with one zero row.
+    y = np.concatenate(
+        [
+            np.asarray(solution.dual_eq, dtype=np.float64)[:m_eq],
+            np.asarray(solution.dual_ineq, dtype=np.float64)[:m_ineq],
+        ]
+    )
+    x = np.clip(np.asarray(solution.primal, dtype=np.float64), lower, upper)
+    reduced_cost = c + A.T @ y
+    at_lower = (reduced_cost > 0) & np.isfinite(lower) & (x - lower <= reduced_cost)
+    at_upper = (reduced_cost < 0) & np.isfinite(upper) & (upper - x <= -reduced_cost)
+    x = np.where(at_lower, lower, np.where(at_upper, upper, x))
+    col_dual = np.where(at_lower | at_upper | (lower == upper), reduced_cost, 0.0)
+    activity = A @ x
+    slack = (b - activity)[m_eq:]
+    active = (y[m_eq:] > 0) & (slack <= y[m_eq:])
+    y[m_eq:] = np.where(active, y[m_eq:], 0.0)
+    # HiGHS recomputes the slacks in its own summation order, so the moved
+    # right-hand sides sit a rounding margin inside the point.
+    moved = m_eq + np.flatnonzero(active & (slack > 0))
+    margin = 1e-12 * (1.0 + abs(A[moved]) @ np.abs(x))
+    moved_b = b.copy()
+    moved_b[moved] = activity[moved] - margin
+
+    start_point = highspy.HighsSolution()
+    start_point.col_value = x
+    start_point.row_value = activity
+    start_point.col_dual = col_dual
+    start_point.row_dual = -y
+    start_point.value_valid = True
+    start_point.dual_valid = True
+
+    highs = highspy.Highs()
+    highs.setOptionValue("output_flag", False)
+    highs.setOptionValue("presolve", "off")
+    for key, value in (highs_options or {}).items():
+        highs.setOptionValue(key, value)
+    model.row_upper_ = moved_b
+    highs.passModel(model)
+    crossover_status = highs.crossover(start_point)
+    pushes = max(int(highs.getInfo().crossover_iteration_count), 0)
+    basis = highs.getBasis()
+
+    model.row_upper_ = b
+    highs.passModel(model)
+    if crossover_status != highspy.HighsStatus.kError and basis.valid:
+        highs.setBasis(basis)
+    highs.run()
+    status = highs.getModelStatus()
+    info = highs.getInfo()
+    vertex = highs.getSolution()
+    basis = highs.getBasis()
+    if vertex.value_valid and vertex.dual_valid:
+        dual_eq, dual_ineq = hh.highs_duals_to_jaddle(
+            np.asarray(vertex.row_dual), np.asarray(model.row_lower_), b
+        )
+        solution = SaddleState(
+            primal=jnp.asarray(vertex.col_value),
+            dual_ineq=jnp.asarray(dual_ineq),
+            dual_eq=jnp.asarray(dual_eq),
+        )
+    return {
+        "solution": solution,
+        "objective": float(c @ np.asarray(solution.primal, dtype=np.float64)),
+        "converged": status == highspy.HighsModelStatus.kOptimal,
+        "status": status.name,
+        "basis": basis if basis.valid else None,
+        "crossover_status": crossover_status.name,
+        "pushes": pushes,
+        "simplex_iterations": max(int(info.simplex_iteration_count), 0),
+        "seconds": time.time() - start,
+    }
 
 
 # %%

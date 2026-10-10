@@ -126,6 +126,29 @@ def highs_duals_to_jaddle(row_dual, row_lower, row_upper):
     return -row_dual[eq_rows], dual_ineq
 
 
+def standard_form_basis_to_highs(basis, row_lower, row_upper):
+    """The basis of a row-bounded LP from a ``highspy.HighsBasis`` of its
+    ``rows_to_standard_form`` (the rows of ``jaddle_lp_to_highs``). A
+    two-sided row is two ``<=`` rows there: it is nonbasic at the bound whose
+    copy is nonbasic, and basic when both copies are. A row free on both
+    sides is basic."""
+    eq_rows, upper_rows, lower_rows = standard_form_row_map(row_lower, row_upper)
+    status = hspy.HighsBasisStatus
+    standard = np.array(list(basis.row_status), dtype=object)
+    nonbasic = standard != status.kBasic
+    row_status = np.full(len(row_lower), status.kBasic, dtype=object)
+    row_status[eq_rows] = standard[: eq_rows.size]
+    row_status[lower_rows[nonbasic[eq_rows.size + upper_rows.size :]]] = status.kLower
+    row_status[
+        upper_rows[nonbasic[eq_rows.size : eq_rows.size + upper_rows.size]]
+    ] = status.kUpper
+    out = hspy.HighsBasis()
+    out.col_status = list(basis.col_status)
+    out.row_status = list(row_status)
+    out.valid = True
+    return out
+
+
 def jaddle_lp_to_highs(lp):
     """A ``highspy.HighsLp`` for a Jaddle ``LP`` / ``JaddleLP``: the equality
     rows (``b_eq <= a.x <= b_eq``) then the inequality rows (``a.x <=

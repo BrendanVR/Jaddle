@@ -664,6 +664,10 @@ def test_solve_with_presolve_reduced_to_empty():
     assert result["stop_reason"] == "presolve_solved"
     assert result["converged"]
     np.testing.assert_allclose(result["solution"].primal, [0.0, 4.0], atol=1e-9)
+    # With nothing left to cross over, postsolve still supplies the basis.
+    result = jl.solve_with_presolve(toy_lp(), run_crossover=True)
+    assert result["crossover"] is None
+    assert basic_count(result["basis"]) == 1
 
 
 def test_solve_with_presolve_detects_infeasibility():
@@ -689,6 +693,67 @@ def test_solve_with_presolve_reads_files(tmp_path):
     assert result["converged"]
     ref = reference_objective(lp)
     assert abs(result["objective"] - ref) / (1 + abs(ref)) < 1e-6
+
+
+def basic_count(basis):
+    import highspy
+
+    statuses = list(basis.col_status) + list(basis.row_status)
+    return sum(status == highspy.HighsBasisStatus.kBasic for status in statuses)
+
+
+def test_crossover_reaches_a_vertex():
+    # The vertex is exact even from a loose first-order solution.
+    lp = random_lp()
+    loose = solve(lp, tol=1e-3)
+    crossed = jl.crossover(lp, loose["solution"])
+    assert crossed["converged"]
+    ref = reference_objective(lp)
+    assert abs(crossed["objective"] - ref) <= 1e-9 * (1 + abs(ref))
+    # A basis has one basic variable per row.
+    assert basic_count(crossed["basis"]) == lp.b_eq.size + lp.b_ineq.size
+    s = crossed["solution"]
+    assert s.dual_eq.shape == lp.b_eq.shape
+    assert s.dual_ineq.shape == lp.b_ineq.shape
+    cert = solve_certificate(lp, s)
+    assert cert["relative_primal_feasibility_residual"] <= 1e-9
+    assert cert["relative_dual_feasibility_residual"] <= 1e-9
+    assert cert["relative_gap_abs"] <= 1e-9
+
+
+def test_crossover_without_equality_rows():
+    # solve() pads toy_lp's empty equality block; crossover() must not.
+    lp = toy_lp()
+    crossed = jl.crossover(lp, solve(lp)["solution"])
+    assert crossed["converged"]
+    np.testing.assert_allclose(crossed["solution"].primal, [0.0, 4.0], atol=1e-12)
+    assert crossed["solution"].dual_eq.shape == (0,)
+
+
+def test_solve_with_presolve_crossover():
+    import highspy
+
+    from jaddle.highs_helpers import jaddle_lp_to_highs
+
+    # Two-sided rows are two rows in Jaddle's standard form, so the basis has
+    # to be mapped back onto HiGHS's rows before postsolve.
+    lp = reducible_lp()
+    model = jaddle_lp_to_highs(lp)
+    row_lower = np.array(model.row_lower_)
+    row_lower[lp.b_eq.size :] = lp.b_ineq - 1.2
+    model.row_lower_ = row_lower
+    highs = highspy.Highs()
+    highs.setOptionValue("output_flag", False)
+    highs.passModel(model)
+    highs.run()
+    ref = highs.getInfo().objective_function_value
+
+    result = jl.solve_with_presolve(model, run_crossover=True)
+    assert result["converged"]
+    assert result["crossover"]["converged"]
+    assert abs(result["objective"] - ref) <= 1e-9 * (1 + abs(ref))
+    assert basic_count(result["basis"]) == model.num_row_
+    assert result["finish"]["epochs"] == 0
 
 
 def test_warm_start_without_padding_rows():

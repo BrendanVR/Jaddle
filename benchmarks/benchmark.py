@@ -219,7 +219,11 @@ def parse_args():
 
 
 def highs_reference(
-    path, highs_solver="simplex", tol=1e-3, highs_verbose=False, highs_kkt_tolerance=None
+    path,
+    highs_solver="simplex",
+    tol=1e-3,
+    highs_verbose=False,
+    highs_kkt_tolerance=None,
 ):
     """Solve the LP relaxation with HiGHS for a trusted reference optimum.
 
@@ -244,7 +248,9 @@ def highs_reference(
     highs.readModel(path)
     relax_integrality(highs)
     highs.setOptionValue("presolve", "on")
-    highs.setOptionValue("kkt_tolerance", tol if highs_kkt_tolerance is None else highs_kkt_tolerance)
+    highs.setOptionValue(
+        "kkt_tolerance", tol if highs_kkt_tolerance is None else highs_kkt_tolerance
+    )
     highs.setOptionValue("solver", highs_solver)
     t0 = time.perf_counter()
     highs.run()
@@ -450,8 +456,12 @@ def run_jaddle_presolved(
         "jaddle_orig_dfr": cert.get("relative_dual_feasibility_residual", ""),
         "jaddle_orig_gap": cert.get("relative_gap_abs", ""),
         # Blank unless polish=True.
-        "jaddle_polished": result["polish"]["polished"] if polish and "polish" in result else "",
-        "jaddle_polish_attempts": result["polish"]["attempts"] if polish and "polish" in result else "",
+        "jaddle_polished": (
+            result["polish"]["polished"] if polish and "polish" in result else ""
+        ),
+        "jaddle_polish_attempts": (
+            result["polish"]["attempts"] if polish and "polish" in result else ""
+        ),
     }
 
 
@@ -655,7 +665,9 @@ def print_markdown(rows, highs_solver="simplex"):
     print("|---|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|:---:|---:|")
     for r in rows:
         if r.get("error"):
-            print(f"| {r['problem']} | — | — | — | — | — | — | — | ⚠️ error | — | — | — |")
+            print(
+                f"| {r['problem']} | — | — | — | — | — | — | — | ⚠️ error | — | — | — |"
+            )
             continue
         conv = "✅" if r.get("jaddle_converged") else "❌"
         orig = "✅" if r.get("jaddle_original_certified") else "❌"
