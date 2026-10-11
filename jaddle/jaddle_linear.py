@@ -7,6 +7,7 @@ import optax
 import numpy as np
 import copy
 import functools
+import os
 from typing import NamedTuple
 import time
 from scipy import sparse as sp
@@ -2760,6 +2761,105 @@ def make_solution(lp, active_tol=1e-6, **settings):
     return x_fn
 
 
+def _highs_model(model, highs_options=None):
+    """A ``highspy.Highs`` holding the LP relaxation of ``model``: a path to a
+    file HiGHS reads, a ``highspy.Highs`` with a model loaded (used in place),
+    a ``highspy.HighsLp``, or a Jaddle ``LP`` / ``JaddleLP``. Output is off
+    unless ``highs_options`` (a dict of HiGHS options) turns it on."""
+    import highspy
+    from jaddle import highs_helpers as hh
+
+    highs = model if isinstance(model, highspy.Highs) else highspy.Highs()
+    highs.setOptionValue("output_flag", False)
+    for key, value in (highs_options or {}).items():
+        highs.setOptionValue(key, value)
+    if isinstance(model, (str, os.PathLike)):
+        status = highs.readModel(os.fspath(model))
+        if status == highspy.HighsStatus.kError:
+            raise ValueError(f"HiGHS could not read {model!r}")
+    elif isinstance(model, highspy.HighsLp):
+        highs.passModel(model)
+    elif isinstance(model, (LP, JaddleLP)):
+        highs.passModel(hh.jaddle_lp_to_highs(model))
+    elif not isinstance(model, highspy.Highs):
+        raise TypeError(f"unsupported model type {type(model).__name__}")
+    n = highs.getNumCol()
+    if n:
+        highs.changeColsIntegrality(
+            n, np.arange(n, dtype=np.int32), np.zeros(n, dtype=np.uint8)
+        )
+    return highs
+
+
+def load(
+    path,
+    presolve=False,
+    eliminate_defined_vars=False,
+    highs_options=None,
+    return_offset=False,
+):
+    """
+    Load an LP from a file into a ``JaddleLP``, ready for ``solve()``.
+
+    ``path`` is any file HiGHS reads (MPS, LP, gzipped or not). Integer
+    variables are relaxed: the result is the LP relaxation, in Jaddle's
+    standard form (``highs_helpers.rows_to_standard_form`` of the file's
+    rows) and the active precision profile's dtype.
+
+    ``presolve=True`` runs HiGHS's presolve and returns the reduced LP
+    instead. Its variables and rows are not the file's, and nothing here
+    maps a solution back: use ``solve_with_presolve`` for a solution of the
+    problem as given. ``eliminate_defined_vars=True`` also runs
+    ``presolve.eliminate_defined_variables`` (on the reduced LP when
+    ``presolve`` is on, otherwise on the file's). ``highs_options`` (a dict)
+    is applied to the HiGHS instance that reads and presolves.
+
+    A ``JaddleLP`` has no objective constant, so the file's constant and
+    whatever the reductions fold into it are dropped from the LP;
+    ``return_offset=True`` returns ``(lp, offset)``, with ``offset`` to be
+    added to ``c @ x``. A maximisation model is returned as the minimisation
+    of its negated objective, so ``-(c @ x + offset)`` is its value.
+
+    Raises ``ValueError`` when HiGHS cannot read the file or its presolve
+    finds the problem infeasible or unbounded. Presolve may also solve the
+    problem outright, leaving an LP with no variables whose ``offset`` is the
+    optimal value.
+    """
+    import highspy
+    from jaddle import highs_helpers as hh
+
+    highs = _highs_model(os.fspath(path), highs_options)
+    highs_lp = highs.getLp()
+    if presolve:
+        highs.presolve()
+        status = highs.getModelPresolveStatus()
+        PS = highspy.HighsPresolveStatus
+        if status in (PS.kNullError, PS.kOptionsError):
+            raise RuntimeError(f"HiGHS presolve failed: {status.name}")
+        if status in (PS.kInfeasible, PS.kUnboundedOrInfeasible):
+            raise ValueError(
+                f"HiGHS presolve found {os.fspath(path)!r} "
+                + (
+                    "infeasible"
+                    if status == PS.kInfeasible
+                    else "unbounded or infeasible"
+                )
+            )
+        highs_lp = highs.getPresolvedLp()
+    lp = hh.highs_to_standard_form_sparse(highs_lp)
+    offset = float(highs_lp.offset_)
+    # HiGHS's presolve already hands back a minimisation.
+    if highs_lp.sense_ == highspy.ObjSense.kMaximize:
+        lp.c, offset = -lp.c, -offset
+    if eliminate_defined_vars:
+        from jaddle import presolve as jaddle_presolve
+
+        lp, extra_offset, _ = jaddle_presolve.eliminate_defined_variables(lp)
+        offset += extra_offset
+    lp = to_jaddle_sparse(lp)
+    return (lp, offset) if return_offset else lp
+
+
 def solve_with_presolve(
     model,
     highs_options=None,
@@ -2778,6 +2878,11 @@ def solve_with_presolve(
     ``LP`` / ``JaddleLP``. Integer variables are relaxed: Jaddle solves the
     LP relaxation. ``highs_options`` (a dict) is applied to the HiGHS instance
     that presolves; other keyword arguments go to ``solve()``.
+
+    A maximisation model is solved as the minimisation of its negated
+    objective. ``"objective"`` is the model's own (maximal) value and
+    ``"highs_solution"`` carries HiGHS's duals for the model as given, while
+    ``"solution"``'s duals and ``"certificate"`` are the minimisation's.
 
     ``eliminate_defined_vars=True`` also runs
     ``presolve.eliminate_defined_variables`` on HiGHS's reduced LP (dense
@@ -2852,26 +2957,18 @@ def solve_with_presolve(
     import highspy
     from jaddle import highs_helpers as hh
 
-    highs = model if isinstance(model, highspy.Highs) else highspy.Highs()
-    highs.setOptionValue("output_flag", False)
-    for key, value in (highs_options or {}).items():
-        highs.setOptionValue(key, value)
-    if isinstance(model, str):
-        status = highs.readModel(model)
-        if status == highspy.HighsStatus.kError:
-            raise ValueError(f"HiGHS could not read {model!r}")
-    elif isinstance(model, highspy.HighsLp):
-        highs.passModel(model)
-    elif isinstance(model, (LP, JaddleLP)):
-        highs.passModel(hh.jaddle_lp_to_highs(model))
-    elif not isinstance(model, highspy.Highs):
-        raise TypeError(f"unsupported model type {type(model).__name__}")
-    n = highs.getNumCol()
-    if n:
-        highs.changeColsIntegrality(
-            n, np.arange(n, dtype=np.int32), np.zeros(n, dtype=np.uint8)
-        )
+    highs = _highs_model(model, highs_options)
     original = highs.getLp()
+    maximise = original.sense_ == highspy.ObjSense.kMaximize
+    if maximise:
+        # Everything below is a minimisation (solve(), the certificate, the
+        # dual signs), so work on min -objective in a HiGHS instance of our
+        # own; a caller's instance keeps its model.
+        original.sense_ = highspy.ObjSense.kMinimize
+        original.col_cost_ = -np.asarray(original.col_cost_)
+        original.offset_ = -original.offset_
+        highs = _highs_model(original, highs_options)
+        original = highs.getLp()
 
     start = time.time()
     highs.presolve()
@@ -3077,12 +3174,19 @@ def solve_with_presolve(
                 "row_value": A_orig @ x,
                 "row_dual": row_dual,
             }
+    if maximise:
+        # HiGHS's duals of a maximisation are minus those of min -objective.
+        highs_solution["col_dual"] = -highs_solution["col_dual"]
+        highs_solution["row_dual"] = -highs_solution["row_dual"]
     result.update(
         solution=solution,
         converged=original_certified,
         reduced_converged=bool(result["converged"]),
-        objective=float(np.asarray(original.col_cost_) @ np.asarray(solution.primal))
-        + float(original.offset_),
+        objective=(-1.0 if maximise else 1.0)
+        * (
+            float(np.asarray(original.col_cost_) @ np.asarray(solution.primal))
+            + float(original.offset_)
+        ),
         highs_solution=highs_solution,
         certificate=certificate,
         presolve=presolve,

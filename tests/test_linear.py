@@ -695,6 +695,108 @@ def test_solve_with_presolve_reads_files(tmp_path):
     assert abs(result["objective"] - ref) / (1 + abs(ref)) < 1e-6
 
 
+def write_mps(lp, path, maximise=False, offset=0.0):
+    import highspy
+
+    from jaddle.highs_helpers import jaddle_lp_to_highs
+
+    model = jaddle_lp_to_highs(lp)
+    model.offset_ = offset
+    if maximise:
+        model.sense_ = highspy.ObjSense.kMaximize
+    highs = highspy.Highs()
+    highs.setOptionValue("output_flag", False)
+    highs.passModel(model)
+    highs.writeModel(str(path))
+
+
+def test_load(tmp_path):
+    lp = reducible_lp()
+    path = tmp_path / "reducible.mps"
+    write_mps(lp, path, offset=2.5)
+    ref = reference_objective(lp) + 2.5
+
+    loaded = jl.load(path)
+    assert isinstance(loaded, jl.JaddleLP)
+    assert loaded.c.shape == lp.c.shape
+    assert loaded.b_eq.shape == lp.b_eq.shape
+    assert loaded.b_ineq.shape == lp.b_ineq.shape
+    np.testing.assert_allclose(loaded.c, lp.c)
+
+    for presolve in (False, True):
+        loaded, offset = jl.load(str(path), presolve=presolve, return_offset=True)
+        if presolve:
+            assert loaded.c.shape[0] < lp.c.shape[0]
+        result = jl.solve(loaded, **PRESOLVE_TOL)
+        assert result["converged"]
+        objective = float(loaded.c @ result["solution"].primal) + offset
+        assert abs(objective - ref) / (1 + abs(ref)) < 1e-6
+
+
+@pytest.mark.parametrize("presolve", [False, True])
+def test_load_maximisation(tmp_path, presolve):
+    # maximise -c.x is the same problem; load returns it as a minimisation.
+    lp = random_lp()
+    flipped = jl.LP(
+        -lp.c, lp.A_eq, lp.b_eq, lp.A_ineq, lp.b_ineq, lp.lower_bounds, lp.upper_bounds
+    )
+    path = tmp_path / "max.mps"
+    write_mps(flipped, path, maximise=True, offset=1.5)
+    loaded, offset = jl.load(path, presolve=presolve, return_offset=True)
+    result = jl.solve(loaded, **PRESOLVE_TOL)
+    objective = float(loaded.c @ result["solution"].primal) + offset
+    ref = reference_objective(lp) - 1.5
+    assert abs(objective - ref) / (1 + abs(ref)) < 1e-6
+
+
+def test_load_rejects_bad_models(tmp_path):
+    with pytest.raises(ValueError, match="could not read"):
+        jl.load(tmp_path / "missing.mps")
+    path = tmp_path / "infeasible.mps"
+    write_mps(small_lp([1, 1], [[1, 1], [-1, -1]], [1, -3]), path)
+    with pytest.raises(ValueError, match="infeasible"):
+        jl.load(path, presolve=True)
+
+
+@pytest.mark.parametrize(
+    "options", [{}, {"finish_epochs": 0}, {"run_crossover": True}], ids=str
+)
+def test_solve_with_presolve_maximisation(options):
+    import highspy
+
+    from jaddle.highs_helpers import jaddle_lp_to_highs
+
+    # maximise -c.x + 1.5 over reducible_lp's feasible set.
+    lp = reducible_lp()
+    model = jaddle_lp_to_highs(lp)
+    model.col_cost_ = -np.asarray(model.col_cost_)
+    model.sense_ = highspy.ObjSense.kMaximize
+    model.offset_ = 1.5
+    highs = highspy.Highs()
+    highs.setOptionValue("output_flag", False)
+    highs.passModel(model)
+    highs.run()
+    reference = highs.getSolution()
+    ref = 1.5 - reference_objective(lp)
+    assert abs(highs.getInfo().objective_function_value - ref) < 1e-6
+
+    highs.clearSolver()
+    result = jl.solve_with_presolve(highs, **PRESOLVE_TOL, **options)
+    assert result["presolve"]["status"] == "kReduced"
+    assert result["converged"]
+    assert abs(result["objective"] - ref) / (1 + abs(ref)) < 1e-6
+    # The duals are HiGHS's for the maximisation, and the model is untouched.
+    for name in ("col_value", "col_dual", "row_dual"):
+        np.testing.assert_allclose(
+            result["highs_solution"][name], getattr(reference, name), atol=1e-5
+        )
+    assert highs.getLp().sense_ == highspy.ObjSense.kMaximize
+    np.testing.assert_allclose(highs.getLp().col_cost_, -lp.c)
+    # The Jaddle solution certifies the equivalent minimisation, the LP itself.
+    cert = solve_certificate(lp, result["solution"])
+    assert cert["relative_dual_feasibility_residual"] <= 1e-6
+
+
 def basic_count(basis):
     import highspy
 

@@ -331,6 +331,12 @@ tests.
 
 ### Supporting tools
 
+- **Loading models.** `jl.load(path)` reads an MPS or LP file into a
+  `JaddleLP` for `jl.solve` (integer variables are relaxed).
+  `jl.load(path, presolve=True)` returns HiGHS's reduced LP instead, and
+  `return_offset=True` also returns the objective constant to add to `c @ x`.
+  The reduced LP's solution is not mapped back to the file's variables; use
+  `jl.solve_with_presolve` for that.
 - **Presolve and postsolve.** `jl.solve_with_presolve(model, **options)`
   presolves with HiGHS, solves the reduced LP, and maps the primal *and* dual
   solution back with HiGHS's postsolve. `model` can be an MPS/LP file path, a
