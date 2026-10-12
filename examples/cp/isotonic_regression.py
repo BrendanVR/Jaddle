@@ -7,13 +7,15 @@
 import numpy as np
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
+import time
 import jaddle.jaddle_convex as jc
 import jaddle.jaddle_optimisers as jo
+from sklearn.isotonic import IsotonicRegression
 
 # %% [markdown]
 # ## Generate Synthetic Data
 # We will create synthetic data that follows a cubic relationship with some added noise.
-n = 1000
+n = 500
 x = np.linspace(-1, 1, n)
 y = x**3
 y += 0.15 * np.random.randn(n)  # add noise
@@ -51,13 +53,28 @@ cp = jc.JaddleCP(
 # ## Solve the problem using Jaddle Convex SPS optimizer
 solution = jc.solve(cp, primal_feasibility_tolerance=1e-6)["solution"]
 
+# %% [markdown]
+# ## Solve the problem using scikit-learn's Isotonic Regression
+start_time = time.time()
+ir = IsotonicRegression(increasing=True)
+y_pred_sklearn = ir.fit_transform(x, y)
+end_time = time.time()
+print("Scikit-learn Isotonic Regression Time:", end_time - start_time)
+
 # %%
 plt.figure(figsize=(10, 6))
 plt.plot(x, y, label="Noisy data", marker="o", linestyle="", alpha=0.2)
 plt.plot(
     x,
+    y_pred_sklearn,
+    label="Scikit-learn Isotonic Regression",
+    color="blue",
+    linewidth=2,
+)
+plt.plot(
+    x,
     solution.primal,
-    label="Isotonic regression solution",
+    label="Jaddle Isotonic regression solution",
     color="red",
     linewidth=2,
 )

@@ -11,16 +11,20 @@
 # * **Same stopping rule.** Both stop on relative primal residual, dual residual
 #   and duality gap below `--tol`. MPAX is run with `eps_abs = eps_rel = tol`,
 #   which gives the same `residual / (1 + norm)` form Jaddle uses, and in the
-#   L2 norm by default to match Jaddle (`--mpax-norm inf` restores MPAX's own
-#   default). The one remaining difference: MPAX normalises the gap by
-#   `1 + max(|p|, |d|)`, Jaddle by `1 + |p| + |d|`.
+#   norm `--norm` selects for both solvers (L2 by default; `--mpax-norm`
+#   overrides it for MPAX alone). The one remaining difference: MPAX
+#   normalises the gap by `1 + max(|p|, |d|)`, Jaddle by `1 + |p| + |d|`.
 # * **Shared verification.** Every returned primal-dual pair is re-checked with
 #   `jaddle_linear.evaluate_lp_certificate` in the original units, so neither
-#   solver is judged only by its own stopping test. The re-check uses the L2
-#   norm and the PDLP dual residual, the form both solvers stop on by default
-#   (with `--mpax-norm inf` MPAX stops on a different norm than it is checked
-#   in). "Verified" means all three relative residuals are within `--tol`
-#   (plus 1% to absorb rounding).
+#   solver is judged only by its own stopping test. The re-check uses the
+#   `--norm` norm and the PDLP dual residual, the form Jaddle stops on (an
+#   `--mpax-norm` that differs from `--norm` makes MPAX stop on a different
+#   norm than it is checked in). "Verified" means all three relative
+#   residuals are within `--tol` (plus 1% to absorb rounding).
+# * **Reference optimum (optional).** `--highs-solver` also solves each
+#   instance with HiGHS and reports both solvers' objective gap to it,
+#   `|obj - opt| / (1 + |opt|)`. HiGHS reads the original file and runs in the
+#   parent process on the CPU, outside the `--max-seconds` budget.
 # * **Same timing.** Each solve runs in its own worker process with the whole
 #   GPU. The clock starts once the worker has loaded the LP and covers scaling,
 #   XLA compilation and iteration for both solvers. MPAX has no time limit of
@@ -35,6 +39,7 @@
 #     python benchmarks/benchmark_mpax.py --only stp3d boeing
 #     python benchmarks/benchmark_mpax.py --presolve none --no-eliminate-defined-vars
 #     python benchmarks/benchmark_mpax.py --solvers mpax --mpax-algorithm rapdhg
+#     python benchmarks/benchmark_mpax.py --highs-solver simplex
 
 # %%
 import os
@@ -54,6 +59,7 @@ import csv
 import importlib.util
 import json
 import math
+import statistics
 import subprocess
 import tempfile
 import threading
@@ -73,8 +79,11 @@ from benchmark import (
     _fmt,
     add_cost_col_floor_flag,
     add_jaddle_verbose_flag,
+    add_norm_flag,
     discover_instances,
+    highs_reference,
     presolved_lp,
+    rel_obj_gap,
 )
 
 SOLVERS = ("jaddle", "mpax")
@@ -179,6 +188,7 @@ def parse_args():
         "(default: float64).",
     )
     add_cost_col_floor_flag(p)
+    add_norm_flag(p)
     # Jaddle's verbosity follows --verbose here unless set explicitly (None).
     add_jaddle_verbose_flag(p, None, "same as --verbose")
     p.add_argument(
@@ -197,6 +207,14 @@ def parse_args():
         "--no-eliminate-defined-vars for a fully unpresolved run.",
     )
     p.add_argument(
+        "--highs-solver",
+        default="none",
+        choices=("simplex", "ipm", "pdlp", "none"),
+        help="Also solve each instance with this HiGHS solver and report both "
+        "solvers' objective gap to its optimum. HiGHS runs on the original "
+        "file, on the CPU, with no time limit. (default: none, no HiGHS solve)",
+    )
+    p.add_argument(
         "--mpax-algorithm",
         choices=("r2hpdhg", "rapdhg"),
         default="r2hpdhg",
@@ -206,9 +224,9 @@ def parse_args():
     p.add_argument(
         "--mpax-norm",
         choices=("2", "inf"),
-        default="2",
-        help="Norm for MPAX's termination residuals (default 2, matching "
-        "Jaddle's default; MPAX's own default is inf).",
+        default=None,
+        help="Norm passed to MPAX as optimality_norm (default: the one --norm "
+        "selects; MPAX's own default is inf).",
     )
     p.add_argument(
         "--mpax-iteration-limit",
@@ -232,6 +250,8 @@ def parse_args():
     args = p.parse_args()
     if args.jaddle_verbose is None:
         args.jaddle_verbose = args.verbose
+    if args.mpax_norm is None:
+        args.mpax_norm = "2" if args.norm == "l2" else "inf"
     return args
 
 
@@ -315,6 +335,7 @@ def worker_main(config_path):
                     cfg["max_seconds"],
                     verbose=cfg["jaddle_verbose"],
                     cost_col_floor=cfg["cost_col_floor"],
+                    norm=cfg["norm"],
                 ),
             )
             sol = jax.block_until_ready(result["solution"])
@@ -368,7 +389,7 @@ def worker_main(config_path):
             jax.numpy.asarray(x),
             jax.numpy.asarray(y_eq),
             jax.numpy.asarray(y_ineq),
-            norm="l2",
+            norm=cfg["norm"],
             dual_residual="pdlp",
         )
         out["objective"] = float(cert["objective"])
@@ -398,6 +419,7 @@ def run_worker(solver, lp_dir, args):
                 "max_seconds": args.max_seconds,
                 "update_mode": args.update_mode,
                 "cost_col_floor": args.cost_col_floor,
+                "norm": args.norm,
                 "jax_profile": args.jax_profile,
                 "mpax_algorithm": args.mpax_algorithm,
                 "mpax_norm": args.mpax_norm,
@@ -487,6 +509,9 @@ CSV_FIELDS = [
     "presolve",
     "presolve_seconds",
     "offset",
+    "opt_obj",
+    "highs_status",
+    "highs_solve_seconds",
     "solver",
     "status",
     "claims_optimal",
@@ -495,6 +520,7 @@ CSV_FIELDS = [
     "epochs",
     "iterations",
     "objective",
+    "rel_obj_gap",
     "rel_primal",
     "rel_dual",
     "rel_gap",
@@ -517,6 +543,11 @@ def write_csv(path, rows):
             writer.writerow({k: row.get(k, "") for k in CSV_FIELDS})
 
 
+def _finite(x):
+    """x if it is a finite number, else None (which _fmt prints as a dash)."""
+    return x if isinstance(x, (int, float)) and math.isfinite(x) else None
+
+
 def shifted_geomean(times, shift=SGM_SHIFT_SECONDS):
     if not times:
         return math.nan
@@ -533,9 +564,16 @@ def print_report(rows, args):
     print(f"\n## Jaddle vs MPAX (tol {args.tol:g}, presolve: {args.presolve})\n")
     header = "| Problem | Vars | Cons |"
     rule = "|---|---:|---:|"
+    with_highs = args.highs_solver != "none"
     for s in solvers:
         header += f" {names[s]} | {names[s]} time (s) |"
         rule += ":---:|---:|"
+        if with_highs:
+            header += f" {names[s]} opt. gap |"
+            rule += "---:|"
+    if with_highs:
+        header += f" HiGHS {args.highs_solver} | HiGHS time (s) |"
+        rule += "---:|---:|"
     if len(solvers) == 2:
         header += " Obj. rel. diff |"
         rule += "---:|"
@@ -556,6 +594,13 @@ def print_report(rows, args):
             else:
                 cell = f"❌ {r.get('status', '—')}"
             line += f" {cell} | {_fmt(r.get('wall_seconds'), '{:.2f}')} |"
+            if with_highs:
+                line += f" {_fmt(_finite(r.get('rel_obj_gap')), '{:.1e}')} |"
+        if with_highs:
+            line += (
+                f" {_fmt(_finite(first.get('opt_obj')), '{:.6g}')} | "
+                f"{_fmt(_finite(first.get('highs_solve_seconds')), '{:.2f}')} |"
+            )
         if len(solvers) == 2:
             a, b = (res.get(s, {}).get("objective") for s in solvers)
             diff = (
@@ -581,6 +626,15 @@ def print_report(rows, args):
             f"{SGM_SHIFT_SECONDS:g} s"
             + (", unverified solves counted at the time limit)" if cap else ")")
         )
+        gaps = [
+            g for g in (_finite(r.get("rel_obj_gap")) for r in ran) if g is not None
+        ]
+        if gaps:
+            print(
+                f"  - objective gap to the HiGHS {args.highs_solver} optimum over "
+                f"{len(gaps)} instance(s): median {statistics.median(gaps):.1e}, "
+                f"max {max(gaps):.1e}; {sum(g > args.tol for g in gaps)} above tol"
+            )
 
 
 # %%
@@ -599,7 +653,8 @@ def main():
 
     print(
         f"Running {len(instances)} instance(s) with {', '.join(args.solvers)} at "
-        f"tol={args.tol:g}, max_seconds={args.max_seconds}, presolve={args.presolve}\n"
+        f"tol={args.tol:g}, norm={args.norm}, max_seconds={args.max_seconds}, "
+        f"presolve={args.presolve}\n"
     )
     rows = []
     for name, path, size_mb in instances:
@@ -608,6 +663,9 @@ def main():
         try:
             lp, offset, presolve_seconds = load_lp(
                 path, args.presolve, args.eliminate_defined_vars
+            )
+            opt_obj, highs_status, highs_seconds = highs_reference(
+                path, highs_solver=args.highs_solver, tol=args.tol
             )
         except Exception as exc:
             print(f"  ERROR loading: {exc!r}")
@@ -619,7 +677,16 @@ def main():
             n_cons=int(lp.num_constraints()),
             presolve_seconds=presolve_seconds,
             offset=offset,
+            opt_obj=opt_obj,
+            highs_status=highs_status,
+            highs_solve_seconds=highs_seconds,
         )
+        with_highs = args.highs_solver != "none"
+        if with_highs:
+            print(
+                f"  optimum (HiGHS {args.highs_solver}): {opt_obj:.6g} "
+                f"({highs_status}, solve={highs_seconds:.2f}s)"
+            )
         with tempfile.TemporaryDirectory(prefix="jaddle_mpax_") as lp_dir:
             save_lp(lp, lp_dir)
             del lp
@@ -627,6 +694,8 @@ def main():
                 res = run_worker(solver, lp_dir, args)
                 if "objective" in res:
                     res["objective"] += offset
+                    if with_highs:
+                        res["rel_obj_gap"] = rel_obj_gap(res["objective"], opt_obj)
                 res["verified"] = is_verified(res, args.tol)
                 rows.append({**base, **res})
                 if res.get("error"):
@@ -636,7 +705,12 @@ def main():
                         f"  {solver}: {res['status']} in "
                         f"{_fmt(res.get('wall_seconds'), '{:.2f}')}s, "
                         f"obj={_fmt(res.get('objective'), '{:.6g}')}, "
-                        f"verified={res['verified']} (primal "
+                        + (
+                            f"opt gap={_fmt(res.get('rel_obj_gap'), '{:.1e}')}, "
+                            if with_highs
+                            else ""
+                        )
+                        + f"verified={res['verified']} (primal "
                         f"{_fmt(res.get('rel_primal'), '{:.1e}')}, dual "
                         f"{_fmt(res.get('rel_dual'), '{:.1e}')}, gap "
                         f"{_fmt(res.get('rel_gap'), '{:.1e}')})"

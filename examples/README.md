@@ -21,7 +21,7 @@ python examples/lp/intro_example.py
 |---|---|---|
 | [`intro_example.py`](lp/intro_example.py) | The smallest end-to-end LP: build an `LP` from NumPy/SciPy arrays, call `jl.solve`, and read off the primal solution and objective. | — |
 | [`miplib_standard.py`](lp/miplib_standard.py) | Load a MIPLIB instance with HiGHS, relax integrality, convert it to Jaddle's sparse standard form with `highs_to_standard_form_sparse`, and solve it. | `highspy`, a MIPLIB `.mps` file |
-| [`battery_sizing.py`](lp/battery_sizing.py) | Batched, differentiable solves: size a battery by gradient descent, where each step solves 32 daily operating LPs at once with `jax.vmap` and differentiates their optimal costs with `jl.make_optimal_value`. Checks the result against one large LP solved by HiGHS and plots the design's convergence and a day's schedule. | `matplotlib` |
+| [`battery_sizing.py`](lp/battery_sizing.py) | Batched, differentiable solves: size a battery by gradient descent, where each step solves 32 daily operating LPs at once with `jax.vmap` and differentiates their optimal costs with `jl.make_optimal_value`. The battery's price has economies of scale, so the sizing problem is not one large LP. Checks the result with a second run from a different start and plots the design's convergence and a day's schedule. | `matplotlib` |
 
 ### `intro_example.py`
 
@@ -58,12 +58,20 @@ size appears only in that LP's upper bounds. The example minimises the
 battery's daily cost plus the average optimal operating cost over 32 scenario
 days, each with its own prices, demand and solar output.
 
+The battery's cost grows as the 0.8 power of its size. With a cost
+proportional to size the whole problem would be a single LP (the size as two
+extra variables beside every scenario's operating problem), and solving that
+directly takes well under a second, far quicker than the approach here.
+Economies of scale make the cost concave, so no such LP exists and the
+decomposition is needed.
+
 The gradient of an LP's optimal value with respect to a bound is the reduced
 cost there, so `jax.grad` of the batched `jl.make_optimal_value` gives the
 design's gradient without differentiating through the solver. Forty Adam steps
-bring the daily cost from $6.02 with no battery to $3.51, within 0.1% of the
-exact optimum from HiGHS (14.2 kWh against 14.7 kWh; the cost is flat near
-the optimum). It takes about 35 seconds on a CPU.
+bring the daily cost from $6.02 with no battery to $3.83. The problem is not
+convex, so the example repeats the run from an oversized battery: the two
+runs agree within 0.03% in cost (14.3 kWh against 14.6 kWh; the cost is flat
+near the optimum). It takes about 50 seconds on a CPU.
 
 ## Convex programs (`cp/`)
 

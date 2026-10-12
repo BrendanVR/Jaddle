@@ -1,11 +1,16 @@
 # %% [markdown]
 # # Linear Regression with Random Fourier Features
 # This notebook demonstrates how to perform linear regression using Random Fourier Features (RFF) to approximate a non-linear function. We will use Jaddle's convex optimization framework to solve the regression problem with L2 regularization.
+
+# %% [markdown]
+# ## Import Libraries
 import numpy as np
 import jax.numpy as jnp
 import jaddle.jaddle_convex as jc
 import jaddle.jaddle_optimisers as jo
 from sklearn.kernel_approximation import RBFSampler
+from sklearn.linear_model import Ridge
+import time
 import matplotlib.pyplot as plt
 
 # %%
@@ -16,7 +21,7 @@ np.random.seed(42)
 # Generate synthetic data
 n_samples = 2000
 X = np.linspace(-2 * np.pi, 2 * np.pi, n_samples)
-y = 3 * np.sin(X) + 2 * np.cos(5 * X) + np.random.normal(0, 0.5, n_samples)
+y = 3 * np.sin(X) + 2 * np.cos(5 * X) + np.random.normal(0, 0.75, n_samples)
 
 # %%
 # Apply Random Fourier Features
@@ -63,6 +68,14 @@ l2_norm = jnp.linalg.norm(solution.primal, ord=2)
 print("L2 norm of solution.primal:", l2_norm)
 
 # %%
+# Solve the problem using scikit-learn's Linear Regression for comparison
+start_time = time.time()
+lr = Ridge(solver="lsqr")
+lr.fit(X=X_transformed, y=y)
+end_time = time.time()
+print("Scikit-learn Linear Regression Time:", end_time - start_time)
+
+# %%
 y_pred = jnp.dot(X_jax, solution.primal)
 
 # Plot predictions vs actual values
@@ -75,7 +88,5 @@ plt.legend()
 plt.title("Linear Regression with RBF Features")
 plt.grid(True, alpha=0.3)
 plt.show()
-
-# %%
 
 # %%

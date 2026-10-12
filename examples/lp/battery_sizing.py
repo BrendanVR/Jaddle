@@ -5,6 +5,11 @@
 # problem: one linear program per day. This example solves a batch of those LPs at
 # once with `jax.vmap`, differentiates their optimal costs with respect to the
 # battery's size, and runs gradient descent on the size.
+#
+# The battery's price has economies of scale, so the sizing problem is not itself
+# a linear program. That is what makes the decomposition worthwhile: with a price
+# proportional to size, everything below would collapse into one LP, and solving
+# that LP directly would be far quicker.
 
 # %%
 import jax
@@ -13,7 +18,6 @@ import numpy as np
 import optax
 import scipy.sparse as sp
 import matplotlib.pyplot as plt
-from scipy.optimize import linprog
 import jaddle.jaddle_linear as jl
 import jaddle.jaddle_optimisers as jo
 
@@ -88,9 +92,9 @@ def operating_lp(price, net_load, energy, power):
 
 # %% [markdown]
 # ## The Sizing Problem
-# The battery costs a fixed amount per day for each kWh of storage and each kW of
-# power. The total daily cost of a design is that plus the average optimal
-# operating cost over the scenarios.
+# The battery's daily cost grows as the 0.8 power of its storage and of its power
+# rating, so doubling either costs about 1.74 times as much. The total daily cost
+# of a design is that plus the average optimal operating cost over the scenarios.
 #
 # `jl.make_optimal_value` returns an LP's optimal value as a differentiable
 # function of its numbers. Every day's LP has the same sparsity pattern, so one
@@ -99,7 +103,8 @@ def operating_lp(price, net_load, energy, power):
 # taken through the solver's iterations. The gradient of an LP's optimal value
 # with respect to a bound is the reduced cost at that bound, which the solver
 # has already computed.
-energy_cost, power_cost = 0.08, 0.03  # $/kWh/day and $/kW/day
+energy_cost, power_cost = 0.17, 0.05  # $/day for 1 kWh and for 1 kW
+scale_exponent = 0.8
 tolerance = dict(
     primal_feasibility_tolerance=1e-4,
     dual_feasibility_tolerance=1e-4,
@@ -122,7 +127,10 @@ def day_cost(design, price, net_load):
 
 
 def total_cost(design):
-    investment = energy_cost * design[0] + power_cost * design[1]
+    investment = (
+        energy_cost * design[0] ** scale_exponent
+        + power_cost * design[1] ** scale_exponent
+    )
     return investment + jnp.mean(
         jax.vmap(day_cost, in_axes=(None, 0, 0))(design, prices, net_load)
     )
@@ -130,64 +138,43 @@ def total_cost(design):
 
 # %% [markdown]
 # ## Optimise the Design
-# Projected gradient descent with Adam and a decaying step, from a small battery.
-# Every step solves all the scenarios' LPs.
+# Projected gradient descent with Adam and a decaying step. Every step solves all
+# the scenarios' LPs. The size is kept slightly above zero, where the investment
+# cost's slope is unbounded.
 cost_and_gradient = jax.jit(jax.value_and_grad(total_cost))
 num_steps = 40
-optimiser = optax.adam(optax.exponential_decay(2.5, num_steps, 0.01), b1=0.5)
-design = jnp.array([1.0, 0.5])  # energy (kWh), power (kW)
-opt_state = optimiser.init(design)
-history = []
-for step in range(num_steps):
-    cost, gradient = cost_and_gradient(design)
-    history.append((float(cost), *np.asarray(design)))
-    updates, opt_state = optimiser.update(gradient, opt_state)
-    design = jnp.maximum(design + updates, 0.0)
-history = np.array(history)
+smallest_size = 1e-3
+
+
+def descend(start):
+    optimiser = optax.adam(optax.exponential_decay(2.5, num_steps, 0.01), b1=0.5)
+    design = jnp.array(start)
+    opt_state = optimiser.init(design)
+    history = []
+    for step in range(num_steps):
+        cost, gradient = cost_and_gradient(design)
+        history.append((float(cost), *np.asarray(design)))
+        updates, opt_state = optimiser.update(gradient, opt_state)
+        design = jnp.maximum(design + updates, smallest_size)
+    return design, float(total_cost(design)), np.array(history)
+
+
+design, cost, history = descend([1.0, 0.5])  # energy (kWh), power (kW)
 energy, power = (float(v) for v in design)
-print(f"No battery:      ${float(total_cost(jnp.zeros(2))):.4f} per day")
-print(
-    f"Gradient design: {energy:.2f} kWh, {power:.2f} kW, ${float(total_cost(design)):.4f} per day"
-)
+print(f"No battery:        ${float(total_cost(jnp.zeros(2))):.4f} per day")
+print(f"From a small one:  {energy:.2f} kWh, {power:.2f} kW, ${cost:.4f} per day")
 
 # %% [markdown]
-# ## Check Against One Large LP
-# The sizing problem is also a single LP: make the size two extra variables and
-# stack every scenario's operating problem beside them. It grows with the number
-# of scenarios, where the batched approach above stays one small LP solved many
-# times, but here it is small enough for HiGHS to give the exact answer. The cost
-# is flat near the optimum, so the two designs agree more closely in cost than in
-# size.
-n = 4 * T
-is_power, is_soc = np.arange(n) < 2 * T, np.arange(n) >= 3 * T
-bounded = is_power | is_soc
-# One row per bounded variable: x[j] <= energy or x[j] <= power.
-size_columns = -np.column_stack([is_soc[bounded], is_power[bounded]]).astype(float)
-select_bounded = sp.identity(n, format="csr")[bounded]
-per_day = sp.identity(num_days, format="csr")
-no_size = sp.csr_matrix((num_days * T, 2))
-day_costs = np.hstack([np.zeros((num_days, 2 * T)), prices, np.zeros((num_days, T))])
-exact = linprog(
-    c=np.concatenate([[energy_cost, power_cost], day_costs.ravel() / num_days]),
-    A_eq=sp.hstack([no_size, sp.kron(per_day, A_eq)]),
-    b_eq=np.zeros(num_days * T),
-    A_ub=sp.vstack(
-        [
-            sp.hstack([no_size, sp.kron(per_day, A_ineq)]),
-            sp.hstack(
-                [
-                    sp.kron(np.ones((num_days, 1)), size_columns),
-                    sp.kron(per_day, select_bounded),
-                ]
-            ),
-        ]
-    ),
-    b_ub=np.concatenate([-net_load.ravel(), np.zeros(num_days * bounded.sum())]),
-    bounds=(0, None),
-    method="highs",
-)
+# ## Check From a Second Start
+# Economies of scale make the investment cost concave, so the sizing problem is
+# not convex and gradient descent only promises a local optimum. There is no
+# exact solver to compare against, so the check is a second run from an oversized
+# battery, which should arrive at the same design. The cost is flat near the
+# optimum, so the two runs agree more closely in cost than in size.
+large_design, large_cost, large_history = descend([30.0, 8.0])
 print(
-    f"Exact design:    {exact.x[0]:.2f} kWh, {exact.x[1]:.2f} kW, ${exact.fun:.4f} per day"
+    f"From a large one:  {float(large_design[0]):.2f} kWh, "
+    f"{float(large_design[1]):.2f} kW, ${large_cost:.4f} per day"
 )
 
 # %%
@@ -200,10 +187,10 @@ charge, discharge, grid, soc = np.split(np.asarray(schedule["solution"].primal),
 figure, (left, right) = plt.subplots(1, 2, figsize=(14, 5))
 left.plot(history[:, 1], label="Energy (kWh)")
 left.plot(history[:, 2], label="Power (kW)")
-left.axhline(exact.x[0], color="C0", linestyle="--", alpha=0.6)
-left.axhline(exact.x[1], color="C1", linestyle="--", alpha=0.6)
+left.plot(large_history[:, 1], color="C0", linestyle="--", alpha=0.6)
+left.plot(large_history[:, 2], color="C1", linestyle="--", alpha=0.6)
 left.set_xlabel("Gradient step")
-left.set_title("Battery size (dashed: exact)")
+left.set_title("Battery size (dashed: from a large battery)")
 left.legend()
 
 right.step(hours, soc, where="post", label="State of charge (kWh)")

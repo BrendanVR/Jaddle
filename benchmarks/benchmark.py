@@ -71,6 +71,18 @@ def add_cost_col_floor_flag(p):
     )
 
 
+def add_norm_flag(p):
+    """Add the --norm flag every LP benchmark script shares."""
+    p.add_argument(
+        "--norm",
+        default="l2",
+        choices=["l2", "inf"],
+        help="Norm for Jaddle's primal / dual feasibility residuals, in both "
+        "the termination test and the restart merit (jl.solve's "
+        "termination_norm and restart_norm). (default: %(default)s)",
+    )
+
+
 def add_polish_flags(p):
     """Add the --gap-tol and --polish flags (feasibility polishing A/Bs)."""
     p.add_argument(
@@ -213,6 +225,7 @@ def parse_args():
         "(default: float64).",
     )
     add_cost_col_floor_flag(p)
+    add_norm_flag(p)
     add_polish_flags(p)
     add_jaddle_verbose_flag(p, default=True)
     return p.parse_args()
@@ -299,10 +312,13 @@ def jaddle_solve_kwargs(
     verbose=True,
     cost_col_floor=0.0,
     gap_tol=None,
+    norm="l2",
 ):
     """The ``jl.solve`` settings every benchmark harness uses, so all of them
     (and benchmark_mpax.py's Jaddle arm) run the same configuration.
-    ``gap_tol`` (default: ``tol``) sets the duality-gap tolerance alone."""
+    ``gap_tol`` (default: ``tol``) sets the duality-gap tolerance alone.
+    ``norm`` (``"l2"`` or ``"inf"``) sets both the termination and the
+    restart norm."""
     return dict(
         max_epochs=max_epochs,
         max_seconds=max_seconds,
@@ -315,6 +331,8 @@ def jaddle_solve_kwargs(
         iterations_per_epoch=64 * 10,
         epochs_per_restart=10,
         cost_col_floor=cost_col_floor,
+        termination_norm=norm,
+        restart_norm=norm,
     )
 
 
@@ -328,6 +346,7 @@ def run_jaddle(
     cost_col_floor=0.0,
     gap_tol=None,
     polish=False,
+    norm="l2",
 ):
     """Solve with Jaddle's saddle-point solver. Returns a dict of metrics.
 
@@ -356,7 +375,14 @@ def run_jaddle(
     result = solve(
         lp,
         **jaddle_solve_kwargs(
-            tol, max_epochs, update_mode, max_seconds, verbose, cost_col_floor, gap_tol
+            tol,
+            max_epochs,
+            update_mode,
+            max_seconds,
+            verbose,
+            cost_col_floor,
+            gap_tol,
+            norm,
         ),
     )
     wall_seconds = time.perf_counter() - t0
@@ -404,6 +430,7 @@ def run_jaddle_presolved(
     gap_tol=None,
     polish=False,
     eliminate_defined_vars=True,
+    norm="l2",
 ):
     """Solve an instance file with ``jl.solve_with_presolve`` (HiGHS presolve,
     optional defined-variable elimination, Jaddle, postsolve). Returns a dict
@@ -427,7 +454,14 @@ def run_jaddle_presolved(
         eliminate_defined_vars=eliminate_defined_vars,
         reduced_solver=jl.solve_with_polishing if polish else None,
         **jaddle_solve_kwargs(
-            tol, max_epochs, update_mode, max_seconds, verbose, cost_col_floor, gap_tol
+            tol,
+            max_epochs,
+            update_mode,
+            max_seconds,
+            verbose,
+            cost_col_floor,
+            gap_tol,
+            norm,
         ),
     )
     wall_seconds = time.perf_counter() - t0
@@ -514,7 +548,7 @@ def main():
     polish_text = ", feasibility polishing" if args.polish else ""
     print(
         f"Running {len(instances)} instance(s) at tol={args.tol:g}"
-        f"{gap_text}{polish_text}\n"
+        f"{gap_text}, norm={args.norm}{polish_text}\n"
     )
     rows = []
     for name, path, size_mb in instances:
@@ -546,6 +580,7 @@ def main():
                 gap_tol=args.gap_tol,
                 polish=args.polish,
                 eliminate_defined_vars=args.eliminate_defined_vars,
+                norm=args.norm,
             )
             row.update(jres)
             row["rel_obj_gap"] = (

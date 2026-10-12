@@ -45,7 +45,7 @@ comment lists the remaining fairness choices.
 | Script | Presolve | Reference optimum | Default CSV |
 |---|---|---|---|
 | `benchmark.py` | HiGHS | Yes. A HiGHS solve (`simplex` by default) is used as a ground-truth objective oracle, and the relative gap to it is reported. | `benchmark_results.csv` |
-| `benchmark_mpax.py` | HiGHS, or none | No. Both solvers are judged by the shared certificate re-check instead. | `benchmark_mpax_results.csv` |
+| `benchmark_mpax.py` | HiGHS, or none | Off by default: both solvers are judged by the shared certificate re-check. `--highs-solver` adds a HiGHS solve and reports each solver's relative gap to it. | `benchmark_mpax_results.csv` |
 
 CSVs are written to the repo root. `benchmark.py` rewrites its CSV after every
 instance, so a crash partway through a sweep keeps the results so far. It also
@@ -84,6 +84,7 @@ python benchmarks/benchmark_mpax.py --presolve none --no-eliminate-defined-vars
 | `--max-seconds S` | none | Per-instance Jaddle wall-clock budget, including setup and XLA compile. It is checked at epoch boundaries. |
 | `--update-mode` | `alternating` | Passed to `jl.solve`: `alternating`, `pdhg` or `halpern`. |
 | `--cost-col-floor X` | `0` | Passed to `jl.solve` as `cost_col_floor`. A costed column whose largest scaled matrix entry is below `X` is rescaled so that entry becomes 1. This fixes epigraph objectives such as fhnw-binschedule0. `0` disables it, as in `jl.solve`'s default; try `1e-2` to enable it. |
+| `--norm {l2,inf}` | `l2` | Norm for Jaddle's primal and dual feasibility residuals, in both the termination test and the restart merit (`jl.solve`'s `termination_norm` and `restart_norm`). In `benchmark_mpax.py` it also sets MPAX's norm and the norm of the shared re-check. |
 | `--jax-profile` | `float64` | Passed to `configure_jax`: `float64`, `float32` or `float16`. |
 | `--skip-bigm` | off | Skip instances with cost big-M (see [`scan_bigm.py`](#scan_bigmpy)). |
 | `--skip-bigm-matrix` | off | Skip instances with matrix (row) big-M. |
@@ -101,8 +102,9 @@ python benchmarks/benchmark_mpax.py --presolve none --no-eliminate-defined-vars
 | `benchmark.py` | `--highs-verbose` | Show HiGHS's own log. |
 | `benchmark_mpax.py` | `--solvers {jaddle,mpax} ...` | Run only some of the solvers (default: both). |
 | `benchmark_mpax.py` | `--presolve {highs,none}` | Presolve applied before both solvers. `none` solves the raw relaxation, as in the PDLP and MPAX papers. |
+| `benchmark_mpax.py` | `--highs-solver {simplex,ipm,pdlp,none}` | Also solve each instance with HiGHS and report both solvers' objective gap to its optimum (default `none`: no HiGHS solve). HiGHS runs on the original file with no time limit. |
 | `benchmark_mpax.py` | `--mpax-algorithm {r2hpdhg,rapdhg}` | MPAX solver (default `r2hpdhg`). |
-| `benchmark_mpax.py` | `--mpax-norm {2,inf}` | Norm for MPAX's termination residuals (default `2`, matching Jaddle). |
+| `benchmark_mpax.py` | `--mpax-norm {2,inf}` | Norm for MPAX alone (default: the one `--norm` selects). If it differs from `--norm`, MPAX stops on a different norm than it is re-checked in. |
 | `benchmark_mpax.py` | `--mpax-iteration-limit N` | Optional MPAX iteration cap. |
 | `benchmark_mpax.py` | `--startup-timeout S` | Seconds a worker may take to start and load the LP (default `600`). |
 | `benchmark_mpax.py` | `--verbose` | Stream both solvers' progress logs. `--jaddle-verbose` follows it unless set explicitly. |
