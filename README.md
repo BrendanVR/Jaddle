@@ -374,6 +374,7 @@ tests.
   pays off when feasibility is tighter than the gap, e.g. `tol=1e-8,
   dual_gap_tolerance=1e-4`: on stp3d (float64) that certifies in 24 s, where a
   plain solve is still at PFR 5e-6 after 150 s.
+  `jl.solve_with_presolve(model, polish=True)` uses it for the reduced LP.
 - **Infeasibility detection.** `jl.detect_infeasibility` classifies an LP as
   `"primal_infeasible"`, `"dual_infeasible"` (unbounded if feasible),
   `"optimal"` or `"undetermined"` the PDLP way: diverging iterates give a

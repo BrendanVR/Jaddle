@@ -2867,6 +2867,7 @@ def solve_with_presolve(
     eliminate_defined_vars=False,
     reduced_solver=None,
     run_crossover=False,
+    polish=False,
     **solve_kwargs,
 ):
     """
@@ -2890,9 +2891,17 @@ def solve_with_presolve(
     which stall first-order methods: gmut-*, proteindesign*, radiation*). Its
     own postsolve maps the primal and dual back before HiGHS's does.
 
-    ``reduced_solver`` replaces ``solve()`` for the reduced LP (e.g.
-    ``solve_with_polishing``); it is called with ``solve_kwargs`` and must
-    return ``solve()``'s result keys.
+    ``polish=True`` solves the reduced LP with ``solve_with_polishing``
+    instead of ``solve()``, and the result gains its ``"polish"`` dict (absent
+    when presolve leaves nothing to solve). ``first_polish_epoch``,
+    ``polish_fraction`` and ``tol`` may then be given among the keyword
+    arguments. The tolerances keep ``solve()``'s default of 1e-3, not
+    ``solve_with_polishing``'s 1e-6, so the flag changes the method and not
+    the target. The finishing solve below stays a plain ``solve()``.
+
+    ``reduced_solver`` replaces ``solve()`` for the reduced LP with any other
+    callable; it is called with ``solve_kwargs`` and must return ``solve()``'s
+    result keys. It cannot be combined with ``polish=True``.
 
     HiGHS's postsolve maps the duals as well as the primal values (no basis
     is needed), so the returned point carries a certificate for the problem
@@ -2956,6 +2965,29 @@ def solve_with_presolve(
     """
     import highspy
     from jaddle import highs_helpers as hh
+
+    polish_kwargs = {}
+    if polish:
+        if reduced_solver is not None:
+            raise ValueError("polish=True and reduced_solver are alternatives")
+        reduced_solver = solve_with_polishing
+        # solve_with_polishing's own arguments: the finishing solve() does not
+        # take them.
+        polish_kwargs = {
+            key: solve_kwargs.pop(key)
+            for key in ("first_polish_epoch", "polish_fraction")
+            if key in solve_kwargs
+        }
+        # Resolve the tolerances here, so that the reduced solve, the original
+        # certificate and the finishing solve all test the same ones.
+        tol = solve_kwargs.pop("tol", 1e-3)
+        for key in (
+            "primal_feasibility_tolerance",
+            "dual_feasibility_tolerance",
+            "dual_gap_tolerance",
+        ):
+            if solve_kwargs.get(key) is None:
+                solve_kwargs[key] = tol
 
     highs = _highs_model(model, highs_options)
     original = highs.getLp()
@@ -3021,7 +3053,7 @@ def solve_with_presolve(
             lp_solved, _, elimination = jaddle_presolve.eliminate_defined_variables(
                 lp_reduced
             )
-        result = (reduced_solver or solve)(lp_solved, **solve_kwargs)
+        result = (reduced_solver or solve)(lp_solved, **polish_kwargs, **solve_kwargs)
         s = result["solution"]
         x = np.asarray(s.primal, dtype=np.float64)
         # solve() may have padded an empty block with one zero row; that row

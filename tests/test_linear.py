@@ -659,6 +659,28 @@ def test_solve_with_presolve(make_lp):
     assert cert["relative_dual_feasibility_residual"] <= 1e-6
 
 
+def test_solve_with_presolve_polish():
+    # Tight feasibility, loose gap; polish from the first epoch on.
+    lp = reducible_lp()
+    result = jl.solve_with_presolve(
+        lp,
+        polish=True,
+        tol=1e-8,
+        dual_gap_tolerance=1e-4,
+        first_polish_epoch=1,
+        iterations_per_epoch=16,
+        max_epochs=2000,
+    )
+    assert result["converged"]
+    assert set(result["polish"]) == {"attempts", "epochs", "polished"}
+    cert = solve_certificate(lp, result["solution"])
+    assert cert["relative_primal_feasibility_residual"] <= 1e-8
+    assert cert["relative_dual_feasibility_residual"] <= 1e-8
+    assert cert["relative_gap_abs"] <= 1e-4
+    with pytest.raises(ValueError, match="alternatives"):
+        jl.solve_with_presolve(lp, polish=True, reduced_solver=jl.solve)
+
+
 def test_solve_with_presolve_reduced_to_empty():
     result = jl.solve_with_presolve(toy_lp())
     assert result["stop_reason"] == "presolve_solved"

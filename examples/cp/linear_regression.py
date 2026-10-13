@@ -69,8 +69,8 @@ print("L2 norm of solution.primal:", l2_norm)
 
 # %%
 # Solve the problem using scikit-learn's Linear Regression for comparison
-start_time = time.time()
 lr = Ridge(solver="lsqr")
+start_time = time.time()
 lr.fit(X=X_transformed, y=y)
 end_time = time.time()
 print("Scikit-learn Linear Regression Time:", end_time - start_time)

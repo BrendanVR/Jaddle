@@ -55,8 +55,8 @@ solution = jc.solve(cp, primal_feasibility_tolerance=1e-6)["solution"]
 
 # %% [markdown]
 # ## Solve the problem using scikit-learn's Isotonic Regression
-start_time = time.time()
 ir = IsotonicRegression(increasing=True)
+start_time = time.time()
 y_pred_sklearn = ir.fit_transform(x, y)
 end_time = time.time()
 print("Scikit-learn Isotonic Regression Time:", end_time - start_time)

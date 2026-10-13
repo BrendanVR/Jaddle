@@ -56,9 +56,6 @@ result = jc.quadratic_program(
     b_eq=np.zeros(1),
     lower_bounds=np.zeros(n),
     upper_bounds=np.full(n, C),
-    primal_feasibility_tolerance=1e-4,
-    dual_feasibility_tolerance=1e-4,
-    dual_gap_tolerance=1e-4,
 )
 alpha = np.asarray(result["solution"].primal)
 # The intercept is the multiplier of the constraint yᵀα = 0.
