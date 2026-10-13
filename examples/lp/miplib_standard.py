@@ -5,10 +5,13 @@
 
 # %%
 import os
+from time import time
+from tracemalloc import start
 
 # Suppress INFO and WARNING logs from XLA/JAX
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
+import jax
 import jaddle.jaddle_optimisers as jo
 import jaddle.jaddle_linear as jl
 import highspy as hspy
@@ -19,15 +22,14 @@ jo.configure_jax("float64")
 
 # %% [markdown]
 # ## Path to the LP
-PROBLEM_NAME = "sct1"  # name of MIPLIB problem (without .mps extension)
+PROBLEM_NAME = "dc1l"  # name of MIPLIB problem (without .mps extension)
 PATH_TO_MPS = os.path.join(
     os.path.dirname(__file__), "..", "..", "data", f"{PROBLEM_NAME}.mps"
 )
 
 # %% [markdown]
-# ## Solve he LP with HiGHS
+# ## Read in the problem with HiGHS
 highs = hspy.Highs()
-highs.setOptionValue("output_flag", "true")
 highs.readModel(PATH_TO_MPS)
 
 n = highs.getNumCol()
@@ -35,33 +37,37 @@ highs.changeColsIntegrality(
     n, np.arange(n, dtype=np.int32), np.zeros(n, dtype=np.uint8)
 )
 
+# %%
 highs.run()
-
-print("HiGHS status:", highs.getModelStatus())
-print("HiGHS objective value:", highs.getObjectiveValue())
 
 # %% [markdown]
 # ## Solve the LP with Jaddle
 # Here we solve the LP using Jaddle, crossing over to the simplex method to render the solution basic.
 tol = 1e-6
+gap_tol = 1e-6
 problem_options = dict(
     primal_feasibility_tolerance=tol,
     dual_feasibility_tolerance=tol,
-    dual_gap_tolerance=tol,
+    dual_gap_tolerance=gap_tol,
 )
 
+start_time = time()
 solution = jl.solve_with_presolve(
-    PATH_TO_MPS,
+    highs,
     run_crossover=True,
     verbose=True,
     highs_options=dict(output_flag="true"),
     **problem_options,
 )
+end_time = time()
+print("Jaddle solve time:", end_time - start_time)
 
 # %%
+print("Jaddle objective value:", solution["objective"])
+print(
+    "Jaddle primal feasibility:", solution["certificate"]["primal_feasibility_residual"]
+)
+print("Jaddle duality gap:", solution["certificate"]["duality_gap"])
+
 # %%
-solution
-# %%
-for k in solution.keys():
-    print(k)
 # %%

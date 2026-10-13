@@ -854,6 +854,57 @@ def test_crossover_without_equality_rows():
     assert crossed["solution"].dual_eq.shape == (0,)
 
 
+def test_crossover_repairs_a_doubly_infeasible_basis(monkeypatch):
+    import highspy
+
+    from jaddle import highs_helpers as hh
+
+    # A noisy optimum crosses over to a basis that is neither primal nor dual
+    # feasible, which the repair handles in two stages: the primal simplex on
+    # relaxed bounds, then the dual simplex.
+    lp = random_lp(seed=1, m_eq=20, m_ineq=60, n=120)
+    model = hh.jaddle_lp_to_highs(lp)
+    highs = highspy.Highs()
+    highs.setOptionValue("output_flag", False)
+    highs.passModel(model)
+    highs.run()
+    optimum = highs.getSolution()
+    dual_eq, dual_ineq = hh.highs_duals_to_jaddle(
+        np.asarray(optimum.row_dual), model.row_lower_, model.row_upper_
+    )
+    rng = np.random.default_rng(0)
+    noisy = jl.SaddleState(
+        primal=np.asarray(optimum.col_value) + 0.03 * rng.standard_normal(lp.c.size),
+        dual_ineq=np.maximum(dual_ineq + 0.03 * rng.standard_normal(dual_ineq.size), 0),
+        dual_eq=dual_eq + 0.03 * rng.standard_normal(dual_eq.size),
+    )
+
+    first_stage = getattr(jl, "__relaxed_primal_repair")
+    stages = []
+
+    def recording(highs, *bounds):
+        pivots = first_stage(highs, *bounds)
+        # The first stage leaves the dual simplex selected when it has run.
+        stages.append((highs.getOptionValue("simplex_strategy")[1], pivots))
+        return pivots
+
+    monkeypatch.setattr(jl, "__relaxed_primal_repair", recording)
+    crossed = jl.crossover(lp, noisy)
+    assert [strategy for strategy, _ in stages] == [1]
+    assert crossed["converged"]
+    assert crossed["simplex_iterations"] >= stages[0][1] > 0
+    ref = reference_objective(lp)
+    assert abs(crossed["objective"] - ref) <= 1e-6 * (1 + abs(ref))
+    assert basic_count(crossed["basis"]) == lp.b_eq.size + lp.b_ineq.size
+
+    # A simplex strategy of the caller's is left to do the whole repair.
+    stages.clear()
+    crossed = jl.crossover(lp, noisy, highs_options={"simplex_strategy": 1})
+    assert stages == []
+    assert crossed["converged"]
+    assert abs(crossed["objective"] - ref) <= 1e-6 * (1 + abs(ref))
+
+
 def test_solve_with_presolve_crossover():
     import highspy
 

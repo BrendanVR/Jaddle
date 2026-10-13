@@ -3257,7 +3257,22 @@ def crossover(lp, solution, highs_options=None):
 
     The simplex repair makes the answer exact whatever the quality of
     ``solution``; a looser solution just costs more pivots. If HiGHS rejects
-    the starting point the simplex method runs from cold.
+    the starting point the simplex method runs from cold. The repair runs
+    with ``simplex_strategy=0`` (the primal simplex from a primal feasible
+    basis, the dual otherwise) and Devex dual edge weights, which
+    ``highs_options`` can override. On stp3d polished to 1e-8 the crossover's
+    basis is primal feasible with a few dozen wrong-sign reduced costs, and
+    HiGHS's defaults (dual simplex, exact steepest edge weights) spent 20 s
+    of a 27 s call before the first pivot, against 6 s for the call now.
+    A basis infeasible both ways is repaired in two stages, the primal
+    simplex on relaxed bounds and then the dual, unless ``highs_options``
+    sets ``simplex_strategy``.
+
+    The snap ratio (on a bound when the distance is at most the dual) stays
+    at 1. Ratios of 0.1, 10 and 100 were each best on some of 16 points from
+    8 instances and each many times worse on others (rail01 at 1e-4: 2734
+    repair pivots at 1, about 55000 at 0.1 and at 10), and which ratio won
+    did not follow the point's accuracy.
 
     Returns a dict:
 
@@ -3323,7 +3338,18 @@ def crossover(lp, solution, highs_options=None):
 
     highs = highspy.Highs()
     highs.setOptionValue("output_flag", False)
+    # Highs.crossover (1.14) segfaults on a large model (stp3d) in a process
+    # where HiGHS has not yet run or presolved anything. A run with no model
+    # does that initialisation.
+    highs.run()
     highs.setOptionValue("presolve", "off")
+    # For the repair. HiGHS's default is the dual simplex with exact steepest
+    # edge weights, which for a basis that is not the slack one cost a solve
+    # per row before the first pivot, and a dual phase 1 when a few reduced
+    # costs have the wrong sign. "Choose" takes the primal simplex when the
+    # basis is primal feasible, as the crossover's is from an accurate point.
+    highs.setOptionValue("simplex_strategy", 0)
+    highs.setOptionValue("simplex_dual_edge_weight_strategy", 1)
     for key, value in (highs_options or {}).items():
         highs.setOptionValue(key, value)
     model.row_upper_ = moved_b
@@ -3334,11 +3360,17 @@ def crossover(lp, solution, highs_options=None):
 
     model.row_upper_ = b
     highs.passModel(model)
+    repair_iterations = 0
     if crossover_status != highspy.HighsStatus.kError and basis.valid:
         highs.setBasis(basis)
+        if "simplex_strategy" not in (highs_options or {}):
+            repair_iterations = __relaxed_primal_repair(
+                highs, lower, upper, np.asarray(model.row_lower_), b
+            )
     highs.run()
     status = highs.getModelStatus()
     info = highs.getInfo()
+    repair_iterations += max(int(info.simplex_iteration_count), 0)
     vertex = highs.getSolution()
     basis = highs.getBasis()
     if vertex.value_valid and vertex.dual_valid:
@@ -3358,9 +3390,62 @@ def crossover(lp, solution, highs_options=None):
         "basis": basis if basis.valid else None,
         "crossover_status": crossover_status.name,
         "pushes": pushes,
-        "simplex_iterations": max(int(info.simplex_iteration_count), 0),
+        "simplex_iterations": repair_iterations,
         "seconds": time.time() - start,
     }
+
+
+def __relaxed_primal_repair(highs, lower, upper, row_lower, row_upper):
+    """
+    First stage of ``crossover()``'s repair when the basis set on ``highs`` is
+    both primal and dual infeasible; returns the pivots it took (0 when the
+    basis is infeasible in at most one way, and nothing is done).
+
+    From such a basis HiGHS runs a dual phase 1, which can take tens of
+    thousands of pivots to remove a handful of infeasibilities. Instead the
+    bounds the basic solution violates are relaxed onto it, which makes the
+    basis primal feasible, the primal simplex is run to a basis that is dual
+    feasible, and the bounds are put back. Dual feasibility does not depend on
+    the bounds' values, so the caller's run can finish with the dual simplex,
+    which this sets. At a snap ratio of 1, in repair pivots without and with:
+    stp3d (polished) 9996 and 10, sct1 (polished) 622 and 13, rail01 (1e-4)
+    12635 and 2734, mzzv11 (1e-4) 15871 and 11134, momentum1 (1e-4) 848 and
+    1142.
+    """
+    _, iteration_limit = highs.getOptionValue("simplex_iteration_limit")
+    # A run without pivots, for the basic solution and its infeasibilities.
+    highs.setOptionValue("simplex_iteration_limit", 0)
+    highs.run()
+    highs.setOptionValue("simplex_iteration_limit", iteration_limit)
+    info = highs.getInfo()
+    if info.num_primal_infeasibilities <= 0 or info.num_dual_infeasibilities <= 0:
+        return 0
+    point = highs.getSolution()
+    x, activity = np.asarray(point.col_value), np.asarray(point.row_value)
+    cols = np.flatnonzero((x < lower) | (x > upper)).astype(np.int32)
+    rows = np.flatnonzero((activity < row_lower) | (activity > row_upper)).astype(
+        np.int32
+    )
+    if cols.size:
+        highs.changeColsBounds(
+            cols.size, cols, np.minimum(lower, x)[cols], np.maximum(upper, x)[cols]
+        )
+    if rows.size:
+        highs.changeRowsBounds(
+            rows.size,
+            rows,
+            np.minimum(row_lower, activity)[rows],
+            np.maximum(row_upper, activity)[rows],
+        )
+    highs.setOptionValue("simplex_strategy", 4)
+    highs.run()
+    iterations = max(int(highs.getInfo().simplex_iteration_count), 0)
+    if cols.size:
+        highs.changeColsBounds(cols.size, cols, lower[cols], upper[cols])
+    if rows.size:
+        highs.changeRowsBounds(rows.size, rows, row_lower[rows], row_upper[rows])
+    highs.setOptionValue("simplex_strategy", 1)
+    return iterations
 
 
 # %%
