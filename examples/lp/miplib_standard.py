@@ -22,7 +22,7 @@ jo.configure_jax("float64")
 
 # %% [markdown]
 # ## Path to the LP
-PROBLEM_NAME = "dc1l"  # name of MIPLIB problem (without .mps extension)
+PROBLEM_NAME = "mzzv11"  # name of MIPLIB problem (without .mps extension)
 PATH_TO_MPS = os.path.join(
     os.path.dirname(__file__), "..", "..", "data", f"{PROBLEM_NAME}.mps"
 )
@@ -37,24 +37,23 @@ highs.changeColsIntegrality(
     n, np.arange(n, dtype=np.int32), np.zeros(n, dtype=np.uint8)
 )
 
-# %%
-highs.run()
-
 # %% [markdown]
 # ## Solve the LP with Jaddle
 # Here we solve the LP using Jaddle, crossing over to the simplex method to render the solution basic.
 tol = 1e-6
-gap_tol = 1e-6
+gap_tol = 1e-4
 problem_options = dict(
     primal_feasibility_tolerance=tol,
     dual_feasibility_tolerance=tol,
     dual_gap_tolerance=gap_tol,
+    epochs_per_restart=10,
 )
 
 start_time = time()
 solution = jl.solve_with_presolve(
     highs,
     run_crossover=True,
+    polish=True,
     verbose=True,
     highs_options=dict(output_flag="true"),
     **problem_options,

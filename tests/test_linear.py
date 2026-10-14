@@ -359,7 +359,9 @@ def test_solve_with_polishing_epoch_budget():
     [{}, {"update_mode": "pdhg"}, {"update_mode": "halpern"}, {"scale": False}],
 )
 def test_make_solver_matches_solve(options):
-    # One traced solve reproduces solve() exactly (CPU, float64).
+    # One traced solve reproduces solve() to rounding (CPU, float64). The two
+    # paths compile to different XLA programs, so bit-equality varies by jax
+    # version (jax 0.11 differs by ~3e-11 relative under update_mode="pdhg").
     lp = random_lp()
     tolerances = dict(
         primal_feasibility_tolerance=TOL,
@@ -370,7 +372,9 @@ def test_make_solver_matches_solve(options):
     result = jax.jit(jl.make_solver(lp, **tolerances, **options))()
     assert int(result.epochs) == reference["epochs"]
     for a, b in zip(result.solution, reference["solution"]):
-        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+        np.testing.assert_allclose(
+            np.asarray(a), np.asarray(b), rtol=1e-9, atol=1e-12
+        )
 
 
 def test_make_solver_vmap_batch():
