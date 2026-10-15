@@ -7,6 +7,7 @@ import jax
 import numpy as np
 import scipy.sparse as sp
 import jaddle.jaddle_linear as jl
+import time
 
 jax.config.update("jax_platform_name", "cpu")  # Using CPU for toy problem
 
@@ -39,11 +40,18 @@ lp = jl.LP(
     lower_bounds=lower_bounds,
     upper_bounds=upper_bounds,
 )
+lp = jl.to_jaddle_sparse(lp)
 
 # %% [markdown]
 # ## Solving the LP Problem
-solution = jl.solve(lp, dual_gap_tolerance=1e-6)["solution"]
-# %%
+start_time = time.time()
+solution = jl.solve(
+    lp,
+    dual_gap_tolerance=1e-6,
+    scale=False,
+)["solution"]
+end_time = time.time()
 print(f"x1 = {solution.primal[0]:.4f}, x2 = {solution.primal[1]:.4f}")
 print(f"Optimal objective value: {lp.objective(solution.primal):.4f}")
+print(f"Solving time: {end_time - start_time:.4f} seconds")
 # %%

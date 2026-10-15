@@ -411,9 +411,9 @@ automatic differentiation. No derivatives are required from the user.
 
 | Mode | Gradient evaluations per iteration | Description |
 |---|---|---|
-| `"extragradient"` (default) | 2 | Korpelevich extragradient: a look-ahead step followed by a corrector step. Contractive for monotone problems. |
+| `"alternating"` (default) | 1 | Primal step, then a dual step at the new primal point. The update rule is a user-supplied Optax optimiser. |
+| `"extragradient"` | 2 | Korpelevich extragradient: a look-ahead step followed by a corrector step. Contractive for monotone problems. |
 | `"forward_reflected"` | 1 | Malitsky–Tam forward-reflected-backward: one gradient per iteration plus a reflection term built from the previous gradient. Requires the adaptive step. |
-| `"alternating"` | 1 | Primal step, then a dual step at the new primal point. The update rule is a user-supplied Optax optimiser. |
 
 **Adaptive step size.** With `adaptive_eta="auto"` (the default), the
 extragradient and forward-reflected schemes use a Malitsky–Tam line search
@@ -434,9 +434,12 @@ players through `jaddle_optimisers.create_saddle_optimiser`. Ready-made
 choices include `jo.gd`, `jo.optimistic_gd`, `jo.optimistic_adadelta` and
 `jo.gd_dual_momentum`.
 
-**Restarts and averaging.** Adaptive restarts (`restarts=True`) and iterate
-averaging (`average=True`, with an optional `weight_function`) are available
-but off by default.
+**Restarts and averaging.** Iterate averaging (`average=True`, with an
+optional `weight_function`) is on by default. As in the LP solver,
+`report_best=True` (the default) tests convergence on, and returns, whichever
+of the average and the last iterate has the lower KKT merit each epoch, so
+averaging never holds back a last iterate that is already converging. Adaptive
+restarts (`restarts=True`) are available but off by default.
 
 **Termination.** The solver stops when all three of the following fall below
 their tolerances:
@@ -451,7 +454,7 @@ their tolerances:
 
 | Argument | Default | Purpose |
 |---|---|---|
-| `update_mode` | `"extragradient"` | Iteration scheme (see above). |
+| `update_mode` | `"alternating"` | Iteration scheme (see above). |
 | `adaptive_eta` | `"auto"` | Adaptive line-searched step. Pass a float to set the seed, or `None` to use the optimiser's fixed learning rate. |
 | `optimiser` | `None` | Optax optimiser for `alternating` mode. When `None`, gradient descent with learning rate 0.5 is used. |
 | `iterations_per_epoch` | `1000` | Iterations per compiled epoch. |

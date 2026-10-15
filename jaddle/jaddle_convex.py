@@ -21,6 +21,16 @@ _EVT_CAP = 64
 _ADAPTIVE_MODES = ("extragradient", "forward_reflected")
 
 
+def _reported_point(carry, average):
+    # The point the last epoch's metrics describe: the average or the last
+    # iterate (with report_best, whichever had the lower merit).
+    if not average:
+        return carry["state"]
+    return jax.tree.map(
+        lambda a, s: jnp.where(carry["used_avg"], a, s), carry["avg"], carry["state"]
+    )
+
+
 def _init_k_slot(k, eta, state, update_mode):
     # The k-slot rides in opt_state next to the optimiser state:
     #   - k-scaling only (eta None):        k
@@ -187,7 +197,6 @@ def _make_epoch_fn(
             return (opt_state, k)
         return opt_state
 
-
     def run_epoch(
         max_iter,
         start_iter,
@@ -244,9 +253,7 @@ def _make_epoch_fn(
                 # isotonic n=10k); a rejection here only costs one iteration.
                 out, eta_bar = trial(eta)
                 accept = eta <= eta_bar
-                out = jax.tree.map(
-                    lambda a, b: jnp.where(accept, a, b), out, keep
-                )
+                out = jax.tree.map(lambda a, b: jnp.where(accept, a, b), out, keep)
                 eta_next = jnp.where(
                     accept,
                     _advance_eta(eta_bar, eta, ip1),
@@ -285,9 +292,7 @@ def _make_epoch_fn(
                     g = grad(state)
                     return g, jax.tree.map(lambda x: x + 0, g)
 
-                F_cur0, F_prev0 = jax.lax.cond(
-                    valid0, lambda: (F_cur0, F_prev0), _seed
-                )
+                F_cur0, F_prev0 = jax.lax.cond(valid0, lambda: (F_cur0, F_prev0), _seed)
 
                 def step(carry, _):
                     (
@@ -303,14 +308,11 @@ def _make_epoch_fn(
                     ip1 = jnp.asarray(i + 1, eta.dtype)
                     k = k0
                     # Reflection term is fixed across line-search retries.
-                    refl = jax.tree.map(
-                        lambda a, b: eta_prev * (a - b), F_cur, F_prev
-                    )
+                    refl = jax.tree.map(lambda a, b: eta_prev * (a - b), F_cur, F_prev)
 
                     def trial(eta_t):
                         x_new = projection_primal(
-                            state.primal
-                            - (eta_t * F_cur.primal + refl.primal) / k
+                            state.primal - (eta_t * F_cur.primal + refl.primal) / k
                         )
                         dual_ineq = projection_non_negative(
                             state.dual_ineq
@@ -344,9 +346,7 @@ def _make_epoch_fn(
                     # On rejection the whole FRB state (iterate, F history,
                     # previous step) stays put; only eta shrinks.
                     (new_state, F_new, F_old, eta_prev_new), eta_next, accept = (
-                        _line_search(
-                            trial, eta, ip1, (state, F_cur, F_prev, eta_prev)
-                        )
+                        _line_search(trial, eta, ip1, (state, F_cur, F_prev, eta_prev))
                     )
                     average_state, total_weight = _accumulate(
                         i, new_state, average_state, total_weight, accept
@@ -396,13 +396,9 @@ def _make_epoch_fn(
                 tau = eta / k
                 sigma = eta * k
                 xh = projection_primal(state.primal - tau * g.primal)
-                yh_ineq = projection_non_negative(
-                    state.dual_ineq - sigma * g.dual_ineq
-                )
+                yh_ineq = projection_non_negative(state.dual_ineq - sigma * g.dual_ineq)
                 yh_eq = state.dual_eq - sigma * g.dual_eq
-                state_half = SaddleState(
-                    primal=xh, dual_ineq=yh_ineq, dual_eq=yh_eq
-                )
+                state_half = SaddleState(primal=xh, dual_ineq=yh_ineq, dual_eq=yh_eq)
                 g_half = grad(state_half)
                 # Corrector from the ORIGINAL state using the look-ahead grad.
                 x_new = projection_primal(state.primal - tau * g_half.primal)
@@ -410,9 +406,7 @@ def _make_epoch_fn(
                     state.dual_ineq - sigma * g_half.dual_ineq
                 )
                 dual_eq = state.dual_eq - sigma * g_half.dual_eq
-                cand = SaddleState(
-                    primal=x_new, dual_ineq=dual_ineq, dual_eq=dual_eq
-                )
+                cand = SaddleState(primal=x_new, dual_ineq=dual_ineq, dual_eq=dual_eq)
 
                 # Local Lipschitz estimate, measured on the look-ahead
                 # displacement.
@@ -543,9 +537,7 @@ def _make_epoch_fn(
                 # Corrector: gradient at look-ahead point, applied from original state
                 g_half = grad(state_half)
                 scaled_g_half = scale_by_k(g_half, k) if k_scaling else g_half
-                corr_updates, opt_state = opt_update(
-                    scaled_g_half, opt_state, state
-                )
+                corr_updates, opt_state = opt_update(scaled_g_half, opt_state, state)
                 state = optax.apply_updates(state, corr_updates)
                 state = SaddleState(
                     primal=projection_primal(state.primal),
@@ -644,6 +636,7 @@ def _device_solver(
     verbose,
     log_every,
     average,
+    report_best,
     update_mode,
     k_scaling,
     k_lo,
@@ -668,6 +661,7 @@ def _device_solver(
     ``run_chunk(carry, n_epochs)`` for an epoch length, and ``carry`` is the
     initial loop state.
     """
+
     def projection_primal(primal_state):
         return projection_box(primal_state, cp.lower_bounds, cp.upper_bounds)
 
@@ -877,9 +871,11 @@ def _device_solver(
         # +inf everywhere (and gap finiteness False) so the convergence test
         # can't pass before the first epoch has computed real metrics.
         return tuple(
-            jnp.zeros(m.shape, m.dtype)
-            if m.dtype == jnp.bool_
-            else jnp.full(m.shape, jnp.inf, m.dtype)
+            (
+                jnp.zeros(m.shape, m.dtype)
+                if m.dtype == jnp.bool_
+                else jnp.full(m.shape, jnp.inf, m.dtype)
+            )
             for m in _metric_shapes
         )
 
@@ -908,9 +904,26 @@ def _device_solver(
             count = c["count"] + 1
 
             metrics = compute_epoch_metrics(avg if average else state)
-            objective_value, primal_grad_norm, complementarity_slack, constraint_bound = (
-                metrics[:4]
-            )
+            # `used_avg` tracks which point the metrics describe.
+            used_avg = jnp.asarray(bool(average))
+            # report_best: when averaging is on, the average and the last iterate
+            # are different points and either can be the better solution
+            # (averaging stabilises rotational problems but lags the last iterate
+            # when it is already contracting). Report/converge on whichever has
+            # the lower KKT merit, at the cost of a second metrics pass per epoch.
+            if report_best and average:
+                state_metrics = compute_epoch_metrics(state)
+                iterate_better = kkt_merit(*state_metrics[1:4]) < kkt_merit(
+                    *metrics[1:4]
+                )
+                metrics = _select(iterate_better, state_metrics, metrics)
+                used_avg = ~iterate_better
+            (
+                objective_value,
+                primal_grad_norm,
+                complementarity_slack,
+                constraint_bound,
+            ) = metrics[:4]
 
             log, n_log, evt, n_evt = c["log"], c["n_log"], c["evt"], c["n_evt"]
             if verbose:
@@ -941,10 +954,11 @@ def _device_solver(
                 )
 
                 # Two-point restart: pick the better of average and iterate.
-                restart_point = avg if average else state
+                # With report_best the metrics already describe the better one.
+                restart_used_avg = used_avg
+                restart_point = _select(used_avg, avg, state) if average else state
                 restart_merit = merit
-                restart_used_avg = jnp.asarray(bool(average))
-                if average:
+                if average and not report_best:
                     st = compute_epoch_metrics(state)
                     state_merit = kkt_merit(st[1], st[2], st[3])
                     iterate_better = state_merit < merit
@@ -1006,6 +1020,7 @@ def _device_solver(
             new = dict(
                 state=state,
                 avg=avg,
+                used_avg=used_avg,
                 opt=opt,
                 state_at_last_restart=at_restart,
                 metrics=metrics,
@@ -1048,6 +1063,7 @@ def _device_solver(
         dict(
             state=initial_solution,
             avg=initial_solution,
+            used_avg=jnp.asarray(bool(average)),
             opt=opt_state,
             state_at_last_restart=initial_solution,
             metrics=_initial_metrics(),
@@ -1085,8 +1101,9 @@ def solve(
     weight_function=lambda _: 1.0,
     verbose=False,
     log_every=1,
-    average=False,
-    update_mode="extragradient",
+    average=True,
+    report_best=True,
+    update_mode="alternating",
     k_scale=10.0,
     k_theta=0.5,
     k_init=None,
@@ -1165,13 +1182,21 @@ def solve(
             ``average=True``.
         verbose: Print per-epoch progress (default ``False``).
         log_every: With ``verbose``, print every this many epochs (default 1).
-        average: Report and test convergence on the weighted running average
-            of the iterates rather than the last iterate (default ``False``);
-            restarts then resume from whichever of the two has the better merit. Averaging helps non-contractive schemes such as
-            ``"alternating"``; the adaptive schemes converge in the last iterate.
+        average: Keep a weighted running average of the iterates (default
+            ``True``) and report / test convergence on it (see
+            ``report_best``); restarts then resume from whichever of the average
+            and the last iterate has the better merit. Averaging helps
+            non-contractive schemes such as ``"alternating"``; the adaptive
+            schemes converge in the last iterate.
+        report_best: With ``average``, test convergence on and return
+            whichever of the average and the last iterate has the lower KKT
+            merit, re-chosen every epoch (default ``True``), so averaging never
+            holds back a last iterate that is already converging. Costs a second
+            metrics evaluation per epoch. ``False`` always uses the average.
         update_mode: Selects the stepping scheme (single source of truth):
-            ``"extragradient"`` (default; Korpelevich two-call),
-            ``"alternating"`` (primal step, then dual step at the new primal) or
+            ``"alternating"`` (default; primal step, then dual step at the new
+            primal, driven by ``optimiser``), ``"extragradient"`` (Korpelevich
+            two-call) or
             ``"forward_reflected"`` (Malitsky-Tam forward-reflected-backward:
             one gradient evaluation per iteration; requires ``adaptive_eta``).
         k_scale: Primal-weight (k) scaling control. ``None`` disables it;
@@ -1290,6 +1315,7 @@ def solve(
         verbose=verbose,
         log_every=log_every,
         average=average,
+        report_best=report_best,
         update_mode=update_mode,
         k_scaling=k_scaling,
         k_lo=k_lo,
@@ -1431,7 +1457,7 @@ def solve(
         print("----------------------------------------------")
 
     opt_state = carry["opt"]
-    output = carry["avg"] if average else carry["state"]
+    output = _reported_point(carry, average)
 
     output = jax.block_until_ready(output)
     end_time = time.time()
@@ -1475,8 +1501,9 @@ def make_solver(
     primal_feasibility_tolerance=1e-3,
     complementarity_slack_tolerance=1e-3,
     weight_function=lambda _: 1.0,
-    average=False,
-    update_mode="extragradient",
+    average=True,
+    report_best=True,
+    update_mode="alternating",
     k_scale=10.0,
     k_theta=0.5,
     k_init=None,
@@ -1536,6 +1563,7 @@ def make_solver(
             verbose=False,
             log_every=1,
             average=average,
+            report_best=report_best,
             update_mode=update_mode,
             k_scaling=k_scaling,
             k_lo=k_lo,
@@ -1549,13 +1577,15 @@ def make_solver(
             restart_multiplier=restart_multiplier,
             restart_decay=restart_decay,
             iterations_per_epoch_decay=1.0,
-            iterations_per_epoch_min=min(iterations_per_epoch_min, iterations_per_epoch),
+            iterations_per_epoch_min=min(
+                iterations_per_epoch_min, iterations_per_epoch
+            ),
         )
         carry = build_chunk(iterations_per_epoch)(
             carry, jnp.asarray(n_epochs, carry["count"].dtype)
         )
         return SolveCoreResult(
-            solution=carry["avg"] if average else carry["state"],
+            solution=_reported_point(carry, average),
             converged=carry["done"],
             epochs=carry["count"],
         )
@@ -1715,16 +1745,16 @@ def make_solution(build_cp, active_tol=1e-6, gmres_tol=1e-10, **settings):
         def transpose_jacobian(w):
             return vjp_z(w)[0]
 
-        w, _ = gmres(transpose_jacobian, rhs, tol=gmres_tol, atol=0.0, restart=50, maxiter=50)
+        w, _ = gmres(
+            transpose_jacobian, rhs, tol=gmres_tol, atol=0.0, restart=50, maxiter=50
+        )
         residual = jax.tree.map(lambda a, b: a - b, transpose_jacobian(w), rhs)
         flat_norm = lambda t: jnp.sqrt(sum(jnp.vdot(a, a) for a in jax.tree.leaves(t)))
         ok = flat_norm(residual) <= 1e3 * gmres_tol * (1 + flat_norm(rhs))
 
         _, vjp_params = jax.vjp(lambda p: kkt(z, p, masks), params)
         (grad_params,) = vjp_params(w)
-        return (
-            jax.tree.map(lambda t: jnp.where(ok, -t, jnp.nan), grad_params),
-        )
+        return (jax.tree.map(lambda t: jnp.where(ok, -t, jnp.nan), grad_params),)
 
     @jax.custom_vjp
     def solution_map(params):
@@ -1789,8 +1819,7 @@ def _qp_certificate(Q, c, A_eq, b_eq, A_ineq, b_ineq, lower, upper, solution):
     at_lower = (reduced_cost > 0) & np.isfinite(lower)
     at_upper = (reduced_cost < 0) & np.isfinite(upper)
     bound_term = np.sum(
-        reduced_cost
-        * np.where(at_lower, lower, np.where(at_upper, upper, 0.0)),
+        reduced_cost * np.where(at_lower, lower, np.where(at_upper, upper, 0.0)),
     )
     primal_residual = np.linalg.norm(
         np.concatenate(
@@ -1928,7 +1957,9 @@ def quadratic_program(
     lower_s = jnp.asarray(lower / d, dtype=dtype)
     upper_s = jnp.asarray(upper / d, dtype=dtype)
     d_j = jnp.asarray(d, dtype=dtype)
-    e_eq, e_ineq = jnp.asarray(e[:m_eq], dtype=dtype), jnp.asarray(e[m_eq:], dtype=dtype)
+    e_eq, e_ineq = jnp.asarray(e[:m_eq], dtype=dtype), jnp.asarray(
+        e[m_eq:], dtype=dtype
+    )
     b_norm = float(np.linalg.norm(np.concatenate([b_eq, b_ineq])))
     c_norm = float(np.linalg.norm(c))
 
@@ -2006,7 +2037,9 @@ def quadratic_program(
     scaled = result["solution"]
     solution = SaddleState(
         primal=jnp.asarray(d * np.asarray(scaled.primal, dtype=np.float64)),
-        dual_ineq=jnp.asarray(e[m_eq:] * np.asarray(scaled.dual_ineq, dtype=np.float64)),
+        dual_ineq=jnp.asarray(
+            e[m_eq:] * np.asarray(scaled.dual_ineq, dtype=np.float64)
+        ),
         dual_eq=jnp.asarray(e[:m_eq] * np.asarray(scaled.dual_eq, dtype=np.float64)),
     )
     certificate = _qp_certificate(

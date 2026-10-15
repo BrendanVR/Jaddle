@@ -22,7 +22,7 @@ jo.configure_jax("float64")
 
 # %% [markdown]
 # ## Path to the LP
-PROBLEM_NAME = "mzzv11"  # name of MIPLIB problem (without .mps extension)
+PROBLEM_NAME = "stp3d"  # name of MIPLIB problem (without .mps extension)
 PATH_TO_MPS = os.path.join(
     os.path.dirname(__file__), "..", "..", "data", f"{PROBLEM_NAME}.mps"
 )
@@ -40,12 +40,12 @@ highs.changeColsIntegrality(
 # %% [markdown]
 # ## Solve the LP with Jaddle
 # Here we solve the LP using Jaddle, crossing over to the simplex method to render the solution basic.
-tol = 1e-6
-gap_tol = 1e-4
 problem_options = dict(
-    primal_feasibility_tolerance=tol,
-    dual_feasibility_tolerance=tol,
-    dual_gap_tolerance=gap_tol,
+    primal_feasibility_tolerance=1e-8,
+    dual_feasibility_tolerance=1e-4,
+    dual_gap_tolerance=1e-4,
+    scaled_augmented=False,
+    cost_col_floor=1e-2,
 )
 
 start_time = time()

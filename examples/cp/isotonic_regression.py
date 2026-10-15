@@ -18,7 +18,7 @@ from sklearn.isotonic import IsotonicRegression
 n = 500
 x = np.linspace(-1, 1, n)
 y = x**3
-y += 0.15 * np.random.randn(n)  # add noise
+y += 0.1 * np.random.randn(n)  # add noise
 
 
 # %% [markdown]
@@ -51,7 +51,12 @@ cp = jc.JaddleCP(
 
 # %% [markdown]
 # ## Solve the problem using Jaddle Convex SPS optimizer
-solution = jc.solve(cp, primal_feasibility_tolerance=1e-6)["solution"]
+solution = jc.solve(
+    cp,
+    primal_feasibility_tolerance=1e-6,
+    update_mode="extragradient",
+    verbose=True,
+)["solution"]
 
 # %% [markdown]
 # ## Solve the problem using scikit-learn's Isotonic Regression
@@ -74,7 +79,7 @@ plt.plot(
 plt.plot(
     x,
     solution.primal,
-    label="Jaddle Isotonic regression solution",
+    label="Jaddle Isotonic Regression solution",
     color="red",
     linewidth=2,
 )

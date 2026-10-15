@@ -6,19 +6,20 @@
 
 # %%
 import numpy as np
+import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import jaddle.jaddle_convex as jc
 import jaddle.jaddle_optimisers as jo
 from sklearn.svm import SVC
 import time
 
-jo.configure_jax("float64")
+jo.configure_jax("float32")
 
 # %% [markdown]
 # ## Generate Synthetic Data
 # Two interleaved half-moons, one per class, with labels `y` in {-1, +1}.
 rng = np.random.default_rng(0)
-n = 1000
+n = 200
 theta = rng.uniform(0, np.pi, n // 2)
 upper_moon = np.column_stack([np.cos(theta), np.sin(theta)])
 lower_moon = np.column_stack([1 - np.cos(theta), 0.5 - np.sin(theta)])
@@ -43,20 +44,40 @@ def rbf_kernel(A, B, gamma):
     return np.exp(-gamma * squared_distances)
 
 
-C = 10.0
+C = 1
 gamma = 2.0
 Q = np.outer(y, y) * rbf_kernel(X, X, gamma)
 
 # %% [markdown]
 # ## Solve the problem using Jaddle
-result = jc.quadratic_program(
-    Q,
-    -np.ones(n),
-    A_eq=y[None, :],
-    b_eq=np.zeros(1),
-    lower_bounds=np.zeros(n),
-    upper_bounds=np.full(n, C),
+Q = jnp.array(Q)
+y = jnp.array(y)
+
+objective = lambda alpha: 0.5 * alpha @ Q @ alpha - jnp.sum(alpha)
+constraints_eq = lambda alpha: jnp.array([jnp.dot(y, alpha)])
+constraints_ineq = lambda alpha: jnp.zeros(0)
+
+lower_bounds = jnp.zeros(n)
+upper_bounds = jnp.full(n, C)
+
+problem = jc.JaddleCP(
+    num_variables=n,
+    objective=objective,
+    constraints_eq=constraints_eq,
+    constraints_ineq=constraints_ineq,
+    lower_bounds=lower_bounds,
+    upper_bounds=upper_bounds,
 )
+
+# %%
+result = jc.solve(
+    problem,
+    verbose=True,
+    update_mode="extragradient",
+    average=False,
+    report_best=False,
+)
+
 alpha = np.asarray(result["solution"].primal)
 # The intercept is the multiplier of the constraint yᵀα = 0.
 intercept = float(result["solution"].dual_eq[0])
@@ -83,7 +104,6 @@ support = alpha > 1e-6 * C
 print("Converged:", result["converged"])
 print("Support vectors:", int(support.sum()), "of", n)
 print("Training accuracy:", np.mean(np.sign(decision_function(X)) == y))
-print("Relative duality gap:", result["certificate"]["relative_gap"])
 
 # %%
 grid_x, grid_y = np.meshgrid(np.linspace(-1.7, 2.7, 300), np.linspace(-1.3, 1.8, 300))
