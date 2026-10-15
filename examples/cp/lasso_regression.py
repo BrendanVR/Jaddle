@@ -319,7 +319,11 @@ fig, (ax_alpha, ax_penalty) = plt.subplots(1, 2, figsize=(14, 5))
 alphas_seen, losses_seen = np.array(history).T
 ax_alpha.plot(alpha_grid, val_grid, color="C7", label="Grid search")
 ax_alpha.scatter(
-    alphas_seen, losses_seen, c=np.arange(len(history)), cmap="viridis", zorder=3,
+    alphas_seen,
+    losses_seen,
+    c=np.arange(len(history)),
+    cmap="viridis",
+    zorder=3,
     label="Gradient descent (colour = step)",
 )
 ax_alpha.set_xscale("log")
@@ -331,15 +335,30 @@ ax_alpha.legend()
 
 alpha_features = np.exp(np.asarray(log_alpha_features))
 in_support = w_true != 0
-ax_penalty.bar(np.flatnonzero(~in_support), alpha_features[~in_support], color="C7",
-               label="Irrelevant feature")
-ax_penalty.bar(np.flatnonzero(in_support), alpha_features[in_support], color="C3",
-               label="True feature")
-ax_penalty.axhline(alpha_best, color="k", linestyle="--", linewidth=1,
-                   label="Starting value (best single alpha)")
+ax_penalty.bar(
+    np.flatnonzero(~in_support),
+    alpha_features[~in_support],
+    color="C7",
+    label="Irrelevant feature",
+)
+ax_penalty.bar(
+    np.flatnonzero(in_support),
+    alpha_features[in_support],
+    color="C3",
+    label="True feature",
+)
+ax_penalty.axhline(
+    alpha_best,
+    color="k",
+    linestyle="--",
+    linewidth=1,
+    label="Starting value (best single alpha)",
+)
 ax_penalty.set_yscale("log")
 ax_penalty.set_xlabel("Feature index")
 ax_penalty.set_ylabel("alpha_j")
 ax_penalty.set_title("Tuned penalty per feature")
 ax_penalty.legend()
 plt.show()
+
+# %%

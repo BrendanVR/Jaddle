@@ -203,12 +203,25 @@ def parse_args():
         "~1e7, objective still drifting at 80 epochs). See benchmarks/scan_bigm.py.",
     )
     p.add_argument(
+        "--presolve",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Presolve with HiGHS and solve the reduced LP via "
+        "jl.solve_with_presolve (converged = certified on the presolved LP). "
+        "--no-presolve solves the file's LP relaxation as given with jl.solve, "
+        "skipping defined-variable elimination too, so converged is certified "
+        "on the original LP (the no-presolve setting of the cuPDLP papers). "
+        "--no-presolve also turns presolve off in the HiGHS reference solve. "
+        "(default: %(default)s)",
+    )
+    p.add_argument(
         "--eliminate-defined-vars",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="After HiGHS presolve, substitute out variables defined by a dense "
         "equality row (z = sum_j a_j x_j, e.g. gmut-*, proteindesign*), which "
-        "HiGHS keeps. On by default; --no-eliminate-defined-vars disables it. See "
+        "HiGHS keeps. On by default; --no-eliminate-defined-vars disables it. "
+        "Ignored with --no-presolve. See "
         "jaddle.presolve.eliminate_defined_variables.",
     )
     p.add_argument(
@@ -237,6 +250,7 @@ def highs_reference(
     tol=1e-3,
     highs_verbose=False,
     highs_kkt_tolerance=None,
+    presolve=True,
 ):
     """Solve the LP relaxation with HiGHS for a trusted reference optimum.
 
@@ -249,6 +263,8 @@ def highs_reference(
 
     ``highs_verbose`` enables HiGHS's own solve logging. ``highs_kkt_tolerance``
     overrides the KKT tolerance passed to HiGHS (defaults to ``tol``).
+    ``presolve=False`` turns HiGHS's presolve off, matching Jaddle's
+    ``--no-presolve`` run.
 
     Returns ``(opt_obj, highs_status, highs_seconds)``; NaN, "skipped", NaN
     when skipped. ``highs_seconds`` times only ``run()``, the like-for-like
@@ -260,7 +276,7 @@ def highs_reference(
     highs.setOptionValue("output_flag", "true" if highs_verbose else "false")
     highs.readModel(path)
     relax_integrality(highs)
-    highs.setOptionValue("presolve", "on")
+    highs.setOptionValue("presolve", "on" if presolve else "off")
     highs.setOptionValue(
         "kkt_tolerance", tol if highs_kkt_tolerance is None else highs_kkt_tolerance
     )
@@ -304,6 +320,22 @@ def presolved_lp(path, eliminate_defined_vars=True):
     return lp, offset
 
 
+def original_lp(path):
+    """The file's LP relaxation in Jaddle's standard form, as a minimisation,
+    with no presolve. Returns ``(lp, sign, offset, n_vars, n_cons)``: the
+    original objective is ``sign * (lp.c @ x) + offset`` (``sign`` is -1 for a
+    maximisation, whose cost is negated), and the sizes are HiGHS's."""
+    highs = hspy.Highs()
+    highs.setOptionValue("output_flag", False)
+    highs.readModel(path)
+    relax_integrality(highs)
+    highs_lp = highs.getLp()
+    lp = hh.highs_to_standard_form_sparse(highs_lp)
+    sign = -1.0 if highs_lp.sense_ == hspy.ObjSense.kMaximize else 1.0
+    lp.c = sign * lp.c
+    return lp, sign, float(highs_lp.offset_), highs_lp.num_col_, highs_lp.num_row_
+
+
 def jaddle_solve_kwargs(
     tol,
     max_epochs,
@@ -333,6 +365,7 @@ def jaddle_solve_kwargs(
         cost_col_floor=cost_col_floor,
         termination_norm=norm,
         restart_norm=norm,
+        scaled_augmented=True,
     )
 
 
@@ -405,6 +438,7 @@ def run_jaddle(
         # "time_limit" = epoch / time budget exhausted. Disambiguates the two
         # ways converged can be True.
         "jaddle_stop_reason": stop_reason,
+        "jaddle_epochs": result["epochs"],
         "jaddle_solve_seconds": solve_seconds,
         # Steady-state solve time with the first-epoch XLA compile amortised out:
         # n_epochs * (solve - first_epoch) / (n_epochs - 1). Falls back to
@@ -499,6 +533,41 @@ def run_jaddle_presolved(
     }
 
 
+def run_jaddle_unpresolved(
+    path,
+    tol,
+    max_epochs,
+    update_mode="pdhg",
+    max_seconds=None,
+    verbose=True,
+    cost_col_floor=0.0,
+    gap_tol=None,
+    polish=False,
+    norm="l2",
+):
+    """Solve an instance file's LP relaxation as given (no presolve) with
+    ``run_jaddle``. The certificate is then on the original LP, so
+    ``jaddle_original_certified`` equals ``jaddle_converged``, and
+    ``jaddle_obj`` is the original objective, offset included."""
+    lp, sign, offset, n_vars, n_cons = original_lp(path)
+    res = run_jaddle(
+        lp,
+        tol,
+        max_epochs,
+        update_mode,
+        max_seconds=max_seconds,
+        verbose=verbose,
+        cost_col_floor=cost_col_floor,
+        gap_tol=gap_tol,
+        polish=polish,
+        norm=norm,
+    )
+    res["jaddle_obj"] = sign * res["jaddle_obj"] + offset
+    res["jaddle_original_certified"] = res["jaddle_converged"]
+    res.update(n_vars=n_vars, n_cons=n_cons)
+    return res
+
+
 def rel_obj_gap(jaddle_obj, opt_obj):
     """Relative gap to the exact optimum |jaddle - opt| / (1 + |opt|),
     PDLP-convention normalisation."""
@@ -546,9 +615,10 @@ def main():
 
     gap_text = "" if args.gap_tol is None else f", gap_tol={args.gap_tol:g}"
     polish_text = ", feasibility polishing" if args.polish else ""
+    presolve_text = "" if args.presolve else ", no presolve"
     print(
         f"Running {len(instances)} instance(s) at tol={args.tol:g}"
-        f"{gap_text}, norm={args.norm}{polish_text}\n"
+        f"{gap_text}, norm={args.norm}{polish_text}{presolve_text}\n"
     )
     rows = []
     for name, path, size_mb in instances:
@@ -561,6 +631,7 @@ def main():
                 tol=args.tol,
                 highs_verbose=args.highs_verbose,
                 highs_kkt_tolerance=args.highs_kkt_tolerance,
+                presolve=args.presolve,
             )
             row.update(
                 {
@@ -569,19 +640,27 @@ def main():
                     "highs_solve_seconds": highs_seconds,
                 }
             )
-            jres = run_jaddle_presolved(
-                path,
-                args.tol,
-                args.max_epochs,
-                args.update_mode,
+            jaddle_kwargs = dict(
                 max_seconds=args.max_seconds,
                 verbose=args.jaddle_verbose,
                 cost_col_floor=args.cost_col_floor,
                 gap_tol=args.gap_tol,
                 polish=args.polish,
-                eliminate_defined_vars=args.eliminate_defined_vars,
                 norm=args.norm,
             )
+            if args.presolve:
+                jres = run_jaddle_presolved(
+                    path,
+                    args.tol,
+                    args.max_epochs,
+                    args.update_mode,
+                    eliminate_defined_vars=args.eliminate_defined_vars,
+                    **jaddle_kwargs,
+                )
+            else:
+                jres = run_jaddle_unpresolved(
+                    path, args.tol, args.max_epochs, args.update_mode, **jaddle_kwargs
+                )
             row.update(jres)
             row["rel_obj_gap"] = (
                 rel_obj_gap(jres["jaddle_obj"], opt_obj)
@@ -621,7 +700,7 @@ def main():
         print()
 
     write_csv(args.csv, rows)
-    print_markdown(rows, highs_solver=args.highs_solver)
+    print_markdown(rows, highs_solver=args.highs_solver, presolve=args.presolve)
     print(f"\nCSV written to {args.csv}")
 
 
@@ -672,7 +751,7 @@ def _fmt(x, spec="{:.4g}"):
         return str(x)
 
 
-def print_markdown(rows, highs_solver="simplex"):
+def print_markdown(rows, highs_solver="simplex", presolve=True):
     print("\n## Benchmark Results\n")
     if highs_solver == "none":
         oracle = (
@@ -684,13 +763,22 @@ def print_markdown(rows, highs_solver="simplex"):
             f"Optimum is HiGHS's {highs_solver} solver, used as a ground-truth "
             "objective oracle."
         )
+    if presolve:
+        certified = (
+            "Converged = certified on the presolved LP; Original certified = "
+            "the postsolved point certified on the LP as given."
+        )
+    else:
+        certified = (
+            "No presolve: Converged = Original certified = certified on the LP "
+            "as given."
+        )
     print(
         f"_{oracle} Jaddle solve time is solve-only (iterate loop incl. "
         "first-epoch XLA compile, excl. setup/scaling); corrected time amortises "
         "the one-off first-epoch compile out "
         "(`n·(solve−first)/(n−1)`); see `jaddle_wall_seconds` in the CSV for full "
-        "call time. Converged = certified on the presolved LP; Original certified = "
-        "the postsolved point certified on the LP as given._\n"
+        f"call time. {certified}_\n"
     )
     print(
         "| Problem | Vars | Cons | Optimum | HiGHS solve (s) | "

@@ -344,8 +344,9 @@ tests.
   given: `converged` reports the original LP's certificate, and
   `reduced_converged` the reduced solve's. Postsolve can enlarge a first-order
   solution's small dual errors, so when the postsolved point misses the
-  certificate, a short warm-started solve of the original LP finishes it
-  (`finish_epochs`, default 50; one epoch on neos-1593097). The two verdicts
+  certificate, a warm-started solve of the original LP finishes it
+  (`finish_epochs`, default no cap beyond `max_epochs` / `max_seconds`; one
+  epoch on neos-1593097). The two verdicts
   can still disagree when presolve rescales the problem drastically. On leo1
   it folds a row with 1e7 coefficients into the cost, so a reduced solve
   certified at 1e-6 has a correct objective but fails the original's dual

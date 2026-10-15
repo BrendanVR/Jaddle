@@ -50,8 +50,10 @@ def sample(m):
 X, y, y_fair, group_b = sample(4000)
 X_test, y_test, y_fair_test, group_b_test = sample(20000)
 num_features = X.shape[1]
-print(f"Positive rate in the training labels: A {y[~group_b].mean():.2f}, "
-      f"B {y[group_b].mean():.2f}")
+print(
+    f"Positive rate in the training labels: A {y[~group_b].mean():.2f}, "
+    f"B {y[group_b].mean():.2f}"
+)
 
 
 # %% [markdown]
@@ -130,8 +132,10 @@ def evaluate(params):
 
 def report(name, params):
     m = evaluate(params)
-    print(f"{name:28s} accuracy {m['accuracy']:.3f}  "
-          f"fair accuracy {m['fair_accuracy']:.3f}  gap {m['gap']:+.3f}")
+    print(
+        f"{name:28s} accuracy {m['accuracy']:.3f}  "
+        f"fair accuracy {m['fair_accuracy']:.3f}  gap {m['gap']:+.3f}"
+    )
 
 
 # %% [markdown]
@@ -168,7 +172,11 @@ print("Weights on the proxies, fair:         ", np.round(theta_fair[3:5], 3))
 # constraint is active and this is just its dual. At `c = 0` both are, and
 # then only the difference of the duals is determined.
 covariance_unconstrained = abs(
-    float(jnp.mean(s_centred * (X_jax @ theta_unconstrained[:-1] + theta_unconstrained[-1])))
+    float(
+        jnp.mean(
+            s_centred * (X_jax @ theta_unconstrained[:-1] + theta_unconstrained[-1])
+        )
+    )
 )
 thresholds = jnp.linspace(0.0, covariance_unconstrained, 40)
 solve_curve = jax.jit(jax.vmap(jc.make_solver(build_cp, **settings)))
@@ -203,3 +211,5 @@ plt.show()
 # fairness grows steadily as `c` tightens, so each further step towards
 # parity costs more training loss than the last. It is zero at the
 # unconstrained model's covariance, where the constraint stops binding.
+
+# %%

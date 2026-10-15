@@ -37,7 +37,7 @@ presolve, the defined-variable elimination, Jaddle on the reduced LP, then
 postsolve of both the primal and the dual back to the original problem. The
 reported objective is the original one. `benchmark_mpax.py` presolves each
 instance once (HiGHS plus the defined-variable elimination, or nothing with
-`--presolve none`), hands the identical reduced LP to both solvers in separate
+`--no-presolve`), hands the identical reduced LP to both solvers in separate
 worker processes with the whole GPU, and re-checks every returned primal-dual
 pair with `jl.evaluate_lp_certificate` in the original units. Its header
 comment lists the remaining fairness choices.
@@ -69,7 +69,7 @@ python benchmarks/benchmark.py --highs-solver none
 
 # Jaddle vs MPAX (needs `pip install mpax`)
 python benchmarks/benchmark_mpax.py --tol 1e-4 --max-seconds 600
-python benchmarks/benchmark_mpax.py --presolve none --no-eliminate-defined-vars
+python benchmarks/benchmark_mpax.py --no-presolve
 ```
 
 ### Options shared by both harnesses
@@ -89,7 +89,8 @@ python benchmarks/benchmark_mpax.py --presolve none --no-eliminate-defined-vars
 | `--skip-bigm` | off | Skip instances with cost big-M (see [`scan_bigm.py`](#scan_bigmpy)). |
 | `--skip-bigm-matrix` | off | Skip instances with matrix (row) big-M. |
 | `--skip-bigm-column` | off | Skip instances with column big-M. |
-| `--eliminate-defined-vars` | on | After presolve, substitute out variables defined by a dense equality row `z = Σ aⱼxⱼ` (see `jaddle.presolve.eliminate_defined_variables`). Use `--no-eliminate-defined-vars` to turn it off. |
+| `--presolve` | on | Presolve with HiGHS before Jaddle (and MPAX). Use `--no-presolve` to solve the file's LP relaxation as given, as in the cuPDLP and MPAX papers. That also skips the defined-variable elimination and turns presolve off in the HiGHS reference solve. Jaddle's certificate is then on the original LP. |
+| `--eliminate-defined-vars` | on | After presolve, substitute out variables defined by a dense equality row `z = Σ aⱼxⱼ` (see `jaddle.presolve.eliminate_defined_variables`). Use `--no-eliminate-defined-vars` to turn it off. It is ignored with `--no-presolve`. |
 | `--jaddle-verbose` | on | Run Jaddle with `verbose=True`, printing its per-epoch log and restart messages. Use `--no-jaddle-verbose` to silence it; with no `--max-epochs` or `--max-seconds` budget either, each solve then runs as a single device call. |
 | `--csv PATH` | see table above | Where to write the results. |
 
@@ -101,7 +102,6 @@ python benchmarks/benchmark_mpax.py --presolve none --no-eliminate-defined-vars
 | `benchmark.py` | `--highs-kkt-tolerance X` | KKT tolerance for the reference solve (defaults to `--tol`). |
 | `benchmark.py` | `--highs-verbose` | Show HiGHS's own log. |
 | `benchmark_mpax.py` | `--solvers {jaddle,mpax} ...` | Run only some of the solvers (default: both). |
-| `benchmark_mpax.py` | `--presolve {highs,none}` | Presolve applied before both solvers. `none` solves the raw relaxation, as in the PDLP and MPAX papers. |
 | `benchmark_mpax.py` | `--highs-solver {simplex,ipm,pdlp,none}` | Also solve each instance with HiGHS and report both solvers' objective gap to its optimum (default `none`: no HiGHS solve). HiGHS runs on the original file with no time limit. |
 | `benchmark_mpax.py` | `--mpax-algorithm {r2hpdhg,rapdhg}` | MPAX solver (default `r2hpdhg`). |
 | `benchmark_mpax.py` | `--mpax-norm {2,inf}` | Norm for MPAX alone (default: the one `--norm` selects). If it differs from `--norm`, MPAX stops on a different norm than it is re-checked in. |
@@ -136,8 +136,9 @@ Three timings are reported for Jaddle:
 sweeps. `benchmark.py` also judges the postsolved point on the LP as given:
 `jaddle_original_certified`, with that certificate's residuals in
 `jaddle_orig_pfr`, `jaddle_orig_dfr` and `jaddle_orig_gap`. When the point
-misses the original certificate, up to 50 epochs of `jl.solve` on the original
-LP, warm-started from it, try to finish (`jaddle_finish_epochs`). The two
+misses the original certificate, `jl.solve` on the original LP, warm-started
+from it, tries to finish (`jaddle_finish_epochs`; no epoch cap beyond
+`--max-epochs`, and what is left of `--max-seconds`). The two
 verdicts can disagree when presolve rescales the problem, because the
 tolerances are relative. leo1's presolve folds a row with 1e7 coefficients into
 the cost (‖c‖ 1 → 3e9): the objective is right, but the original's dual test

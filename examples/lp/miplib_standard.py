@@ -6,14 +6,13 @@
 # %%
 import os
 from time import time
-from tracemalloc import start
 
 # Suppress INFO and WARNING logs from XLA/JAX
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
-import jax
 import jaddle.jaddle_optimisers as jo
 import jaddle.jaddle_linear as jl
+import jaddle.highs_helpers as jhh
 import highspy as hspy
 import numpy as np
 
@@ -22,7 +21,7 @@ jo.configure_jax("float64")
 
 # %% [markdown]
 # ## Path to the LP
-PROBLEM_NAME = "stp3d"  # name of MIPLIB problem (without .mps extension)
+PROBLEM_NAME = "leo2"  # name of MIPLIB problem (without .mps extension)
 PATH_TO_MPS = os.path.join(
     os.path.dirname(__file__), "..", "..", "data", f"{PROBLEM_NAME}.mps"
 )
@@ -37,22 +36,34 @@ highs.changeColsIntegrality(
     n, np.arange(n, dtype=np.int32), np.zeros(n, dtype=np.uint8)
 )
 
+lp = jl.to_jaddle_sparse(jhh.highs_to_standard_form_sparse(highs.getLp()))
+
+# # %% [markdown]
+# # ## Add a small amount of Gaussian noise to the costs
+# NOISE_SCALE = 1e-5
+# rng = np.random.default_rng(0)
+# col_cost = np.array(highs.getLp().col_cost_, dtype=np.float64)
+# noise = NOISE_SCALE * rng.standard_normal(n)
+# noisy_cost = col_cost + noise
+# highs.changeColsCost(n, np.arange(n, dtype=np.int32), noisy_cost)
+
+# %%
+jl.detect_infeasibility(lp)
+
 # %% [markdown]
 # ## Solve the LP with Jaddle
 # Here we solve the LP using Jaddle, crossing over to the simplex method to render the solution basic.
 problem_options = dict(
-    primal_feasibility_tolerance=1e-8,
+    primal_feasibility_tolerance=1e-4,
     dual_feasibility_tolerance=1e-4,
     dual_gap_tolerance=1e-4,
     scaled_augmented=False,
-    cost_col_floor=1e-2,
 )
 
 start_time = time()
 solution = jl.solve_with_presolve(
     highs,
     run_crossover=True,
-    polish=True,
     verbose=True,
     highs_options=dict(output_flag="true"),
     **problem_options,
@@ -67,5 +78,4 @@ print(
 )
 print("Jaddle duality gap:", solution["certificate"]["duality_gap"])
 
-# %%
 # %%

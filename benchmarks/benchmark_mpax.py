@@ -7,7 +7,7 @@
 #
 # Fairness choices:
 # * **Same input.** Each instance is presolved once (HiGHS by default, or not at
-#   all with `--presolve none`) and the identical LP is handed to both solvers.
+#   all with `--no-presolve`) and the identical LP is handed to both solvers.
 # * **Same stopping rule.** Both stop on relative primal residual, dual residual
 #   and duality gap below `--tol`. MPAX is run with `eps_abs = eps_rel = tol`,
 #   which gives the same `residual / (1 + norm)` form Jaddle uses, and in the
@@ -37,7 +37,7 @@
 # Usage:
 #     python benchmarks/benchmark_mpax.py --tol 1e-4 --max-seconds 600
 #     python benchmarks/benchmark_mpax.py --only stp3d boeing
-#     python benchmarks/benchmark_mpax.py --presolve none --no-eliminate-defined-vars
+#     python benchmarks/benchmark_mpax.py --no-presolve
 #     python benchmarks/benchmark_mpax.py --solvers mpax --mpax-algorithm rapdhg
 #     python benchmarks/benchmark_mpax.py --highs-solver simplex
 
@@ -65,12 +65,9 @@ import tempfile
 import threading
 import time
 
-import highspy as hspy
 import numpy as np
 import scipy.sparse as sp
 
-import jaddle.highs_helpers as hh
-import jaddle.presolve as presolve
 from jaddle.jaddle_basic_types import LP
 
 from benchmark import (
@@ -82,6 +79,7 @@ from benchmark import (
     add_norm_flag,
     discover_instances,
     highs_reference,
+    original_lp,
     presolved_lp,
     rel_obj_gap,
 )
@@ -171,8 +169,8 @@ def parse_args():
         default=True,
         help="After presolve, substitute out variables defined by a dense "
         "equality row (z = sum_j a_j x_j, e.g. gmut-*). On by default; "
-        "--no-eliminate-defined-vars disables it. See "
-        "jaddle.presolve.eliminate_defined_variables.",
+        "--no-eliminate-defined-vars disables it. Ignored with --no-presolve. "
+        "See jaddle.presolve.eliminate_defined_variables.",
     )
     p.add_argument(
         "--update-mode",
@@ -200,11 +198,13 @@ def parse_args():
     )
     p.add_argument(
         "--presolve",
-        choices=("highs", "none"),
-        default="highs",
-        help="Presolve applied before both solvers (default highs). 'none' "
-        "solves the raw relaxation, as in the PDLP and MPAX papers; combine with "
-        "--no-eliminate-defined-vars for a fully unpresolved run.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Presolve with HiGHS (plus --eliminate-defined-vars) before both "
+        "solvers. --no-presolve hands both the file's LP relaxation as given, "
+        "as in the cuPDLP and MPAX papers: no HiGHS presolve, no defined-variable "
+        "elimination, and presolve off in the --highs-solver reference solve too. "
+        "(default: %(default)s)",
     )
     p.add_argument(
         "--highs-solver",
@@ -260,22 +260,17 @@ def parse_args():
 
 
 # %%
-def load_lp(path, presolve_mode, eliminate_defined_vars):
-    """Return (lp, offset, presolve_seconds) with lp a scipy-backed LP."""
+def load_lp(path, use_presolve, eliminate_defined_vars):
+    """Return (lp, sign, offset, presolve_seconds) with lp a scipy-backed LP,
+    a minimisation whose original objective is ``sign * (c @ x) + offset``."""
     t0 = time.perf_counter()
-    if presolve_mode == "highs":
+    if use_presolve:
+        # HiGHS's presolve already hands back a minimisation.
         lp, offset = presolved_lp(path, eliminate_defined_vars=eliminate_defined_vars)
+        sign = 1.0
     else:
-        highs = hspy.Highs()
-        highs.setOptionValue("output_flag", False)
-        highs.readModel(path)
-        highs_lp = highs.getLp()
-        lp = hh.highs_to_standard_form_sparse(highs_lp)
-        offset = float(highs_lp.offset_)
-        if eliminate_defined_vars:
-            lp, extra_offset, _ = presolve.eliminate_defined_variables(lp, verbose=True)
-            offset += extra_offset
-    return lp, float(offset), time.perf_counter() - t0
+        lp, sign, offset, _, _ = original_lp(path)
+    return lp, sign, float(offset), time.perf_counter() - t0
 
 
 def save_lp(lp, directory):
@@ -561,7 +556,10 @@ def print_report(rows, args):
     for r in rows:
         by_problem.setdefault(r["problem"], {})[r.get("solver")] = r
 
-    print(f"\n## Jaddle vs MPAX (tol {args.tol:g}, presolve: {args.presolve})\n")
+    print(
+        f"\n## Jaddle vs MPAX (tol {args.tol:g}, presolve: "
+        f"{presolve_label(args)})\n"
+    )
     header = "| Problem | Vars | Cons |"
     rule = "|---|---:|---:|"
     with_highs = args.highs_solver != "none"
@@ -637,6 +635,11 @@ def print_report(rows, args):
             )
 
 
+def presolve_label(args):
+    """The presolve setting as reported in the CSV and the report."""
+    return "highs" if args.presolve else "none"
+
+
 # %%
 def main():
     args = parse_args()
@@ -654,18 +657,25 @@ def main():
     print(
         f"Running {len(instances)} instance(s) with {', '.join(args.solvers)} at "
         f"tol={args.tol:g}, norm={args.norm}, max_seconds={args.max_seconds}, "
-        f"presolve={args.presolve}\n"
+        f"presolve={presolve_label(args)}\n"
     )
     rows = []
     for name, path, size_mb in instances:
         print(f"=== {name} ({size_mb:.1f} MB) ===")
-        base = {"problem": name, "size_mb": round(size_mb, 1), "presolve": args.presolve}
+        base = {
+            "problem": name,
+            "size_mb": round(size_mb, 1),
+            "presolve": presolve_label(args),
+        }
         try:
-            lp, offset, presolve_seconds = load_lp(
+            lp, sign, offset, presolve_seconds = load_lp(
                 path, args.presolve, args.eliminate_defined_vars
             )
             opt_obj, highs_status, highs_seconds = highs_reference(
-                path, highs_solver=args.highs_solver, tol=args.tol
+                path,
+                highs_solver=args.highs_solver,
+                tol=args.tol,
+                presolve=args.presolve,
             )
         except Exception as exc:
             print(f"  ERROR loading: {exc!r}")
@@ -693,7 +703,7 @@ def main():
             for solver in args.solvers:
                 res = run_worker(solver, lp_dir, args)
                 if "objective" in res:
-                    res["objective"] += offset
+                    res["objective"] = sign * res["objective"] + offset
                     if with_highs:
                         res["rel_obj_gap"] = rel_obj_gap(res["objective"], opt_obj)
                 res["verified"] = is_verified(res, args.tol)

@@ -593,7 +593,11 @@ def _device_solver(
         # which are already unscaled by row_scale; without this the reduced cost
         # is inflated by up to max(col_scale) on badly-scaled columns (≈5.8x /
         # 289x spread observed on boeing), making DFR/PGN artificially harsh.
-        reduced_cost_true = grad_primal / col_scale
+        # The scaled cost is also normalised by c_max (lp.c = c·col_scale/c_max,
+        # duals likewise), so c_max multiplies back too: without it the DFR was
+        # c_max times too small, and leo2 under A-only Ruiz (c_max ≈ 1.3e4)
+        # certified at a true relative DFR of 5.6.
+        reduced_cost_true = grad_primal * c_max / col_scale
         primal_true = average_state.primal * col_scale
         lower_bounds_true = lp.lower_bounds * col_scale
         upper_bounds_true = lp.upper_bounds * col_scale
@@ -938,7 +942,7 @@ def _device_solver(
     # *relative* progress, not absolute units. These MUST be in TRUE (original)
     # units, because the residuals they normalise are reported in true units
     # (constraint_bound is row-scale-unscaled; the reduced cost is /col_scale):
-    # b_true = b_scaled / row_scale, c_true = c_scaled / col_scale. Using the
+    # b_true = b_scaled / row_scale, c_true = c_scaled · c_max / col_scale. Using the
     # scaled-space norms here was a unit mismatch — on boeing it made the relative
     # convergence test and the gap sign-guard band wrong (true ‖c‖≈43 vs scaled
     # ‖c‖≈0.8), so the gap read +∞ at a point whose true relative gap was ~2e-3.
@@ -946,7 +950,7 @@ def _device_solver(
     # b_norm / c_norm normalise the restart merit (restart_norm); the
     # termination_* pair normalises the stopping test / printed PFR, DFR.
     _b_true = lp.b / _row_scale_all
-    _c_true = lp.c / col_scale
+    _c_true = lp.c * c_max / col_scale
     b_norm = _vector_norm(_b_true, restart_norm)
     c_norm = _vector_norm(_c_true, restart_norm)
     termination_b_norm = _vector_norm(_b_true, termination_norm)
@@ -2863,7 +2867,7 @@ def load(
 def solve_with_presolve(
     model,
     highs_options=None,
-    finish_epochs=50,
+    finish_epochs=None,
     eliminate_defined_vars=False,
     reduced_solver=None,
     run_crossover=False,
@@ -2913,10 +2917,12 @@ def solve_with_presolve(
     ones, which is exact at a vertex but can enlarge a first-order solution's
     small dual errors (neos-1593097 at 1e-6: some runs certified on the
     original, one had dual residual 6.6e-5). When the postsolved point fails
-    the original certificate, up to ``finish_epochs`` epochs of ``solve()``
-    on the original LP, warm-started from it, finish the job (2 epochs on
-    neos-1593097, against 23 from cold); the finished point is kept only if
-    it certifies. ``finish_epochs=0`` disables this.
+    the original certificate, ``solve()`` on the original LP, warm-started
+    from it, finishes the job (2 epochs on neos-1593097, against 23 from
+    cold); the finished point is kept only if it certifies. ``finish_epochs``
+    caps its epochs; the default ``None`` sets no cap of its own, so it runs
+    under the caller's ``max_epochs`` and what remains of ``max_seconds``
+    (with neither, until it certifies). ``finish_epochs=0`` disables it.
 
     ``run_crossover=True`` returns a vertex instead: ``crossover()`` takes
     the reduced solve's point to an optimal basic solution of the reduced
@@ -3162,16 +3168,14 @@ def solve_with_presolve(
 
     certificate, original_certified = original_certificate(solution)
     finish = {"epochs": 0, "certified": False}
-    if not original_certified and finish_epochs and not run_crossover:
+    if not original_certified and finish_epochs != 0 and not run_crossover:
         finish_kwargs = dict(solve_kwargs)
+        if finish_epochs is not None:
+            finish_kwargs["max_epochs"] = int(finish_epochs)
         if solve_kwargs.get("max_seconds") is not None:
             spent = time.time() - start
             finish_kwargs["max_seconds"] = max(solve_kwargs["max_seconds"] - spent, 1e-6)
-        finished = solve(
-            lp_original,
-            initial_solution=solution,
-            **{**finish_kwargs, "max_epochs": int(finish_epochs)},
-        )
+        finished = solve(lp_original, initial_solution=solution, **finish_kwargs)
         finish["epochs"] = finished["epochs"]
         f = finished["solution"]
         # Drop the zero row solve() pads an empty block with.
