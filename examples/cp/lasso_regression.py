@@ -6,7 +6,15 @@
 # lasso finds them.
 
 # %%
+import os
+
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_FLAGS"] = "--xla_gpu_autotune_level=2"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["JAX_BCOO_CUSPARSE_LOWERING"] = "true"
+
 import jax
+
 from jax import vmap
 import numpy as np
 import jax.numpy as jnp

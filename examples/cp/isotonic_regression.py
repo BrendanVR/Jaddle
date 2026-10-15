@@ -4,6 +4,17 @@
 # Isotonic regression is a type of regression that fits a non-decreasing function to the data.
 
 # %%
+import os
+
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_FLAGS"] = (
+    "--xla_gpu_autotune_level=5" + " " + "xla_gpu_enable_triton_gemm"
+)
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["JAX_BCOO_CUSPARSE_LOWERING"] = "true"
+
+import jax
+
 import numpy as np
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
@@ -54,7 +65,6 @@ cp = jc.JaddleCP(
 solution = jc.solve(
     cp,
     primal_feasibility_tolerance=1e-6,
-    update_mode="extragradient",
     verbose=True,
 )["solution"]
 

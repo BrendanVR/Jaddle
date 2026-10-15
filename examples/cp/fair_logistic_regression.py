@@ -12,6 +12,13 @@
 # general `JaddleCP` rather than `jc.quadratic_program`.
 
 # %%
+import os
+
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_FLAGS"] = "--xla_gpu_autotune_level=2"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["JAX_BCOO_CUSPARSE_LOWERING"] = "true"
+
 import jax
 import jax.numpy as jnp
 import numpy as np

@@ -5,23 +5,25 @@
 
 # %%
 import os
-from time import time
 
-# Suppress INFO and WARNING logs from XLA/JAX
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_FLAGS"] = "--xla_gpu_autotune_level=2"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["JAX_BCOO_CUSPARSE_LOWERING"] = "true"
 
+import jax
 import jaddle.jaddle_optimisers as jo
 import jaddle.jaddle_linear as jl
 import jaddle.highs_helpers as jhh
 import highspy as hspy
 import numpy as np
+from time import time
 
-# %%
 jo.configure_jax("float64")
 
 # %% [markdown]
 # ## Path to the LP
-PROBLEM_NAME = "leo2"  # name of MIPLIB problem (without .mps extension)
+PROBLEM_NAME = "rmine25"  # name of MIPLIB problem (without .mps extension)
 PATH_TO_MPS = os.path.join(
     os.path.dirname(__file__), "..", "..", "data", f"{PROBLEM_NAME}.mps"
 )
@@ -37,18 +39,6 @@ highs.changeColsIntegrality(
 )
 
 lp = jl.to_jaddle_sparse(jhh.highs_to_standard_form_sparse(highs.getLp()))
-
-# # %% [markdown]
-# # ## Add a small amount of Gaussian noise to the costs
-# NOISE_SCALE = 1e-5
-# rng = np.random.default_rng(0)
-# col_cost = np.array(highs.getLp().col_cost_, dtype=np.float64)
-# noise = NOISE_SCALE * rng.standard_normal(n)
-# noisy_cost = col_cost + noise
-# highs.changeColsCost(n, np.arange(n, dtype=np.int32), noisy_cost)
-
-# %%
-jl.detect_infeasibility(lp)
 
 # %% [markdown]
 # ## Solve the LP with Jaddle

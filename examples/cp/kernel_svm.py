@@ -5,13 +5,23 @@
 # The SVM's dual is a quadratic program, so we solve it with `jc.quadratic_program`.
 
 # %%
+import os
+
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_FLAGS"] = (
+    "--xla_gpu_autotune_level=5" + " " + "xla_gpu_enable_triton_gemm"
+)
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["JAX_BCOO_CUSPARSE_LOWERING"] = "true"
+
+import jax
+
 import numpy as np
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import jaddle.jaddle_convex as jc
 import jaddle.jaddle_optimisers as jo
-from sklearn.svm import SVC
-import time
+from functools import partial
 
 jo.configure_jax("float32")
 
@@ -19,7 +29,7 @@ jo.configure_jax("float32")
 # ## Generate Synthetic Data
 # Two interleaved half-moons, one per class, with labels `y` in {-1, +1}.
 rng = np.random.default_rng(0)
-n = 200
+n = 1000
 theta = rng.uniform(0, np.pi, n // 2)
 upper_moon = np.column_stack([np.cos(theta), np.sin(theta)])
 lower_moon = np.column_stack([1 - np.cos(theta), 0.5 - np.sin(theta)])
@@ -44,19 +54,39 @@ def rbf_kernel(A, B, gamma):
     return np.exp(-gamma * squared_distances)
 
 
-C = 1
+# %% [markdown]
+# ## Solve the problem using Jaddle
+C = 50
 gamma = 2.0
 Q = np.outer(y, y) * rbf_kernel(X, X, gamma)
 
-# %% [markdown]
-# ## Solve the problem using Jaddle
 Q = jnp.array(Q)
 y = jnp.array(y)
 
-objective = lambda alpha: 0.5 * alpha @ Q @ alpha - jnp.sum(alpha)
-constraints_eq = lambda alpha: jnp.array([jnp.dot(y, alpha)])
-constraints_ineq = lambda alpha: jnp.zeros(0)
 
+# Low rank approximation Q ≈ F Fᵀ using the Nystroem method:
+# Q ≈ C W⁺ Cᵀ, where C = Q[:, idx] and W = Q[idx, idx] for k sampled landmarks.
+@partial(jax.jit, static_argnames=("k",))
+def nystroem(A, k, key=jax.random.PRNGKey(0)):
+    n = A.shape[0]
+    idx = jax.random.choice(key, n, (k,), replace=False)
+    C = A[:, idx]  # n x k
+    W = C[idx, :]  # k x k
+    W = (W + W.T) / 2
+    w, V = jnp.linalg.eigh(W)
+    tol = jnp.max(jnp.abs(w)) * k * jnp.finfo(A.dtype).eps
+    inv_sqrt = jnp.where(w > tol, 1.0 / jnp.sqrt(jnp.maximum(w, tol)), 0.0)
+    return C @ (V * inv_sqrt)  # n x k, so that Q ≈ F Fᵀ
+
+
+rank = 500
+F = nystroem(Q, rank)
+
+objective = lambda alpha: 0.5 * jnp.linalg.multi_dot([alpha, F, F.T, alpha]) - jnp.sum(
+    alpha
+)
+constraints_eq = lambda alpha: jnp.array([jnp.dot(y, alpha)])
+constraints_ineq = lambda _: jnp.zeros(0)
 lower_bounds = jnp.zeros(n)
 upper_bounds = jnp.full(n, C)
 
@@ -74,21 +104,11 @@ result = jc.solve(
     problem,
     verbose=True,
     update_mode="extragradient",
-    average=False,
-    report_best=False,
 )
 
 alpha = np.asarray(result["solution"].primal)
 # The intercept is the multiplier of the constraint yᵀα = 0.
 intercept = float(result["solution"].dual_eq[0])
-
-# %%
-start_time = time.time()
-sklearn_svm = SVC(kernel="rbf", C=C, gamma=gamma)
-sklearn_svm.fit(X, y)
-end_time = time.time()
-print("Sklearn SVM training time:", end_time - start_time)
-print("Sklearn SVM training accuracy:", sklearn_svm.score(X, y))
 
 
 # %% [markdown]

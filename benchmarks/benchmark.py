@@ -19,8 +19,13 @@
 # %%
 import os
 
-# Suppress INFO and WARNING logs from XLA/JAX before importing JAX.
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_FLAGS"] = "--xla_gpu_autotune_level=2"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["JAX_BCOO_CUSPARSE_LOWERING"] = "true"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
+import jax
 
 import argparse
 import csv
@@ -36,7 +41,6 @@ import jaddle.jaddle_linear as jl
 import jaddle.highs_helpers as hh
 import jaddle.presolve as presolve
 
-import jax
 
 from scan_bigm import is_bigm_cost, is_bigm_matrix, is_bigm_column
 
