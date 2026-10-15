@@ -77,7 +77,10 @@ def solve(lp, tol=TOL, **kwargs):
 def assert_certified(lp, result, ref_obj, tol=TOL):
     assert result["converged"]
     assert result["stop_reason"] == "certificate"
-    sol = result["solution"]
+    assert_certifies(lp, result["solution"], ref_obj, tol)
+
+
+def assert_certifies(lp, sol, ref_obj, tol=TOL):
     obj = float(lp.objective(sol.primal))
     assert abs(obj - ref_obj) / (1 + abs(ref_obj)) < 10 * tol
     # Independently re-check the certificate in the original problem's units.
@@ -359,9 +362,11 @@ def test_solve_with_polishing_epoch_budget():
     [{}, {"update_mode": "pdhg"}, {"update_mode": "halpern"}, {"scale": False}],
 )
 def test_make_solver_matches_solve(options):
-    # One traced solve reproduces solve() to rounding (CPU, float64). The two
-    # paths compile to different XLA programs, so bit-equality varies by jax
-    # version (jax 0.11 differs by ~3e-11 relative under update_mode="pdhg").
+    # One traced solve runs the same algorithm as solve(), but not to the bit:
+    # the two paths compile to different XLA programs, and the adaptive steps
+    # amplify the rounding differences by an amount that depends on the jax
+    # version and the CPU (a CI runner saw ~1e-6 relative under halpern). So
+    # check that both stop together and the traced solution certifies.
     lp = random_lp()
     tolerances = dict(
         primal_feasibility_tolerance=TOL,
@@ -370,11 +375,10 @@ def test_make_solver_matches_solve(options):
     )
     reference = jl.solve(lp, **tolerances, **options)
     result = jax.jit(jl.make_solver(lp, **tolerances, **options))()
-    assert int(result.epochs) == reference["epochs"]
-    for a, b in zip(result.solution, reference["solution"]):
-        np.testing.assert_allclose(
-            np.asarray(a), np.asarray(b), rtol=1e-9, atol=1e-12
-        )
+    assert reference["stop_reason"] == "certificate"
+    assert bool(result.converged) and int(result.stop_code) == 1
+    assert abs(int(result.epochs) - reference["epochs"]) <= 1
+    assert_certifies(lp, result.solution, reference_objective(lp))
 
 
 def test_make_solver_vmap_batch():

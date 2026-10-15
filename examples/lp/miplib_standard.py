@@ -46,7 +46,6 @@ problem_options = dict(
     primal_feasibility_tolerance=tol,
     dual_feasibility_tolerance=tol,
     dual_gap_tolerance=gap_tol,
-    epochs_per_restart=10,
 )
 
 start_time = time()
