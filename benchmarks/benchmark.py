@@ -484,7 +484,7 @@ def run_jaddle_presolved(
     Times: ``jaddle_solve_seconds`` / ``jaddle_corrected_seconds`` are the
     reduced solve's iterate loop (as in ``run_jaddle``),
     ``jaddle_presolve_seconds`` is HiGHS presolve, and
-    ``jaddle_wall_seconds`` the whole call, finishing solve included.
+    ``jaddle_wall_seconds`` the whole call, postsolve included.
     """
     t0 = time.perf_counter()
     result = jl.solve_with_presolve(
@@ -519,7 +519,6 @@ def run_jaddle_presolved(
         # presolve settled the problem itself.
         "jaddle_stop_reason": result["stop_reason"],
         "jaddle_epochs": result["epochs"],
-        "jaddle_finish_epochs": result.get("finish", {}).get("epochs", 0),
         "jaddle_solve_seconds": result.get("solve_seconds", 0.0),
         "jaddle_corrected_seconds": result.get("corrected_seconds", 0.0),
         "jaddle_presolve_seconds": presolve_info["seconds"],
@@ -723,7 +722,6 @@ CSV_FIELDS = [
     "jaddle_original_certified",
     "jaddle_stop_reason",
     "jaddle_epochs",
-    "jaddle_finish_epochs",
     "jaddle_solve_seconds",
     "jaddle_corrected_seconds",
     "jaddle_presolve_seconds",

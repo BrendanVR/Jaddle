@@ -120,7 +120,7 @@ Three timings are reported for Jaddle:
   out: `n · (solve − first_epoch) / (n − 1)`. It estimates the runtime if
   every epoch had run at the warm rate.
 - **`jaddle_wall_seconds`**: the whole call. In `benchmark.py` that includes
-  presolve (`jaddle_presolve_seconds`), postsolve and any finishing solve.
+  presolve (`jaddle_presolve_seconds`) and postsolve.
 
 `jaddle_converged` can be true for more than one reason, so check
 `jaddle_stop_reason` alongside it:
@@ -135,11 +135,9 @@ Three timings are reported for Jaddle:
 `jaddle_converged` means certified on the **presolved** LP, as in earlier
 sweeps. `benchmark.py` also judges the postsolved point on the LP as given:
 `jaddle_original_certified`, with that certificate's residuals in
-`jaddle_orig_pfr`, `jaddle_orig_dfr` and `jaddle_orig_gap`. When the point
-misses the original certificate, `jl.solve` on the original LP, warm-started
-from it, tries to finish (`jaddle_finish_epochs`; no epoch cap beyond
-`--max-epochs`, and what is left of `--max-seconds`). The two
-verdicts can disagree when presolve rescales the problem, because the
+`jaddle_orig_pfr`, `jaddle_orig_dfr` and `jaddle_orig_gap`. A point that
+misses the original certificate is reported as such; no further solve is
+attempted. The two verdicts can disagree when presolve rescales the problem, because the
 tolerances are relative. leo1's presolve folds a row with 1e7 coefficients into
 the cost (‖c‖ 1 → 3e9): the objective is right, but the original's dual test
 fails. A certificate on a drastically rescaled reduced LP can also be false.

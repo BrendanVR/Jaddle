@@ -2867,7 +2867,6 @@ def load(
 def solve_with_presolve(
     model,
     highs_options=None,
-    finish_epochs=None,
     eliminate_defined_vars=False,
     reduced_solver=None,
     run_crossover=False,
@@ -2901,7 +2900,7 @@ def solve_with_presolve(
     ``polish_fraction`` and ``tol`` may then be given among the keyword
     arguments. The tolerances keep ``solve()``'s default of 1e-3, not
     ``solve_with_polishing``'s 1e-6, so the flag changes the method and not
-    the target. The finishing solve below stays a plain ``solve()``.
+    the target.
 
     ``reduced_solver`` replaces ``solve()`` for the reduced LP with any other
     callable; it is called with ``solve_kwargs`` and must return ``solve()``'s
@@ -2916,13 +2915,9 @@ def solve_with_presolve(
     Postsolve rebuilds eliminated rows' and columns' duals from the reduced
     ones, which is exact at a vertex but can enlarge a first-order solution's
     small dual errors (neos-1593097 at 1e-6: some runs certified on the
-    original, one had dual residual 6.6e-5). When the postsolved point fails
-    the original certificate, ``solve()`` on the original LP, warm-started
-    from it, finishes the job (2 epochs on neos-1593097, against 23 from
-    cold); the finished point is kept only if it certifies. ``finish_epochs``
-    caps its epochs; the default ``None`` sets no cap of its own, so it runs
-    under the caller's ``max_epochs`` and what remains of ``max_seconds``
-    (with neither, until it certifies). ``finish_epochs=0`` disables it.
+    original, one had dual residual 6.6e-5). Such a point is returned as it
+    is, with ``"converged"`` False and the residuals in ``"certificate"``;
+    no further solve is attempted on the original LP.
 
     ``run_crossover=True`` returns a vertex instead: ``crossover()`` takes
     the reduced solve's point to an optimal basic solution of the reduced
@@ -2932,8 +2927,7 @@ def solve_with_presolve(
     original model (``None`` if HiGHS has no valid one), and ``"crossover"``,
     ``crossover()``'s statistics plus ``"postsolve_simplex_iterations"``
     (``None`` when presolve left nothing to cross over).
-    ``highs_options`` applies to the crossover too, and no finishing solve
-    runs, since it would leave the vertex.
+    ``highs_options`` applies to the crossover too.
 
     Returns ``solve()``'s dict for the reduced solve, with these keys
     replaced or added:
@@ -2946,8 +2940,6 @@ def solve_with_presolve(
       included.
     * ``"highs_solution"``: the same point in HiGHS's row form for the
       original model, ``col_value``, ``col_dual``, ``row_value``, ``row_dual``.
-    * ``"finish"``: the finishing solve's ``epochs`` and whether it
-      ``certified`` (0 and False when it was not needed).
     * ``"certificate"``: ``evaluate_lp_certificate`` of the original LP at
       the postsolved point (l2 norm, PDLP dual residual, as ``solve()``
       tests).
@@ -2977,15 +2969,14 @@ def solve_with_presolve(
         if reduced_solver is not None:
             raise ValueError("polish=True and reduced_solver are alternatives")
         reduced_solver = solve_with_polishing
-        # solve_with_polishing's own arguments: the finishing solve() does not
-        # take them.
+        # solve_with_polishing's own arguments, kept apart from solve()'s.
         polish_kwargs = {
             key: solve_kwargs.pop(key)
             for key in ("first_polish_epoch", "polish_fraction")
             if key in solve_kwargs
         }
-        # Resolve the tolerances here, so that the reduced solve, the original
-        # certificate and the finishing solve all test the same ones.
+        # Resolve the tolerances here, so that the reduced solve and the
+        # original certificate test the same ones.
         tol = solve_kwargs.pop("tol", 1e-3)
         for key in (
             "primal_feasibility_tolerance",
@@ -3141,75 +3132,28 @@ def solve_with_presolve(
     )
     lp_check = __pad_empty_blocks(to_jaddle_sparse(lp_original))
 
-    def original_certificate(state):
-        # The point padded to lp_check's rows (an empty block has one zero row).
-        cert = evaluate_lp_certificate(
-            lp_check,
-            state.primal,
-            jnp.zeros(lp_check.n_eq).at[: state.dual_eq.size].set(state.dual_eq),
-            jnp.zeros(lp_check.A_ineq.shape[0])
-            .at[: state.dual_ineq.size]
-            .set(state.dual_ineq),
-            norm=solve_kwargs.get("termination_norm", "l2"),
-            dual_residual=solve_kwargs.get("dual_residual", "pdlp"),
-        )
-        cert = {key: float(value) for key, value in cert.items()}
-        # Judged with solve()'s test, on the problem as given.
-        certified = (
-            cert["relative_primal_feasibility_residual"]
-            <= solve_kwargs.get("primal_feasibility_tolerance", 1e-3)
-            and cert["relative_dual_feasibility_residual"]
-            <= solve_kwargs.get("dual_feasibility_tolerance", 1e-3)
-            and np.isfinite(cert["duality_gap"])
-            and cert["relative_gap_abs"]
-            <= solve_kwargs.get("dual_gap_tolerance", 1e-3)
-        )
-        return cert, bool(certified)
-
-    certificate, original_certified = original_certificate(solution)
-    finish = {"epochs": 0, "certified": False}
-    if not original_certified and finish_epochs != 0 and not run_crossover:
-        finish_kwargs = dict(solve_kwargs)
-        if finish_epochs is not None:
-            finish_kwargs["max_epochs"] = int(finish_epochs)
-        if solve_kwargs.get("max_seconds") is not None:
-            spent = time.time() - start
-            finish_kwargs["max_seconds"] = max(solve_kwargs["max_seconds"] - spent, 1e-6)
-        finished = solve(lp_original, initial_solution=solution, **finish_kwargs)
-        finish["epochs"] = finished["epochs"]
-        f = finished["solution"]
-        # Drop the zero row solve() pads an empty block with.
-        f = SaddleState(
-            primal=f.primal,
-            dual_ineq=f.dual_ineq[: lp_original.A_ineq.shape[0]],
-            dual_eq=f.dual_eq[: lp_original.A_eq.shape[0]],
-        )
-        finished_cert, finished_certified = original_certificate(f)
-        if finished_certified:
-            finish["certified"] = True
-            solution, certificate, original_certified = f, finished_cert, True
-            # The same point in HiGHS's row form.
-            A_orig = sp.csc_matrix(
-                (
-                    original.a_matrix_.value_,
-                    original.a_matrix_.index_,
-                    original.a_matrix_.start_,
-                ),
-                shape=(original.num_row_, original.num_col_),
-            )
-            x = np.asarray(f.primal, dtype=np.float64)
-            row_dual = hh.jaddle_duals_to_highs(
-                np.asarray(f.dual_eq),
-                np.asarray(f.dual_ineq),
-                np.asarray(original.row_lower_),
-                np.asarray(original.row_upper_),
-            )
-            highs_solution = {
-                "col_value": x,
-                "col_dual": np.asarray(original.col_cost_) - A_orig.T @ row_dual,
-                "row_value": A_orig @ x,
-                "row_dual": row_dual,
-            }
+    # The point padded to lp_check's rows (an empty block has one zero row).
+    certificate = evaluate_lp_certificate(
+        lp_check,
+        solution.primal,
+        jnp.zeros(lp_check.n_eq).at[: solution.dual_eq.size].set(solution.dual_eq),
+        jnp.zeros(lp_check.A_ineq.shape[0])
+        .at[: solution.dual_ineq.size]
+        .set(solution.dual_ineq),
+        norm=solve_kwargs.get("termination_norm", "l2"),
+        dual_residual=solve_kwargs.get("dual_residual", "pdlp"),
+    )
+    certificate = {key: float(value) for key, value in certificate.items()}
+    # Judged with solve()'s test, on the problem as given.
+    original_certified = bool(
+        certificate["relative_primal_feasibility_residual"]
+        <= solve_kwargs.get("primal_feasibility_tolerance", 1e-3)
+        and certificate["relative_dual_feasibility_residual"]
+        <= solve_kwargs.get("dual_feasibility_tolerance", 1e-3)
+        and np.isfinite(certificate["duality_gap"])
+        and certificate["relative_gap_abs"]
+        <= solve_kwargs.get("dual_gap_tolerance", 1e-3)
+    )
     if maximise:
         # HiGHS's duals of a maximisation are minus those of min -objective.
         highs_solution["col_dual"] = -highs_solution["col_dual"]
@@ -3226,7 +3170,6 @@ def solve_with_presolve(
         highs_solution=highs_solution,
         certificate=certificate,
         presolve=presolve,
-        finish=finish,
     )
     return result
 

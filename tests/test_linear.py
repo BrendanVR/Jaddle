@@ -788,9 +788,7 @@ def test_load_rejects_bad_models(tmp_path):
         jl.load(path, presolve=True)
 
 
-@pytest.mark.parametrize(
-    "options", [{}, {"finish_epochs": 0}, {"run_crossover": True}], ids=str
-)
+@pytest.mark.parametrize("options", [{}, {"run_crossover": True}], ids=str)
 def test_solve_with_presolve_maximisation(options):
     import highspy
 
@@ -936,7 +934,6 @@ def test_solve_with_presolve_crossover():
     assert result["crossover"]["converged"]
     assert abs(result["objective"] - ref) <= 1e-9 * (1 + abs(ref))
     assert basic_count(result["basis"]) == model.num_row_
-    assert result["finish"]["epochs"] == 0
 
 
 def test_warm_start_without_padding_rows():
