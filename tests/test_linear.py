@@ -224,6 +224,23 @@ def test_primal_polish_restores_feasibility():
     assert after < 1e-2 * before
 
 
+def test_primal_polish_objective_bound():
+    lp, sol, noise = perturbed_optimum()
+    bad = jl.SaddleState(
+        primal=noise(sol.primal), dual_ineq=sol.dual_ineq, dual_eq=sol.dual_eq
+    )
+    before = solve_certificate(lp, bad)["relative_primal_feasibility_residual"]
+    objective = float(np.asarray(lp.c) @ np.asarray(sol.primal))
+    bound = objective + 1e-3 * (1 + abs(objective))
+    x = jl.primal_polish(
+        jl.to_jaddle_sparse(lp), bad, objective_bound=bound, max_epochs=4
+    )
+    polished = jl.SaddleState(primal=x, dual_ineq=sol.dual_ineq, dual_eq=sol.dual_eq)
+    after = solve_certificate(lp, polished)["relative_primal_feasibility_residual"]
+    assert after < 1e-2 * before
+    assert float(np.asarray(lp.c) @ np.asarray(x)) <= bound + 1e-6 * (1 + abs(bound))
+
+
 def test_dual_polish_restores_feasibility():
     lp, sol, noise = perturbed_optimum()
     bad = jl.SaddleState(
@@ -241,8 +258,10 @@ def test_dual_polish_restores_feasibility():
     assert moved <= perturbation
 
 
+@pytest.mark.parametrize("polish_objective_slack", [None, 0.5])
+@pytest.mark.parametrize("polish_trigger", ["auto", "doubling"])
 @pytest.mark.parametrize("make_lp", [toy_lp, random_lp])
-def test_solve_with_polishing(make_lp):
+def test_solve_with_polishing(make_lp, polish_trigger, polish_objective_slack):
     # Tight feasibility, loose gap; polish from the first epoch on.
     lp = make_lp()
     result = jl.solve_with_polishing(
@@ -250,6 +269,8 @@ def test_solve_with_polishing(make_lp):
         tol=1e-9,
         dual_gap_tolerance=1e-4,
         first_polish_epoch=1,
+        polish_trigger=polish_trigger,
+        polish_objective_slack=polish_objective_slack,
         iterations_per_epoch=16,
         max_epochs=2000,
     )
@@ -349,12 +370,39 @@ def test_infeasibility_certificate_ignores_rounding():
     assert float(cert["dual_infeasibility_ratio"]) == np.inf
 
 
-def test_solve_with_polishing_epoch_budget():
+@pytest.mark.parametrize("polish_trigger", ["auto", "doubling"])
+def test_solve_with_polishing_epoch_budget(polish_trigger):
     result = jl.solve_with_polishing(
-        random_lp(), tol=1e-12, first_polish_epoch=1, max_epochs=3
+        random_lp(),
+        tol=1e-12,
+        first_polish_epoch=1,
+        polish_trigger=polish_trigger,
+        max_epochs=3,
     )
     assert result["stop_reason"] == "max_epochs"
     assert result["epochs"] == 3
+
+
+def test_solve_polish_trigger_stops_once_gap_closes():
+    # Loose gap, unreachable feasibility: the trigger stops the solve at the
+    # first allowed epoch whose gap test passes, unconverged.
+    lp = random_lp()
+    kwargs = dict(
+        primal_feasibility_tolerance=1e-14,
+        dual_feasibility_tolerance=1e-14,
+        dual_gap_tolerance=1e-2,
+        iterations_per_epoch=16,
+        max_epochs=500,
+    )
+    result = jl.solve(lp, _polish_trigger=(3, None), **kwargs)
+    assert result["stop_reason"] == "polish_ready"
+    assert not result["converged"]
+    assert 3 <= result["epochs"] < 500
+    cert = solve_certificate(lp, result["solution"])
+    assert cert["relative_gap_abs"] <= 1e-2
+    # A residual gate it cannot meet never fires.
+    gated = jl.solve(lp, _polish_trigger=(0, 1.0), **{**kwargs, "max_epochs": 20})
+    assert gated["stop_reason"] == "max_epochs"
 
 
 @pytest.mark.parametrize(

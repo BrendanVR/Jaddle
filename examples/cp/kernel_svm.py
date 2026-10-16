@@ -13,7 +13,7 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 import jax
 
-jax.config.update("jax_optimization_level", "O1")
+jax.config.update("jax_optimization_level", "O3")
 
 
 import numpy as np
@@ -59,7 +59,6 @@ def rbf_kernel(A, B, gamma):
 C = 1
 gamma = 2.0
 Q = np.outer(y, y) * rbf_kernel(X, X, gamma)
-
 Q = jnp.array(Q)
 y = jnp.array(y)
 

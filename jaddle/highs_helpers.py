@@ -110,7 +110,9 @@ def jaddle_duals_to_highs(dual_eq, dual_ineq, row_lower, row_upper):
     row_dual = np.zeros(len(row_lower))
     row_dual[eq_rows] = -dual_eq[: eq_rows.size]
     row_dual[upper_rows] -= dual_ineq[: upper_rows.size]
-    row_dual[lower_rows] += dual_ineq[upper_rows.size : upper_rows.size + lower_rows.size]
+    row_dual[lower_rows] += dual_ineq[
+        upper_rows.size : upper_rows.size + lower_rows.size
+    ]
     return row_dual
 
 
@@ -139,9 +141,9 @@ def standard_form_basis_to_highs(basis, row_lower, row_upper):
     row_status = np.full(len(row_lower), status.kBasic, dtype=object)
     row_status[eq_rows] = standard[: eq_rows.size]
     row_status[lower_rows[nonbasic[eq_rows.size + upper_rows.size :]]] = status.kLower
-    row_status[
-        upper_rows[nonbasic[eq_rows.size : eq_rows.size + upper_rows.size]]
-    ] = status.kUpper
+    row_status[upper_rows[nonbasic[eq_rows.size : eq_rows.size + upper_rows.size]]] = (
+        status.kUpper
+    )
     out = hspy.HighsBasis()
     out.col_status = list(basis.col_status)
     out.row_status = list(row_status)
@@ -156,7 +158,8 @@ def jaddle_lp_to_highs(lp):
     same order."""
     if isinstance(lp, JaddleLP):
         A_eq = sp.csr_matrix(
-            (np.asarray(lp.A_eq.data), np.asarray(lp.A_eq.indices).T), shape=lp.A_eq.shape
+            (np.asarray(lp.A_eq.data), np.asarray(lp.A_eq.indices).T),
+            shape=lp.A_eq.shape,
         )
         A_ineq = sp.csr_matrix(
             (np.asarray(lp.A_ineq.data), np.asarray(lp.A_ineq.indices).T),

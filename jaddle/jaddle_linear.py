@@ -7,6 +7,7 @@ import optax
 import numpy as np
 import copy
 import functools
+import inspect
 import os
 from typing import NamedTuple
 import time
@@ -243,9 +244,7 @@ def _make_epoch_fn(
             dual_ineq = projection_non_negative(state.dual_ineq - sigma * gd_ineq)
             dual_eq = state.dual_eq - sigma * gd_eq
             cand = SaddleState(primal=x_new, dual_ineq=dual_ineq, dual_eq=dual_eq)
-            dy = jnp.concatenate(
-                [dual_eq - state.dual_eq, dual_ineq - state.dual_ineq]
-            )
+            dy = jnp.concatenate([dual_eq - state.dual_eq, dual_ineq - state.dual_ineq])
             interaction = jnp.abs(jnp.vdot(dy, A_dx))
             return cand, _descent_bound(state, cand, k, interaction), Ax_new
 
@@ -387,9 +386,7 @@ def _make_epoch_fn(
                     m = jnp.minimum(m, merit_fn(avg))
                 # Condition (ii) needs a previous chunk in this epoch, so the
                 # first chunk (prev_m = inf) can only fire condition (i).
-                stalled = (
-                    (m <= stall_threshold) & jnp.isfinite(prev_m) & (m > prev_m)
-                )
+                stalled = (m <= stall_threshold) & jnp.isfinite(prev_m) & (m > prev_m)
                 done = (m <= merit_threshold) | stalled
                 return chunk + 1, carry, done, stalled, m
 
@@ -538,6 +535,7 @@ def _device_solver(
     iterations_per_epoch_min,
     restart_check_every,
     reference_objective,
+    polish_trigger=None,
 ):
     """The device side of ``solve()``: everything that runs inside its jitted
     epoch loop, built for one scaled problem.
@@ -545,7 +543,9 @@ def _device_solver(
     ``lp`` is the scaled ``JaddleLP``; ``c_true`` the (scaled) cost the metrics
     report when ``vertex_bias`` perturbs ``lp.c``; ``c_max``, ``col_scale`` and
     the row scales map residuals back to true units; ``initial_solution`` is
-    in scaled space. The remaining arguments are ``solve()``'s settings.
+    in scaled space. ``polish_trigger`` is ``solve_with_polishing``'s
+    ``(not_before_epoch, factor)`` stop (see ``solve()``'s ``_polish_trigger``),
+    or ``None``. The remaining arguments are ``solve()``'s settings.
 
     Returns ``(build_chunk, carry, print_epoch_metrics, adaptive_theta,
     chunk_target_seconds)``: ``build_chunk(ipe)`` gives the jitted
@@ -878,6 +878,38 @@ def _device_solver(
             & (gap_abs <= dual_gap_tolerance)
         )
 
+    def polish_ready(
+        constraint_bound,
+        dual_feasibility_residual,
+        duality_gap,
+        dual_gap_is_finite,
+        objective_value,
+        gap_bound_comp,
+        gap_ineq_comp,
+        gap_eq_comp,
+    ):
+        # solve_with_polishing's trigger: the certificate's gap test passes
+        # (polishing does not improve the gap, so it cannot certify before
+        # this) and, given a factor, both relative residuals are within that
+        # factor of their tolerances (polishing cannot rescue a point far from
+        # feasible).
+        gap_abs = relative_gap_abs(
+            objective_value, duality_gap, gap_bound_comp, gap_ineq_comp, gap_eq_comp
+        )
+        ready = dual_gap_is_finite & (gap_abs <= dual_gap_tolerance)
+        factor = polish_trigger[1]
+        if factor is not None:
+            relative_primal_residual = constraint_bound / (1.0 + termination_b_norm)
+            relative_dual_residual = dual_feasibility_residual / (
+                1.0 + termination_c_norm
+            )
+            ready = (
+                ready
+                & (relative_primal_residual <= factor * primal_feasibility_tolerance)
+                & (relative_dual_residual <= factor * dual_feasibility_threshold)
+            )
+        return ready
+
     def converged_primal(constraint_bound, obj_window):
         # Dual-free, opt-in stopping rule for "I just want the primal solved".
         # Optimality is certified heuristically (no dual): primal feasibility
@@ -1090,9 +1122,11 @@ def _device_solver(
         # +inf everywhere (and gap finiteness False) so the convergence tests
         # can't fire before the first epoch has computed real metrics.
         return tuple(
-            jnp.zeros(m.shape, m.dtype)
-            if m.dtype == jnp.bool_
-            else jnp.full(m.shape, jnp.inf, m.dtype)
+            (
+                jnp.zeros(m.shape, m.dtype)
+                if m.dtype == jnp.bool_
+                else jnp.full(m.shape, jnp.inf, m.dtype)
+            )
             for m in _metric_shapes
         )
 
@@ -1247,7 +1281,9 @@ def _device_solver(
                     )
                     iterate_better = need & (state_merit < merit)
                     restart_point = _select(iterate_better, state, restart_point)
-                    restart_merit = jnp.where(iterate_better, state_merit, restart_merit)
+                    restart_merit = jnp.where(
+                        iterate_better, state_merit, restart_merit
+                    )
                     restart_used_avg = restart_used_avg & ~iterate_better
 
                 # A non-finite merit carries no progress signal — it just means
@@ -1434,6 +1470,23 @@ def _device_solver(
                 primal_stall = converged_primal(metrics[10], obj_window)
             else:
                 primal_stall = jnp.asarray(False)
+            if polish_trigger is not None:
+                polish = (
+                    polish_ready(
+                        metrics[10],
+                        metrics[11],
+                        metrics[5],
+                        metrics[6],
+                        metrics[0],
+                        metrics[7],
+                        metrics[8],
+                        metrics[9],
+                    )
+                    & (count >= c["polish_after"])
+                    & ~certificate
+                )
+            else:
+                polish = jnp.asarray(False)
 
             new = dict(
                 state=state,
@@ -1459,8 +1512,13 @@ def _device_solver(
                 prev_epoch_merit=prev_epoch_merit,
                 restarts_done=restarts_done,
                 ipe=ipe_next,
-                done=certificate | primal_stall,
-                stop_code=jnp.where(certificate, 1, jnp.where(primal_stall, 2, 0)),
+                polish_after=c["polish_after"],
+                done=certificate | primal_stall | polish,
+                stop_code=jnp.where(
+                    certificate,
+                    1,
+                    jnp.where(primal_stall, 2, jnp.where(polish, 3, 0)),
+                ),
                 log=log,
                 n_log=n_log,
                 evt=evt,
@@ -1519,6 +1577,11 @@ def _device_solver(
         prev_epoch_merit=jnp.asarray(jnp.inf, _merit_dtype),
         restarts_done=jnp.asarray(0),
         ipe=jnp.asarray(iterations_per_epoch),
+        # Earliest epoch for the polish stop. Carried, not baked into the jit,
+        # so successive solve_with_polishing calls share one compiled loop.
+        polish_after=jnp.asarray(
+            0 if polish_trigger is None else int(polish_trigger[0])
+        ),
         done=jnp.asarray(False),
         stop_code=jnp.asarray(0),
         log=jnp.zeros((_LOG_CAP, 10), _merit_dtype) if verbose else None,
@@ -1527,7 +1590,13 @@ def _device_solver(
         n_evt=jnp.asarray(0),
     )
     carry = _strong(carry)
-    return _build_chunk, carry, print_epoch_metrics, adaptive_theta, _CHUNK_TARGET_SECONDS
+    return (
+        _build_chunk,
+        carry,
+        print_epoch_metrics,
+        adaptive_theta,
+        _CHUNK_TARGET_SECONDS,
+    )
 
 
 def solve(
@@ -1580,6 +1649,7 @@ def solve(
     vertex_bias=0.0,
     vertex_bias_seed=0,
     reference_objective=None,
+    _polish_trigger=None,
 ):
     """
     Solve a linear program via saddle-point optimisation.
@@ -1795,6 +1865,12 @@ def solve(
             comparing ``OBJERR`` against ``RDG`` quantifies how much of the gap is
             dual lag versus genuine primal suboptimality. Does not affect
             termination — convergence still uses the full LP certificate.
+        _polish_trigger: Internal to ``solve_with_polishing``. A
+            ``(not_before_epoch, factor)`` pair that also stops the solve,
+            unconverged, with ``stop_reason="polish_ready"`` at the first epoch
+            ``>= not_before_epoch`` (counted within this call) where the gap
+            test passes and, unless ``factor`` is ``None``, both relative
+            residuals are within ``factor`` times their tolerances.
 
     Returns:
         dict: The solution together with diagnostics. Keys:
@@ -1811,8 +1887,9 @@ def solve(
               ``"primal_stall"`` (the ``primal_stop`` heuristic fired — feasible
               but not certified optimal, so the objective may be suboptimal even
               though ``"converged"`` is ``True``), ``"max_epochs"`` (epoch budget
-              exhausted), ``"time_limit"`` (``max_seconds`` exhausted), or
-              ``"interrupted"`` (KeyboardInterrupt).
+              exhausted), ``"time_limit"`` (``max_seconds`` exhausted),
+              ``"interrupted"`` (KeyboardInterrupt), or ``"polish_ready"``
+              (only with ``_polish_trigger``).
             * ``"solve_seconds"``: ``float`` wall time of the epoch loop (incl. the
               first-epoch XLA compile but not the scaling / sparse-setup phase).
             * ``"corrected_seconds"``: ``float`` steady-state runtime with the
@@ -1837,7 +1914,12 @@ def solve(
         print("----------------------------------------------")
 
     k_lo, k_hi, adaptive_eta, halpern = _check_settings(
-        dual_residual, termination_norm, restart_norm, update_mode, k_scale, adaptive_eta
+        dual_residual,
+        termination_norm,
+        restart_norm,
+        update_mode,
+        k_scale,
+        adaptive_eta,
     )
 
     if verbose:
@@ -2025,6 +2107,7 @@ def solve(
         iterations_per_epoch_min=iterations_per_epoch_min,
         restart_check_every=restart_check_every,
         reference_objective=reference_objective,
+        polish_trigger=_polish_trigger,
     )
 
     chunk_fns = {}
@@ -2083,7 +2166,10 @@ def solve(
     try:
         while True:
             if done:
-                stop_reason = "certificate" if stop_code == 1 else "primal_stall"
+                stop_reason = {1: "certificate", 2: "primal_stall", 3: "polish_ready"}[
+                    stop_code
+                ]
+                is_converged = stop_code != 3
                 break
             if max_epochs and count >= max_epochs:
                 is_converged = False
@@ -2313,7 +2399,12 @@ def make_solver(
         lp = to_jaddle_sparse(lp)
     pattern = __pad_empty_blocks(lp)
     k_lo, k_hi, adaptive_eta_setting, halpern = _check_settings(
-        dual_residual, termination_norm, restart_norm, update_mode, k_scale, adaptive_eta
+        dual_residual,
+        termination_norm,
+        restart_norm,
+        update_mode,
+        k_scale,
+        adaptive_eta,
     )
     float_dtype, compute_dtype = __profile_dtypes()
     n_eq = pattern.n_eq
@@ -2429,7 +2520,9 @@ def make_solver(
             primal_stop_obj_tol=primal_stop_obj_tol,
             halpern_reanchor_per_epoch=halpern_reanchor_per_epoch,
             iterations_per_epoch_decay=1.0,
-            iterations_per_epoch_min=min(iterations_per_epoch_min, iterations_per_epoch),
+            iterations_per_epoch_min=min(
+                iterations_per_epoch_min, iterations_per_epoch
+            ),
             restart_check_every=restart_check_every,
             reference_objective=None,
         )
@@ -2610,9 +2703,7 @@ def make_optimal_value(lp, return_solution=False, **settings):
     return value_fn
 
 
-def make_perturbed_solution(
-    lp, sigma=0.1, num_samples=16, antithetic=True, **settings
-):
+def make_perturbed_solution(lp, sigma=0.1, num_samples=16, antithetic=True, **settings):
     """
     A smoothed, differentiable solution map ``c -> x*_σ(c)`` (the perturbed
     optimizer of Berthet et al., "Learning with Differentiable Perturbed
@@ -2638,9 +2729,7 @@ def make_perturbed_solution(
     samples with ``c₂ + σZ₂ < 0`` drove the mean of ``x₂`` to ~500).
     """
     if num_samples < 1 or (antithetic and num_samples % 2):
-        raise ValueError(
-            "num_samples must be >= 1, and even when antithetic=True"
-        )
+        raise ValueError("num_samples must be >= 1, and even when antithetic=True")
     if sigma <= 0:
         raise ValueError("sigma must be > 0")
     solve_fn = make_solver(lp, **settings)
@@ -2792,7 +2881,9 @@ def make_solution(lp, active_tol=1e-6, **settings):
             lower_bounds=jnp.where(at_lower, w, 0.0),
             upper_bounds=jnp.where(at_upper, w, 0.0),
         )
-        return (jax.tree.map(lambda t, v: t.astype(jnp.asarray(v).dtype), grad, values),)
+        return (
+            jax.tree.map(lambda t, v: t.astype(jnp.asarray(v).dtype), grad, values),
+        )
 
     @jax.custom_vjp
     def solution(values):
@@ -2939,8 +3030,9 @@ def solve_with_presolve(
     ``polish=True`` solves the reduced LP with ``solve_with_polishing``
     instead of ``solve()``, and the result gains its ``"polish"`` dict (absent
     when presolve leaves nothing to solve). ``first_polish_epoch``,
-    ``polish_fraction`` and ``tol`` may then be given among the keyword
-    arguments. The tolerances keep ``solve()``'s default of 1e-3, not
+    ``polish_fraction``, ``polish_trigger``, ``polish_ready_factor``,
+    ``polish_objective_slack`` and ``tol`` may then be given among the
+    keyword arguments. The tolerances keep ``solve()``'s default of 1e-3, not
     ``solve_with_polishing``'s 1e-6, so the flag changes the method and not
     the target.
 
@@ -3014,7 +3106,13 @@ def solve_with_presolve(
         # solve_with_polishing's own arguments, kept apart from solve()'s.
         polish_kwargs = {
             key: solve_kwargs.pop(key)
-            for key in ("first_polish_epoch", "polish_fraction")
+            for key in (
+                "first_polish_epoch",
+                "polish_fraction",
+                "polish_trigger",
+                "polish_ready_factor",
+                "polish_objective_slack",
+            )
             if key in solve_kwargs
         }
         # Resolve the tolerances here, so that the reduced solve and the
@@ -4438,10 +4536,47 @@ def _with_vectors(lp: JaddleLP, c=None, b_eq=None, b_ineq=None, lower=None, uppe
     return out
 
 
-def primal_feasibility_lp(lp: JaddleLP) -> JaddleLP:
+def primal_feasibility_lp(lp: JaddleLP, objective_bound=None) -> JaddleLP:
     """The primal feasibility problem (Eq. 6 of Applegate et al.,
-    arXiv:2501.07018): ``lp`` with its objective set to zero."""
-    return _with_vectors(lp, c=jnp.zeros_like(lp.c))
+    arXiv:2501.07018): ``lp`` with its objective set to zero.
+
+    With ``objective_bound`` ``U`` it also gets the inequality row
+    ``cᵀx <= U`` (appended last to ``A_ineq``). Without it, the walk to
+    feasibility is free to raise the objective, and on stp3d it did, by
+    2e-4 to 6e-4 relative, giving back a gap that had already closed."""
+    zero_c = jnp.zeros_like(lp.c)
+    if objective_bound is None:
+        return _with_vectors(lp, c=zero_c)
+    c = np.asarray(lp.c)
+    cols = np.flatnonzero(c)
+    n_ineq, n = lp.A_ineq.shape
+    row = np.stack([np.full(cols.size, n_ineq), cols], axis=1)
+    A_ineq = jsp.BCOO(
+        (
+            jnp.concatenate(
+                [lp.A_ineq.data, jnp.asarray(c[cols], lp.A_ineq.data.dtype)]
+            ),
+            jnp.concatenate(
+                [lp.A_ineq.indices, jnp.asarray(row, lp.A_ineq.indices.dtype)]
+            ),
+        ),
+        shape=(n_ineq + 1, n),
+        # A row below every existing one, columns ascending: order is kept.
+        indices_sorted=lp.A_ineq.indices_sorted,
+        unique_indices=True,
+    )
+    b_ineq = jnp.concatenate(
+        [lp.b_ineq, jnp.asarray([objective_bound], lp.b_ineq.dtype)]
+    )
+    return JaddleLP(
+        zero_c,
+        lp.A_eq,
+        lp.b_eq,
+        A_ineq,
+        b_ineq,
+        lp.lower_bounds,
+        lp.upper_bounds,
+    )
 
 
 def homogenised_dual_lp(lp: JaddleLP, primal=None) -> JaddleLP:
@@ -4472,19 +4607,35 @@ def homogenised_dual_lp(lp: JaddleLP, primal=None) -> JaddleLP:
     )
 
 
-def _primal_polish_solve(lp: JaddleLP, warm_start: SaddleState, **kwargs):
+def _primal_polish_solve(
+    lp: JaddleLP, warm_start: SaddleState, objective_bound=None, **kwargs
+):
     # Optimal dual of a zero-objective problem is 0, so start the dual there.
     # k_init is left to the ||c||/||b|| derivation: c = 0 sends it to the low
     # clamp, i.e. a large primal step and no objective force — what a
     # feasibility projection wants (seeding the main solve's learned k left
     # mzzv11's 2-epoch feasibility problem unconverged at 20 epochs).
     kwargs.setdefault("max_epochs", 1)
+    feasibility_lp = primal_feasibility_lp(lp, objective_bound)
+    if objective_bound is not None:
+        # The relative PFR divides by 1 + ||b||, and the objective row puts
+        # |U| into b: stp3d's 1 + ||b|| went from 48 to 485, so the sub-solve
+        # stopped at 1e-8 of its own norm with PFR ~6e-8 of the original's.
+        # Tighten its tolerance to the original's absolute target.
+        norm = kwargs.get("termination_norm", "l2")
+        kwargs["primal_feasibility_tolerance"] = kwargs.get(
+            "primal_feasibility_tolerance",
+            inspect.signature(solve).parameters["primal_feasibility_tolerance"].default,
+        ) * float(
+            (1.0 + _vector_norm(lp.b, norm))
+            / (1.0 + _vector_norm(feasibility_lp.b, norm))
+        )
     init = SaddleState(
         primal=warm_start.primal,
-        dual_ineq=jnp.zeros_like(warm_start.dual_ineq),
+        dual_ineq=jnp.zeros(feasibility_lp.b_ineq.shape, warm_start.dual_ineq.dtype),
         dual_eq=jnp.zeros_like(warm_start.dual_eq),
     )
-    return solve(primal_feasibility_lp(lp), initial_solution=init, **kwargs)
+    return solve(feasibility_lp, initial_solution=init, **kwargs)
 
 
 def _dual_polish_solve(lp: JaddleLP, warm_start: SaddleState, **kwargs):
@@ -4504,12 +4655,15 @@ def _dual_polish_solve(lp: JaddleLP, warm_start: SaddleState, **kwargs):
 def primal_polish(
     lp: JaddleLP,
     warm_start: SaddleState,
+    objective_bound=None,
     **kwargs,
 ):
     """
     Algorithm 4's primal step (Applegate et al., arXiv:2501.07018): a short
     ``solve()`` of the primal feasibility problem (``c = 0``) warm-started at
     ``warm_start.primal`` with a zero dual. Returns the polished primal.
+    ``objective_bound`` adds the row ``cᵀx <= objective_bound`` (see
+    ``primal_feasibility_lp``).
 
     The zero objective leaves the solver free to wander anywhere in the
     feasible set, so this must be a short burst from a point that is already
@@ -4520,7 +4674,9 @@ def primal_polish(
     """
     if not isinstance(lp, JaddleLP):
         lp = to_jaddle_sparse(lp)
-    return _primal_polish_solve(lp, warm_start, **kwargs)["solution"].primal
+    return _primal_polish_solve(lp, warm_start, objective_bound, **kwargs)[
+        "solution"
+    ].primal
 
 
 def dual_polish(
@@ -4573,6 +4729,9 @@ def solve_with_polishing(
     max_seconds=None,
     first_polish_epoch=16,
     polish_fraction=0.125,
+    polish_trigger="doubling",
+    polish_ready_factor=None,
+    polish_objective_slack=None,
     **kwargs,
 ):
     """
@@ -4581,13 +4740,21 @@ def solve_with_polishing(
 
     First-order LP solvers often close the duality gap well before the primal
     and dual residuals reach a tight tolerance. Polishing targets that tail.
-    The main solve runs in chunks whose total length doubles (``first_polish_epoch``,
-    then 2×, 4×, … epochs). After each chunk that ends uncertified with the
-    gap already within ``dual_gap_tolerance``, each side that is still
-    infeasible is polished by a short sub-solve of ``polish_fraction`` times
-    the main epochs so far:
+    A polishing attempt fires when the main solve's gap is within
+    ``dual_gap_tolerance`` but the point is uncertified, no earlier than
+    ``first_polish_epoch`` and, after an attempt at epoch ``E``, no earlier
+    than ``2E``. ``polish_trigger`` decides when that is checked:
 
-    * primal: ``primal_polish`` (``c = 0``) from the current primal;
+    * ``"auto"``: every epoch, inside ``solve()``'s loop, so an attempt fires
+      as soon as it is allowed (optionally gated by ``polish_ready_factor``);
+    * ``"doubling"``: PDLP's schedule, only when the main solve's total length
+      reaches ``first_polish_epoch``, then 2×, 4×, … epochs.
+
+    Each side that is still infeasible is then polished by a short sub-solve
+    of ``polish_fraction`` times the main epochs so far:
+
+    * primal: ``primal_polish`` (``c = 0``) from the current primal,
+      optionally with an objective row (``polish_objective_slack``);
     * dual: ``dual_polish`` (homogenised ``b = 0`` problem) from the current dual.
 
     The recombined pair is checked against the same certificate ``solve()``
@@ -4600,9 +4767,11 @@ def solve_with_polishing(
     from tolerance: a feasibility sub-solve warm-started there inherits the
     stall, and a cold-started feasible point ignores the objective.
 
-    Each chunk boundary is a warm restart (``initial_solution`` /
+    Each stop of the main solve is a warm restart (``initial_solution`` /
     ``initial_opt_state`` carry the point, ``k`` and ``eta``; the averaging
-    resets), and each ``solve()`` call repeats the scaling setup.
+    resets), and each ``solve()`` call repeats the scaling setup. Under
+    ``"auto"`` the main solve stops only for polishing attempts, which the
+    ``2E`` back-off keeps as rare as under ``"doubling"``.
 
     Args:
         tol: Default for the three tolerances below.
@@ -4613,10 +4782,23 @@ def solve_with_polishing(
         max_epochs: Main-solve epoch budget across all chunks (polishing
             epochs are not counted). ``None`` = no limit.
         max_seconds: Wall-clock budget for the whole call, polishing included.
-        first_polish_epoch: Length of the first main chunk, i.e. the earliest
-            epoch at which polishing can fire.
+        first_polish_epoch: The earliest epoch at which polishing can fire.
         polish_fraction: Per-side polishing budget as a fraction of the main
             epochs so far (PDLP: 1/8).
+        polish_trigger: ``"doubling"`` (default) or ``"auto"``; see above.
+            On stp3d the two match (its gap first closes at epoch 32); on
+            mzzv11 ``"auto"`` finds gap-closed windows that ``"doubling"``
+            misses, but those attempts failed on the gap, as polishing moved
+            the objective.
+        polish_ready_factor: ``"auto"`` only. When set, an attempt also waits
+            until both relative residuals are within this factor of their
+            tolerances. ``None`` (default) waits only for the gap.
+        polish_objective_slack: When set to ``θ``, the primal polish keeps
+            ``cᵀx <= d + θ * dual_gap_tolerance * (1 + |p| + |d|)``, where
+            ``p`` and ``d`` are the current primal and dual objectives, so the
+            primal side may use only ``θ`` of the gap tolerance. ``None``
+            (default) is PDLP's unconstrained ``c = 0`` problem, whose walk
+            to feasibility can raise the objective and reopen the gap.
         **kwargs: Passed to ``solve()``. The sub-solves get them too, except
             the start point, ``k_init``, ``vertex_bias``, ``primal_stop`` and
             ``reference_objective``.
@@ -4638,10 +4820,14 @@ def solve_with_polishing(
         raise ValueError("first_polish_epoch must be >= 1")
     if not 0.0 < polish_fraction:
         raise ValueError("polish_fraction must be > 0")
+    if polish_trigger not in ("auto", "doubling"):
+        raise ValueError('polish_trigger must be "auto" or "doubling"')
 
     tolerances = {
         "primal_feasibility_tolerance": (
-            tol if primal_feasibility_tolerance is None else primal_feasibility_tolerance
+            tol
+            if primal_feasibility_tolerance is None
+            else primal_feasibility_tolerance
         ),
         "dual_feasibility_tolerance": (
             tol if dual_feasibility_tolerance is None else dual_feasibility_tolerance
@@ -4670,12 +4856,20 @@ def solve_with_polishing(
     polish_epochs = 0
     attempts = 0
     polished = False
-    chunk = int(first_polish_epoch)
+    polish_not_before = int(first_polish_epoch)
     result = None
 
     while True:
-        if max_epochs is not None:
-            chunk = min(chunk, int(max_epochs) - main_epochs)
+        remaining = None if max_epochs is None else int(max_epochs) - main_epochs
+        if polish_trigger == "auto":
+            # One solve() that stops itself once an attempt may fire.
+            chunk = remaining
+            trigger = (max(0, polish_not_before - main_epochs), polish_ready_factor)
+        else:
+            chunk = polish_not_before - main_epochs
+            if remaining is not None:
+                chunk = min(chunk, remaining)
+            trigger = None
         left = seconds_left()
         if left is not None and left <= 0:
             if result is not None:
@@ -4688,16 +4882,18 @@ def solve_with_polishing(
             max_seconds=left,
             initial_solution=state,
             initial_opt_state=opt_state,
+            _polish_trigger=trigger,
             **tolerances,
             **kwargs,
         )
         main_epochs += result["epochs"]
         state, opt_state = result["solution"], result["opt_state"]
-        # Anything but an exhausted chunk (certified, primal_stall, time limit,
+        # Anything but a polishing stop (certified, primal_stall, time limit,
         # interrupted) ends the solve, as does the overall epoch budget.
-        if result["stop_reason"] != "max_epochs" or (
-            max_epochs is not None and main_epochs >= max_epochs
-        ):
+        if result["stop_reason"] not in ("max_epochs", "polish_ready"):
+            break
+        if max_epochs is not None and main_epochs >= max_epochs:
+            result["stop_reason"] = "max_epochs"
             break
 
         cert = evaluate_lp_certificate(
@@ -4731,6 +4927,12 @@ def solve_with_polishing(
                 polish_solve = (
                     _primal_polish_solve if side == "primal" else _dual_polish_solve
                 )
+                side_kwargs = {}
+                if side == "primal" and polish_objective_slack is not None:
+                    p0, d0 = float(cert["objective"]), float(cert["dual_objective"])
+                    side_kwargs["objective_bound"] = d0 + (
+                        polish_objective_slack * g_tol * (1.0 + abs(p0) + abs(d0))
+                    )
                 # The dual side runs second and homogenises its bounds at the
                 # already-polished primal, the one it will be paired with.
                 sub = polish_solve(
@@ -4743,6 +4945,7 @@ def solve_with_polishing(
                         **tolerances,
                         "max_epochs": budget,
                         "max_seconds": left,
+                        **side_kwargs,
                     },
                 )
                 polish_epochs += sub["epochs"]
@@ -4788,9 +4991,15 @@ def solve_with_polishing(
                     f"DFR {float(candidate['relative_dual_feasibility_residual']):.2e}, "
                     f"gap {float(candidate['relative_gap_abs']):.2e}); resuming."
                 )
+        elif verbose:
+            print(
+                f"No polish after {main_epochs} epochs: gap "
+                f"{float(cert['relative_gap_abs']):.2e} > {g_tol:.0e}."
+            )
 
-        # Double the main solve's total length.
-        chunk = main_epochs
+        # Back off: the next attempt waits until the main solve's length has
+        # doubled, which bounds polishing at ~2 * polish_fraction of it.
+        polish_not_before = 2 * main_epochs
 
     wall = time.time() - entry_time
     result["epochs"] = main_epochs
@@ -4813,7 +5022,9 @@ def _project_rays(lp: JaddleLP, primal_ray, dual_ray_eq, dual_ray_ineq):
     bound, <= 0 under a finite upper one, so boxed variables get 0) and the
     inequality part of the dual ray onto y >= 0. A certificate for the
     projected ray is a certificate, so projecting only discards noise."""
-    d = jnp.where(jnp.isfinite(lp.lower_bounds), jnp.maximum(primal_ray, 0.0), primal_ray)
+    d = jnp.where(
+        jnp.isfinite(lp.lower_bounds), jnp.maximum(primal_ray, 0.0), primal_ray
+    )
     d = jnp.where(jnp.isfinite(lp.upper_bounds), jnp.minimum(d, 0.0), d)
     return d, dual_ray_eq, jnp.maximum(dual_ray_ineq, 0.0)
 
@@ -4879,8 +5090,7 @@ def evaluate_infeasibility_certificate(
     )
     primal_infeasibility_ratio = jnp.where(
         dual_significant,
-        dual_ray_infeasibility
-        / jnp.where(dual_significant, dual_ray_objective, 1.0),
+        dual_ray_infeasibility / jnp.where(dual_significant, dual_ray_objective, 1.0),
         jnp.inf,
     )
 
@@ -4947,9 +5157,7 @@ def _refine_rays(A, n_eq, lower, upper, d, y_eq, y_ineq):
         y[rows] += _min_norm_correction(A[rows][:, cols].T.tocsr(), -q[cols])
 
     Ad = A @ d
-    rows = np.concatenate(
-        [np.arange(n_eq), n_eq + np.flatnonzero(Ad[n_eq:] > 0)]
-    )
+    rows = np.concatenate([np.arange(n_eq), n_eq + np.flatnonzero(Ad[n_eq:] > 0)])
     cols = np.flatnonzero((d != 0) | (~finite_lower & ~finite_upper))
     if rows.size:
         d = d.copy()
@@ -5068,9 +5276,7 @@ def detect_infeasibility(
             ).items()
         }
         d_scale = float(jnp.max(jnp.abs(d), initial=0.0))
-        y_scale = float(
-            jnp.max(jnp.abs(jnp.concatenate([y_eq, y_ineq])), initial=0.0)
-        )
+        y_scale = float(jnp.max(jnp.abs(jnp.concatenate([y_eq, y_ineq])), initial=0.0))
         rays = (
             d / d_scale if d_scale > 0.0 else d,
             y_eq / y_scale if y_scale > 0.0 else y_eq,
@@ -5132,7 +5338,10 @@ def detect_infeasibility(
             )
         if refine and not passes(cert):
             refined = _refine_rays(
-                A_host, lp.n_eq, lower_host, upper_host,
+                A_host,
+                lp.n_eq,
+                lower_host,
+                upper_host,
                 *(np.asarray(v) for v in candidate),
             )
             refined_rays, refined_cert = check(

@@ -12,6 +12,10 @@
 # that LP directly would be far quicker.
 
 # %%
+import os
+
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -21,8 +25,7 @@ import matplotlib.pyplot as plt
 import jaddle.jaddle_linear as jl
 import jaddle.jaddle_optimisers as jo
 
-jo.configure_jax("float64")
-jax.config.update("jax_platform_name", "cpu")  # Using CPU for small problems
+jo.configure_jax("float32")
 
 # %% [markdown]
 # ## Generate Scenarios
@@ -136,7 +139,6 @@ def total_cost(design):
     )
 
 
-# %% [markdown]
 # ## Optimise the Design
 # Projected gradient descent with Adam and a decaying step. Every step solves all
 # the scenarios' LPs. The size is kept slightly above zero, where the investment

@@ -24,7 +24,7 @@ from time import time
 
 # %% [markdown]
 # ## Path to the LP
-PROBLEM_NAME = "fhnw-binschedule0"  # name of MIPLIB problem (without .mps extension)
+PROBLEM_NAME = "stp3d"  # name of MIPLIB problem (without .mps extension)
 PATH_TO_MPS = os.path.join(
     os.path.dirname(__file__), "..", "..", "data", f"{PROBLEM_NAME}.mps"
 )
@@ -39,21 +39,15 @@ highs.changeColsIntegrality(
     n, np.arange(n, dtype=np.int32), np.zeros(n, dtype=np.uint8)
 )
 
-lp = jl.to_jaddle_sparse(jhh.highs_to_standard_form_sparse(highs.getLp()))
-
 # %% [markdown]
 # ## Solve the LP with Jaddle
 # Here we solve the LP using Jaddle, crossing over to the simplex method to render the solution basic.
-problem_options = dict(
+solve_options = dict(
     primal_feasibility_tolerance=1e-8,
     dual_feasibility_tolerance=1e-8,
     dual_gap_tolerance=1e-4,
-    # scaled_augmented=False,
-    adaptive_eta="auto",
-    scaled_augmented=False,
-    # primal_damping=1e-8,
-    # dual_damping_eq=1e-8,
-    # dual_damping_ineq=1e-8,
+    polish_objective_slack=0.1,
+    polish_trigger="auto",
 )
 
 start_time = time()
@@ -63,7 +57,7 @@ solution = jl.solve_with_presolve(
     run_crossover=True,
     polish=True,
     highs_options=dict(output_flag="true"),
-    **problem_options,
+    **solve_options,
 )
 end_time = time()
 print("Jaddle solve time:", end_time - start_time)

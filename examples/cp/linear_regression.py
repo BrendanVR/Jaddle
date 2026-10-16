@@ -7,9 +7,8 @@
 import os
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_FLAGS"] = "--xla_gpu_autotune_level=2"
+os.environ["XLA_FLAGS"] = "--xla_gpu_autotune_level=5"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-os.environ["JAX_BCOO_CUSPARSE_LOWERING"] = "true"
 
 import jax
 
@@ -71,6 +70,7 @@ cp = jc.JaddleCP(
 
 # %%
 # Solve the problem using Jaddle Convex SPS optimizer
+
 solution = jc.solve(cp)["solution"]
 
 l2_norm = jnp.linalg.norm(solution.primal, ord=2)
