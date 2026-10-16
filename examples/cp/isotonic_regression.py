@@ -62,7 +62,6 @@ cp = jc.JaddleCP(
 solution = jc.solve(
     cp,
     primal_feasibility_tolerance=1e-6,
-    verbose=True,
 )["solution"]
 
 # %% [markdown]

@@ -7,12 +7,13 @@
 import os
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_FLAGS"] = "--xla_gpu_autotune_level=0"
+os.environ["XLA_FLAGS"] = "--xla_gpu_autotune_level=2"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 import jax
 import jaddle.jaddle_optimisers as jo
 
+jax.config.update("jax_optimization_level", "O3")
 jax.config.update("jax_bcoo_cusparse_lowering", True)
 jo.configure_jax("float64")
 
@@ -48,6 +49,7 @@ solve_options = dict(
     dual_gap_tolerance=1e-4,
     polish_objective_slack=0.1,
     polish_trigger="auto",
+    scaled_augmented=False,
 )
 
 start_time = time()

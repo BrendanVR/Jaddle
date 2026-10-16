@@ -26,6 +26,7 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 import jax
 
 jax.config.update("jax_bcoo_cusparse_lowering", True)
+jax.config.update("jax_optimization_level", "O3")
 
 import argparse
 import csv

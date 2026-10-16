@@ -2,19 +2,17 @@
 # # Kernel SVM with Jaddle
 # This example trains a support vector machine with an RBF kernel on a small
 # two-dimensional problem that no straight line can separate.
-# The SVM's dual is a quadratic program, so we solve it with `jc.quadratic_program`.
 
 # %%
 import os
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_FLAGS"] = "--xla_gpu_autotune_level=5"
+os.environ["XLA_FLAGS"] = "--xla_gpu_autotune_level=2"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 import jax
 
 jax.config.update("jax_optimization_level", "O3")
-
 
 import numpy as np
 import jax.numpy as jnp
