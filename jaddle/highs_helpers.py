@@ -6,6 +6,27 @@ import jax.experimental.sparse as jsp
 from jaddle.jaddle_basic_types import JaddleLP, LP
 
 
+def read_model(highs: hspy.Highs, path):
+    """``highs.readModel(path)``, retrying an MPS file HiGHS's default (free
+    format) parser rejects with its fixed-format parser. Some MIPLIB files
+    (rvb-sub) carry fixed-format ``$`` comments in field 3 of ROWS lines,
+    which only the fixed parser skips. Raises ``ValueError`` if neither reads
+    the file, rather than leaving ``highs`` holding an empty model."""
+    path = str(path)
+    status = highs.readModel(path)
+    if status == hspy.HighsStatus.kError and path.lower().endswith(
+        (".mps", ".mps.gz")
+    ):
+        highs.setOptionValue("mps_parser_type_free", False)
+        try:
+            status = highs.readModel(path)
+        finally:
+            highs.setOptionValue("mps_parser_type_free", True)
+    if status == hspy.HighsStatus.kError:
+        raise ValueError(f"HiGHS could not read {path!r}")
+    return status
+
+
 def highs_to_standard_form_sparse(lp: hspy.HighsLp):
     """
     Converts a HighsLp object to standard form matrices:

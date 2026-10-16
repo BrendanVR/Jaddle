@@ -2911,9 +2911,7 @@ def _highs_model(model, highs_options=None):
     for key, value in (highs_options or {}).items():
         highs.setOptionValue(key, value)
     if isinstance(model, (str, os.PathLike)):
-        status = highs.readModel(os.fspath(model))
-        if status == highspy.HighsStatus.kError:
-            raise ValueError(f"HiGHS could not read {model!r}")
+        hh.read_model(highs, os.fspath(model))
     elif isinstance(model, highspy.HighsLp):
         highs.passModel(model)
     elif isinstance(model, (LP, JaddleLP)):

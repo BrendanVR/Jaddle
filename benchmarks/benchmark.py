@@ -279,7 +279,7 @@ def highs_reference(
         return float("nan"), "skipped", float("nan")
     highs = hspy.Highs()
     highs.setOptionValue("output_flag", "true" if highs_verbose else "false")
-    highs.readModel(path)
+    hh.read_model(highs, path)
     relax_integrality(highs)
     highs.setOptionValue("presolve", "on" if presolve else "off")
     highs.setOptionValue(
@@ -313,7 +313,7 @@ def presolved_lp(path, eliminate_defined_vars=True):
     """
     highs = hspy.Highs()
     highs.setOptionValue("output_flag", False)
-    highs.readModel(path)
+    hh.read_model(highs, path)
     relax_integrality(highs)
     highs.presolve()
     highs_lp = highs.getPresolvedLp()
@@ -332,7 +332,7 @@ def original_lp(path):
     maximisation, whose cost is negated), and the sizes are HiGHS's."""
     highs = hspy.Highs()
     highs.setOptionValue("output_flag", False)
-    highs.readModel(path)
+    hh.read_model(highs, path)
     relax_integrality(highs)
     highs_lp = highs.getLp()
     lp = hh.highs_to_standard_form_sparse(highs_lp)

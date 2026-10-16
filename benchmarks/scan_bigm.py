@@ -64,6 +64,7 @@ import glob
 
 import numpy as np
 import highspy as hspy
+import jaddle.highs_helpers as hh
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DATA_DIR = os.path.join(REPO_ROOT, "data")
@@ -197,7 +198,7 @@ class InstanceArrays:
     def __init__(self, path):
         highs = hspy.Highs()
         highs.setOptionValue("output_flag", "false")
-        highs.readModel(path)
+        hh.read_model(highs, path)
         lp = highs.getLp()
         self.num_row = lp.num_row_
         self.num_col = lp.num_col_
