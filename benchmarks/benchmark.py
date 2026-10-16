@@ -22,10 +22,10 @@ import os
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_FLAGS"] = "--xla_gpu_autotune_level=5"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-os.environ["JAX_BCOO_CUSPARSE_LOWERING"] = "true"
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 import jax
+
+jax.config.update("jax_bcoo_cusparse_lowering", True)
 
 import argparse
 import csv
@@ -364,12 +364,10 @@ def jaddle_solve_kwargs(
         dual_feasibility_tolerance=tol,
         dual_gap_tolerance=tol if gap_tol is None else gap_tol,
         update_mode=update_mode,
-        iterations_per_epoch=64 * 10 * 2,
-        # epochs_per_restart=10,
+        iterations_per_epoch=64 * 10,
         cost_col_floor=cost_col_floor,
         termination_norm=norm,
         restart_norm=norm,
-        scaled_augmented=True,
     )
 
 

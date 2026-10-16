@@ -7,23 +7,24 @@
 import os
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_FLAGS"] = "--xla_gpu_autotune_level=2"
+os.environ["XLA_FLAGS"] = "--xla_gpu_autotune_level=0"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-os.environ["JAX_BCOO_CUSPARSE_LOWERING"] = "true"
 
 import jax
 import jaddle.jaddle_optimisers as jo
+
+jax.config.update("jax_bcoo_cusparse_lowering", True)
+jo.configure_jax("float64")
+
 import jaddle.jaddle_linear as jl
 import jaddle.highs_helpers as jhh
 import highspy as hspy
 import numpy as np
 from time import time
 
-jo.configure_jax("float64")
-
 # %% [markdown]
 # ## Path to the LP
-PROBLEM_NAME = "hgms30"  # name of MIPLIB problem (without .mps extension)
+PROBLEM_NAME = "fhnw-binschedule0"  # name of MIPLIB problem (without .mps extension)
 PATH_TO_MPS = os.path.join(
     os.path.dirname(__file__), "..", "..", "data", f"{PROBLEM_NAME}.mps"
 )
@@ -44,12 +45,15 @@ lp = jl.to_jaddle_sparse(jhh.highs_to_standard_form_sparse(highs.getLp()))
 # ## Solve the LP with Jaddle
 # Here we solve the LP using Jaddle, crossing over to the simplex method to render the solution basic.
 problem_options = dict(
-    primal_feasibility_tolerance=1e-4,
-    dual_feasibility_tolerance=1e-4,
+    primal_feasibility_tolerance=1e-8,
+    dual_feasibility_tolerance=1e-8,
     dual_gap_tolerance=1e-4,
     # scaled_augmented=False,
     adaptive_eta="auto",
-    artificial_restart_fraction=0.15,
+    scaled_augmented=False,
+    # primal_damping=1e-8,
+    # dual_damping_eq=1e-8,
+    # dual_damping_ineq=1e-8,
 )
 
 start_time = time()
@@ -57,7 +61,7 @@ solution = jl.solve_with_presolve(
     highs,
     verbose=True,
     run_crossover=True,
-    # polish=True,
+    polish=True,
     highs_options=dict(output_flag="true"),
     **problem_options,
 )
