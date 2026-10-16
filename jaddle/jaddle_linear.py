@@ -527,6 +527,7 @@ def _device_solver(
     restarts,
     epochs_per_restart,
     restart_multiplier,
+    artificial_restart_fraction,
     restart_decay,
     necessary_decay,
     primal_stop,
@@ -1296,7 +1297,31 @@ def _device_solver(
                         )
                     )
                 )
-                restarted = sufficient_progress | stalling_restart | cycle_exhausted
+                # cuPDLP condition (iii) — artificial restart: the cycle has run
+                # for more than `artificial_restart_fraction` of all iterations
+                # so far. Gated on the merit NOT having reached necessary_decay
+                # of its cycle-start value, the one case where (i) and (ii) can
+                # never fire: without it a merit that rises after a restart locks
+                # the run into one endless cycle (hgms30: no restart for 1250+
+                # epochs after epoch 3, k frozen, objective hovering 7% off).
+                # Restarting resets `mal` to the current merit, re-arming (i)/(ii).
+                # Never on the first epoch (the baseline is only seeded there),
+                # and suppressed like the cycle cap while `still_improving`.
+                if artificial_restart_fraction:
+                    artificial_restart = (
+                        jnp.isfinite(c["merit_at_last_restart"])
+                        & (iterations_since >= artificial_restart_fraction * (i - 1))
+                        & ~(merit_is_finite & (restart_merit <= necessary_decay * mal))
+                        & ~still_improving
+                    )
+                else:
+                    artificial_restart = jnp.asarray(False)
+                restarted = (
+                    sufficient_progress
+                    | stalling_restart
+                    | cycle_exhausted
+                    | artificial_restart
+                )
 
                 # PDLP-style primal-weight rebalance from the movement over the
                 # just-finished cycle, blended in log space (k_theta), clamped.
@@ -1355,7 +1380,11 @@ def _device_solver(
                 restarts_done = restarts_done + restarted
                 if verbose:
                     reason = jnp.where(
-                        sufficient_progress, 0, jnp.where(stalling_restart, 1, 2)
+                        sufficient_progress,
+                        0,
+                        jnp.where(
+                            stalling_restart, 1, jnp.where(cycle_exhausted, 2, 3)
+                        ),
                     )
                     row = jnp.stack(
                         [
@@ -1538,6 +1567,7 @@ def solve(
     restarts=True,
     epochs_per_restart=None,
     restart_multiplier=1.0,
+    artificial_restart_fraction=0.36,
     restart_decay=0.2,
     necessary_decay=0.8,
     primal_stop=False,
@@ -1640,6 +1670,13 @@ def solve(
             ever fired. Subsequent cycle caps grow by ``restart_multiplier``.
         restart_multiplier: Geometric growth factor for cycle-length caps
             (default 1.0 = fixed length, 2.0 = doubling).
+        artificial_restart_fraction: cuPDLP's artificial restart (default
+            0.36; ``None`` or 0 disables). A restart fires once the current
+            cycle exceeds this fraction of all iterations run so far, but only
+            while the merit is still above ``necessary_decay`` times its value
+            at the last restart, the case where the sufficient-progress and
+            stalling triggers can never fire. Without it, a merit that rises
+            after a restart locks the solve into a single endless cycle.
         restart_decay: Sufficient-progress threshold (default 0.2; cuPDLP
             β_sufficient). A restart fires when the KKT merit drops below
             ``restart_decay`` times its value at the last restart.
@@ -1977,6 +2014,7 @@ def solve(
         restarts=restarts,
         epochs_per_restart=epochs_per_restart,
         restart_multiplier=restart_multiplier,
+        artificial_restart_fraction=artificial_restart_fraction,
         restart_decay=restart_decay,
         necessary_decay=necessary_decay,
         primal_stop=primal_stop,
@@ -2025,7 +2063,9 @@ def solve(
                 )
                 continue
             restarts_printed += 1
-            reason = ("sufficient-progress", "stalling", "cycle-cap")[int(r[1])]
+            reason = ("sufficient-progress", "stalling", "cycle-cap", "artificial")[
+                int(r[1])
+            ]
             which = "avg" if r[3] else "iterate"
             k_msg = f", k={float(r[4]):.3e}"
             if adaptive_theta:
@@ -2240,6 +2280,7 @@ def make_solver(
     restarts=True,
     epochs_per_restart=None,
     restart_multiplier=1.0,
+    artificial_restart_fraction=0.36,
     restart_decay=0.2,
     necessary_decay=0.8,
     primal_stop=False,
@@ -2380,6 +2421,7 @@ def make_solver(
             restarts=restarts,
             epochs_per_restart=epochs_per_restart,
             restart_multiplier=restart_multiplier,
+            artificial_restart_fraction=artificial_restart_fraction,
             restart_decay=restart_decay,
             necessary_decay=necessary_decay,
             primal_stop=primal_stop,

@@ -7,9 +7,7 @@
 import os
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_FLAGS"] = (
-    "--xla_gpu_autotune_level=5" + " " + "xla_gpu_enable_triton_gemm"
-)
+os.environ["XLA_FLAGS"] = "--xla_gpu_autotune_level=5"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 os.environ["JAX_BCOO_CUSPARSE_LOWERING"] = "true"
 

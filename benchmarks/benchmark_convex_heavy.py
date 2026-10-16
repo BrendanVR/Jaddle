@@ -22,7 +22,7 @@ import jaddle.jaddle_optimisers as jo
 
 from benchmark import add_jaddle_verbose_flag
 
-jo.configure_jax("x64")
+jo.configure_jax("float64")
 print(jax.devices())
 rng = np.random.default_rng(0)
 

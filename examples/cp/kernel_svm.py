@@ -8,13 +8,13 @@
 import os
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_FLAGS"] = (
-    "--xla_gpu_autotune_level=5" + " " + "xla_gpu_enable_triton_gemm"
-)
+os.environ["XLA_FLAGS"] = "--xla_gpu_autotune_level=5"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-os.environ["JAX_BCOO_CUSPARSE_LOWERING"] = "true"
 
 import jax
+
+jax.config.update("jax_optimization_level", "O1")
+
 
 import numpy as np
 import jax.numpy as jnp
@@ -56,7 +56,7 @@ def rbf_kernel(A, B, gamma):
 
 # %% [markdown]
 # ## Solve the problem using Jaddle
-C = 50
+C = 1
 gamma = 2.0
 Q = np.outer(y, y) * rbf_kernel(X, X, gamma)
 
@@ -79,7 +79,7 @@ def nystroem(A, k, key=jax.random.PRNGKey(0)):
     return C @ (V * inv_sqrt)  # n x k, so that Q ≈ F Fᵀ
 
 
-rank = 500
+rank = 30
 F = nystroem(Q, rank)
 
 objective = lambda alpha: 0.5 * jnp.linalg.multi_dot([alpha, F, F.T, alpha]) - jnp.sum(

@@ -23,7 +23,7 @@ jo.configure_jax("float64")
 
 # %% [markdown]
 # ## Path to the LP
-PROBLEM_NAME = "rmine25"  # name of MIPLIB problem (without .mps extension)
+PROBLEM_NAME = "hgms30"  # name of MIPLIB problem (without .mps extension)
 PATH_TO_MPS = os.path.join(
     os.path.dirname(__file__), "..", "..", "data", f"{PROBLEM_NAME}.mps"
 )
@@ -47,14 +47,17 @@ problem_options = dict(
     primal_feasibility_tolerance=1e-4,
     dual_feasibility_tolerance=1e-4,
     dual_gap_tolerance=1e-4,
-    scaled_augmented=False,
+    # scaled_augmented=False,
+    adaptive_eta="auto",
+    artificial_restart_fraction=0.15,
 )
 
 start_time = time()
 solution = jl.solve_with_presolve(
     highs,
-    run_crossover=True,
     verbose=True,
+    run_crossover=True,
+    # polish=True,
     highs_options=dict(output_flag="true"),
     **problem_options,
 )
