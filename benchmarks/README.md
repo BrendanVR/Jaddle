@@ -4,7 +4,7 @@ Scripts for measuring Jaddle's solvers. They come in three kinds:
 
 | Kind | Scripts | Purpose |
 |---|---|---|
-| **LP harnesses** | [`benchmark.py`](benchmark.py), [`benchmark_mpax.py`](benchmark_mpax.py) | Solve the LP relaxations of a directory of MIPLIB instances with `jaddle_linear.solve`, then write a CSV and a README-ready markdown table. `benchmark_mpax.py` also runs [MPAX](https://github.com/MIT-Lu-Lab/MPAX) on the same presolved LPs for a head-to-head comparison. |
+| **LP harnesses** | [`benchmark.py`](benchmark.py), [`benchmark_mpax.py`](benchmark_mpax.py), [`benchmark_pipeline.py`](benchmark_pipeline.py) | Solve the LP relaxations of a directory of MIPLIB instances with `jaddle_linear.solve`, then write a CSV and a README-ready markdown table. `benchmark_mpax.py` also runs [MPAX](https://github.com/MIT-Lu-Lab/MPAX) on the same presolved LPs for a head-to-head comparison. `benchmark_pipeline.py` runs the whole `jl.solve_with_presolve` pipeline with polishing and crossover. |
 | **Convex A/B suites** | [`benchmark_convex.py`](benchmark_convex.py), [`benchmark_convex_heavy.py`](benchmark_convex_heavy.py) | Compare `jaddle_convex.solve` configurations (update mode, adaptive step, restarts) on synthetic convex problems. |
 | **Instance diagnostics** | [`scan_bigm.py`](scan_bigm.py) | Flag MPS instances whose big-M structure is known to stall saddle-point solvers. The LP harnesses use it to skip those instances. |
 
@@ -149,6 +149,47 @@ optimum, and `jaddle_original_certified` was false.
 (PDLP's normalisation) against the HiGHS optimum, and both the original and the
 presolved sizes (`n_vars`/`n_cons`, `n_vars_presolved`/`n_cons_presolved`,
 counted as HiGHS columns and rows).
+
+## Full-pipeline harness
+
+`benchmark_pipeline.py` runs every step of `jl.solve_with_presolve` on each
+instance:
+
+1. HiGHS presolve.
+2. Defined-variable elimination.
+3. Jaddle with feasibility polishing (`polish=True`).
+4. Crossover to an optimal vertex of the reduced LP (`run_crossover=True`).
+5. HiGHS postsolve of that vertex and its basis.
+
+The answer is a vertex, so the script compares it with an exact HiGHS solve
+(`--highs-solver`, `simplex` by default). It compares the objectives and also
+the end-to-end times: HiGHS's whole `run()` against Jaddle's whole call. It
+shares `benchmark.py`'s Jaddle settings and its instance options (`--only`,
+`--max-mb`, `--skip-bigm*`, `--tol`, `--norm`, ...). It adds these options:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--polish` / `--no-polish` | on | Solve the reduced LP with feasibility polishing. |
+| `--first-polish-epoch N`, `--polish-fraction X`, `--polish-trigger {doubling,auto}` | `16`, `0.125`, `doubling` | Passed to `solve_with_polishing`. |
+| `--gap-tol X` | `--tol` | Gap tolerance alone. Polishing fires only once the gap is within it. |
+| `--crossover` / `--no-crossover` | on | Cross over to a vertex before postsolve. |
+| `--crossover-time-limit S` | none | HiGHS `time_limit` passed as `highs_options`. It applies to the presolving HiGHS instance too. |
+
+The CSV (`benchmark_pipeline_results.csv` by default) splits Jaddle's wall
+time into `jaddle_presolve_seconds`, `jaddle_solve_seconds` (with polishing,
+the whole polished solve), `crossover_seconds` and `jaddle_other_seconds`.
+The last covers elimination, postsolve with its simplex repair, and the
+certificate check. It also records the crossover's statistics:
+`crossover_status`, `crossover_converged`, `crossover_pushes`,
+`crossover_simplex_iterations` and `postsolve_simplex_iterations`. Then
+`jaddle_original_certified` reports whether the returned vertex is certified
+on the LP as given.
+
+```bash
+python benchmarks/benchmark_pipeline.py --only stp3d mzzv11
+python benchmarks/benchmark_pipeline.py --tol 1e-4 --max-seconds 600
+python benchmarks/benchmark_pipeline.py --no-crossover   # polish only
+```
 
 ## Convex A/B suites
 
