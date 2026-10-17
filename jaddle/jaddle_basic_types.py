@@ -17,8 +17,9 @@ class SaddleState(NamedTuple):
 
 
 class LPValues(NamedTuple):
-    """The numbers of an LP ``min cᵀx s.t. A_eq x = b_eq, A_ineq x <= b_ineq,
-    lower <= x <= upper`` on a fixed sparsity pattern: the constraint
+    """The numbers of an LP
+    ``min cᵀx s.t. A_eq x = b_eq, A_ineq x <= b_ineq, lower <= x <= upper``
+    on a fixed sparsity pattern: the constraint
     matrices' stored nonzeros (in their BCOO order) plus the vectors. A pytree,
     so it can be batched with ``vmap`` and differentiated."""
 

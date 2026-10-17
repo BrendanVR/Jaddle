@@ -1127,10 +1127,10 @@ def solve(
     three of the following are within tolerance:
 
     * stationarity, ``‖x - proj(x - ∇ₓL)‖∞ <= primal_grad_norm_tolerance``;
-    * primal feasibility, the largest violation ``max(g(x)⁺, |h(x)|) <=
-      primal_feasibility_tolerance``;
-    * complementary slackness, ``max|λ ⊙ g(x)| / (1 + |f(x)|) <=
-      complementarity_slack_tolerance``.
+    * primal feasibility, the largest violation
+      ``max(g(x)⁺, |h(x)|) <= primal_feasibility_tolerance``;
+    * complementary slackness,
+      ``max|λ ⊙ g(x)| / (1 + |f(x)|) <= complementarity_slack_tolerance``.
 
     The epoch loop runs on the device: each call into JAX executes a chunk of
     many epochs, including the metrics, convergence test and restart logic, with
@@ -1200,15 +1200,16 @@ def solve(
             ``"forward_reflected"`` (Malitsky-Tam forward-reflected-backward:
             one gradient evaluation per iteration; requires ``adaptive_eta``).
         k_scale: Primal-weight (k) scaling control. ``None`` disables it;
-            otherwise a float sets a symmetric clamp band ``[1/k_scale,
-            k_scale]`` for ``k`` (default ``10`` → ``[0.1, 10]``). When enabled —
-            orthogonal to ``update_mode``, so it composes with every scheme
-            — a primal weight ``k`` rescales the primal/dual gradients by
-            ``(1/k, k)`` before each ``opt_update``, making the dual/primal step
-            ratio ``k**2``. ``k`` is initialised from ``k_init`` and rebalanced
-            at each restart (PDLP-style) from primal-vs-dual iterate movement; it
-            is constant within an epoch (not adapted per iteration). Tuned by
-            ``k_theta``/``k_scale`` and ``k_init``.
+            otherwise a float sets a symmetric clamp band
+            ``[1/k_scale, k_scale]`` for ``k`` (default ``10`` →
+            ``[0.1, 10]``). When enabled — orthogonal to ``update_mode``, so
+            it composes with every scheme — a primal weight ``k`` rescales the
+            primal/dual gradients by ``(1/k, k)`` before each ``opt_update``,
+            making the dual/primal step ratio ``k**2``. ``k`` is initialised
+            from ``k_init`` and rebalanced at each restart (PDLP-style) from
+            primal-vs-dual iterate movement; it is constant within an epoch
+            (not adapted per iteration). Tuned by ``k_theta``/``k_scale`` and
+            ``k_init``.
         k_theta: Smoothing coefficient for the log-space primal-weight update at
             each restart (default 0.5 = geometric mean of the movement-based
             target and the current weight, matching PDLP). Smaller = slower
@@ -1523,10 +1524,11 @@ def make_solver(
 
     ``build_cp(params)`` returns an ordinary ``JaddleCP`` whose functions
     close over ``params`` (any pytree: data, weights, right-hand sides,
-    bounds). ``make_solver`` returns ``solve_fn(params, initial_solution=None)
-    -> SolveCoreResult``. The whole solve is traceable, so ``solve_fn`` can be
-    ``jax.jit``-ed and ``jax.vmap``-ed over a batch of ``params`` whose
-    problems share their shapes::
+    bounds). ``make_solver`` returns
+    ``solve_fn(params, initial_solution=None) -> SolveCoreResult``. The whole
+    solve is traceable, so ``solve_fn`` can be ``jax.jit``-ed and
+    ``jax.vmap``-ed over a batch of ``params`` whose problems share their
+    shapes::
 
         def build_cp(a):
             return JaddleCP(n, objective=lambda x: jnp.sum((x - a) ** 2), ...)
@@ -1619,10 +1621,9 @@ def make_optimal_value(build_cp, return_solution=False, **settings):
     kink and this is the subgradient at the solution found. Only as accurate
     as the solve: use tight tolerances. Works under ``jit`` and ``vmap``.
 
-    ``return_solution=True`` makes ``value_fn`` return ``(z*,
-    SolveCoreResult)`` from the same solve, for ``jax.grad(value_fn,
-    has_aux=True)``: each call is a fresh solve, and separate solves differ
-    slightly.
+    ``return_solution=True`` makes ``value_fn`` return ``(z*, SolveCoreResult)``
+    from the same solve, for ``jax.grad(value_fn, has_aux=True)``: each call
+    is a fresh solve, and separate solves differ slightly.
     """
     solve_fn = make_solver(build_cp, **settings)
 
@@ -1908,8 +1909,9 @@ def quadratic_program(
     Returns ``solve()``'s dict, with these keys replaced or added:
 
     * ``"solution"``: a ``SaddleState`` in the problem's own units. The
-      Lagrangian is ``½xᵀQx + cᵀx + y_eqᵀ(A_eq x − b_eq) + y_ineqᵀ(A_ineq x −
-      b_ineq)`` with ``y_ineq >= 0``.
+      Lagrangian is
+      ``½xᵀQx + cᵀx + y_eqᵀ(A_eq x − b_eq) + y_ineqᵀ(A_ineq x − b_ineq)``
+      with ``y_ineq >= 0``.
     * ``"objective"``: the objective there.
     * ``"certificate"``: the three residuals above, recomputed from the
       unscaled matrices (the keys of

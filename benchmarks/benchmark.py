@@ -89,7 +89,8 @@ def add_norm_flag(p):
 
 
 def add_polish_flags(p):
-    """Add the --gap-tol and --polish flags (feasibility polishing A/Bs)."""
+    """Add the --gap-tol, --gap-test and --polish flags (feasibility polishing
+    and gap-test A/Bs)."""
     p.add_argument(
         "--gap-tol",
         type=float,
@@ -97,6 +98,14 @@ def add_polish_flags(p):
         help="Relative duality-gap tolerance for Jaddle (default: same as --tol). "
         "Set it looser than --tol for a tight-feasibility / loose-gap "
         "certificate, the regime where --polish pays off.",
+    )
+    p.add_argument(
+        "--gap-test",
+        default="abs",
+        choices=["abs", "pdlp"],
+        help="Which relative gap must meet --gap-tol (jl.solve's gap_test): "
+        "'abs' sums the |gap components| so they cannot cancel; 'pdlp' is "
+        "PDLP's signed |primal_obj - dual_obj|. (default: %(default)s)",
     )
     p.add_argument(
         "--polish",
@@ -350,12 +359,13 @@ def jaddle_solve_kwargs(
     cost_col_floor=0.0,
     gap_tol=None,
     norm="l2",
+    gap_test="abs",
 ):
     """The ``jl.solve`` settings every benchmark harness uses, so all of them
     (and benchmark_mpax.py's Jaddle arm) run the same configuration.
     ``gap_tol`` (default: ``tol``) sets the duality-gap tolerance alone.
     ``norm`` (``"l2"`` or ``"inf"``) sets both the termination and the
-    restart norm."""
+    restart norm. ``gap_test`` is ``jl.solve``'s."""
     return dict(
         max_epochs=max_epochs,
         max_seconds=max_seconds,
@@ -364,6 +374,7 @@ def jaddle_solve_kwargs(
         primal_feasibility_tolerance=tol,
         dual_feasibility_tolerance=tol,
         dual_gap_tolerance=tol if gap_tol is None else gap_tol,
+        gap_test=gap_test,
         update_mode=update_mode,
         iterations_per_epoch=64 * 10,
         cost_col_floor=cost_col_floor,
@@ -383,6 +394,7 @@ def run_jaddle(
     gap_tol=None,
     polish=False,
     norm="l2",
+    gap_test="abs",
 ):
     """Solve with Jaddle's saddle-point solver. Returns a dict of metrics.
 
@@ -419,6 +431,7 @@ def run_jaddle(
             cost_col_floor,
             gap_tol,
             norm,
+            gap_test,
         ),
     )
     wall_seconds = time.perf_counter() - t0
@@ -468,6 +481,7 @@ def run_jaddle_presolved(
     polish=False,
     eliminate_defined_vars=True,
     norm="l2",
+    gap_test="abs",
 ):
     """Solve an instance file with ``jl.solve_with_presolve`` (HiGHS presolve,
     optional defined-variable elimination, Jaddle, postsolve). Returns a dict
@@ -499,6 +513,7 @@ def run_jaddle_presolved(
             cost_col_floor,
             gap_tol,
             norm,
+            gap_test,
         ),
     )
     wall_seconds = time.perf_counter() - t0
@@ -546,6 +561,7 @@ def run_jaddle_unpresolved(
     gap_tol=None,
     polish=False,
     norm="l2",
+    gap_test="abs",
 ):
     """Solve an instance file's LP relaxation as given (no presolve) with
     ``run_jaddle``. The certificate is then on the original LP, so
@@ -563,6 +579,7 @@ def run_jaddle_unpresolved(
         gap_tol=gap_tol,
         polish=polish,
         norm=norm,
+        gap_test=gap_test,
     )
     res["jaddle_obj"] = sign * res["jaddle_obj"] + offset
     res["jaddle_original_certified"] = res["jaddle_converged"]
@@ -616,6 +633,8 @@ def main():
         return
 
     gap_text = "" if args.gap_tol is None else f", gap_tol={args.gap_tol:g}"
+    if args.gap_test != "abs":
+        gap_text += f", gap_test={args.gap_test}"
     polish_text = ", feasibility polishing" if args.polish else ""
     presolve_text = "" if args.presolve else ", no presolve"
     print(
@@ -649,6 +668,7 @@ def main():
                 gap_tol=args.gap_tol,
                 polish=args.polish,
                 norm=args.norm,
+                gap_test=args.gap_test,
             )
             if args.presolve:
                 jres = run_jaddle_presolved(

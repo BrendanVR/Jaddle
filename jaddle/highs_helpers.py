@@ -101,9 +101,9 @@ def standard_form_row_map(row_lower, row_upper):
     """Which rows of a row-bounded LP become which rows of
     ``rows_to_standard_form``'s output: ``(eq_rows, upper_rows, lower_rows)``.
     Rows with equal finite bounds (within 1e-8) are the equalities, in order;
-    the inequality rows are ``upper_rows`` (finite upper bound, ``a.x <=
-    upper``) followed by ``lower_rows`` (finite lower bound, ``-a.x <=
-    -lower``). A row free on both sides appears in none."""
+    the inequality rows are ``upper_rows`` (finite upper bound,
+    ``a.x <= upper``) followed by ``lower_rows`` (finite lower bound,
+    ``-a.x <= -lower``). A row free on both sides appears in none."""
     row_lower = np.asarray(row_lower, dtype=np.float64)
     row_upper = np.asarray(row_upper, dtype=np.float64)
     eq_mask = (
@@ -174,8 +174,8 @@ def standard_form_basis_to_highs(basis, row_lower, row_upper):
 
 def jaddle_lp_to_highs(lp):
     """A ``highspy.HighsLp`` for a Jaddle ``LP`` / ``JaddleLP``: the equality
-    rows (``b_eq <= a.x <= b_eq``) then the inequality rows (``a.x <=
-    b_ineq``). ``rows_to_standard_form`` maps it back to the same rows in the
+    rows (``b_eq <= a.x <= b_eq``) then the inequality rows
+    (``a.x <= b_ineq``). ``rows_to_standard_form`` maps it back to the same rows in the
     same order."""
     if isinstance(lp, JaddleLP):
         A_eq = sp.csr_matrix(

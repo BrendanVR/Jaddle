@@ -447,8 +447,20 @@ def _unscale_output(
     return output
 
 
+# The `evaluate_lp_certificate` key each `gap_test` compares against
+# `dual_gap_tolerance`: "abs" is the no-cancellation sum of |gap component|s,
+# "pdlp" the signed |primal_obj − dual_obj| (PDLP / cuPDLP).
+_GAP_TEST_KEYS = {"abs": "relative_gap_abs", "pdlp": "relative_gap"}
+
+
 def _check_settings(
-    dual_residual, termination_norm, restart_norm, update_mode, k_scale, adaptive_eta
+    dual_residual,
+    termination_norm,
+    restart_norm,
+    update_mode,
+    k_scale,
+    adaptive_eta,
+    gap_test="abs",
 ):
     """Validate the settings ``solve()`` and ``make_solver`` share. Returns
     ``(k_lo, k_hi, adaptive_eta, halpern)``, with ``adaptive_eta`` either a
@@ -457,6 +469,8 @@ def _check_settings(
         raise ValueError(
             f"dual_residual must be 'pdlp' or 'projected', got {dual_residual!r}"
         )
+    if gap_test not in _GAP_TEST_KEYS:
+        raise ValueError(f"gap_test must be 'abs' or 'pdlp', got {gap_test!r}")
     if termination_norm not in ("inf", "l2"):
         raise ValueError(
             f"termination_norm must be 'inf' or 'l2', got {termination_norm!r}"
@@ -510,6 +524,7 @@ def _device_solver(
     primal_feasibility_tolerance,
     dual_feasibility_tolerance,
     dual_gap_tolerance,
+    gap_test,
     dual_residual,
     termination_norm,
     restart_norm,
@@ -547,8 +562,8 @@ def _device_solver(
     ``(not_before_epoch, factor)`` stop (see ``solve()``'s ``_polish_trigger``),
     or ``None``. The remaining arguments are ``solve()``'s settings.
 
-    Returns ``(build_chunk, carry, print_epoch_metrics, adaptive_theta,
-    chunk_target_seconds)``: ``build_chunk(ipe)`` gives the jitted
+    Returns ``(build_chunk, carry, print_epoch_metrics, adaptive_theta,``
+    ``chunk_target_seconds)``: ``build_chunk(ipe)`` gives the jitted
     ``run_chunk(carry, n_epochs)`` for an epoch length, ``carry`` is the
     initial loop state, and the rest serve ``solve()``'s host loop.
     """
@@ -821,6 +836,18 @@ def _device_solver(
             jnp.abs(gap_bound_comp) + jnp.abs(gap_ineq_comp) + jnp.abs(gap_eq_comp)
         ) / gap_denom
 
+    def gap_measure(
+        objective_value, duality_gap, gap_bound_comp, gap_ineq_comp, gap_eq_comp
+    ):
+        # The relative gap `dual_gap_tolerance` is tested against: the
+        # no-cancellation `relative_gap_abs` ("abs") or PDLP's signed
+        # `relative_gap` ("pdlp").
+        if gap_test == "pdlp":
+            return relative_gap(duality_gap, objective_value)
+        return relative_gap_abs(
+            objective_value, duality_gap, gap_bound_comp, gap_ineq_comp, gap_eq_comp
+        )
+
     def converged(
         constraint_bound,
         dual_feasibility_residual,
@@ -849,7 +876,10 @@ def _device_solver(
         relative_primal_residual = constraint_bound / (1.0 + termination_b_norm)
         relative_dual_residual = dual_feasibility_residual / (1.0 + termination_c_norm)
 
-        # No-cancellation guard, and the ONLY gap test needed. `duality_gap` is
+        # No-cancellation guard (gap_test="abs", the default), and the ONLY gap
+        # test needed; gap_test="pdlp" tests the signed RDG instead, as PDLP
+        # does. The qap10 case below predates the DFR c_max units fix and
+        # qap10 is not in the MIPLIB benchmark set. `duality_gap` is
         # the SIGNED sum of three complementarity terms (bound, inequality,
         # equality coupling): duality_gap = gap_bound_comp + gap_ineq_comp +
         # gap_eq_comp exactly. At a true KKT point each term is ~0, so the sum is
@@ -868,14 +898,14 @@ def _device_solver(
         # plain, cancellation-prone RDG) is NEVER larger than `gap_abs` — testing
         # gap_abs alone subsumes it; a separate RDG <= tol test can never reject
         # a point gap_abs already accepted.
-        gap_abs = relative_gap_abs(
+        gap = gap_measure(
             objective_value, duality_gap, gap_bound_comp, gap_ineq_comp, gap_eq_comp
         )
         return (
             (relative_primal_residual <= primal_feasibility_tolerance)
             & (relative_dual_residual <= dual_feasibility_threshold)
             & dual_gap_is_finite
-            & (gap_abs <= dual_gap_tolerance)
+            & (gap <= dual_gap_tolerance)
         )
 
     def polish_ready(
@@ -893,10 +923,10 @@ def _device_solver(
         # this) and, given a factor, both relative residuals are within that
         # factor of their tolerances (polishing cannot rescue a point far from
         # feasible).
-        gap_abs = relative_gap_abs(
+        gap = gap_measure(
             objective_value, duality_gap, gap_bound_comp, gap_ineq_comp, gap_eq_comp
         )
-        ready = dual_gap_is_finite & (gap_abs <= dual_gap_tolerance)
+        ready = dual_gap_is_finite & (gap <= dual_gap_tolerance)
         factor = polish_trigger[1]
         if factor is not None:
             relative_primal_residual = constraint_bound / (1.0 + termination_b_norm)
@@ -1039,7 +1069,8 @@ def _device_solver(
         relative_pfr = termination_pfr / (1.0 + float(termination_b_norm))
         relative_dfr = termination_dfr / (1.0 + float(termination_c_norm))
         # RDGABS: the no-cancellation companion to RDG (see relative_gap_abs).
-        # `converged()` requires RDGABS <= dual_gap_tolerance; without printing
+        # With gap_test="abs" `converged()` requires RDGABS <= dual_gap_tolerance
+        # (with "pdlp", RDG); without printing
         # it a run can show PFR/DFR/RDG all comfortably inside tolerance yet
         # never certify because the gap components are cancelling rather than
         # genuinely small.
@@ -1612,6 +1643,7 @@ def solve(
     primal_feasibility_tolerance=1e-3,
     dual_feasibility_tolerance=1e-3,
     dual_gap_tolerance=1e-3,
+    gap_test="abs",
     dual_residual="pdlp",
     termination_norm="l2",
     restart_norm="l2",
@@ -1695,6 +1727,14 @@ def solve(
             point is returned with ``stop_reason="time_limit"``. The solve can
             overrun by about one epoch (shrink ``iterations_per_epoch`` for a
             tighter cutoff).
+        gap_test: Which relative gap must be within ``dual_gap_tolerance``.
+            ``"abs"`` (default) sums the |bound|, |inequality| and |equality|
+            complementarity terms of the gap, so they cannot cancel; it is
+            never smaller than ``"pdlp"``, PDLP's signed
+            |primal_obj − dual_obj|. Both divide by 1+|primal_obj|+|dual_obj|.
+            Near a feasible point the difference is about 2|yᵀ(b − Ax)|, so
+            ``"abs"`` also bounds the objective error from primal
+            infeasibility weighted by large duals.
         dual_residual: How reduced costs split between the dual residual (DFR)
             and the dual objective (hence the gap). ``"pdlp"`` (default) follows
             PDLP with ``handle_some_primal_gradients_on_finite_bounds_as_residuals``:
@@ -1764,10 +1804,11 @@ def solve(
               the extrapolated primal x_bar = 2x^{k+1} − x^k).
             * ``"halpern"``: restarted Halpern-anchored PDHG. Each iterate is the
               adaptive PDHG step T(z) blended back toward an anchor z_0:
-              ``z_{k+1} = lambda_k z_0 + (1−lambda_k) T(z_k)``, ``lambda_k =
-              1/(k+1)`` (cycle-local k). The anchor z_0 and lambda counter reset
-              to the current iterate at each restart, giving last-iterate
-              acceleration. Best paired with ``restarts=True``.
+              ``z_{k+1} = lambda_k z_0 + (1−lambda_k) T(z_k)``,
+              ``lambda_k = 1/(k+1)`` (cycle-local k). The anchor z_0 and
+              lambda counter reset to the current iterate at each restart,
+              giving last-iterate acceleration. Best paired with
+              ``restarts=True``.
         k_scale: Clamp band ``[1/k_scale, k_scale]`` for the primal weight ``k``
             (default ``1e8``); ``None`` leaves ``k`` unclamped. The primal and
             dual steps are ``eta / k`` and ``eta * k``, so the dual/primal step
@@ -1782,11 +1823,11 @@ def solve(
         k_update_per_epoch: When ``True``, the primal weight ``k`` is
             rebalanced at every epoch boundary (not only at restarts) using the
             primal-vs-dual iterate movement over the just-finished epoch — same
-            log-space geometric-mean blend (``k_theta``) and ``[1/k_scale,
-            k_scale]`` clamp as the restart rebalance. Unlike a restart it does
-            NOT reset averaging or (for halpern) re-anchor ``z_0`` / reset
-            ``eta``; only ``k`` changes, so the step split tracks the local
-            primal/dual progress within a restart cycle.
+            log-space geometric-mean blend (``k_theta``) and
+            ``[1/k_scale, k_scale]`` clamp as the restart rebalance. Unlike a
+            restart it does NOT reset averaging or (for halpern) re-anchor
+            ``z_0`` / reset ``eta``; only ``k`` changes, so the step split
+            tracks the local primal/dual progress within a restart cycle.
             ``False`` (default, the PDLP convention) keeps k frozen between
             restarts: under a wide ``k_scale`` clamp the per-epoch update let k
             run away on mzzv11 (k→1e8, gap 0.94).
@@ -1920,6 +1961,7 @@ def solve(
         update_mode,
         k_scale,
         adaptive_eta,
+        gap_test,
     )
 
     if verbose:
@@ -2082,6 +2124,7 @@ def solve(
         primal_feasibility_tolerance=primal_feasibility_tolerance,
         dual_feasibility_tolerance=dual_feasibility_tolerance,
         dual_gap_tolerance=dual_gap_tolerance,
+        gap_test=gap_test,
         dual_residual=dual_residual,
         termination_norm=termination_norm,
         restart_norm=restart_norm,
@@ -2346,6 +2389,7 @@ def make_solver(
     primal_feasibility_tolerance=1e-3,
     dual_feasibility_tolerance=1e-3,
     dual_gap_tolerance=1e-3,
+    gap_test="abs",
     dual_residual="pdlp",
     termination_norm="l2",
     restart_norm="l2",
@@ -2407,6 +2451,7 @@ def make_solver(
         update_mode,
         k_scale,
         adaptive_eta,
+        gap_test,
     )
     float_dtype, compute_dtype = __profile_dtypes()
     n_eq = pattern.n_eq
@@ -2500,6 +2545,7 @@ def make_solver(
             primal_feasibility_tolerance=primal_feasibility_tolerance,
             dual_feasibility_tolerance=dual_feasibility_tolerance,
             dual_gap_tolerance=dual_gap_tolerance,
+            gap_test=gap_test,
             dual_residual=dual_residual,
             termination_norm=termination_norm,
             restart_norm=restart_norm,
@@ -3291,7 +3337,7 @@ def solve_with_presolve(
         and certificate["relative_dual_feasibility_residual"]
         <= solve_kwargs.get("dual_feasibility_tolerance", 1e-3)
         and np.isfinite(certificate["duality_gap"])
-        and certificate["relative_gap_abs"]
+        and certificate[_GAP_TEST_KEYS[solve_kwargs.get("gap_test", "abs")]]
         <= solve_kwargs.get("dual_gap_tolerance", 1e-3)
     )
     if maximise:
@@ -3793,8 +3839,8 @@ def __scale_problem_jax(
     """Device-side body of ``scale_problem``: equilibrate, then apply the scales.
 
     Takes the BCOO data/indices of ``A_eq``/``A_ineq`` plus the LP vectors and
-    returns ``(row_scale, col_scale, eq_data, ineq_data, c, b_eq, b_ineq,
-    lower_bounds, upper_bounds, c_max)``, all scaled. The sparsity pattern is
+    returns ``(row_scale, col_scale, eq_data, ineq_data, c, b_eq, b_ineq,``
+    ``lower_bounds, upper_bounds, c_max)``, all scaled. The sparsity pattern is
     unchanged by diagonal scaling, so the callers reuse the input indices.
     """
     n_eq = b_eq.shape[0]
@@ -4860,6 +4906,7 @@ def solve_with_polishing(
     p_tol = tolerances["primal_feasibility_tolerance"]
     d_tol = tolerances["dual_feasibility_tolerance"]
     g_tol = tolerances["dual_gap_tolerance"]
+    gap_key = _GAP_TEST_KEYS[kwargs.get("gap_test", "abs")]
     # Judge points with solve()'s own stopping test.
     cert_options = {
         "norm": kwargs.get("termination_norm", "l2"),
@@ -4924,7 +4971,7 @@ def solve_with_polishing(
         )
         # PDLP polishes only once the gap has closed: polishing does not
         # improve the gap, so an earlier candidate cannot certify.
-        if float(cert["relative_gap_abs"]) <= g_tol:
+        if float(cert[gap_key]) <= g_tol:
             attempts += 1
             budget = max(1, int(np.ceil(polish_fraction * main_epochs)))
             if verbose:
@@ -4996,7 +5043,7 @@ def solve_with_polishing(
                 float(candidate["relative_primal_feasibility_residual"]) <= p_tol
                 and float(candidate["relative_dual_feasibility_residual"]) <= d_tol
                 and bool(jnp.isfinite(candidate["duality_gap"]))
-                and float(candidate["relative_gap_abs"]) <= g_tol
+                and float(candidate[gap_key]) <= g_tol
             ):
                 if verbose:
                     print("Polished point is certified.")
@@ -5012,12 +5059,12 @@ def solve_with_polishing(
                     "Polished point not certified "
                     f"(PFR {float(candidate['relative_primal_feasibility_residual']):.2e}, "
                     f"DFR {float(candidate['relative_dual_feasibility_residual']):.2e}, "
-                    f"gap {float(candidate['relative_gap_abs']):.2e}); resuming."
+                    f"gap {float(candidate[gap_key]):.2e}); resuming."
                 )
         elif verbose:
             print(
                 f"No polish after {main_epochs} epochs: gap "
-                f"{float(cert['relative_gap_abs']):.2e} > {g_tol:.0e}."
+                f"{float(cert[gap_key]):.2e} > {g_tol:.0e}."
             )
 
         # Back off: the next attempt waits until the main solve's length has
@@ -5063,9 +5110,10 @@ def evaluate_infeasibility_certificate(
     invariant to the rays' scale.
 
     Primal infeasibility (Farkas): a dual ray ``y`` (``y_ineq >= 0``) with
-    ``q = Aᵀy`` and dual ray objective ``F = Σ_j inf_{l_j<=x_j<=u_j} q_j x_j
-    − bᵀy``, where only the components of ``q`` some finite bound absorbs
-    count towards the infimum and the rest are its infeasibility. If the
+    ``q = Aᵀy`` and dual ray objective
+    ``F = Σ_j inf_{l_j<=x_j<=u_j} q_j x_j − bᵀy``, where only the components
+    of ``q`` some finite bound absorbs count towards the infimum and the rest
+    are its infeasibility. If the
     infeasibility were 0 and ``F > 0``, every x in the box would have
     ``yᵀ(Ax − b) > 0``, which no feasible x can. The test is
     ``F > 0`` and ``infeasibility / F <= tol``; it then holds for no LP with a

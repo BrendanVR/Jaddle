@@ -129,6 +129,28 @@ def test_invalid_update_mode():
         jl.solve(toy_lp(), update_mode="synchronous")
 
 
+def test_invalid_gap_test():
+    with pytest.raises(ValueError):
+        jl.solve(toy_lp(), gap_test="signed")
+
+
+def test_pdlp_gap_test():
+    # The signed PDLP gap is never larger than the no-cancellation one, so the
+    # point still matches the reference and passes the gap it was tested on.
+    lp = random_lp()
+    result = solve(lp, gap_test="pdlp")
+    assert result["converged"] and result["stop_reason"] == "certificate"
+    cert = solve_certificate(lp, result["solution"])
+    assert cert["relative_primal_feasibility_residual"] <= TOL
+    assert cert["relative_dual_feasibility_residual"] <= TOL
+    assert cert["relative_gap"] <= TOL
+    assert cert["relative_gap"] <= cert["relative_gap_abs"]
+    ref = reference_objective(lp)
+    assert abs(float(lp.objective(result["solution"].primal)) - ref) <= 1e-4 * (
+        1 + abs(ref)
+    )
+
+
 def test_unscaled_solve():
     lp = random_lp()
     assert_certified(lp, solve(lp, scale=False), reference_objective(lp))

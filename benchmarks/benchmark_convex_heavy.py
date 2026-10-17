@@ -22,7 +22,7 @@ import jaddle.jaddle_optimisers as jo
 
 from benchmark import add_jaddle_verbose_flag
 
-jo.configure_jax("float64")
+jo.configure_jax("float32")
 print(jax.devices())
 rng = np.random.default_rng(0)
 
@@ -44,28 +44,48 @@ def ineq(z):
     )
 
 
-cp = jc.JaddleCP(2 * d, obj, lambda z: jnp.zeros(0), ineq,
-                 -jnp.inf * jnp.ones(2 * d), jnp.inf * jnp.ones(2 * d))
+cp = jc.JaddleCP(
+    2 * d,
+    obj,
+    lambda z: jnp.zeros(0),
+    ineq,
+    -jnp.inf * jnp.ones(2 * d),
+    jnp.inf * jnp.ones(2 * d),
+)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("modes", nargs="*",
-                        help="Update modes to run (default: extragradient and "
-                        "forward_reflected).")
+    parser.add_argument(
+        "modes",
+        nargs="*",
+        help="Update modes to run (default: extragradient and " "forward_reflected).",
+    )
     add_jaddle_verbose_flag(parser, default=False)
     args = parser.parse_args()
     for mode in args.modes or ["extragradient", "forward_reflected"]:
         # Show Jaddle's own output only when verbose; otherwise keep the
         # table clean.
-        quiet = contextlib.nullcontext() if args.jaddle_verbose else (
-            contextlib.redirect_stdout(io.StringIO()))
+        quiet = (
+            contextlib.nullcontext()
+            if args.jaddle_verbose
+            else (contextlib.redirect_stdout(io.StringIO()))
+        )
         with quiet:
-            out = jc.solve(cp, max_epochs=300, iterations_per_epoch=200, update_mode=mode,
-                           adaptive_eta=0.5, primal_grad_norm_tolerance=1e-6,
-                           primal_feasibility_tolerance=1e-6,
-                           complementarity_slack_tolerance=1e-6,
-                           verbose=args.jaddle_verbose)
+            out = jc.solve(
+                cp,
+                max_epochs=300,
+                iterations_per_epoch=200,
+                update_mode=mode,
+                adaptive_eta=0.5,
+                primal_grad_norm_tolerance=1e-4,
+                primal_feasibility_tolerance=1e-4,
+                complementarity_slack_tolerance=1e-4,
+                verbose=args.jaddle_verbose,
+            )
         ep = out["epochs"]
-        print(f"{mode:18s} conv={out['converged']} epochs={ep} t={out['solve_seconds']:.2f}s "
-              f"per-epoch={out['solve_seconds'] / ep:.3f}s "
-              f"obj={float(obj(out['solution'].primal)):.8e}", flush=True)
+        print(
+            f"{mode:18s} conv={out['converged']} epochs={ep} t={out['solve_seconds']:.2f}s "
+            f"per-epoch={out['solve_seconds'] / ep:.3f}s "
+            f"obj={float(obj(out['solution'].primal)):.8e}",
+            flush=True,
+        )
