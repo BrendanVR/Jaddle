@@ -1,5 +1,10 @@
 <img width="1536" height="1024" alt="jaddle_logo_full" src="https://github.com/user-attachments/assets/d4e61518-3557-4273-b4d0-0d89510e0f3f" />
 
+[![PyPI](https://img.shields.io/pypi/v/jaddle)](https://pypi.org/project/jaddle/)
+[![Python](https://img.shields.io/pypi/pyversions/jaddle)](https://pypi.org/project/jaddle/)
+[![Tests](https://github.com/BrendanVR/Jaddle/actions/workflows/tests.yml/badge.svg)](https://github.com/BrendanVR/Jaddle/actions/workflows/tests.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/BrendanVR/Jaddle/blob/main/LICENSE.txt)
+
 # Jaddle: The JAX Saddle Solver
 
 *First-order primal–dual solvers for large-scale linear and convex programs, written entirely in JAX.*
