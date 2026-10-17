@@ -81,9 +81,7 @@ if __name__ == "__main__":
                 primal_feasibility_tolerance=1e-4,
                 complementarity_slack_tolerance=1e-4,
                 verbose=args.jaddle_verbose,
-                diag_adapt=True,
                 gradient_scaling=True,
-                restarts=True,
             )
         ep = out["epochs"]
         print(
