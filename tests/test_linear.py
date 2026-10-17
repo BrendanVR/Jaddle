@@ -123,7 +123,7 @@ def test_diag_adapt_certifies(update_mode, capsys):
 def test_diag_adapt_frozen_matches_off():
     # diag_theta=0 keeps t = s = 1, so the run is the plain solve.
     lp = random_lp(seed=1, m_eq=8, m_ineq=25, n=50)
-    off = solve(lp)
+    off = solve(lp, diag_adapt=False)
     frozen = solve(lp, diag_adapt=True, diag_theta=0.0)
     assert frozen["stop_reason"] == off["stop_reason"] == "certificate"
     assert abs(frozen["epochs"] - off["epochs"]) <= 1
@@ -453,7 +453,7 @@ def test_solve_polish_trigger_stops_once_gap_closes():
         {"update_mode": "pdhg"},
         {"update_mode": "halpern"},
         {"scale": False},
-        {"diag_adapt": True},
+        {"diag_adapt": False},
     ],
 )
 def test_make_solver_matches_solve(options):

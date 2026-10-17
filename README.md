@@ -276,6 +276,7 @@ the dual objective as in PDLP, so far-away finite bounds do not swamp the gap.
 | `restarts`, `epochs_per_restart` | `True`, `None` | Adaptive restarts and the length cap of a restart cycle (`None` = no cap). |
 | `restart_decay`, `necessary_decay` | `0.2`, `0.8` | Thresholds for the sufficient-progress and stalling restarts. |
 | `k_scale`, `k_theta`, `k_init` | `1e8`, `0.5`, `None` | Clamp band, smoothing and initial value for the primal weight. |
+| `diag_adapt`, `diag_theta`, `diag_clamp` | `True`, `0.5`, `10.0` | Per-coordinate diagonal step metric on top of the scaling, adapted at each restart (larger steps for steadily drifting coordinates, smaller for oscillating ones). |
 | `ruiz_iterations`, `pc_iterations` | `10`, `1` | Number of preconditioning sweeps. |
 | `initial_solution`, `initial_opt_state` | `None` | Warm start from a previous solve's `solution` and `opt_state`. |
 | `vertex_bias` | `0.0` | Small cost perturbation that steers the solver to a vertex of the optimal face rather than its interior. Useful before `jl.crossover`. |
@@ -583,10 +584,9 @@ Laptop GPU.
 
 | Outcome | Instances |
 |---|---|
-| Certified optimal on the HiGHS-presolved LP | **376 / 383** (one settled by presolve itself) |
-| Certified optimal on the original LP, after HiGHS postsolve | **295 / 383** |
-| Time limit reached | 6 |
-| Could not be read by HiGHS (`rvb-sub`) | 1 |
+| Certified optimal on the HiGHS-presolved LP | **380 / 383** (one settled by presolve itself) |
+| Certified optimal on the original LP, after HiGHS postsolve | **291 / 383** |
+| Time limit reached | 3 |
 
 The two certificates differ because postsolve can enlarge a first-order
 solution's small dual errors, and because presolve can rescale a problem
@@ -600,9 +600,9 @@ counted at the 600-second limit, as in the PDLP papers):
 
 | Time measured | SGM10 |
 |---|---|
-| Iteration loop, including the first-epoch compile (`solve_seconds`) | 8.62 s |
-| Iteration loop with the compile amortised out (`corrected_seconds`) | 6.42 s |
-| Wall clock, including presolve, scaling and setup | 12.98 s |
+| Iteration loop, including the first-epoch compile (`solve_seconds`) | 7.04 s |
+| Iteration loop with the compile amortised out (`corrected_seconds`) | 4.62 s |
+| Wall clock, including presolve, scaling and setup | 9.81 s |
 
 The benchmark harnesses, instance diagnostics and instructions for reproducing
 these results are described in [`benchmarks/README.md`](https://github.com/BrendanVR/Jaddle/blob/main/benchmarks/README.md).

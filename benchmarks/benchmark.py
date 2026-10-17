@@ -380,6 +380,8 @@ def jaddle_solve_kwargs(
         cost_col_floor=cost_col_floor,
         termination_norm=norm,
         restart_norm=norm,
+        average=False if update_mode == "halpern" else True,
+        report_best=False if update_mode == "halpern" else True,
     )
 
 

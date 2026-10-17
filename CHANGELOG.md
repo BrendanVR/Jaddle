@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- LP and convex `solve`/`make_solver`: `diag_adapt` (with `diag_theta` and
+  `diag_clamp`), a per-coordinate diagonal step metric on top of the scaling,
+  adapted at each restart. The convex solver supports it only for adaptive
+  extragradient with restarts, and leaves it off by default.
+
+### Changed
+
+- LP `solve`/`make_solver`: `diag_adapt=True` is the default. On the MIPLIB
+  2017 LP set it certifies 380/383 presolved instances (376 before) and cuts
+  the shifted geometric-mean solve time from 8.62 s to 7.04 s.
+
 ## 0.2.1
 
 ### Changed

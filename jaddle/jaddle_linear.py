@@ -1788,7 +1788,7 @@ def solve(
     vertex_bias=0.0,
     vertex_bias_seed=0,
     reference_objective=None,
-    diag_adapt=False,
+    diag_adapt=True,
     diag_theta=0.5,
     diag_clamp=10.0,
     _polish_trigger=None,
@@ -2025,7 +2025,10 @@ def solve(
             where ``rho = |net displacement| / sqrt(accumulated)`` (large for a
             steadily drifting coordinate, small for an oscillating one). The
             metric only changes at restarts, and the line search keeps any
-            diagonal stable. Default ``False``.
+            diagonal stable. Default ``True``: on the MIPLIB 2017 LP set it
+            cut the shifted geometric-mean solve time by ~18% (by ~40% on the
+            instances above 10 s) for ~6% more time per epoch. Some instances
+            are slower with it, so ``False`` is worth trying on a stall.
         diag_theta: Log-space step of the ``diag_adapt`` update (``0`` freezes
             ``t = s = 1``).
         diag_clamp: ``diag_adapt`` clamp: ``t, s`` stay in
@@ -2550,7 +2553,7 @@ def make_solver(
     halpern_reanchor_per_epoch=False,
     iterations_per_epoch_min=100,
     restart_check_every="auto",
-    diag_adapt=False,
+    diag_adapt=True,
     diag_theta=0.5,
     diag_clamp=10.0,
 ):
