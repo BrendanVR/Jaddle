@@ -111,6 +111,25 @@ def test_other_random_lps(seed):
     assert_certified(lp, solve(lp), reference_objective(lp))
 
 
+@pytest.mark.parametrize("update_mode", ["alternating", "pdhg", "halpern"])
+def test_diag_adapt_certifies(update_mode, capsys):
+    lp = random_lp()
+    result = solve(lp, update_mode=update_mode, diag_adapt=True, verbose=True)
+    assert_certified(lp, result, reference_objective(lp))
+    if "Restart" in capsys.readouterr().out:
+        assert result["epochs"] > 0
+
+
+def test_diag_adapt_frozen_matches_off():
+    # diag_theta=0 keeps t = s = 1, so the run is the plain solve.
+    lp = random_lp(seed=1, m_eq=8, m_ineq=25, n=50)
+    off = solve(lp)
+    frozen = solve(lp, diag_adapt=True, diag_theta=0.0)
+    assert frozen["stop_reason"] == off["stop_reason"] == "certificate"
+    assert abs(frozen["epochs"] - off["epochs"]) <= 1
+    assert_certifies(lp, frozen["solution"], reference_objective(lp))
+
+
 @pytest.mark.parametrize("adaptive_eta", [0.3, 0.0, "auto"])
 def test_adaptive_eta_seeds(adaptive_eta):
     lp = random_lp()
@@ -429,7 +448,13 @@ def test_solve_polish_trigger_stops_once_gap_closes():
 
 @pytest.mark.parametrize(
     "options",
-    [{}, {"update_mode": "pdhg"}, {"update_mode": "halpern"}, {"scale": False}],
+    [
+        {},
+        {"update_mode": "pdhg"},
+        {"update_mode": "halpern"},
+        {"scale": False},
+        {"diag_adapt": True},
+    ],
 )
 def test_make_solver_matches_solve(options):
     # One traced solve runs the same algorithm as solve(), but not to the bit:

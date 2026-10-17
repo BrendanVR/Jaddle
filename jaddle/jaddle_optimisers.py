@@ -1,3 +1,4 @@
+import math
 import os
 import warnings
 
@@ -284,3 +285,51 @@ def tail_average(i_max):
         )
 
     return weight_fn
+
+
+def _rebalance_diag_part(r, H, d, theta, log_clamp):
+    active = H > 1e-30
+    rho = r / jnp.sqrt(jnp.where(active, H, 1.0))
+    log_rho = jnp.log(jnp.maximum(rho, 1e-6))
+    n_active = jnp.maximum(jnp.sum(active), 1)
+    mean = jnp.sum(jnp.where(active, log_rho, 0.0)) / n_active
+    u = jnp.where(active, log_rho - mean, 0.0)
+    return jnp.exp(jnp.clip(jnp.log(d) + theta * u, -log_clamp, log_clamp))
+
+
+def rebalance_diag(new_state, ref_state, diag, accum, theta, clamp):
+    """``diag_adapt``'s restart update of a per-coordinate diagonal metric
+    ``diag = (t, s)`` (primal; dual stacked ``[eq; ineq]``), shared by the
+    linear and convex solvers.
+
+    ``accum = (H_x, H_y)`` holds each coordinate's ``Σ (Δ/eta)²`` over the
+    cycle from ``ref_state`` to ``new_state``. Per coordinate,
+    ``rho = |net displacement| / sqrt(H)`` is ~√N for one drifting steadily and
+    ≪ √N for one oscillating (the DoG distance-over-gradients ratio). Its log,
+    centred over the coordinates that moved, is a multiplicative step
+    (``theta``) on the diagonal, clamped to ``[1/clamp, clamp]`` around 1.
+    Centring keeps the geometric mean of the moving coordinates fixed, so the
+    solvers' scalar step ``eta`` and primal weight ``k`` stay the only gauges;
+    coordinates that never moved (pinned on a bound, slack rows) carry no
+    signal and keep their value."""
+    t, s = diag
+    H_x, H_y = accum
+    log_clamp = math.log(clamp)
+    r_x = jnp.abs(new_state.primal - ref_state.primal)
+    r_y = jnp.abs(
+        jnp.concatenate(
+            [
+                new_state.dual_eq - ref_state.dual_eq,
+                new_state.dual_ineq - ref_state.dual_ineq,
+            ]
+        )
+    )
+    return (
+        _rebalance_diag_part(r_x, H_x, t, theta, log_clamp),
+        _rebalance_diag_part(r_y, H_y, s, theta, log_clamp),
+    )
+
+
+def diag_log_spread(d):
+    """log10(max / min) of a ``diag_adapt`` diagonal; 0 when empty."""
+    return jnp.log10(jnp.max(d, initial=1.0) / jnp.min(d, initial=1.0))

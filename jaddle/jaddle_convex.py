@@ -21,6 +21,155 @@ _EVT_CAP = 64
 _ADAPTIVE_MODES = ("extragradient", "forward_reflected")
 
 
+def _dual_stack(state):
+    return jnp.concatenate([state.dual_eq, state.dual_ineq])
+
+
+def _kkt_residuals(cp, state):
+    """The generic convergence measures of ``cp`` at ``state``, in ``cp``'s
+    own units: ``(objective, primal_grad_norm, constraint_bound,
+    complementarity_slack)`` -- the ∞-norm projected-gradient (stationarity)
+    residual, the largest constraint violation, and the largest |λ g| relative
+    to ``1 + |objective|``."""
+
+    def lagrangian_with_obj(s):
+        # (lagrangian, objective) as (value, aux), so value_and_grad gets the
+        # objective without a second forward pass.
+        obj = cp.objective(s.primal)
+        lagrangian = (
+            obj
+            + s.dual_ineq @ cp.constraints_ineq(s.primal)
+            + s.dual_eq @ cp.constraints_eq(s.primal)
+        )
+        return lagrangian, obj
+
+    (_, objective_value), gradient = jax.value_and_grad(
+        lagrangian_with_obj, has_aux=True
+    )(state)
+
+    projected_primal = projection_box(
+        state.primal - gradient.primal, cp.lower_bounds, cp.upper_bounds
+    )
+    primal_grad_norm = jnp.max(jnp.abs(state.primal - projected_primal))
+
+    ineq_violations = jnp.maximum(gradient.dual_ineq, 0.0)
+    max_ineq_violation = (
+        jnp.max(ineq_violations) if ineq_violations.size > 0 else jnp.zeros(())
+    )
+    eq_violations = jnp.abs(gradient.dual_eq)
+    max_eq_violation = (
+        jnp.max(eq_violations) if eq_violations.size > 0 else jnp.zeros(())
+    )
+    complementarity_slack = (
+        jnp.max(jnp.abs(state.dual_ineq * gradient.dual_ineq))
+        if state.dual_ineq.size > 0
+        else jnp.zeros(())
+    ) / (1.0 + jnp.abs(objective_value))
+    constraint_bound = jnp.maximum(max_ineq_violation, max_eq_violation)
+    return objective_value, primal_grad_norm, constraint_bound, complementarity_slack
+
+
+# gradient_scaling clamps every scale factor to [1/clip, clip].
+_GRADIENT_SCALING_CLIP = 1e4
+
+
+def _gradient_scales(cp, x0, probes):
+    """IPOPT-style gradient-based scales at ``x0``: ``sigma = 1/‖∇f(x0)‖₂`` for
+    the objective and ``e_i = 1/‖∇g_i(x0)‖₂`` for each constraint row (stacked
+    ``[eq; ineq]``), clamped to ``[1/clip, clip]``; a zero gradient keeps 1.
+
+    The row norms are exact when the Jacobian is cheap (``n <= probes``:
+    forward mode, or ``m <= probes``: reverse mode) and otherwise estimated
+    from ``probes`` Rademacher JVPs: ``E[(J v)_i²] = ‖J_i‖²``, so the cost is
+    ``probes`` JVPs whatever ``m`` and ``n``. The key is fixed, so the scales
+    are deterministic and traceable."""
+
+    def stacked(x):
+        return jnp.concatenate([cp.constraints_eq(x), cp.constraints_ineq(x)])
+
+    n = x0.shape[0]
+    m = jax.eval_shape(stacked, x0).shape[0]
+    grad_f = jax.grad(cp.objective)(x0)
+    if m == 0:
+        row_norm2 = jnp.zeros(0, x0.dtype)
+    elif n <= probes or m <= probes:
+        jac = jax.jacfwd(stacked) if n <= probes else jax.jacrev(stacked)
+        row_norm2 = jnp.sum(jac(x0) ** 2, axis=1)
+    else:
+        V = jax.random.rademacher(jax.random.PRNGKey(0), (probes, n), dtype=x0.dtype)
+        JV = jax.vmap(lambda v: jax.jvp(stacked, (x0,), (v,))[1])(V)
+        row_norm2 = jnp.mean(JV**2, axis=0)
+
+    def scale(norm2):
+        safe = jnp.where(norm2 > 0.0, norm2, 1.0)
+        return jnp.where(
+            norm2 > 0.0,
+            jnp.clip(
+                1.0 / jnp.sqrt(safe),
+                1.0 / _GRADIENT_SCALING_CLIP,
+                _GRADIENT_SCALING_CLIP,
+            ),
+            1.0,
+        )
+
+    return scale(jnp.vdot(grad_f, grad_f)), scale(row_norm2)
+
+
+def _gradient_scaled(cp, x0, probes):
+    """``cp`` with its objective and constraint rows rescaled by
+    ``_gradient_scales`` at ``x0`` (the variables are untouched). Returns
+    ``(scaled_cp, to_scaled, from_scaled, sigma)``: the two maps convert a
+    ``SaddleState``'s duals between the problems, since
+    ``σf + Σ λ̃_i e_i g_i = σ (f + Σ (e_i λ̃_i / σ) g_i)`` gives
+    ``λ_i = e_i λ̃_i / σ``. The scaled problem's ``residuals`` evaluate ``cp``'s
+    own (or the generic ``_kkt_residuals``) at the unscaled point, so the
+    convergence test keeps the original problem's units."""
+    x0 = projection_box(x0, cp.lower_bounds, cp.upper_bounds)
+    m_eq = jax.eval_shape(cp.constraints_eq, x0).shape[0]
+    sigma, e = jax.jit(lambda x: _gradient_scales(cp, x, probes))(x0)
+    e_eq, e_ineq = e[:m_eq], e[m_eq:]
+
+    def from_scaled(state):
+        return SaddleState(
+            primal=state.primal,
+            dual_ineq=e_ineq * state.dual_ineq / sigma,
+            dual_eq=e_eq * state.dual_eq / sigma,
+        )
+
+    def to_scaled(state):
+        return SaddleState(
+            primal=state.primal,
+            dual_ineq=sigma * state.dual_ineq / e_ineq,
+            dual_eq=sigma * state.dual_eq / e_eq,
+        )
+
+    def residuals(state):
+        original = from_scaled(state)
+        if getattr(cp, "residuals", None) is not None:
+            return cp.residuals(original)
+        return _kkt_residuals(cp, original)[1:]
+
+    dual_bound = None
+    if cp.dual_bound is not None:
+
+        def dual_bound(dual_ineq, dual_eq):
+            return sigma * cp.dual_bound(
+                e_ineq * dual_ineq / sigma, e_eq * dual_eq / sigma
+            )
+
+    scaled_cp = JaddleCP(
+        num_variables=cp.num_variables,
+        objective=lambda x: sigma * cp.objective(x),
+        constraints_eq=lambda x: e_eq * cp.constraints_eq(x),
+        constraints_ineq=lambda x: e_ineq * cp.constraints_ineq(x),
+        lower_bounds=cp.lower_bounds,
+        upper_bounds=cp.upper_bounds,
+        dual_bound=dual_bound,
+        residuals=residuals,
+    )
+    return scaled_cp, to_scaled, from_scaled, sigma
+
+
 def _reported_point(carry, average):
     # The point the last epoch's metrics describe: the average or the last
     # iterate (with report_best, whichever had the lower merit).
@@ -60,10 +209,17 @@ def _make_epoch_fn(
     update_mode="alternating",
     k_scaling=False,
     adaptive_step=False,
+    diag=False,
 ):
     # Returns `run_epoch(max_iter, start_iter, state, average_state, opt_state,
     # total_weight)`, which runs one epoch of `max_iter` iterations and returns
-    # (i, state, average_state, opt_state, total_weight). It is a plain
+    # (i, state, average_state, opt_state, total_weight). With `diag`
+    # (diag_adapt, adaptive extragradient only) it also takes `diag=(t, s)` and
+    # `accum=(H_x, H_y)` keywords and returns the updated `accum` last: the
+    # steps become tau = eta/k * t, sigma = eta*k * s, the line search measures
+    # in that metric, and each accepted step adds its eta-normalised squared
+    # movement (Δ/eta)² to the accumulators `solve` turns into the next
+    # diagonal at a restart. It is a plain
     # traceable function, not jitted: `solve` calls it inside its device-side
     # epoch loop (`run_chunk`), which is jitted as a whole. `max_iter` must be a
     # Python int (it is the scan length).
@@ -82,6 +238,7 @@ def _make_epoch_fn(
     # line search cannot fix that, so it is excluded.
     if adaptive_step and not k_scaling:
         raise ValueError("adaptive_eta requires k_scaling (primal weight k)")
+    diag_on = bool(diag)
     # k-scaling is an orthogonal option (any update_mode): a primal weight k
     # rescales the primal/dual gradients by (1/k, k) before opt_update, so the
     # dual/primal step ratio is k**2. When on, k is packed into opt_state and
@@ -204,7 +361,14 @@ def _make_epoch_fn(
         average_state,
         opt_state,
         total_weight,
+        diag=None,
+        accum=None,
     ):
+        if diag_on:
+            t, s = diag
+            m_eq = state.dual_eq.shape[0]
+            s_eq, s_ineq = s[:m_eq], s[m_eq:]
+
         # --- Adaptive extragradient step (Malitsky-Tam line search) ---
         # Mirrors the linear solver's adaptive extragradient path. Each
         # iteration takes a raw look-ahead + corrector at base step eta,
@@ -219,12 +383,22 @@ def _make_epoch_fn(
             # the steps live in (tau = eta/k, sigma = eta*k): displacements
             # in the M-norm k‖dx‖² + ‖dy‖²/k, operator differences in the
             # dual M⁻¹-norm ‖dg_x‖²/k + k‖dg_y‖².
+            # Under diag_adapt the weights become per-coordinate:
+            # T = (eta/k) diag(t), Σ = eta k diag(s).
             def _znorm2(p, de, di, k):
+                if diag_on:
+                    return k * jnp.vdot(p, p / t) + (1.0 / k) * (
+                        jnp.vdot(de, de / s_eq) + jnp.vdot(di, di / s_ineq)
+                    )
                 return k * jnp.vdot(p, p) + (1.0 / k) * (
                     jnp.vdot(de, de) + jnp.vdot(di, di)
                 )
 
             def _gnorm2(p, de, di, k):
+                if diag_on:
+                    return (1.0 / k) * jnp.vdot(p, p * t) + k * (
+                        jnp.vdot(de, de * s_eq) + jnp.vdot(di, di * s_ineq)
+                    )
                 return (1.0 / k) * jnp.vdot(p, p) + k * (
                     jnp.vdot(de, de) + jnp.vdot(di, di)
                 )
@@ -394,18 +568,23 @@ def _make_epoch_fn(
 
             def _trial(eta, state, k, g):
                 tau = eta / k
-                sigma = eta * k
+                sigma_eq = sigma_ineq = eta * k
+                if diag_on:
+                    tau = tau * t
+                    sigma_eq, sigma_ineq = sigma_eq * s_eq, sigma_ineq * s_ineq
                 xh = projection_primal(state.primal - tau * g.primal)
-                yh_ineq = projection_non_negative(state.dual_ineq - sigma * g.dual_ineq)
-                yh_eq = state.dual_eq - sigma * g.dual_eq
+                yh_ineq = projection_non_negative(
+                    state.dual_ineq - sigma_ineq * g.dual_ineq
+                )
+                yh_eq = state.dual_eq - sigma_eq * g.dual_eq
                 state_half = SaddleState(primal=xh, dual_ineq=yh_ineq, dual_eq=yh_eq)
                 g_half = grad(state_half)
                 # Corrector from the ORIGINAL state using the look-ahead grad.
                 x_new = projection_primal(state.primal - tau * g_half.primal)
                 dual_ineq = projection_non_negative(
-                    state.dual_ineq - sigma * g_half.dual_ineq
+                    state.dual_ineq - sigma_ineq * g_half.dual_ineq
                 )
-                dual_eq = state.dual_eq - sigma * g_half.dual_eq
+                dual_eq = state.dual_eq - sigma_eq * g_half.dual_eq
                 cand = SaddleState(primal=x_new, dual_ineq=dual_ineq, dual_eq=dual_eq)
 
                 # Local Lipschitz estimate, measured on the look-ahead
@@ -426,7 +605,7 @@ def _make_epoch_fn(
                 return cand, eta_bar
 
             def step(carry, _):
-                i, state, average_state, opt_state, total_weight = carry
+                i, state, average_state, opt_state, total_weight = carry[:5]
                 opt_state, k, eta = unpack_k(opt_state)
                 ip1 = jnp.asarray(i + 1, eta.dtype)
 
@@ -438,28 +617,31 @@ def _make_epoch_fn(
                 average_state, total_weight = _accumulate(
                     i, new_state, average_state, total_weight, accept
                 )
+                out = (i + 1, new_state, average_state, opt_state, total_weight)
 
-                return (
-                    i + 1,
-                    new_state,
-                    average_state,
-                    opt_state,
-                    total_weight,
-                ), None
+                if diag_on:
+                    # Squared movement of the accepted step (zero when the
+                    # line search rejected it), normalised by the eta it ran at.
+                    H_x, H_y = carry[5]
+                    inv_eta = 1.0 / eta
+                    dx = (new_state.primal - state.primal) * inv_eta
+                    dy = (
+                        jnp.concatenate(
+                            [
+                                new_state.dual_eq - state.dual_eq,
+                                new_state.dual_ineq - state.dual_ineq,
+                            ]
+                        )
+                        * inv_eta
+                    )
+                    out = out + ((H_x + dx * dx, H_y + dy * dy),)
+                return out, None
 
-            (i, state, average_state, opt_state, total_weight), _ = jax.lax.scan(
-                step,
-                (
-                    start_iter,
-                    state,
-                    average_state,
-                    opt_state,
-                    total_weight,
-                ),
-                None,
-                length=max_iter,
-            )
-            return i, state, average_state, opt_state, total_weight
+            init = (start_iter, state, average_state, opt_state, total_weight)
+            if diag_on:
+                init = init + (accum,)
+            out, _ = jax.lax.scan(step, init, None, length=max_iter)
+            return out
 
         def step(carry, _):
             (
@@ -651,6 +833,9 @@ def _device_solver(
     restart_decay,
     iterations_per_epoch_decay,
     iterations_per_epoch_min,
+    diag_adapt=False,
+    diag_theta=0.5,
+    diag_clamp=10.0,
 ):
     """The device side of ``solve()`` for one problem: the jitted epoch loop
     (iterations, metrics, convergence test, restarts and the primal weight)
@@ -661,9 +846,16 @@ def _device_solver(
     ``run_chunk(carry, n_epochs)`` for an epoch length, and ``carry`` is the
     initial loop state.
     """
-
-    def projection_primal(primal_state):
-        return projection_box(primal_state, cp.lower_bounds, cp.upper_bounds)
+    if diag_adapt and not (
+        adaptive_step and update_mode == "extragradient" and restarts
+    ):
+        # The diagonal is learned over a restart cycle and changed only at a
+        # restart, and only the adaptive extragradient line search measures in
+        # its metric; anywhere else it would silently do nothing.
+        raise ValueError(
+            "diag_adapt requires update_mode='extragradient' with adaptive_eta "
+            "and restarts=True"
+        )
 
     def langrangian(state):
         return (
@@ -671,17 +863,6 @@ def _device_solver(
             + state.dual_ineq @ cp.constraints_ineq(state.primal)
             + state.dual_eq @ cp.constraints_eq(state.primal)
         )
-
-    def langrangian_with_obj(state):
-        # Returns (lagrangian, objective) as (value, aux) so value_and_grad can
-        # retrieve the objective without an extra forward pass.
-        obj = cp.objective(state.primal)
-        lagrangian = (
-            obj
-            + state.dual_ineq @ cp.constraints_ineq(state.primal)
-            + state.dual_eq @ cp.constraints_eq(state.primal)
-        )
-        return lagrangian, obj
 
     def grad(state):
         gradient = jax.grad(langrangian)(state)
@@ -695,43 +876,12 @@ def _device_solver(
 
     @jax.jit
     def compute_epoch_metrics(average_state):
-        # value_and_grad with has_aux avoids a second cp.objective forward pass.
-        (_, objective_value), gradient_raw = jax.value_and_grad(
-            langrangian_with_obj, has_aux=True
-        )(average_state)
-        gradient = SaddleState(
-            primal=gradient_raw.primal,
-            dual_ineq=gradient_raw.dual_ineq,
-            dual_eq=gradient_raw.dual_eq,
-        )
-
-        grad_primal = gradient.primal
-        grad_dual_ineq = gradient.dual_ineq
-        grad_dual_eq = gradient.dual_eq
-
-        # Unscale constraint violations to original space
-
-        projected_primal = projection_primal(average_state.primal - grad_primal)
-        projected_gradient_residual = average_state.primal - projected_primal
-        primal_grad_norm = jnp.max(jnp.abs(projected_gradient_residual))
-
-        ineq_violations = jnp.maximum(grad_dual_ineq, 0.0)
-        max_ineq_violation = (
-            jnp.max(ineq_violations) if ineq_violations.size > 0 else jnp.zeros(())
-        )
-
-        eq_violations = jnp.abs(grad_dual_eq)
-        max_eq_violation = (
-            jnp.max(eq_violations) if eq_violations.size > 0 else jnp.zeros(())
-        )
-
-        complementarity_slack = (
-            jnp.max(jnp.abs(average_state.dual_ineq * grad_dual_ineq))
-            if average_state.dual_ineq.size > 0
-            else jnp.zeros(())
-        ) / (1.0 + jnp.abs(objective_value))
-
-        constraint_bound = jnp.maximum(max_ineq_violation, max_eq_violation)
+        (
+            objective_value,
+            primal_grad_norm,
+            constraint_bound,
+            complementarity_slack,
+        ) = _kkt_residuals(cp, average_state)
 
         if getattr(cp, "residuals", None) is not None:
             primal_grad_norm, constraint_bound, complementarity_slack = cp.residuals(
@@ -823,7 +973,7 @@ def _device_solver(
         # The k-slot is a tuple led by k in adaptive_step mode, plain k otherwise.
         return opt_state[1][0] if adaptive_step else opt_state[1]
 
-    def _rebalance_k(new_state, ref_state, k_prev):
+    def _rebalance_k(new_state, ref_state, k_prev, diag=None):
         # PDLP-style primal-weight rebalance: drive k from the primal-vs-dual
         # *movement* over the just-finished cycle (distance between iterates),
         # not per-step gradient norms. omega = ||dy|| / ||dx|| under tau = eta/k,
@@ -837,8 +987,14 @@ def _device_solver(
                 new_state.dual_ineq - ref_state.dual_ineq,
             ]
         )
-        move_p2 = jnp.vdot(dp, dp) + 1e-60
-        move_d2 = jnp.vdot(dd, dd) + 1e-60
+        if diag is None:
+            move_p2 = jnp.vdot(dp, dp) + 1e-60
+            move_d2 = jnp.vdot(dd, dd) + 1e-60
+        else:
+            # diag_adapt: movement in the metric the cycle ran under.
+            t, s = diag
+            move_p2 = jnp.vdot(dp, dp / t) + 1e-60
+            move_d2 = jnp.vdot(dd, dd / s) + 1e-60
         k_target = jnp.sqrt(move_d2 / move_p2)
         log_k = k_theta * jnp.log(k_target) + (1.0 - k_theta) * jnp.log(k_prev)
         return jnp.clip(jnp.exp(log_k), k_lo, k_hi)
@@ -888,6 +1044,7 @@ def _device_solver(
             update_mode,
             k_scaling,
             adaptive_step,
+            diag=diag_adapt,
         )
         ipe_after_restart = max(
             iterations_per_epoch_min, int(ipe * iterations_per_epoch_decay)
@@ -897,9 +1054,19 @@ def _device_solver(
             # The epoch runs on the restart-shifted index, so a restart re-zeros
             # the iteration counter the step schedules and weights see.
             start = c["i"] - c["restart_i_offset"]
-            shifted_i, state, avg, opt, total_weight = run_epoch(
-                ipe, start, c["state"], c["avg"], c["opt"], c["total_weight"]
+            diag, accum = c["diag"], c["accum"]
+            epoch_out = run_epoch(
+                ipe,
+                start,
+                c["state"],
+                c["avg"],
+                c["opt"],
+                c["total_weight"],
+                **(dict(diag=diag, accum=accum) if diag_adapt else {}),
             )
+            if diag_adapt:
+                *epoch_out, accum = epoch_out
+            shifted_i, state, avg, opt, total_weight = epoch_out
             i = shifted_i + c["restart_i_offset"]
             count = c["count"] + 1
 
@@ -972,7 +1139,7 @@ def _device_solver(
                 restarted = sufficient_progress | cycle_exhausted
 
                 if k_scaling:
-                    k_new = _rebalance_k(restart_point, at_restart, _k_of(opt))
+                    k_new = _rebalance_k(restart_point, at_restart, _k_of(opt), diag)
                     # Carry the learned step size across the restart (PDLP
                     # convention, as in the linear solver): re-seeding forced
                     # the adaptive rule to re-climb from adaptive_eta after
@@ -991,6 +1158,15 @@ def _device_solver(
                 # Warm-start from the restart point; reset the optimiser state,
                 # averaging, the weight accumulator and the iteration offset.
                 opt = _select(restarted, opt_restart, opt)
+                if diag_adapt:
+                    # After k, which is judged in the metric the cycle ran under.
+                    diag_new = jo.rebalance_diag(
+                        restart_point, at_restart, diag, accum, diag_theta, diag_clamp
+                    )
+                    diag = _select(restarted, diag_new, diag)
+                    accum = _select(
+                        restarted, jax.tree.map(jnp.zeros_like, accum), accum
+                    )
                 state = _select(restarted, restart_point, state)
                 avg = _select(restarted, restart_point, avg)
                 at_restart = _select(restarted, restart_point, at_restart)
@@ -1013,6 +1189,11 @@ def _device_solver(
                             cycle_cap,
                             ipe_next,
                         ]
+                        + (
+                            [jo.diag_log_spread(diag[0]), jo.diag_log_spread(diag[1])]
+                            if diag_adapt
+                            else []
+                        )
                     ).astype(evt.dtype)
                     evt = jnp.where(restarted, evt.at[n_evt].set(row), evt)
                     n_evt = n_evt + restarted
@@ -1022,6 +1203,8 @@ def _device_solver(
                 avg=avg,
                 used_avg=used_avg,
                 opt=opt,
+                diag=diag,
+                accum=accum,
                 state_at_last_restart=at_restart,
                 metrics=metrics,
                 count=count,
@@ -1065,6 +1248,24 @@ def _device_solver(
             avg=initial_solution,
             used_avg=jnp.asarray(bool(average)),
             opt=opt_state,
+            # diag_adapt: the diagonal metric (t, s), dual stacked [eq; ineq],
+            # and its per-cycle accumulators (H_x, H_y).
+            diag=(
+                (
+                    jnp.ones_like(initial_solution.primal),
+                    jnp.ones_like(_dual_stack(initial_solution)),
+                )
+                if diag_adapt
+                else None
+            ),
+            accum=(
+                (
+                    jnp.zeros_like(initial_solution.primal),
+                    jnp.zeros_like(_dual_stack(initial_solution)),
+                )
+                if diag_adapt
+                else None
+            ),
             state_at_last_restart=initial_solution,
             metrics=_initial_metrics(),
             count=jnp.asarray(0),
@@ -1080,7 +1281,11 @@ def _device_solver(
             done=jnp.asarray(False),
             log=jnp.zeros((_LOG_CAP, 5), _merit_dtype) if verbose else None,
             n_log=jnp.asarray(0),
-            evt=jnp.zeros((_EVT_CAP, 7), _merit_dtype) if verbose else None,
+            evt=(
+                jnp.zeros((_EVT_CAP, 9 if diag_adapt else 7), _merit_dtype)
+                if verbose
+                else None
+            ),
             n_evt=jnp.asarray(0),
         )
     )
@@ -1114,6 +1319,11 @@ def solve(
     restart_decay=0.2,
     iterations_per_epoch_decay=1.0,
     iterations_per_epoch_min=100,
+    diag_adapt=False,
+    diag_theta=0.5,
+    diag_clamp=10.0,
+    gradient_scaling=False,
+    gradient_scaling_probes=16,
     precompile=True,
 ):
     """
@@ -1260,6 +1470,33 @@ def solve(
             more time checking convergence.
         iterations_per_epoch_min: Floor for the decayed epoch length (default
             100). Only used when ``iterations_per_epoch_decay < 1``.
+        diag_adapt: When ``True``, adapt a per-coordinate diagonal metric
+            ``(t, s)`` in the spirit of AdaGrad/DoG: the steps become
+            ``tau = eta/k * t`` and ``sigma = eta*k * s``. Over each restart
+            cycle every coordinate accumulates its squared eta-normalised
+            movement; at a restart its entry is multiplied by
+            ``(rho / geomean rho)**diag_theta``, where
+            ``rho = |net displacement| / sqrt(accumulated)`` (large for a
+            steadily drifting coordinate, small for an oscillating one). The
+            metric only changes at restarts and the line search measures in it,
+            so it requires ``update_mode="extragradient"`` with ``adaptive_eta``
+            and ``restarts=True``. Default ``False``.
+        diag_theta: Log-space step of the ``diag_adapt`` update (``0`` freezes
+            ``t = s = 1``).
+        diag_clamp: ``diag_adapt`` clamp: ``t, s`` stay in
+            ``[1/diag_clamp, diag_clamp]``.
+        gradient_scaling: When ``True``, rescale the objective and each
+            constraint row by the size of its gradient at the start point
+            (IPOPT's gradient-based scaling): ``σ f`` and ``e_i g_i`` with
+            ``σ = 1/‖∇f(x₀)‖₂``, ``e_i = 1/‖∇g_i(x₀)‖₂``, clamped to
+            ``[1e-4, 1e4]`` (a zero gradient keeps 1). The variables are not
+            touched, so this fixes rows and objectives in mismatched units but
+            not variables in mismatched units. The convergence test and the
+            returned duals stay in the problem's own units. Default ``False``.
+        gradient_scaling_probes: Row norms are exact when the constraint
+            Jacobian has at most this many rows or columns, and otherwise
+            estimated from this many random Jacobian-vector products
+            (default 16).
         precompile: Compile the device loop before the timed loop starts
             (default ``True``), so ``"solve_seconds"`` measures iteration time
             rather than XLA compilation. The compile still counts against
@@ -1304,8 +1541,18 @@ def solve(
         print("====Starting Solve====")
         print("----------------------------------------------")
 
+    solve_cp, from_scaled, obj_scale = cp, None, 1.0
+    if gradient_scaling:
+        if initial_solution is None:
+            initial_solution = cp.initial_solution()
+        solve_cp, to_scaled, from_scaled, sigma = _gradient_scaled(
+            cp, initial_solution.primal, gradient_scaling_probes
+        )
+        initial_solution = to_scaled(initial_solution)
+        obj_scale = float(sigma)
+
     _build_chunk, carry = _device_solver(
-        cp,
+        solve_cp,
         optimiser=optimiser,
         initial_solution=initial_solution,
         initial_opt_state=initial_opt_state,
@@ -1332,6 +1579,9 @@ def solve(
         restart_decay=restart_decay,
         iterations_per_epoch_decay=iterations_per_epoch_decay,
         iterations_per_epoch_min=iterations_per_epoch_min,
+        diag_adapt=diag_adapt,
+        diag_theta=diag_theta,
+        diag_clamp=diag_clamp,
     )
 
     def _epochs_arg(n):
@@ -1368,7 +1618,7 @@ def solve(
             if kind == 0:
                 print(
                     f"|Epoch {epoch_no}|"
-                    f"|Obj{float(r[1]):.2e}|"
+                    f"|Obj{float(r[1]) / obj_scale:.2e}|"
                     f"|PGN {float(r[2]):.2e}|"
                     f"|CS {float(r[3]):.2e}|"
                     f"|PFR {float(r[4]):.2e}|"
@@ -1380,6 +1630,8 @@ def solve(
             reason = "sufficient-progress" if r[1] == 0 else "cycle-cap"
             which = "avg" if r[3] else "iterate"
             k_msg = f", k={float(r[4]):.3e}" if k_scaling else ""
+            if diag_adapt:
+                k_msg += f", t-spread=1e{float(r[7]):.2f}, s-spread=1e{float(r[8]):.2f}"
             print(
                 f"Restart {restarts_printed} at epoch {epoch_no} "
                 f"({reason}, merit={float(r[2]):.2e} "
@@ -1462,6 +1714,8 @@ def solve(
 
     opt_state = carry["opt"]
     output = _reported_point(carry, average)
+    if from_scaled is not None:
+        output = from_scaled(output)
 
     output = jax.block_until_ready(output)
     end_time = time.time()
@@ -1518,6 +1772,11 @@ def make_solver(
     restart_multiplier=1.0,
     restart_decay=0.2,
     iterations_per_epoch_min=100,
+    diag_adapt=False,
+    diag_theta=0.5,
+    diag_clamp=10.0,
+    gradient_scaling=False,
+    gradient_scaling_probes=16,
 ):
     """
     Build a pure-JAX solve function for a family of convex problems.
@@ -1556,6 +1815,14 @@ def make_solver(
 
     def solve_fn(params, initial_solution=None):
         cp = build_cp(params)
+        from_scaled = None
+        if gradient_scaling:
+            if initial_solution is None:
+                initial_solution = cp.initial_solution()
+            cp, to_scaled, from_scaled, _ = _gradient_scaled(
+                cp, initial_solution.primal, gradient_scaling_probes
+            )
+            initial_solution = to_scaled(initial_solution)
         build_chunk, carry = _device_solver(
             cp,
             optimiser=optimiser,
@@ -1586,12 +1853,18 @@ def make_solver(
             iterations_per_epoch_min=min(
                 iterations_per_epoch_min, iterations_per_epoch
             ),
+            diag_adapt=diag_adapt,
+            diag_theta=diag_theta,
+            diag_clamp=diag_clamp,
         )
         carry = build_chunk(iterations_per_epoch)(
             carry, jnp.asarray(n_epochs, carry["count"].dtype)
         )
+        solution = _reported_point(carry, average)
+        if from_scaled is not None:
+            solution = from_scaled(solution)
         return SolveCoreResult(
-            solution=_reported_point(carry, average),
+            solution=solution,
             converged=carry["done"],
             epochs=carry["count"],
         )

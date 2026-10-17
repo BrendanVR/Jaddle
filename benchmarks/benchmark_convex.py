@@ -7,6 +7,7 @@ Usage:
     python benchmarks/benchmark_convex.py                 # all configs
     python benchmarks/benchmark_convex.py eg_ad frb_ad    # only these configs
     python benchmarks/benchmark_convex.py eg_ad --jaddle-verbose  # show solver logs
+    python benchmarks/benchmark_convex.py --misscaled     # mis-scaled copies too
 """
 
 import argparse
@@ -86,11 +87,34 @@ PROBLEMS = {"isotonic": isotonic(), "ridge_ball": ridge_ball(), "simplex_qp": si
 TOL = dict(primal_grad_norm_tolerance=1e-6, primal_feasibility_tolerance=1e-6,
            complementarity_slack_tolerance=1e-6)
 
+# --misscaled: each problem again with its objective x MISSCALE_OBJECTIVE and
+# each constraint row x 10^U(-3, 3), the same problem in mismatched units. The
+# convergence tolerances are absolute, so they scale up with the objective
+# (TOL_MISSCALED), and the printed objective is divided back.
+MISSCALE_OBJECTIVE = 1e3
+TOL_MISSCALED = {k: v * MISSCALE_OBJECTIVE for k, v in TOL.items()}
+
+
+def misscaled(cp, seed=0):
+    x0 = jnp.zeros(cp.num_variables)
+    r = np.random.default_rng(seed)
+    e_eq = 10.0 ** r.uniform(-3, 3, cp.constraints_eq(x0).shape[0])
+    e_ineq = 10.0 ** r.uniform(-3, 3, cp.constraints_ineq(x0).shape[0])
+    return jc.JaddleCP(cp.num_variables,
+                       lambda x: MISSCALE_OBJECTIVE * cp.objective(x),
+                       lambda x: e_eq * cp.constraints_eq(x),
+                       lambda x: e_ineq * cp.constraints_ineq(x),
+                       cp.lower_bounds, cp.upper_bounds)
+
 CONFIGS = {
     "alt_gd": dict(update_mode="alternating", optimiser=jo.gd(0.05)),
     "eg_ad": dict(update_mode="extragradient", adaptive_eta=0.5),
     "eg_ad_rs": dict(update_mode="extragradient", adaptive_eta=0.5, restarts=True,
                      epochs_per_restart=5),
+    "eg_ad_rs_dg": dict(update_mode="extragradient", adaptive_eta=0.5, restarts=True,
+                        epochs_per_restart=5, diag_adapt=True),
+    "eg_ad_rs_gs": dict(update_mode="extragradient", adaptive_eta=0.5, restarts=True,
+                        epochs_per_restart=5, gradient_scaling=True),
     "frb_ad": dict(update_mode="forward_reflected", adaptive_eta=0.5),
     "frb_ad_rs": dict(update_mode="forward_reflected", adaptive_eta=0.5,
                       restarts=True, epochs_per_restart=5),
@@ -102,11 +126,18 @@ if __name__ == "__main__":
     parser.add_argument("configs", nargs="*",
                         help=f"Configs to run (default: all of {', '.join(CONFIGS)}).")
     add_jaddle_verbose_flag(parser, default=False)
+    parser.add_argument("--misscaled", action="store_true",
+                        help="Also run each problem in mismatched units (objective "
+                        f"x{MISSCALE_OBJECTIVE:g}, rows x 10^U(-3, 3)).")
     args = parser.parse_args()
     unknown = sorted(set(args.configs) - set(CONFIGS))
     if unknown:
         parser.error(f"unknown config(s): {', '.join(unknown)}")
-    for pname, cp in PROBLEMS.items():
+    runs = [(name, cp, TOL, 1.0) for name, cp in PROBLEMS.items()]
+    if args.misscaled:
+        runs += [(name + "_ms", misscaled(cp), TOL_MISSCALED, MISSCALE_OBJECTIVE)
+                 for name, cp in PROBLEMS.items()]
+    for pname, cp, tol, obj_scale in runs:
         for cname, cfg in CONFIGS.items():
             if args.configs and cname not in args.configs:
                 continue
@@ -116,8 +147,8 @@ if __name__ == "__main__":
                 contextlib.redirect_stdout(io.StringIO()))
             with quiet:
                 out = jc.solve(cp, max_epochs=300, iterations_per_epoch=200,
-                               verbose=args.jaddle_verbose, **TOL, **cfg)
+                               verbose=args.jaddle_verbose, **tol, **cfg)
             ep = out["epochs"]
-            obj = float(cp.objective(out["solution"].primal))
-            print(f"{pname:12s} {cname:10s} conv={str(out['converged']):5s} epochs={ep:4d} "
+            obj = float(cp.objective(out["solution"].primal)) / obj_scale
+            print(f"{pname:15s} {cname:11s} conv={str(out['converged']):5s} epochs={ep:4d} "
                   f"t={out['solve_seconds']:6.2f}s obj={obj:.8e}", flush=True)

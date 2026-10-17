@@ -140,11 +140,17 @@ def _make_epoch_fn(
     update_mode="pdhg",
     merit_fn=None,
     check_every=None,
+    diag=False,
 ):
     # Returns `run_epoch(start_iter, state, average_state, opt_state,
     # total_weight, merit_threshold, stall_threshold, *, max_iter)`, which runs
     # one epoch of `max_iter` iterations and returns
-    # (i, state, average_state, opt_state, total_weight, stalled). It is a plain
+    # (i, state, average_state, opt_state, total_weight, stalled). With `diag`
+    # (diag_adapt) it also takes `diag=(t, s)` and `accum=(H_x, H_y)` keywords
+    # and returns the updated `accum` last: the steps become
+    # tau = eta/k * t, sigma = eta*k * s, and each accepted step adds its
+    # eta-normalised squared movement (Δ/eta)² to the accumulators that `solve`
+    # turns into the next diagonal at a restart. It is a plain
     # traceable function, not jitted: `solve` calls it inside its device-side
     # epoch loop (`run_chunk`), which is jitted as a whole. `max_iter` must be a
     # Python int (it is the scan length).
@@ -176,6 +182,7 @@ def _make_epoch_fn(
     #                    feasible, so no re-projection is needed.
     halpern = update_mode == "halpern"
     theta = 0.0 if update_mode == "alternating" else 1.0
+    diag_on = bool(diag)
 
     def projection_primal(primal_state):
         return projection_box(primal_state, lp.lower_bounds, lp.upper_bounds)
@@ -214,15 +221,29 @@ def _make_epoch_fn(
         stall_threshold,
         *,
         max_iter,
+        diag=None,
+        accum=None,
     ):
+        if diag_on:
+            t, s = diag
+            s_eq, s_ineq = s[: lp.n_eq], s[lp.n_eq :]
+
         def _descent_bound(state, cand, k, interaction):
             # eta_bar = move / (2 |interaction|), move = k‖dx‖² + (1/k)‖dy‖².
+            # Under the diagonal metric the norms are ‖·‖_{t⁻¹} / ‖·‖_{s⁻¹}:
+            # the PDHG step condition for T = (eta/k) diag(t), Σ = eta k diag(s).
             dx = cand.primal - state.primal
             dy_eq = cand.dual_eq - state.dual_eq
             dy_ineq = cand.dual_ineq - state.dual_ineq
-            move = k * jnp.vdot(dx, dx) + (1.0 / k) * (
-                jnp.vdot(dy_eq, dy_eq) + jnp.vdot(dy_ineq, dy_ineq)
-            )
+            if diag_on:
+                move = k * jnp.vdot(dx, dx / t) + (1.0 / k) * (
+                    jnp.vdot(dy_eq, dy_eq / s_eq)
+                    + jnp.vdot(dy_ineq, dy_ineq / s_ineq)
+                )
+            else:
+                move = k * jnp.vdot(dx, dx) + (1.0 / k) * (
+                    jnp.vdot(dy_eq, dy_eq) + jnp.vdot(dy_ineq, dy_ineq)
+                )
             # No movement => any step is fine (avoid 0/0); flag with +inf so
             # the retry loop accepts and the eta-growth branch is suppressed.
             return jnp.where(interaction > 0.0, move / (2.0 * interaction), jnp.inf)
@@ -236,20 +257,28 @@ def _make_epoch_fn(
             # A @ x_bar = Ax_old + (1 + theta) A_dx.
             tau = eta / k
             sigma = eta * k
+            if diag_on:
+                tau = tau * t
+                sigma_eq, sigma_ineq = sigma * s_eq, sigma * s_ineq
+            else:
+                sigma_eq = sigma_ineq = sigma
             x_new = projection_primal(state.primal - tau * gp)
             Ax_new = lp.A @ x_new
             A_dx = Ax_new - Ax_old
             Ax_bar = Ax_old + (1.0 + theta) * A_dx
             gd_ineq, gd_eq = grad_dual_only_from_Ax(Ax_bar, state)
-            dual_ineq = projection_non_negative(state.dual_ineq - sigma * gd_ineq)
-            dual_eq = state.dual_eq - sigma * gd_eq
+            dual_ineq = projection_non_negative(state.dual_ineq - sigma_ineq * gd_ineq)
+            dual_eq = state.dual_eq - sigma_eq * gd_eq
             cand = SaddleState(primal=x_new, dual_ineq=dual_ineq, dual_eq=dual_eq)
             dy = jnp.concatenate([dual_eq - state.dual_eq, dual_ineq - state.dual_ineq])
             interaction = jnp.abs(jnp.vdot(dy, A_dx))
             return cand, _descent_bound(state, cand, k, interaction), Ax_new
 
         def step(carry, _):
-            i, state, average_state, opt_state, total_weight = carry
+            if diag_on:
+                i, state, average_state, opt_state, total_weight, acc = carry
+            else:
+                i, state, average_state, opt_state, total_weight = carry
             if halpern:
                 k, eta, anchor, Ax_anchor, Ax_old = opt_state
             else:
@@ -275,6 +304,21 @@ def _make_epoch_fn(
             eta0, cand, eta_bar, Ax_new = jax.lax.while_loop(
                 cond, body, (eta, cand0, eta_bar0, Ax_new0)
             )
+
+            if diag_on:
+                # Per-coordinate squared movement of the operator step (cand,
+                # before any Halpern blend), normalised by the accepted eta so
+                # the scalar line search does not leak into the shape signal.
+                H_x, H_y = acc
+                inv_eta = 1.0 / eta0
+                dx = (cand.primal - state.primal) * inv_eta
+                dy = (
+                    jnp.concatenate(
+                        [cand.dual_eq - state.dual_eq, cand.dual_ineq - state.dual_ineq]
+                    )
+                    * inv_eta
+                )
+                acc = (H_x + dx * dx, H_y + dy * dy)
 
             if halpern:
                 # Halpern anchor: blend T(z_k)=cand back toward z_0.
@@ -325,6 +369,8 @@ def _make_epoch_fn(
                     new_state, average_state, w / total_weight
                 )
 
+            if diag_on:
+                return (i + 1, new_state, average_state, opt_state, total_weight, acc)
             return (i + 1, new_state, average_state, opt_state, total_weight)
 
         # Fixed iteration count per epoch: lax.scan (static `max_iter`) lets
@@ -350,6 +396,8 @@ def _make_epoch_fn(
             opt_state = (k0, eta0, lp.A @ state.primal)
 
         step_carry = (start_iter, state, average_state, opt_state, total_weight)
+        if diag_on:
+            step_carry = step_carry + (accum,)
         # scan requires the carry's output dtypes to match its input dtypes
         # exactly (e.g. a Python-int start_iter); cast each step's output
         # carry back to the input carry's dtypes so the loop is type-stable.
@@ -380,8 +428,8 @@ def _make_epoch_fn(
             def chunk_body(c):
                 chunk, carry, _, _, prev_m = c
                 carry, _ = jax.lax.scan(step_typed, carry, None, length=check_every)
-                _, s, avg, _, _ = carry
-                m = merit_fn(s)
+                s_, avg = carry[1], carry[2]
+                m = merit_fn(s_)
                 if average:
                     m = jnp.minimum(m, merit_fn(avg))
                 # Condition (ii) needs a previous chunk in this epoch, so the
@@ -401,13 +449,15 @@ def _make_epoch_fn(
                     jnp.asarray(jnp.inf, state.primal.dtype),
                 ),
             )
-        i, state, average_state, opt_state, total_weight = scan_out
+        i, state, average_state, opt_state, total_weight = scan_out[:5]
 
         if halpern:
             opt_state = opt_state[:3]
         else:
             opt_state = opt_state[:2]
 
+        if diag_on:
+            return i, state, average_state, opt_state, total_weight, stalled, scan_out[5]
         return i, state, average_state, opt_state, total_weight, stalled
 
     return run_epoch
@@ -551,6 +601,9 @@ def _device_solver(
     restart_check_every,
     reference_objective,
     polish_trigger=None,
+    diag_adapt=False,
+    diag_theta=0.5,
+    diag_clamp=10.0,
 ):
     """The device side of ``solve()``: everything that runs inside its jitted
     epoch loop, built for one scaled problem.
@@ -1114,7 +1167,7 @@ def _device_solver(
     # restart rebalance and the per-epoch rebalance: log-space geometric-mean
     # blend of the movement-ratio target with the current weight (k_theta), then
     # clamp to [k_lo, k_hi]. Squared norms avoid two sqrts; the ratio is preserved.
-    def _rebalance_k(new_state, ref_state, k_prev, theta):
+    def _rebalance_k(new_state, ref_state, k_prev, theta, diag=None):
         dp = new_state.primal - ref_state.primal
         dd = jnp.concatenate(
             [
@@ -1122,8 +1175,15 @@ def _device_solver(
                 new_state.dual_ineq - ref_state.dual_ineq,
             ]
         )
-        move_p2 = jnp.vdot(dp, dp) + 1e-60
-        move_d2 = jnp.vdot(dd, dd) + 1e-60
+        if diag is None:
+            move_p2 = jnp.vdot(dp, dp) + 1e-60
+            move_d2 = jnp.vdot(dd, dd) + 1e-60
+        else:
+            # diag_adapt: measure the movement in the metric the cycle ran
+            # under (‖·‖_{t⁻¹}, ‖·‖_{s⁻¹}), matching the line search's `move`.
+            t, s = diag
+            move_p2 = jnp.vdot(dp, dp / t) + 1e-60
+            move_d2 = jnp.vdot(dd, dd / s) + 1e-60
         # PDLP primal-weight update: omega = ||dy|| / ||dx|| under tau = eta/k,
         # sigma = eta*k, balancing k||dx||^2 against ||dy||^2 / k.
         k_target = jnp.sqrt(move_d2 / move_p2)
@@ -1192,6 +1252,7 @@ def _device_solver(
             update_mode,
             merit_fn=_inloop_merit if check_every else None,
             check_every=check_every,
+            diag=diag_adapt,
         )
         inloop_restart_check = bool(check_every) and restarts
         ipe_after_restart = max(
@@ -1213,7 +1274,8 @@ def _device_solver(
             # The epoch runs on the restart-shifted index, so a restart re-zeros
             # the halpern lambda counter and the eta growth schedule.
             start = c["i"] - c["restart_i_offset"]
-            shifted_i, state, avg, opt, total_weight, stalled = run_epoch(
+            diag, accum = c["diag"], c["accum"]
+            epoch_out = run_epoch(
                 start,
                 c["state"],
                 c["avg"],
@@ -1222,7 +1284,11 @@ def _device_solver(
                 thr_sufficient,
                 thr_stall,
                 max_iter=ipe,
+                **(dict(diag=diag, accum=accum) if diag_adapt else {}),
             )
+            if diag_adapt:
+                *epoch_out, accum = epoch_out
+            shifted_i, state, avg, opt, total_weight, stalled = epoch_out
             i = shifted_i + c["restart_i_offset"]
             # Iterations actually run (an in-epoch restart check may exit early).
             iters_this_epoch = shifted_i - start
@@ -1409,7 +1475,14 @@ def _device_solver(
                         theta,
                     )
                     k_prev = jnp.where(judge & ~improved, k_before, k_prev)
-                k_new = _rebalance_k(restart_point, at_restart, k_prev, theta_new)
+                k_new = _rebalance_k(
+                    restart_point, at_restart, k_prev, theta_new, diag
+                )
+                if diag_adapt:
+                    # After k, which is judged in the metric the cycle ran under.
+                    diag_new = jo.rebalance_diag(
+                        restart_point, at_restart, diag, accum, diag_theta, diag_clamp
+                    )
                 if halpern:
                     # Restarted Halpern: reset eta and re-anchor z_0 to the
                     # cycle-start iterate.
@@ -1431,6 +1504,11 @@ def _device_solver(
                 k_before = jnp.where(restarted, k_prev, k_before)
                 has_k_before = has_k_before | restarted
                 opt = _select(restarted, opt_restart, opt)
+                if diag_adapt:
+                    diag = _select(restarted, diag_new, diag)
+                    accum = _select(
+                        restarted, jax.tree.map(jnp.zeros_like, accum), accum
+                    )
                 state = _select(restarted, restart_point, state)
                 avg = _select(restarted, restart_point, avg)
                 at_restart = _select(restarted, restart_point, at_restart)
@@ -1464,6 +1542,11 @@ def _device_solver(
                             cycle_cap,
                             ipe_next,
                         ]
+                        + (
+                            [jo.diag_log_spread(diag[0]), jo.diag_log_spread(diag[1])]
+                            if diag_adapt
+                            else []
+                        )
                     ).astype(evt.dtype)
                     evt = jnp.where(restarted, evt.at[n_evt].set(row), evt)
                     n_evt = n_evt + restarted
@@ -1473,7 +1556,7 @@ def _device_solver(
             # Leaves averaging, the halpern anchor and eta untouched.
             at_epoch = c["state_at_last_epoch"]
             if k_per_epoch:
-                k_epoch = _rebalance_k(state, at_epoch, opt[0], theta)
+                k_epoch = _rebalance_k(state, at_epoch, opt[0], theta, diag)
                 opt = (jnp.where(restarted, opt[0], k_epoch),) + tuple(opt[1:])
                 at_epoch = state
 
@@ -1523,6 +1606,8 @@ def _device_solver(
                 state=state,
                 avg=avg,
                 opt=opt,
+                diag=diag,
+                accum=accum,
                 state_at_last_restart=at_restart,
                 state_at_last_epoch=at_epoch,
                 metrics=metrics,
@@ -1578,6 +1663,24 @@ def _device_solver(
         state=initial_solution,
         avg=initial_solution,
         opt=opt_state,
+        # diag_adapt: the diagonal metric (t, s), starting at the Ruiz+PC
+        # baseline, and its per-cycle accumulators (H_x, H_y).
+        diag=(
+            (
+                jnp.ones_like(initial_solution.primal),
+                jnp.ones(lp.b.shape, initial_solution.primal.dtype),
+            )
+            if diag_adapt
+            else None
+        ),
+        accum=(
+            (
+                jnp.zeros_like(initial_solution.primal),
+                jnp.zeros(lp.b.shape, initial_solution.primal.dtype),
+            )
+            if diag_adapt
+            else None
+        ),
         state_at_last_restart=initial_solution,
         state_at_last_epoch=initial_solution if k_per_epoch else None,
         metrics=_initial_metrics(),
@@ -1617,7 +1720,11 @@ def _device_solver(
         stop_code=jnp.asarray(0),
         log=jnp.zeros((_LOG_CAP, 10), _merit_dtype) if verbose else None,
         n_log=jnp.asarray(0),
-        evt=jnp.zeros((_EVT_CAP, 8), _merit_dtype) if verbose else None,
+        evt=(
+            jnp.zeros((_EVT_CAP, 10 if diag_adapt else 8), _merit_dtype)
+            if verbose
+            else None
+        ),
         n_evt=jnp.asarray(0),
     )
     carry = _strong(carry)
@@ -1681,6 +1788,9 @@ def solve(
     vertex_bias=0.0,
     vertex_bias_seed=0,
     reference_objective=None,
+    diag_adapt=False,
+    diag_theta=0.5,
+    diag_clamp=10.0,
     _polish_trigger=None,
 ):
     """
@@ -1906,6 +2016,20 @@ def solve(
             comparing ``OBJERR`` against ``RDG`` quantifies how much of the gap is
             dual lag versus genuine primal suboptimality. Does not affect
             termination — convergence still uses the full LP certificate.
+        diag_adapt: When ``True``, adapt a per-coordinate diagonal metric
+            ``(t, s)`` on top of the Ruiz+PC scaling, in the spirit of
+            AdaGrad/DoG: the steps become ``tau = eta/k * t`` and
+            ``sigma = eta*k * s``. Over each restart cycle every coordinate
+            accumulates its squared eta-normalised movement; at a restart its
+            diagonal entry is multiplied by ``(rho / geomean rho)**diag_theta``,
+            where ``rho = |net displacement| / sqrt(accumulated)`` (large for a
+            steadily drifting coordinate, small for an oscillating one). The
+            metric only changes at restarts, and the line search keeps any
+            diagonal stable. Default ``False``.
+        diag_theta: Log-space step of the ``diag_adapt`` update (``0`` freezes
+            ``t = s = 1``).
+        diag_clamp: ``diag_adapt`` clamp: ``t, s`` stay in
+            ``[1/diag_clamp, diag_clamp]`` around the Ruiz+PC baseline.
         _polish_trigger: Internal to ``solve_with_polishing``. A
             ``(not_before_epoch, factor)`` pair that also stops the solve,
             unconverged, with ``stop_reason="polish_ready"`` at the first epoch
@@ -2151,6 +2275,9 @@ def solve(
         restart_check_every=restart_check_every,
         reference_objective=reference_objective,
         polish_trigger=_polish_trigger,
+        diag_adapt=diag_adapt,
+        diag_theta=diag_theta,
+        diag_clamp=diag_clamp,
     )
 
     chunk_fns = {}
@@ -2196,6 +2323,8 @@ def solve(
             k_msg = f", k={float(r[4]):.3e}"
             if adaptive_theta:
                 k_msg += f", k_theta={float(r[5]):.3g}"
+            if diag_adapt:
+                k_msg += f", t-spread=1e{float(r[8]):.2f}, s-spread=1e{float(r[9]):.2f}"
             print(
                 f"Restart {restarts_printed} at epoch {epoch_no} "
                 f"({reason}, merit={float(r[2]):.2e} "
@@ -2421,6 +2550,9 @@ def make_solver(
     halpern_reanchor_per_epoch=False,
     iterations_per_epoch_min=100,
     restart_check_every="auto",
+    diag_adapt=False,
+    diag_theta=0.5,
+    diag_clamp=10.0,
 ):
     """
     Build a pure-JAX solve function for LPs with ``lp``'s sparsity pattern.
@@ -2573,6 +2705,9 @@ def make_solver(
             ),
             restart_check_every=restart_check_every,
             reference_objective=None,
+            diag_adapt=diag_adapt,
+            diag_theta=diag_theta,
+            diag_clamp=diag_clamp,
         )
         carry = build_chunk(iterations_per_epoch)(carry, n_epochs)
 

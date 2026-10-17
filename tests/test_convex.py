@@ -87,6 +87,138 @@ def test_isotonic_regression():
     )
 
 
+DIAG = dict(update_mode="extragradient", restarts=True, diag_adapt=True)
+
+
+def test_diag_adapt_simplex(capsys):
+    cp, expected = simplex_problem()
+    result = solve(cp, verbose=True, **DIAG)
+    assert result["stop_reason"] == "certificate"
+    np.testing.assert_allclose(result["solution"].primal, expected, atol=1e-5)
+    out = capsys.readouterr().out
+    assert "Restart" not in out or "t-spread" in out
+
+
+def test_diag_adapt_isotonic_regression():
+    n = 60
+    x = np.linspace(-1, 1, n)
+    y = x**3 + 0.15 * np.random.default_rng(0).standard_normal(n)
+    cp = jc.JaddleCP(
+        num_variables=n,
+        objective=lambda p: jnp.sum((p - y) ** 2),
+        constraints_eq=lambda p: jnp.zeros(0),
+        constraints_ineq=lambda p: p[:-1] - p[1:],
+        lower_bounds=-jnp.ones(n),
+        upper_bounds=jnp.ones(n),
+    )
+    result = solve(cp, **DIAG)
+    assert result["converged"]
+    np.testing.assert_allclose(
+        result["solution"].primal, isotonic_fit(y, -1.0, 1.0), atol=1e-4
+    )
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        dict(update_mode="alternating", restarts=True),
+        dict(update_mode="forward_reflected", restarts=True),
+        dict(update_mode="extragradient", restarts=False),
+    ],
+)
+def test_diag_adapt_rejects_unsupported(options):
+    cp, _ = simplex_problem()
+    with pytest.raises(ValueError):
+        jc.solve(cp, diag_adapt=True, **options)
+
+
+def misscaled_isotonic(objective_scale, row_scale, n=60):
+    # test_isotonic_regression's problem with the objective and each
+    # inequality row multiplied by a scale.
+    x = np.linspace(-1, 1, n)
+    y = x**3 + 0.15 * np.random.default_rng(0).standard_normal(n)
+    cp = jc.JaddleCP(
+        num_variables=n,
+        objective=lambda p: objective_scale * jnp.sum((p - y) ** 2),
+        constraints_eq=lambda p: jnp.zeros(0),
+        constraints_ineq=lambda p: row_scale * (p[:-1] - p[1:]),
+        lower_bounds=-jnp.ones(n),
+        upper_bounds=jnp.ones(n),
+    )
+    return cp, isotonic_fit(y, -1.0, 1.0)
+
+
+def test_gradient_scaling_fixes_misscaled_rows_and_objective():
+    # Objective x1e3 and rows x 10^U(-3, 3). The tolerances are absolute in the
+    # problem's own (scaled-up) units, hence 1e-3.
+    tols = dict(
+        primal_grad_norm_tolerance=1e-3,
+        primal_feasibility_tolerance=1e-3,
+        complementarity_slack_tolerance=1e-3,
+    )
+    rows = 10.0 ** np.random.default_rng(1).uniform(-3, 3, 59)
+    reference_cp, fit = misscaled_isotonic(1.0, 1.0)
+    cp, _ = misscaled_isotonic(1e3, rows)
+
+    unscaled = jc.solve(cp, iterations_per_epoch=200, max_epochs=50, **tols)
+    assert not unscaled["converged"]
+
+    result = jc.solve(cp, iterations_per_epoch=200, max_epochs=300, **tols,
+                      gradient_scaling=True)
+    assert result["stop_reason"] == "certificate"
+    np.testing.assert_allclose(result["solution"].primal, fit, atol=1e-5)
+    # The returned duals are the given problem's: the well-scaled problem's
+    # multipliers times objective scale / row scale.
+    reference = solve(reference_cp)
+    expected = np.asarray(reference["solution"].dual_ineq) * 1e3 / rows
+    np.testing.assert_allclose(
+        result["solution"].dual_ineq, expected, atol=1e-4 * (1 + np.abs(expected).max())
+    )
+
+
+@pytest.mark.parametrize("m, probes, exact", [(40, 100, True), (10, 16, True), (40, 16, False)])
+def test_gradient_scales_row_norms(m, probes, exact):
+    # n=60: exact by forward mode when n <= probes, by reverse mode when
+    # m <= probes, otherwise estimated from `probes` random JVPs.
+    rng = np.random.default_rng(0)
+    A = rng.standard_normal((m, 60)) * 10.0 ** rng.uniform(-2, 2, (m, 1))
+    cp = jc.JaddleCP(
+        num_variables=60,
+        objective=lambda x: 5.0 * jnp.sum(x),
+        constraints_eq=lambda x: jnp.zeros(0),
+        constraints_ineq=lambda x: jnp.asarray(A) @ x - 1.0,
+        lower_bounds=-jnp.ones(60),
+        upper_bounds=jnp.ones(60),
+    )
+    sigma, e = jc._gradient_scales(cp, jnp.zeros(60), probes)
+    assert float(sigma) == pytest.approx(1.0 / (5.0 * np.sqrt(60)))
+    true = 1.0 / np.linalg.norm(A, axis=1)
+    if exact:
+        np.testing.assert_allclose(e, true, rtol=1e-10)
+    else:
+        ratio = np.asarray(e) / true
+        assert ratio.min() > 0.5 and ratio.max() < 2.0
+
+
+def test_gradient_scaling_zero_gradient_row():
+    # ‖x‖² <= 1 has a zero gradient at the start point x0 = 0: its scale
+    # stays 1, and the solve still certifies.
+    a = np.random.default_rng(2).standard_normal(20)
+    cp = jc.JaddleCP(
+        num_variables=20,
+        objective=lambda x: jnp.sum((x - a) ** 2),
+        constraints_eq=lambda x: jnp.zeros(0),
+        constraints_ineq=lambda x: jnp.array([x @ x - 1.0]),
+        lower_bounds=jnp.full(20, -jnp.inf),
+        upper_bounds=jnp.full(20, jnp.inf),
+    )
+    _, e = jc._gradient_scales(cp, jnp.zeros(20), 16)
+    np.testing.assert_array_equal(e, [1.0])
+    result = solve(cp, update_mode="extragradient", gradient_scaling=True)
+    assert result["stop_reason"] == "certificate"
+    np.testing.assert_allclose(result["solution"].primal, a / np.linalg.norm(a), atol=1e-5)
+
+
 def test_epoch_budget():
     cp, _ = simplex_problem()
     result = jc.solve(cp, max_epochs=1, iterations_per_epoch=5, **TOLS)
@@ -139,7 +271,13 @@ def exact_scaled_projection(a, s):
 
 @pytest.mark.parametrize(
     "options",
-    [{}, {"update_mode": "forward_reflected"}, {"restarts": True, "average": True}],
+    [
+        {},
+        {"update_mode": "forward_reflected"},
+        {"restarts": True, "average": True},
+        {"update_mode": "extragradient", "restarts": True, "diag_adapt": True},
+        {"gradient_scaling": True},
+    ],
 )
 def test_make_solver_matches_solve(options):
     cp, _ = simplex_problem(n=30)
@@ -300,6 +438,13 @@ def test_quadratic_program(scaled):
     assert s.dual_ineq.shape == (0,)
     objective = float(expected @ expected + qp["c"] @ expected)
     assert abs(result["objective"] - objective) <= 1e-5 * (1 + abs(objective))
+
+
+def test_quadratic_program_diag_adapt():
+    qp, expected = simplex_qp()
+    result = solve_qp(qp, **DIAG)
+    assert_qp_certified(result)
+    np.testing.assert_allclose(result["solution"].primal, expected, atol=1e-5)
 
 
 def test_quadratic_program_inequality_rows():
