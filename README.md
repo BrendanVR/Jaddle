@@ -617,6 +617,12 @@ these results are described in [`benchmarks/README.md`](https://github.com/Brend
 | [`tests/`](https://github.com/BrendanVR/Jaddle/tree/main/tests) | Test suite (`pytest`) |
 | [`CHANGELOG.md`](https://github.com/BrendanVR/Jaddle/blob/main/CHANGELOG.md) | Changes in each release |
 
+## Citing Jaddle
+
+If you use Jaddle in your research, please cite it. The citation details are
+in [`CITATION.cff`](https://github.com/BrendanVR/Jaddle/blob/main/CITATION.cff),
+and GitHub's "Cite this repository" button gives them in APA and BibTeX form.
+
 ## License
 
 Jaddle is released under the MIT License. See [LICENSE.txt](https://github.com/BrendanVR/Jaddle/blob/main/LICENSE.txt).

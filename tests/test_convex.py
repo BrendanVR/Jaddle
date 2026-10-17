@@ -64,7 +64,7 @@ def test_simplex_projection(update_mode):
     cp, expected = simplex_problem()
     result = solve(cp, update_mode=update_mode)
     assert result["converged"]
-    assert result["stop_reason"] == "converged"
+    assert result["stop_reason"] == "certificate"
     np.testing.assert_allclose(result["solution"].primal, expected, atol=1e-5)
 
 

@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use Jaddle in your research, please cite it as below."
+type: software
+title: "Jaddle: The JAX Saddle Solver"
+abstract: >-
+  First-order primal-dual solvers for large-scale linear and convex programs,
+  written in JAX. Jaddle provides a restarted, adaptively step-sized
+  PDHG-family solver for sparse linear programs and a general solver for
+  smooth convex programs defined by JAX functions. Both run on CPU, GPU and
+  TPU, and support batched and differentiable solves.
+authors:
+  - family-names: "van Rooyen"
+    given-names: "Brendan"
+version: 0.2.1
+date-released: 2026-10-17
+license: MIT
+repository-code: "https://github.com/BrendanVR/Jaddle"
+url: "https://github.com/BrendanVR/Jaddle"
+keywords:
+  - optimization
+  - linear programming
+  - convex optimization
+  - PDHG
+  - PDLP
+  - saddle point
+  - JAX
+  - GPU

@@ -172,6 +172,20 @@ def create_saddle_optimiser(
     primal_optimizer: optax.GradientTransformation,
     dual_optimizer: optax.GradientTransformation,
 ):
+    """Combine a primal and a dual Optax optimiser into one for a ``SaddleState``.
+
+    The primal optimiser updates ``primal`` and the dual optimiser updates
+    ``dual_ineq`` and ``dual_eq``. Pass the result as ``optimiser`` to
+    ``jaddle_convex.solve`` in ``"alternating"`` mode.
+
+    Args:
+        primal_optimizer: Update rule for the primal variables.
+        dual_optimizer: Update rule for the dual variables. If ``None``, the
+            primal optimiser is used for both.
+
+    Returns:
+        optax.GradientTransformation: The combined optimiser.
+    """
     if dual_optimizer is None:
         dual_optimizer = primal_optimizer
     optimiser = optax.partition(
@@ -186,7 +200,8 @@ def create_saddle_optimiser(
 
 
 def gd(lr):
-    primal = optax.inject_hyperparams(optax.sgd)(
+    """Plain gradient descent for both players, with learning rate ``lr``."""
+    primal =optax.inject_hyperparams(optax.sgd)(
         learning_rate=lr,
     )
     dual = optax.inject_hyperparams(optax.sgd)(
@@ -199,7 +214,12 @@ def gd(lr):
 
 
 def optimistic_gd(lr):
-    primal = optax.inject_hyperparams(optax.optimistic_gradient_descent)(
+    """Optimistic gradient descent for both players, with learning rate ``lr``.
+
+    Each step adds a correction from the previous gradient, which damps the
+    rotation that plain gradient descent shows on saddle-point problems.
+    """
+    primal =optax.inject_hyperparams(optax.optimistic_gradient_descent)(
         learning_rate=lr,
     )
     dual = optax.inject_hyperparams(optax.optimistic_gradient_descent)(
@@ -212,7 +232,12 @@ def optimistic_gd(lr):
 
 
 def optimistic_adadelta(lr):
-    primal = optax.chain(
+    """Adadelta-scaled optimistic gradient descent for both players.
+
+    Gradients are rescaled per coordinate by Adadelta, then applied with an
+    optimistic step of learning rate ``lr``.
+    """
+    primal =optax.chain(
         optax.scale_by_adadelta(),
         optax.optimistic_gradient_descent(lr),
     )
@@ -227,7 +252,14 @@ def optimistic_adadelta(lr):
 
 
 def gd_dual_momentum(lr, momentum=0.3, nesterov=True):
-    primal = optax.inject_hyperparams(optax.sgd)(
+    """Gradient descent for the primal player and momentum for the dual player.
+
+    Args:
+        lr: Learning rate for both players.
+        momentum: Momentum coefficient of the dual player.
+        nesterov: Use Nesterov momentum for the dual player.
+    """
+    primal =optax.inject_hyperparams(optax.sgd)(
         learning_rate=lr,
     )
     dual = optax.inject_hyperparams(optax.sgd)(

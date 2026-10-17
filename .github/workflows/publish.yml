@@ -2,7 +2,7 @@ name: publish
 
 # Publishes to PyPI when a GitHub release is published. Authentication uses
 # PyPI trusted publishing (OIDC), so no API token is stored in the repository.
-# The release tag must be "v" + the version in pyproject.toml, e.g. v0.2.0.
+# The release tag must be "v" + the version in pyproject.toml, e.g. v0.2.1.
 
 on:
   release:

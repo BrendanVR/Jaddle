@@ -1272,7 +1272,8 @@ def solve(
               criteria (``False`` if the epoch / time budget was exhausted or the
               solve was interrupted).
             * ``"stop_reason"``: ``str``, why the solve terminated:
-              ``"converged"``, ``"max_epochs"``, ``"time_limit"`` (``max_seconds``
+              ``"certificate"`` (the convergence criteria were met, as in
+              ``jaddle_linear.solve``), ``"max_epochs"``, ``"time_limit"`` (``max_seconds``
               exhausted) or ``"interrupted"`` (KeyboardInterrupt).
             * ``"opt_state"``: the final optimiser state, for warm-starting a
               subsequent solve via ``initial_opt_state``.
@@ -1356,7 +1357,7 @@ def solve(
     done = False
     restarts_printed = 0
     is_converged = True
-    stop_reason = "converged"
+    stop_reason = "certificate"
 
     def print_chunk_log(host, epoch_time):
         nonlocal restarts_printed
@@ -1395,15 +1396,17 @@ def solve(
             if max_epochs and count >= max_epochs:
                 is_converged = False
                 stop_reason = "max_epochs"
-                print(f"Reached maximum epochs: {max_epochs}. Stopping.")
-                print("----------------------------------------------")
+                if verbose:
+                    print(f"Reached maximum epochs: {max_epochs}. Stopping.")
+                    print("----------------------------------------------")
                 break
             if max_seconds is not None:
                 if time.time() - solve_entry_time >= max_seconds:
                     is_converged = False
                     stop_reason = "time_limit"
-                    print(f"Reached time limit: {max_seconds}s. Stopping.")
-                    print("----------------------------------------------")
+                    if verbose:
+                        print(f"Reached time limit: {max_seconds}s. Stopping.")
+                        print("----------------------------------------------")
                     break
 
             n_epochs = chunk_epochs
@@ -1461,12 +1464,13 @@ def solve(
 
     output = jax.block_until_ready(output)
     end_time = time.time()
-    print(f"Time to solution: {end_time - start_time:.2f} seconds")
-    print("----------------------------------------------")
-    print(f"Epochs to solution: {count}")
-    print("----------------------------------------------")
-    print(f"Objective: {cp.objective(output.primal):.5e}")
-    print("----------------------------------------------")
+    if verbose:
+        print(f"Time to solution: {end_time - start_time:.2f} seconds")
+        print("----------------------------------------------")
+        print(f"Epochs to solution: {count}")
+        print("----------------------------------------------")
+        print(f"Objective: {cp.objective(output.primal):.5e}")
+        print("----------------------------------------------")
 
     return {
         "solution": output,

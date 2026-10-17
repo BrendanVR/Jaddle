@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.1
+
+### Changed
+
+- Convex `solve`: a solve that meets its convergence criteria now reports
+  `stop_reason="certificate"`, as the LP solver does, instead of
+  `"converged"`.
+- Convex `solve` no longer prints its end-of-solve summary unless
+  `verbose=True`. In both solvers the max-epochs and time-limit messages are
+  printed only with `verbose=True`; the Ctrl-C notice is still always printed.
+
+### Added
+
+- `CITATION.cff`, for GitHub's "Cite this repository".
+- Docstrings for `jaddle_linear.to_jaddle_sparse`,
+  `jaddle_linear.lp_summary_statistics` and the optimisers in
+  `jaddle_optimisers`.
+
 ## 0.2.0
 
 ### Added

@@ -2173,15 +2173,17 @@ def solve(
                 break
             if max_epochs and count >= max_epochs:
                 is_converged = False
-                print(f"Reached maximum epochs: {max_epochs}. Stopping.")
-                print("----------------------------------------------")
+                if verbose:
+                    print(f"Reached maximum epochs: {max_epochs}. Stopping.")
+                    print("----------------------------------------------")
                 break
             if max_seconds is not None:
                 if time.time() - solve_entry_time >= max_seconds:
                     is_converged = False
                     stop_reason = "time_limit"
-                    print(f"Reached time limit: {max_seconds}s. Stopping.")
-                    print("----------------------------------------------")
+                    if verbose:
+                        print(f"Reached time limit: {max_seconds}s. Stopping.")
+                        print("----------------------------------------------")
                     break
 
             n_epochs = chunk_epochs
@@ -3535,6 +3537,19 @@ def __relaxed_primal_repair(highs, lower, upper, row_lower, row_upper):
 
 # %%
 def to_jaddle_sparse(lp: LP):
+    """Convert an ``LP`` of NumPy and SciPy sparse arrays to a ``JaddleLP``.
+
+    The vectors become JAX arrays and the constraint matrices JAX ``BCOO``
+    sparse arrays, all in the dtype of the active precision profile (see
+    ``jaddle_optimisers.configure_jax``). ``solve`` converts an ``LP`` itself;
+    call this to get at the ``JaddleLP``, e.g. for its ``values()``.
+
+    Args:
+        lp: The LP to convert.
+
+    Returns:
+        JaddleLP: The same LP on the device.
+    """
     float_dtype, _ = __profile_dtypes()
 
     lp_jax = JaddleLP(
@@ -3550,6 +3565,16 @@ def to_jaddle_sparse(lp: LP):
 
 
 def lp_summary_statistics(lp: LP):
+    """Print an LP's dimensions, nonzero counts and coefficient ranges.
+
+    The ranges of ``A_eq`` and ``A_ineq`` cover their stored entries and zero.
+    Extreme or widely spread coefficients are the usual cause of a slow or
+    stalled solve, so this is the first thing to check when an instance
+    misbehaves.
+
+    Args:
+        lp: The LP to summarise.
+    """
     num_vars = lp.num_variables()
     num_eq = lp.num_eq_constraints()
     num_ineq = lp.num_ineq_constraints()
