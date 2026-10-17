@@ -78,8 +78,8 @@ therefore amount to passing a value back in. The solver keeps no hidden mutable
 state.
 
 **A small, readable codebase.** Because the compiler handles fusion, memory
-layout and device placement, the full library is roughly 5,700 lines of
-Python. Algorithms remain close to their mathematical description, which makes
+layout and device placement, the full library is roughly 8,600 lines of
+Python, docstrings included. Algorithms remain close to their mathematical description, which makes
 Jaddle well suited to research and experimentation.
 
 ## Installation
@@ -571,10 +571,33 @@ recompilation.
 ## Benchmarks
 
 Jaddle's LP solver is evaluated on the LP relaxations of the 383 MIPLIB 2017
-instances used in the PDLP papers (100k–10M nonzeros). With default solver
-settings, HiGHS presolve, a relative tolerance of `1e-4` and a 600-second
-limit per instance, Jaddle certifies optimality on **377 of the 383**
-instances. Two instances are rendered empty by HiGHS presolve. We achieved an SGM10 of **7.45 seconds** for the full solve, with a corrected score of **5.35 seconds** when removing Jaddles problem scaling and compile time overheads. 
+instances used in the PDLP papers (100k–10M nonzeros). The run below used
+default solver settings in float64, HiGHS presolve, a relative tolerance of
+`1e-4` and a 600-second limit per instance, on one NVIDIA GeForce RTX 5070 Ti
+Laptop GPU.
+
+| Outcome | Instances |
+|---|---|
+| Certified optimal on the HiGHS-presolved LP | **376 / 383** (one settled by presolve itself) |
+| Certified optimal on the original LP, after HiGHS postsolve | **295 / 383** |
+| Time limit reached | 6 |
+| Could not be read by HiGHS (`rvb-sub`) | 1 |
+
+The two certificates differ because postsolve can enlarge a first-order
+solution's small dual errors, and because presolve can rescale a problem
+drastically, which changes what a relative tolerance means (see
+*Presolve and postsolve* above). `jl.solve_with_polishing` and
+`jl.crossover` can tighten a postsolved point when the original certificate
+matters.
+
+Shifted geometric means of the solve time (shift 10 s, unsolved instances
+counted at the 600-second limit, as in the PDLP papers):
+
+| Time measured | SGM10 |
+|---|---|
+| Iteration loop, including the first-epoch compile (`solve_seconds`) | 8.62 s |
+| Iteration loop with the compile amortised out (`corrected_seconds`) | 6.42 s |
+| Wall clock, including presolve, scaling and setup | 12.98 s |
 
 The benchmark harnesses, instance diagnostics and instructions for reproducing
 these results are described in [`benchmarks/README.md`](https://github.com/BrendanVR/Jaddle/blob/main/benchmarks/README.md).
@@ -592,6 +615,7 @@ these results are described in [`benchmarks/README.md`](https://github.com/Brend
 | [`examples/`](https://github.com/BrendanVR/Jaddle/blob/main/examples/README.md) | Worked LP and convex examples |
 | [`benchmarks/`](https://github.com/BrendanVR/Jaddle/blob/main/benchmarks/README.md) | MIPLIB and convex benchmark harnesses |
 | [`tests/`](https://github.com/BrendanVR/Jaddle/tree/main/tests) | Test suite (`pytest`) |
+| [`CHANGELOG.md`](https://github.com/BrendanVR/Jaddle/blob/main/CHANGELOG.md) | Changes in each release |
 
 ## License
 

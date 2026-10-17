@@ -11,10 +11,10 @@
 # directory at the repo root. This harness globs whatever is present there.
 #
 # Usage:
-#     python examples/lp/benchmark.py
-#     python examples/lp/benchmark.py --max-mb 50          # skip huge instances
-#     python examples/lp/benchmark.py --only stp3d boeing  # subset by name
-#     python examples/lp/benchmark.py --tol 1e-4 --max-epochs 500
+#     python benchmarks/benchmark.py
+#     python benchmarks/benchmark.py --max-mb 50          # skip huge instances
+#     python benchmarks/benchmark.py --only stp3d boeing  # subset by name
+#     python benchmarks/benchmark.py --tol 1e-4 --max-epochs 500
 
 # %%
 import os

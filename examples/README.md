@@ -20,7 +20,7 @@ python examples/lp/intro_example.py
 | Example | What it shows | Extra dependencies |
 |---|---|---|
 | [`intro_example.py`](lp/intro_example.py) | The smallest end-to-end LP: build an `LP` from NumPy/SciPy arrays, call `jl.solve`, and read off the primal solution and objective. | — |
-| [`miplib_standard.py`](lp/miplib_standard.py) | Load a MIPLIB instance with HiGHS, relax integrality, convert it to Jaddle's sparse standard form with `highs_to_standard_form_sparse`, and solve it. | `highspy`, a MIPLIB `.mps` file |
+| [`miplib.py`](lp/miplib.py) | Load a MIPLIB instance with HiGHS, relax integrality, and solve it with `jl.solve_with_presolve`: HiGHS presolve, a Jaddle solve with feasibility polishing, crossover to a basic solution, and postsolve back to the original model. | a MIPLIB `.mps` file |
 | [`battery_sizing.py`](lp/battery_sizing.py) | Batched, differentiable solves: size a battery by gradient descent, where each step solves 32 daily operating LPs at once with `jax.vmap` and differentiates their optimal costs with `jl.make_optimal_value`. The battery's price has economies of scale, so the sizing problem is not one large LP. Checks the result with a second run from a different start and plots the design's convergence and a day's schedule. | `matplotlib` |
 
 ### `intro_example.py`
@@ -38,17 +38,20 @@ l ≤ x ≤ u`, so the `≥` constraint is negated to become `-x1 - x2 ≤ -4`. 
 example runs on CPU because the problem is tiny. The expected answer is
 `x = (0, 4)` with objective `8`.
 
-### `miplib_standard.py`
+### `miplib.py`
 
 The MPS files are **not** shipped with Jaddle. Download the instances you want
 from the [MIPLIB website](https://miplib.zib.de/) and put the `.mps` files in
 `data/` at the repo root. The script reads `data/<PROBLEM_NAME>.mps` (default
-`app1-2`, no presolve, `float64`); edit `PROBLEM_NAME` (or `PATH_TO_MPS`) at the
-top of the file to change instance.
+`stp3d`, `float64`); edit `PROBLEM_NAME` (or `PATH_TO_MPS`) at the top of the
+file to change instance.
 
-The script calls `jl.lp_summary_statistics(lp)` before solving, which prints
-the problem size and coefficient ranges. This is a good first check when an
-instance misbehaves. A GPU is strongly recommended for these.
+It asks for tight feasibility (`1e-8`) with a looser gap (`1e-4`), the case
+feasibility polishing is built for, then crosses over to a vertex and prints
+the objective and the original problem's certificate residuals. When an
+instance misbehaves, `jl.lp_summary_statistics(lp)` prints its size and
+coefficient ranges, which is a good first check. A GPU is strongly
+recommended for these.
 
 ### `battery_sizing.py`
 

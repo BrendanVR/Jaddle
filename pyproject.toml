@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jaddle"
-version = "0.1.0"
+version = "0.2.0"
 description = "First-order primal-dual solvers for large-scale linear and convex programs, written in JAX"
 readme = "README.md"
 license = "MIT"
@@ -52,6 +52,7 @@ dev = ["jaddle[examples,test]", "build", "twine"]
 Homepage = "https://github.com/BrendanVR/Jaddle"
 Source = "https://github.com/BrendanVR/Jaddle"
 Issues = "https://github.com/BrendanVR/Jaddle/issues"
+Changelog = "https://github.com/BrendanVR/Jaddle/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 include = ["jaddle*"]
