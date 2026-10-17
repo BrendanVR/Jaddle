@@ -26,7 +26,7 @@ jo.configure_jax("float32")
 print(jax.devices())
 rng = np.random.default_rng(0)
 
-n, d = 20000, 1000
+n, d = 20000, 5000
 Xm = jnp.asarray(rng.standard_normal((n, d)))
 wt = np.zeros(d)
 wt[:20] = 1
@@ -81,6 +81,9 @@ if __name__ == "__main__":
                 primal_feasibility_tolerance=1e-4,
                 complementarity_slack_tolerance=1e-4,
                 verbose=args.jaddle_verbose,
+                diag_adapt=True,
+                gradient_scaling=True,
+                restarts=True,
             )
         ep = out["epochs"]
         print(
