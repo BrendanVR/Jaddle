@@ -31,6 +31,7 @@ up on demanding benchmarks.
 - [Quick start](#quick-start)
 - [The linear programming solver](#the-linear-programming-solver)
 - [The convex programming solver](#the-convex-programming-solver)
+- [Modelling with CVXPY](#modelling-with-cvxpy)
 - [Numerical precision](#numerical-precision)
 - [Benchmarks](#benchmarks)
 - [Repository layout](#repository-layout)
@@ -105,7 +106,8 @@ can be combined, for example `pip install "jaddle[cuda12,examples]"`:
 | `cuda12`, `cuda13` | CUDA-enabled JAX | GPU execution. Choose the extra that matches your CUDA driver; see the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) for TPU and other platforms. |
 | `examples` | `matplotlib`, `scikit-learn` | The convex examples |
 | `benchmarks` | `mpax` | The benchmarks |
-| `test` | `pytest` | Running the test suite |
+| `cvxpy` | `cvxpy` | [Modelling with CVXPY](#modelling-with-cvxpy) |
+| `test` | `pytest`, `cvxpy` | Running the test suite |
 | `dev` | `examples`, `test`, `build`, `twine` | Development and packaging |
 
 Jaddle is developed on Linux, including WSL 2. Continuous integration tests
@@ -130,8 +132,9 @@ pytest
 
 The suite runs on CPU in double precision and takes well under a minute. It
 checks both solvers against exact or reference solutions (SciPy's HiGHS
-interface for LPs, closed-form solutions for the convex problems), the
-defined-variable presolve, and the self-contained examples. GitHub Actions runs
+interface for LPs, closed-form solutions for the convex problems, Clarabel
+for the CVXPY front end), the defined-variable presolve, and the
+self-contained examples. GitHub Actions runs
 it on every push and pull request.
 
 ## Quick start
@@ -558,6 +561,70 @@ The stopping test is supplied through `JaddleCP`'s optional `residuals`
 argument, a function of the solver state that returns the three quantities
 `solve` tests. Any problem with a better certificate of its own can use it.
 
+## Modelling with CVXPY
+
+[CVXPY](https://www.cvxpy.org/) can serve as the modelling language
+(`pip install "jaddle[cvxpy]"`). `jaddle.jaddle_cvxpy` offers two routes, and
+both return results the CVXPY way: `problem.status`, `problem.value`,
+`var.value`, each constraint's `dual_value`, and Jaddle's full result in
+`problem.solver_stats.extra_stats`.
+
+```python
+import cvxpy as cp
+import jaddle.jaddle_cvxpy as jcv
+
+w = cp.Variable(p)
+
+# An LP or QP: Jaddle as a CVXPY solver.
+lasso = cp.Problem(cp.Minimize(cp.sum_squares(X @ w - y) + cp.norm1(w)))
+lasso.solve(solver=jcv.JaddleSolver(), tol=1e-6)
+
+# Any other DCP problem: compiled to a JaddleCP.
+logistic = cp.Problem(cp.Minimize(cp.sum(cp.logistic(-cp.multiply(labels, X @ w)))))
+jcv.solve(logistic, tol=1e-6)
+```
+
+**`JaddleSolver`** is a CVXPY QP solver. CVXPY reduces the problem to
+`min ½xᵀPx + qᵀx  s.t.  Ax = b, Fx ≤ g, l ≤ x ≤ u`, piecewise-linear terms
+included. An LP then goes through `jl.solve_with_presolve` (HiGHS presolve,
+Jaddle, HiGHS postsolve; `presolve=False` skips it), and a QP through
+`jc.quadratic_program`. A presolved LP whose postsolved point misses the
+tolerance on the original problem is reported as `"optimal_inaccurate"`.
+
+**`jcv.solve`** handles the rest. For a general convex problem CVXPY's own
+reductions produce cones (exponential, second-order, PSD), and Jaddle has no
+cone projections. The cone form is also a poor fit for a first-order method:
+on the L1-logistic regression in
+[`examples/cp/cvxpy_lasso.py`](https://github.com/BrendanVR/Jaddle/blob/main/examples/cp/cvxpy_lasso.py) it has 701
+variables, 1500 rows and 400 exponential cones. `jcv.compile_problem` instead
+walks the expression tree and builds a `JaddleCP` of JAX functions, with 101
+variables and 100 linear rows for that problem:
+
+- smooth atoms stay smooth: `logistic`, `log_sum_exp`, `exp`, `huber`,
+  `sum_squares`, `quad_form`, `quad_over_lin` with a constant denominator,
+  even powers, and p-norms with p ≥ 1;
+- piecewise-linear atoms (`abs`, `maximum`, `max`, `norm1`, `norm_inf`, and
+  their concave mirrors `minimum` and `min`; `pos` and `neg` are written with
+  these) become epigraph variables with one linear row per piece. This is
+  exact for a DCP problem. With `epigraph=False` they are left as they are;
+- variable attributes (`nonneg`, `nonpos`, `bounds=`) and constraints that
+  bound a whole variable by a constant (`x >= 0`) become Jaddle's box, which
+  costs no dual. The bound constraints' duals are recovered from the reduced
+  gradient.
+
+Atoms with a restricted domain (`log`, `sqrt`, `entr`, ...) and second-order
+or PSD constraints raise `NotImplementedError`: Jaddle keeps its iterates
+inside the box only, so they would leave the domain. A problem that CVXPY can
+put in QP form goes to `JaddleSolver` unless `qp_route=False`, so it gets
+presolve or KKT scaling. The compiled problem is solved by `jc.solve` with
+adaptive extragradient, restarts and gradient scaling (`jcv.COMPILED_DEFAULTS`).
+Any other `jc.solve` options can be passed as keyword arguments.
+
+`tol` sets every tolerance, whichever route the problem takes. It defaults to
+`1e-6`, not the `1e-3` of Jaddle's own functions, since CVXPY users expect a
+solver to reach that. The QP route's tolerances are relative and the compiled
+route's absolute, as in the functions they call.
+
 ## Numerical precision
 
 Call `jaddle.jaddle_optimisers.configure_jax(profile)` before creating any
@@ -613,6 +680,7 @@ these results are described in [`benchmarks/README.md`](https://github.com/Brend
 |---|---|
 | [`jaddle/jaddle_linear.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_linear.py) | LP solver, scaling, certification and polishing |
 | [`jaddle/jaddle_convex.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_convex.py) | Convex solver |
+| [`jaddle/jaddle_cvxpy.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_cvxpy.py) | CVXPY front end |
 | [`jaddle/jaddle_basic_types.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_basic_types.py) | `SaddleState`, `JaddleCP`, `LP` and `JaddleLP` |
 | [`jaddle/jaddle_optimisers.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_optimisers.py) | Precision profiles and Optax saddle-point optimisers |
 | [`jaddle/presolve.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/presolve.py) | Defined-variable elimination and postsolve |

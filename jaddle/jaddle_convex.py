@@ -912,11 +912,12 @@ def _device_solver(
         complementarity_slack,
         constraint_bound,
     ):
-        # True while NOT yet converged.
-        return (
-            (primal_grad_norm > primal_grad_norm_tolerance)
-            | (complementarity_slack > complementarity_slack_tolerance)
-            | (constraint_bound > primal_feasibility_tolerance)
+        # True while NOT yet converged. Written as the negation of "all within
+        # tolerance" so that a NaN residual (a diverged solve) never certifies.
+        return ~(
+            (primal_grad_norm <= primal_grad_norm_tolerance)
+            & (complementarity_slack <= complementarity_slack_tolerance)
+            & (constraint_bound <= primal_feasibility_tolerance)
         )
 
     if initial_solution is None:

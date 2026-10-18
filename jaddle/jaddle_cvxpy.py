@@ -1,0 +1,850 @@
+"""
+CVXPY as a modelling front end for Jaddle.
+
+Two routes, both returning results the CVXPY way (``prob.status``,
+``prob.value``, ``var.value``, ``constraint.dual_value``):
+
+* ``JaddleSolver`` is a CVXPY QP solver: ``prob.solve(solver=JaddleSolver())``
+  solves any problem CVXPY can put in QP form
+  ``min ½xᵀPx + qᵀx  s.t.  Ax = b, Fx <= g, lower <= x <= upper``. An LP
+  (``P = 0``) goes through ``jaddle_linear.solve_with_presolve`` (HiGHS
+  presolve, then Jaddle, then HiGHS postsolve), a QP through
+  ``jaddle_convex.quadratic_program``.
+* ``solve(prob)`` handles general convex problems. CVXPY's own route would
+  rewrite them into cones (exponential, second-order), which Jaddle cannot
+  project onto and which turn a smooth loss such as the logistic into many
+  extra variables and rows. Instead ``compile_problem`` walks the expression
+  tree and builds a ``JaddleCP`` of JAX functions for
+  ``jaddle_convex.solve``: smooth atoms stay smooth, and only piecewise-linear
+  ones (``abs``, ``maximum``, ``norm1``, ...) become epigraph variables and
+  linear rows. CVXPY still checks that the problem is DCP. A problem CVXPY
+  can put in QP form goes to ``JaddleSolver`` instead, unless
+  ``qp_route=False``.
+
+CVXPY is an optional dependency (``pip install jaddle[cvxpy]``) and
+``import jaddle`` does not import it.
+
+Unless given, every tolerance defaults to ``DEFAULT_TOLERANCE`` (1e-6), the
+accuracy CVXPY users expect of a solver, rather than the 1e-3 of Jaddle's own
+functions. On the QP route the tolerances are relative (as
+``jaddle_linear.solve`` and ``jaddle_convex.quadratic_program`` test them), on
+the compiled route absolute (as ``jaddle_convex.solve`` tests them).
+"""
+
+import time
+
+import cvxpy as cp
+import cvxpy.settings as s
+import jax
+import jax.numpy as jnp
+import jax.scipy.special as jss
+import numpy as np
+import scipy.sparse as sp
+from cvxpy.atoms.affine.add_expr import AddExpression
+from cvxpy.atoms.affine.binary_operators import (
+    DivExpression,
+    MulExpression,
+    multiply,
+)
+from cvxpy.atoms.affine.broadcast_to import broadcast_to
+from cvxpy.atoms.affine.concatenate import Concatenate
+from cvxpy.atoms.affine.diag import diag_mat, diag_vec
+from cvxpy.atoms.affine.hstack import Hstack
+from cvxpy.atoms.affine.index import index, special_index
+from cvxpy.atoms.affine.promote import Promote
+from cvxpy.atoms.affine.reshape import reshape
+from cvxpy.atoms.affine.sum import Sum
+from cvxpy.atoms.affine.trace import Trace
+from cvxpy.atoms.affine.transpose import transpose
+from cvxpy.atoms.affine.unary_operators import NegExpression
+from cvxpy.atoms.affine.vstack import Vstack
+from cvxpy.atoms.elementwise.abs import abs as cvx_abs
+from cvxpy.atoms.elementwise.exp import exp as cvx_exp
+from cvxpy.atoms.elementwise.huber import huber
+from cvxpy.atoms.elementwise.logistic import logistic
+from cvxpy.atoms.elementwise.maximum import maximum
+from cvxpy.atoms.elementwise.minimum import minimum
+from cvxpy.atoms.elementwise.power import Power
+from cvxpy.atoms.log_sum_exp import log_sum_exp
+from cvxpy.atoms.max import max as cvx_max
+from cvxpy.atoms.min import min as cvx_min
+from cvxpy.atoms.norm1 import norm1
+from cvxpy.atoms.norm_inf import norm_inf
+from cvxpy.atoms.pnorm import Pnorm
+from cvxpy.atoms.quad_form import QuadForm
+from cvxpy.atoms.quad_over_lin import quad_over_lin
+from cvxpy.constraints import Equality, Inequality, NonNeg, NonPos, Zero
+from cvxpy.expressions.constants.constant import Constant
+from cvxpy.expressions.constants.parameter import Parameter
+from cvxpy.expressions.variable import Variable
+from cvxpy.problems.problem import SolverStats
+from cvxpy.reductions.solution import Solution, failure_solution
+from cvxpy.reductions.solvers import utilities
+from cvxpy.reductions.solvers.qp_solvers.qp_solver import QpSolver
+
+import jaddle.jaddle_convex as jc
+import jaddle.jaddle_linear as jl
+import jaddle.jaddle_optimisers as jo
+from jaddle.jaddle_basic_types import LP, JaddleCP, SaddleState, scipy_to_bcoo
+
+DEFAULT_TOLERANCE = 1e-6
+
+# The stepping jaddle_convex.solve gets unless overridden: the best general
+# configuration of benchmarks/benchmark_convex.py. Its own default (alternating
+# steps of fixed size) diverges on the free, curvature-free columns CVXPY's
+# QP form introduces.
+QP_DEFAULTS = dict(
+    update_mode="extragradient",
+    adaptive_eta=0.5,
+    restarts=True,
+    epochs_per_restart=5,
+)
+
+# The compiled route adds gradient scaling ("eg_ad_rs_gs"), since a compiled
+# problem is not equilibrated.
+COMPILED_DEFAULTS = dict(QP_DEFAULTS, gradient_scaling=True)
+
+_LIMIT_STOPS = ("max_epochs", "time_limit", "interrupted", "primal_stall")
+
+
+def _status(result):
+    """The CVXPY status of a Jaddle result: ``OPTIMAL`` when certified,
+    ``OPTIMAL_INACCURATE`` when only the presolved LP certified (postsolve
+    can enlarge a first-order point's residuals), ``USER_LIMIT`` for a budget
+    or stall stop (the point is still returned)."""
+    stop = result["stop_reason"]
+    if stop == "presolve_infeasible":
+        return s.INFEASIBLE
+    if stop == "presolve_unbounded_or_infeasible":
+        return s.INFEASIBLE_OR_UNBOUNDED
+    if result["converged"]:
+        return s.OPTIMAL
+    if stop == "certificate":
+        return s.OPTIMAL_INACCURATE
+    if stop in _LIMIT_STOPS:
+        return s.USER_LIMIT
+    return s.SOLVER_ERROR
+
+
+def _with_tolerances(options, keys):
+    """``options`` with each tolerance in ``keys`` set to ``options["tol"]``
+    (default ``DEFAULT_TOLERANCE``) unless given by name."""
+    options = dict(options)
+    tol = options.pop("tol", None)
+    for key in keys:
+        options.setdefault(key, DEFAULT_TOLERANCE if tol is None else tol)
+    return options
+
+
+_QP_TOLERANCES = (
+    "primal_feasibility_tolerance",
+    "dual_feasibility_tolerance",
+    "dual_gap_tolerance",
+)
+_COMPILED_TOLERANCES = (
+    "primal_grad_norm_tolerance",
+    "primal_feasibility_tolerance",
+    "complementarity_slack_tolerance",
+)
+
+
+# %%
+# Route 1: a CVXPY QP solver
+
+
+class JaddleSolver(QpSolver):
+    """
+    Jaddle as a CVXPY QP solver: ``prob.solve(solver=JaddleSolver(), **opts)``.
+
+    An LP is solved by ``jaddle_linear.solve_with_presolve``; ``presolve=False``
+    solves it with ``jaddle_linear.solve`` directly instead. A QP is solved by
+    ``jaddle_convex.quadratic_program``, with ``QP_DEFAULTS`` for its
+    stepping. The other keyword arguments of ``prob.solve`` go to whichever
+    of these runs (``verbose`` included). ``tol`` sets the three relative
+    tolerances (``primal_feasibility_tolerance``,
+    ``dual_feasibility_tolerance``, ``dual_gap_tolerance``) that are not given
+    by name; it defaults to ``DEFAULT_TOLERANCE``.
+
+    ``warm_start=True`` starts a QP, or an LP with ``presolve=False``, from the
+    previous solve's point when the problem's sizes are unchanged. (The
+    presolved LP's variables are not the problem's, so the presolve route
+    always starts cold.)
+
+    ``prob.solver_stats.extra_stats`` is Jaddle's result dict (certificate,
+    epochs, stop reason, presolve sizes).
+    """
+
+    MIP_CAPABLE = False
+    BOUNDED_VARIABLES = True
+
+    def name(self):
+        return "JADDLE"
+
+    def import_solver(self) -> None:
+        import jaddle  # noqa: F401
+
+    def solve_via_data(
+        self, data, warm_start: bool, verbose: bool, solver_opts, solver_cache=None
+    ):
+        options = _with_tolerances(solver_opts, _QP_TOLERANCES)
+        options["verbose"] = verbose
+        presolve = options.pop("presolve", True)
+
+        P, q = data[s.P], np.asarray(data[s.Q], dtype=np.float64)
+        n = q.shape[0]
+        lower, upper = data[s.LOWER_BOUNDS], data[s.UPPER_BOUNDS]
+        lower = np.full(n, -np.inf) if lower is None else np.asarray(lower, float)
+        upper = np.full(n, np.inf) if upper is None else np.asarray(upper, float)
+        problem = dict(
+            A_eq=sp.csc_matrix(data[s.A]),
+            b_eq=np.asarray(data[s.B], dtype=np.float64),
+            A_ineq=sp.csc_matrix(data[s.F]),
+            b_ineq=np.asarray(data[s.G], dtype=np.float64),
+        )
+        is_lp = P.nnz == 0 or not np.any(P.data)
+
+        initial = None
+        cached = None if solver_cache is None else solver_cache.get(self.name())
+        if warm_start and cached is not None and not (is_lp and presolve):
+            if (
+                cached.primal.shape[0] == n
+                and cached.dual_eq.shape[0] == problem["A_eq"].shape[0]
+                and cached.dual_ineq.shape[0] == problem["A_ineq"].shape[0]
+            ):
+                initial = cached
+        if initial is not None:
+            options.setdefault("initial_solution", initial)
+
+        start = time.time()
+        if is_lp:
+            lp = LP(
+                q,
+                problem["A_eq"],
+                problem["b_eq"],
+                problem["A_ineq"],
+                problem["b_ineq"],
+                lower,
+                upper,
+            )
+            if presolve:
+                result = jl.solve_with_presolve(lp, **options)
+            else:
+                result = jl.solve(jl.to_jaddle_sparse(lp), **options)
+                result["objective"] = float(q @ np.asarray(result["solution"].primal))
+        else:
+            Q = sp.csr_matrix(P)
+            result = jc.quadratic_program(
+                Q=0.5 * (Q + Q.T),
+                c=q,
+                lower_bounds=lower,
+                upper_bounds=upper,
+                **problem,
+                **{**QP_DEFAULTS, **options},
+            )
+        result["wall_seconds"] = time.time() - start
+
+        solution = result["solution"]
+        if solution is not None:
+            # solve() may pad an empty block with one zero row.
+            solution = SaddleState(
+                primal=np.asarray(solution.primal, dtype=np.float64),
+                dual_ineq=np.asarray(solution.dual_ineq, dtype=np.float64)[
+                    : problem["A_ineq"].shape[0]
+                ],
+                dual_eq=np.asarray(solution.dual_eq, dtype=np.float64)[
+                    : problem["A_eq"].shape[0]
+                ],
+            )
+            result["solution"] = solution
+            if solver_cache is not None:
+                solver_cache[self.name()] = solution
+        return result
+
+    def invert(self, results, inverse_data):
+        status = _status(results)
+        attr = {
+            s.SOLVE_TIME: results.get("solve_seconds", results["wall_seconds"]),
+            s.NUM_ITERS: results.get("epochs"),
+            s.EXTRA_STATS: results,
+        }
+        if status not in s.SOLUTION_PRESENT:
+            return failure_solution(status, attr)
+        solution = results["solution"]
+        # Jaddle's Lagrangian ½xᵀPx + qᵀx + y_eqᵀ(Ax - b) + y_ineqᵀ(Fx - g),
+        # y_ineq >= 0, is the convention CVXPY's QP duals use (as OSQP's).
+        y = np.concatenate([solution.dual_eq, solution.dual_ineq])
+        n_eq = inverse_data[self.DIMS].zero
+        dual_vars = utilities.get_dual_values(
+            y[:n_eq], utilities.extract_dual_value, inverse_data[self.EQ_CONSTR]
+        ) | utilities.get_dual_values(
+            y[n_eq:], utilities.extract_dual_value, inverse_data[self.NEQ_CONSTR]
+        )
+        return Solution(
+            status,
+            results["objective"] + inverse_data[s.OFFSET],
+            {self.VAR_ID: solution.primal},
+            dual_vars,
+            attr,
+        )
+
+    def cite(self, data):
+        return ""
+
+
+# %%
+# Route 2: compiling the expression tree to a JaddleCP
+
+
+def _safe_norm(v, axis=None, keepdims=False):
+    """The 2-norm with gradient 0 instead of NaN at the origin."""
+    squared = jnp.sum(v * v, axis=axis, keepdims=keepdims)
+    positive = squared > 0
+    return jnp.where(positive, jnp.sqrt(jnp.where(positive, squared, 1.0)), 0.0)
+
+
+def _safe_pnorm(v, p, axis=None, keepdims=False):
+    total = jnp.sum(jnp.abs(v) ** p, axis=axis, keepdims=keepdims)
+    positive = total > 0
+    return jnp.where(positive, jnp.where(positive, total, 1.0) ** (1.0 / p), 0.0)
+
+
+def _huber(v, M):
+    a = jnp.abs(v)
+    return jnp.where(a <= M, v * v, 2 * M * a - M * M)
+
+
+def _expand(t, axis, keepdims, ndim):
+    """``t``, the result of a reduction over ``axis``, broadcastable against
+    the reduced argument again."""
+    if axis is None:
+        return jnp.reshape(t, (1,) * ndim)
+    if keepdims:
+        return t
+    axes = (axis,) if isinstance(axis, int) else tuple(axis)
+    return jnp.expand_dims(t, tuple(a % ndim for a in axes))
+
+
+def _jax_key(key):
+    """A CVXPY index key as JAX accepts it: lists, which NumPy reads as
+    integer arrays, as arrays."""
+    if isinstance(key, list):
+        return np.asarray(key)
+    if isinstance(key, tuple):
+        return tuple(np.asarray(k) if isinstance(k, list) else k for k in key)
+    return key
+
+
+def _even_integer(p):
+    return float(p).is_integer() and int(p) % 2 == 0
+
+
+class CompiledProblem:
+    """A CVXPY problem as a ``JaddleCP`` (``cp``), with what is needed to map
+    a solution back. Built by ``compile_problem``.
+
+    * ``variables``: ``{var.id: (offset, shape)}`` within the primal vector,
+      which also holds the epigraph variables (``num_epigraph`` entries).
+    * ``rows``: ``{constraint.id: ("eq" | "ineq", offset, shape)}`` within
+      ``dual_eq`` / ``dual_ineq``.
+    * ``bounds``: ``{constraint.id: (var.id, side, mask)}`` for the
+      constraints held as box bounds, ``side`` +1 for an upper bound and -1
+      for a lower one; ``mask`` marks the entries whose bound is that
+      constraint's (the box keeps the tightest of several).
+    * ``sign``: -1 for a maximisation, solved as the minimisation of ``-f``.
+    """
+
+    def __init__(self, cp, variables, rows, bounds, sign, num_epigraph):
+        self.cp = cp
+        self.variables = variables
+        self.rows = rows
+        self.bounds = bounds
+        self.sign = sign
+        self.num_epigraph = num_epigraph
+
+
+class _Compiler:
+    def __init__(self, epigraph, dtype):
+        self.epigraph = epigraph
+        self.dtype = dtype
+        self.size = 0
+        self.lower, self.upper = [], []
+        self.variables = {}
+        self.eq_rows, self.ineq_rows = [], []
+        self.eq_size, self.ineq_size = 0, 0
+        self.num_epigraph = 0
+        self.memo = {}
+
+    # -- variables and rows
+
+    def block(self, shape, lower=-np.inf, upper=np.inf):
+        """A new slice of the primal vector, as ``x -> array of shape``."""
+        offset, size = self.size, int(np.prod(shape, dtype=int))
+        self.size += size
+        self.lower.append(np.broadcast_to(np.asarray(lower, float), shape).ravel())
+        self.upper.append(np.broadcast_to(np.asarray(upper, float), shape).ravel())
+        return offset, lambda x: jnp.reshape(x[offset : offset + size], shape)
+
+    def row(self, kind, fn, shape):
+        """Add rows ``fn(x)`` (``= 0`` or ``<= 0``); returns their offset."""
+        size = int(np.prod(shape, dtype=int))
+
+        def flat(x):
+            return jnp.ravel(jnp.broadcast_to(fn(x), shape))
+
+        if kind == "eq":
+            offset, self.eq_size = self.eq_size, self.eq_size + size
+            self.eq_rows.append(flat)
+        else:
+            offset, self.ineq_size = self.ineq_size, self.ineq_size + size
+            self.ineq_rows.append(flat)
+        return offset
+
+    def epigraph_variable(self, expr, concave=False):
+        """An epigraph (or, ``concave``, hypograph) variable for ``expr``,
+        bounded by the atom's sign."""
+        lower = 0.0 if expr.is_nonneg() else -np.inf
+        upper = 0.0 if expr.is_nonpos() else np.inf
+        _, t = self.block(expr.shape, lower, upper)
+        self.num_epigraph += int(np.prod(expr.shape, dtype=int))
+        return t
+
+    def add_variable(self, var):
+        attributes = {
+            k: v
+            for k, v in var.attributes.items()
+            if v is not False and v is not None
+        }
+        lower, upper = -np.inf, np.inf
+        bounds = attributes.pop("bounds", None)
+        if bounds is not None:
+            lb, ub = bounds
+            value = lambda b: b.value if isinstance(b, cp.Expression) else b
+            lower = -np.inf if lb is None else value(lb)
+            upper = np.inf if ub is None else value(ub)
+        if attributes.pop("nonneg", False) | attributes.pop("pos", False):
+            lower = np.maximum(lower, 0.0)
+        if attributes.pop("nonpos", False) | attributes.pop("neg", False):
+            upper = np.minimum(upper, 0.0)
+        if attributes:
+            raise NotImplementedError(
+                f"variable {var.name()}: attributes {sorted(attributes)} are not"
+                " supported by the compiled route"
+            )
+        offset, fn = self.block(var.shape, lower, upper)
+        self.variables[var.id] = (offset, var.shape)
+        self.memo[var.id] = fn
+
+    # -- expressions
+
+    def constant(self, value, dense=True):
+        if sp.issparse(value):
+            if dense:
+                return jnp.asarray(value.toarray(), self.dtype)
+            return scipy_to_bcoo(value, self.dtype)
+        return jnp.asarray(value, self.dtype)
+
+    def expr(self, e):
+        """``x -> value of e`` as a JAX function of the primal vector."""
+        # Constants carry no id; a shared subexpression is built once.
+        key = getattr(e, "id", None) or id(e)
+        if key not in self.memo:
+            self.memo[key] = self._build(e)
+        return self.memo[key]
+
+    def _args(self, e):
+        return [self.expr(a) for a in e.args]
+
+    def _build(self, e):
+        if isinstance(e, Variable):
+            raise ValueError(f"variable {e.name()} is not one of the problem's")
+        if isinstance(e, (Constant, Parameter)):
+            if e.value is None:
+                raise ValueError(f"parameter {e.name()} has no value")
+            value = self.constant(e.value)
+            return lambda x: value
+
+        # Affine atoms. multiply (elementwise) subclasses MulExpression
+        # (matmul), so it is tested first.
+        if isinstance(e, multiply):
+            f, g = self._args(e)
+            return lambda x: f(x) * g(x)
+        if isinstance(e, MulExpression):
+            lhs, rhs = e.args
+            if lhs.ndim == 0 or rhs.ndim == 0:
+                # CVXPY also writes a product with a scalar as a MulExpression.
+                f, g = self._args(e)
+                return lambda x: f(x) * g(x)
+            if isinstance(lhs, (Constant, Parameter)) and sp.issparse(lhs.value):
+                A, g = self.constant(lhs.value, dense=False), self.expr(rhs)
+                return lambda x: A @ g(x)
+            f, g = self._args(e)
+            return lambda x: f(x) @ g(x)
+        if isinstance(e, AddExpression):
+            fs = self._args(e)
+            return lambda x: sum((f(x) for f in fs[1:]), fs[0](x))
+        if isinstance(e, NegExpression):
+            (f,) = self._args(e)
+            return lambda x: -f(x)
+        if isinstance(e, DivExpression):
+            f, g = self._args(e)
+            return lambda x: f(x) / g(x)
+        if isinstance(e, (index, special_index)):
+            # CVXPY writes an integer index as a length-1 slice and drops the
+            # axis afterwards, so the result is reshaped to e.shape.
+            (f,), key, shape = self._args(e), _jax_key(e.key), e.shape
+            return lambda x: jnp.reshape(f(x)[key], shape)
+        if isinstance(e, (Promote, broadcast_to)):
+            (f,), shape = self._args(e), e.shape
+            return lambda x: jnp.broadcast_to(f(x), shape)
+        if isinstance(e, reshape):
+            (f,), shape, order = self._args(e), e.shape, e.order
+            return lambda x: jnp.reshape(f(x), shape, order=order)
+        if isinstance(e, transpose):
+            (f,), axes = self._args(e), getattr(e, "axes", None)
+            return lambda x: jnp.transpose(f(x), axes)
+        if isinstance(e, Sum):
+            (f,), axis, keepdims = self._args(e), e.axis, e.keepdims
+            return lambda x: jnp.sum(f(x), axis=axis, keepdims=keepdims)
+        if isinstance(e, Hstack):
+            fs = self._args(e)
+            return lambda x: jnp.hstack([f(x) for f in fs])
+        if isinstance(e, Vstack):
+            fs = self._args(e)
+            return lambda x: jnp.vstack([f(x) for f in fs])
+        if isinstance(e, Concatenate):
+            fs, axis = self._args(e), e.axis
+            return lambda x: jnp.concatenate([f(x) for f in fs], axis=axis)
+        if isinstance(e, Trace):
+            (f,) = self._args(e)
+            return lambda x: jnp.trace(f(x))
+        if isinstance(e, (diag_vec, diag_mat)):
+            (f,), k = self._args(e), getattr(e, "k", 0)
+            return lambda x: jnp.diag(f(x), k)
+
+        # Smooth atoms.
+        if isinstance(e, quad_over_lin):
+            numerator, denominator = e.args
+            if not isinstance(denominator, (Constant, Parameter)):
+                raise NotImplementedError(
+                    "quad_over_lin with a variable denominator (domain y > 0)"
+                    " is not supported by the compiled route"
+                )
+            f, g = self._args(e)
+            axis, keepdims = getattr(e, "axis", None), getattr(e, "keepdims", False)
+            return lambda x: jnp.sum(f(x) ** 2, axis=axis, keepdims=keepdims) / g(x)
+        if isinstance(e, QuadForm):
+            f, P = self._args(e)
+            return lambda x: f(x) @ (P(x) @ f(x))
+        if isinstance(e, Power):
+            p = float(getattr(e, "_p_orig", e.p.value))
+            if p == 1:
+                return self._args(e)[0]
+            if not _even_integer(p):
+                raise NotImplementedError(
+                    f"power(x, {p}) has a restricted domain and is not supported"
+                    " by the compiled route; only even integer powers are"
+                )
+            (f,) = self._args(e)
+            return lambda x: f(x) ** int(p)
+        if isinstance(e, cvx_exp):
+            (f,) = self._args(e)
+            return lambda x: jnp.exp(f(x))
+        if isinstance(e, logistic):
+            (f,) = self._args(e)
+            return lambda x: jnp.logaddexp(0.0, f(x))
+        if isinstance(e, log_sum_exp):
+            (f,), axis, keepdims = self._args(e), e.axis, e.keepdims
+            return lambda x: jss.logsumexp(f(x), axis=axis, keepdims=keepdims)
+        if isinstance(e, huber):
+            (f,), M = self._args(e), float(e.M.value)
+            return lambda x: _huber(f(x), M)
+        if isinstance(e, Pnorm):
+            p = float(getattr(e, "original_p", e.p))
+            if p < 1:
+                raise NotImplementedError(
+                    f"pnorm(x, {p}) is concave with a restricted domain and is"
+                    " not supported by the compiled route"
+                )
+            (f,), axis, keepdims = self._args(e), e.axis, e.keepdims
+            if p == 2:
+                return lambda x: _safe_norm(f(x), axis, keepdims)
+            return lambda x: _safe_pnorm(f(x), p, axis, keepdims)
+
+        # Piecewise-linear atoms.
+        if isinstance(e, cvx_abs):
+            return self._abs(e)
+        if isinstance(e, (maximum, minimum)):
+            fs, concave = self._args(e), isinstance(e, minimum)
+            if not self.epigraph:
+                op = jnp.minimum if concave else jnp.maximum
+
+                def direct(x):
+                    out = fs[0](x)
+                    for f in fs[1:]:
+                        out = op(out, f(x))
+                    return out
+
+                return direct
+            t, shape = self.epigraph_variable(e, concave), e.shape
+            sign = -1.0 if concave else 1.0
+            for f in fs:
+                self.row(
+                    "ineq", lambda x, f=f: sign * (f(x) - t(x)), shape
+                )
+            return t
+        if isinstance(e, (cvx_max, cvx_min)):
+            (f,), concave = self._args(e), isinstance(e, cvx_min)
+            axis, keepdims = e.axis, e.keepdims
+            if not self.epigraph:
+                op = jnp.min if concave else jnp.max
+                return lambda x: op(f(x), axis=axis, keepdims=keepdims)
+            t, ndim = self.epigraph_variable(e, concave), e.args[0].ndim
+            sign = -1.0 if concave else 1.0
+            self.row(
+                "ineq",
+                lambda x: sign * (f(x) - _expand(t(x), axis, keepdims, ndim)),
+                e.args[0].shape,
+            )
+            return t
+        if isinstance(e, norm1):
+            s_ = self._abs(e.args[0], absolute_of=True)
+            axis, keepdims = e.axis, e.keepdims
+            return lambda x: jnp.sum(s_(x), axis=axis, keepdims=keepdims)
+        if isinstance(e, norm_inf):
+            (f,), axis, keepdims = self._args(e), e.axis, e.keepdims
+            if not self.epigraph:
+                return lambda x: jnp.max(jnp.abs(f(x)), axis=axis, keepdims=keepdims)
+            t, arg = self.epigraph_variable(e), e.args[0]
+            for sign in (1.0, -1.0):
+                self.row(
+                    "ineq",
+                    lambda x, sign=sign: sign * f(x)
+                    - _expand(t(x), axis, keepdims, arg.ndim),
+                    arg.shape,
+                )
+            return t
+
+        raise NotImplementedError(
+            f"{type(e).__name__} is not supported by the compiled route"
+        )
+
+    def _abs(self, e, absolute_of=False):
+        """``abs`` of ``e``'s argument, or with ``absolute_of`` of ``e``
+        itself: an epigraph variable ``t >= ±u``."""
+        u = e if absolute_of else e.args[0]
+        f = self.expr(u)
+        if not self.epigraph:
+            return lambda x: jnp.abs(f(x))
+        _, t = self.block(u.shape, 0.0, np.inf)
+        self.num_epigraph += int(np.prod(u.shape, dtype=int))
+        for sign in (1.0, -1.0):
+            self.row("ineq", lambda x, sign=sign: sign * f(x) - t(x), u.shape)
+        return t
+
+
+def _bound_of(constraint):
+    """``(variable, side, value)`` when ``constraint`` bounds a whole
+    variable by a constant, ``side`` +1 for ``var <= value`` and -1 for
+    ``var >= value``; otherwise ``None``."""
+
+    def constant(e):
+        return isinstance(e, (Constant, Parameter)) and e.value is not None
+
+    if isinstance(constraint, Inequality):
+        lhs, rhs = constraint.args
+        if isinstance(lhs, Variable) and constant(rhs):
+            return lhs, 1, rhs.value
+        if isinstance(rhs, Variable) and constant(lhs):
+            return rhs, -1, lhs.value
+    if isinstance(constraint, (NonNeg, NonPos)) and isinstance(
+        constraint.args[0], Variable
+    ):
+        return constraint.args[0], (-1 if isinstance(constraint, NonNeg) else 1), 0.0
+    return None
+
+
+def compile_problem(problem, epigraph=True, detect_bounds=True):
+    """
+    Compile a DCP ``cvxpy.Problem`` to a ``CompiledProblem`` whose ``cp`` is a
+    ``JaddleCP`` for ``jaddle_convex.solve``.
+
+    Variables become slices of one primal vector, with their ``nonneg`` /
+    ``nonpos`` / ``bounds`` attributes as box bounds; with ``detect_bounds``
+    so do constraints bounding a whole variable by a constant
+    (``x >= 0``, ``x <= u``), which then cost no dual. An equality
+    ``lhs == rhs`` becomes the row ``lhs - rhs = 0``, an inequality
+    ``lhs <= rhs`` the row ``lhs - rhs <= 0``.
+
+    With ``epigraph`` (default) the piecewise-linear atoms (``abs``,
+    ``maximum``, ``max``, ``norm1``, ``norm_inf``, their concave mirrors, and
+    ``pos`` / ``neg``, which CVXPY writes with them) become epigraph
+    variables with one linear row per piece, exact for a DCP problem; without
+    it they are evaluated as they are and the solver sees their subgradients.
+
+    Parameters are read at compile time. Atoms with a restricted domain
+    (``log``, ``sqrt``, ``entr``, ...) and second-order or PSD constraints are
+    not supported: Jaddle's iterates respect only the box, so they would
+    leave the domain. They, and anything else not covered, raise
+    ``NotImplementedError``.
+    """
+    if not problem.is_dcp():
+        raise cp.error.DCPError("problem is not DCP")
+    compiler = _Compiler(epigraph, jo.jaddle_dtype())
+    for var in problem.variables():
+        compiler.add_variable(var)
+
+    # Constraints held as box bounds; the box keeps the tightest of several.
+    bound_constraints = []
+    general = []
+    for constraint in problem.constraints:
+        bound = _bound_of(constraint) if detect_bounds else None
+        if bound is None:
+            general.append(constraint)
+            continue
+        var, side, value = bound
+        offset, shape = compiler.variables[var.id]
+        size = int(np.prod(shape, dtype=int))
+        value = np.broadcast_to(np.asarray(value, float), shape).ravel()
+        box = compiler.lower if side < 0 else compiler.upper
+        # Blocks are allocated one per variable before any epigraph block,
+        # so the variable's block index is its position.
+        block = list(compiler.variables).index(var.id)
+        box[block] = np.maximum(box[block], value) if side < 0 else np.minimum(
+            box[block], value
+        )
+        bound_constraints.append((constraint, var.id, side, value, offset, size, block))
+
+    rows = {}
+    for constraint in general:
+        if isinstance(constraint, (Equality, Zero)):
+            kind = "eq"
+        elif isinstance(constraint, (Inequality, NonNeg, NonPos)):
+            kind = "ineq"
+        else:
+            raise NotImplementedError(
+                f"{type(constraint).__name__} constraints are not supported by"
+                " the compiled route"
+            )
+        if isinstance(constraint, (Equality, Inequality)):
+            lhs, rhs = (compiler.expr(a) for a in constraint.args)
+            fn = lambda x, lhs=lhs, rhs=rhs: lhs(x) - rhs(x)
+        else:
+            f = compiler.expr(constraint.args[0])
+            fn = (lambda x, f=f: -f(x)) if isinstance(constraint, NonNeg) else f
+        rows[constraint.id] = (kind, compiler.row(kind, fn, constraint.shape), constraint.shape)
+
+    sign = -1.0 if isinstance(problem.objective, cp.Maximize) else 1.0
+    objective_fn = compiler.expr(problem.objective.expr)
+
+    lower = np.concatenate(compiler.lower) if compiler.lower else np.zeros(0)
+    upper = np.concatenate(compiler.upper) if compiler.upper else np.zeros(0)
+    bounds = {}
+    claimed = {}
+    for constraint, var_id, side, value, offset, size, block in bound_constraints:
+        box = lower if side < 0 else upper
+        tight = box[offset : offset + size] == value
+        taken = claimed.setdefault((var_id, side), np.zeros(size, bool))
+        mask = tight & ~taken
+        taken |= mask
+        bounds[constraint.id] = (var_id, side, mask)
+
+    eq_rows, ineq_rows = compiler.eq_rows, compiler.ineq_rows
+    dtype = compiler.dtype
+
+    def stack(fns):
+        if not fns:
+            return lambda x: jnp.zeros(0, dtype)
+        return lambda x: jnp.concatenate([f(x) for f in fns])
+
+    jcp = JaddleCP(
+        num_variables=compiler.size,
+        objective=lambda x: sign * jnp.sum(objective_fn(x)),
+        constraints_eq=stack(eq_rows),
+        constraints_ineq=stack(ineq_rows),
+        lower_bounds=jnp.asarray(lower, dtype),
+        upper_bounds=jnp.asarray(upper, dtype),
+    )
+    return CompiledProblem(
+        jcp, compiler.variables, rows, bounds, sign, compiler.num_epigraph
+    )
+
+
+def _unpack(problem, compiled, result):
+    """Write a ``jaddle_convex.solve`` result back into ``problem``."""
+    status = _status(result)
+    attr = {
+        s.SOLVE_TIME: result["solve_seconds"],
+        s.NUM_ITERS: result["epochs"],
+        s.EXTRA_STATS: result,
+    }
+    if status not in s.SOLUTION_PRESENT:
+        solution = failure_solution(status, attr)
+    else:
+        state = result["solution"]
+        x = np.asarray(state.primal, dtype=np.float64)
+        y_eq = np.asarray(state.dual_eq, dtype=np.float64)
+        y_ineq = np.asarray(state.dual_ineq, dtype=np.float64)
+        primal_vars = {
+            var_id: x[offset : offset + int(np.prod(shape, dtype=int))].reshape(shape)
+            for var_id, (offset, shape) in compiled.variables.items()
+        }
+        dual_vars = {}
+        for constraint_id, (kind, offset, shape) in compiled.rows.items():
+            y = y_eq if kind == "eq" else y_ineq
+            size = int(np.prod(shape, dtype=int))
+            dual_vars[constraint_id] = y[offset : offset + size].reshape(shape)
+        if compiled.bounds:
+            # A bound's dual is the reduced gradient it absorbs: for x >= l,
+            # ∇L - y = 0 with y >= 0, so y = max(∇L, 0); for x <= u, max(-∇L, 0).
+            jcp = compiled.cp
+
+            def lagrangian(x):
+                return (
+                    jcp.objective(x)
+                    + jnp.dot(state.dual_eq, jcp.constraints_eq(x))
+                    + jnp.dot(state.dual_ineq, jcp.constraints_ineq(x))
+                )
+
+            gradient = np.asarray(jax.grad(lagrangian)(state.primal), np.float64)
+            for constraint_id, (var_id, side, mask) in compiled.bounds.items():
+                offset, shape = compiled.variables[var_id]
+                g = gradient[offset : offset + mask.size]
+                dual = np.where(mask, np.maximum(-side * g, 0.0), 0.0)
+                dual_vars[constraint_id] = dual.reshape(shape)
+        objective = float(compiled.sign * compiled.cp.objective(state.primal))
+        solution = Solution(status, objective, primal_vars, dual_vars, attr)
+    problem.unpack(solution)
+    problem._solver_stats = SolverStats.from_dict(attr, "JADDLE")
+
+
+def solve(problem, qp_route=True, epigraph=True, detect_bounds=True, **options):
+    """
+    Solve a CVXPY problem with Jaddle and write the result back into it
+    (``problem.status``, ``problem.value``, ``var.value``,
+    ``constraint.dual_value``, ``problem.solver_stats``); returns
+    ``problem.value``.
+
+    A problem CVXPY can put in QP form (``problem.is_qp()``: an LP or QP,
+    piecewise-linear terms included) is solved by
+    ``problem.solve(solver=JaddleSolver(), **options)``, which gets HiGHS's
+    presolve or ``quadratic_program``'s KKT scaling. Any other DCP problem, or
+    every problem when ``qp_route=False``, is compiled by ``compile_problem``
+    (with ``epigraph`` and ``detect_bounds``) and solved by
+    ``jaddle_convex.solve`` with ``COMPILED_DEFAULTS`` updated by ``options``.
+    Its tolerances are absolute, in the problem's own units.
+
+    On either route ``tol`` (default ``DEFAULT_TOLERANCE``) sets every
+    tolerance not given by its own name, so the same call works whichever
+    route the problem takes.
+
+    Status: ``"optimal"`` when the solve certified, ``"user_limit"`` when a
+    budget (``max_epochs``, ``max_seconds``) stopped it, with the point
+    returned; ``problem.solver_stats.extra_stats`` holds Jaddle's result.
+    """
+    if qp_route and problem.is_qp():
+        return problem.solve(solver=JaddleSolver(), **options)
+    compiled = compile_problem(problem, epigraph=epigraph, detect_bounds=detect_bounds)
+    options = _with_tolerances(options, _COMPILED_TOLERANCES)
+    result = jc.solve(compiled.cp, **{**COMPILED_DEFAULTS, **options})
+    _unpack(problem, compiled, result)
+    return problem.value

@@ -26,6 +26,7 @@ def has(module):
         ("lp/intro_example.py", []),
         ("cp/isotonic_regression.py", ["matplotlib"]),
         ("cp/linear_regression.py", ["matplotlib", "sklearn"]),
+        ("cp/cvxpy_lasso.py", ["cvxpy"]),
     ],
 )
 def test_example_runs(script, requires):

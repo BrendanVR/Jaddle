@@ -542,3 +542,23 @@ def test_quadratic_program_dense_and_sparse_storage_agree(monkeypatch):
 def test_quadratic_program_rejects_asymmetric_Q():
     with pytest.raises(ValueError, match="symmetric"):
         jc.quadratic_program(Q=np.array([[1.0, 1.0], [0.0, 1.0]]), c=np.zeros(2))
+
+
+def test_diverged_solve_does_not_certify():
+    # Free columns without curvature (the epigraph form of sum((x - a)^2)):
+    # the default fixed-step alternating scheme diverges to NaN, and a NaN
+    # residual must not pass the convergence test.
+    a = np.array([0.3, -0.2])
+    result = jc.quadratic_program(
+        Q=np.diag([0.0, 0.0, 2.0, 2.0]),
+        c=np.zeros(4),
+        A_eq=np.array([[-1.0, 0, 1, 0], [0, -1, 0, 1], [1, 1, 0, 0]]),
+        b_eq=np.array([-a[0], -a[1], 1.0]),
+        ruiz_iterations=0,
+        pc_iterations=0,
+        max_epochs=300,
+        iterations_per_epoch=5,
+    )
+    assert not np.all(np.isfinite(result["solution"].primal))
+    assert not result["converged"]
+    assert result["stop_reason"] == "max_epochs"
