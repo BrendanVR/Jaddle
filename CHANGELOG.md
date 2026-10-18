@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.2
 
 ### Added
 
@@ -20,6 +20,15 @@
   adapted at each restart. The convex solver supports it only for adaptive
   extragradient with restarts, and leaves it off by default.
 
+- LP `solve`/`make_solver`: `gap_test` selects the relative gap tested
+  against `dual_gap_tolerance`. `"pdlp"` is PDLP's signed
+  |primal_obj − dual_obj|; `"abs"` sums the absolute complementarity terms so
+  they cannot cancel.
+
+- Convex `solve`/`make_solver`: `gradient_scaling` (with `gradient_scaling_probes`)
+  rescales the objective and each constraint row by its gradient norm at the
+  start point, as IPOPT does. Off by default; the CVXPY compiler turns it on.
+
 ### Fixed
 
 - Convex `solve`: a solve whose residuals had become NaN (a diverged run)
@@ -31,6 +40,9 @@
 - LP `solve`/`make_solver`: `diag_adapt=True` is the default. On the MIPLIB
   2017 LP set it certifies 380/383 presolved instances (376 before) and cuts
   the shifted geometric-mean solve time from 8.62 s to 7.04 s.
+- LP certificate: the default gap test is now `gap_test="pdlp"` (the signed
+  gap, as in PDLP and cuPDLP). Pass `gap_test="abs"` for the previous,
+  stricter no-cancellation test.
 
 ## 0.2.1
 
