@@ -101,7 +101,7 @@ def add_polish_flags(p):
     )
     p.add_argument(
         "--gap-test",
-        default="abs",
+        default="pdlp",
         choices=["abs", "pdlp"],
         help="Which relative gap must meet --gap-tol (jl.solve's gap_test): "
         "'abs' sums the |gap components| so they cannot cancel; 'pdlp' is "
@@ -359,7 +359,7 @@ def jaddle_solve_kwargs(
     cost_col_floor=0.0,
     gap_tol=None,
     norm="l2",
-    gap_test="abs",
+    gap_test="pdlp",
 ):
     """The ``jl.solve`` settings every benchmark harness uses, so all of them
     (and benchmark_mpax.py's Jaddle arm) run the same configuration.
@@ -396,7 +396,7 @@ def run_jaddle(
     gap_tol=None,
     polish=False,
     norm="l2",
-    gap_test="abs",
+    gap_test="pdlp",
 ):
     """Solve with Jaddle's saddle-point solver. Returns a dict of metrics.
 
@@ -483,7 +483,7 @@ def run_jaddle_presolved(
     polish=False,
     eliminate_defined_vars=True,
     norm="l2",
-    gap_test="abs",
+    gap_test="pdlp",
 ):
     """Solve an instance file with ``jl.solve_with_presolve`` (HiGHS presolve,
     optional defined-variable elimination, Jaddle, postsolve). Returns a dict
@@ -563,7 +563,7 @@ def run_jaddle_unpresolved(
     gap_tol=None,
     polish=False,
     norm="l2",
-    gap_test="abs",
+    gap_test="pdlp",
 ):
     """Solve an instance file's LP relaxation as given (no presolve) with
     ``run_jaddle``. The certificate is then on the original LP, so
@@ -635,7 +635,7 @@ def main():
         return
 
     gap_text = "" if args.gap_tol is None else f", gap_tol={args.gap_tol:g}"
-    if args.gap_test != "abs":
+    if args.gap_test != "pdlp":
         gap_text += f", gap_test={args.gap_test}"
     polish_text = ", feasibility polishing" if args.polish else ""
     presolve_text = "" if args.presolve else ", no presolve"

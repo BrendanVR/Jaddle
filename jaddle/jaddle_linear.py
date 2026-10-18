@@ -510,7 +510,7 @@ def _check_settings(
     update_mode,
     k_scale,
     adaptive_eta,
-    gap_test="abs",
+    gap_test="pdlp",
 ):
     """Validate the settings ``solve()`` and ``make_solver`` share. Returns
     ``(k_lo, k_hi, adaptive_eta, halpern)``, with ``adaptive_eta`` either a
@@ -929,9 +929,9 @@ def _device_solver(
         relative_primal_residual = constraint_bound / (1.0 + termination_b_norm)
         relative_dual_residual = dual_feasibility_residual / (1.0 + termination_c_norm)
 
-        # No-cancellation guard (gap_test="abs", the default), and the ONLY gap
-        # test needed; gap_test="pdlp" tests the signed RDG instead, as PDLP
-        # does. The qap10 case below predates the DFR c_max units fix and
+        # No-cancellation guard (gap_test="abs"), and the ONLY gap test
+        # needed; gap_test="pdlp" (the default) tests the signed RDG instead,
+        # as PDLP does. The qap10 case below predates the DFR c_max units fix and
         # qap10 is not in the MIPLIB benchmark set. `duality_gap` is
         # the SIGNED sum of three complementarity terms (bound, inequality,
         # equality coupling): duality_gap = gap_bound_comp + gap_ineq_comp +
@@ -1121,18 +1121,24 @@ def _device_solver(
         # RDG is already relative (÷(1+|obj|)).
         relative_pfr = termination_pfr / (1.0 + float(termination_b_norm))
         relative_dfr = termination_dfr / (1.0 + float(termination_c_norm))
-        # RDGABS: the no-cancellation companion to RDG (see relative_gap_abs).
-        # With gap_test="abs" `converged()` requires RDGABS <= dual_gap_tolerance
-        # (with "pdlp", RDG); without printing
-        # it a run can show PFR/DFR/RDG all comfortably inside tolerance yet
-        # never certify because the gap components are cancelling rather than
-        # genuinely small.
+        # RDGABS: the no-cancellation companion to RDG (see relative_gap_abs),
+        # printed only with gap_test="abs", where `converged()` requires
+        # RDGABS <= dual_gap_tolerance; without it a run can show PFR/DFR/RDG
+        # all comfortably inside tolerance yet never certify because the gap
+        # components are cancelling rather than genuinely small.
         rdg = float(relative_gap(duality_gap, objective_value))
-        rdg_abs = float(
-            relative_gap_abs(
-                objective_value, duality_gap, gap_bound_comp, gap_ineq_comp, gap_eq_comp
+        rdg_abs_str = ""
+        if gap_test == "abs":
+            rdg_abs = float(
+                relative_gap_abs(
+                    objective_value,
+                    duality_gap,
+                    gap_bound_comp,
+                    gap_ineq_comp,
+                    gap_eq_comp,
+                )
             )
-        )
+            rdg_abs_str = f"|RDGABS {rdg_abs:.2e}|"
         # OBJERR: true relative objective error vs a supplied reference optimum.
         # The duality gap (RDG) is a complementarity sum gated by the dual, so it
         # lags the primal; OBJERR isolates genuine primal suboptimality, and the
@@ -1149,7 +1155,7 @@ def _device_solver(
             f"|PFR {relative_pfr:.2e}|"
             f"|DFR {relative_dfr:.2e}|"
             f"|RDG {rdg:.2e}|"
-            f"|RDGABS {rdg_abs:.2e}|"
+            f"{rdg_abs_str}"
             f"{objerr_str}"
             f"{ke_str}"
             f"{time_str}"
@@ -1750,7 +1756,7 @@ def solve(
     primal_feasibility_tolerance=1e-3,
     dual_feasibility_tolerance=1e-3,
     dual_gap_tolerance=1e-3,
-    gap_test="abs",
+    gap_test="pdlp",
     dual_residual="pdlp",
     termination_norm="l2",
     restart_norm="l2",
@@ -1838,10 +1844,11 @@ def solve(
             overrun by about one epoch (shrink ``iterations_per_epoch`` for a
             tighter cutoff).
         gap_test: Which relative gap must be within ``dual_gap_tolerance``.
-            ``"abs"`` (default) sums the |bound|, |inequality| and |equality|
+            ``"pdlp"`` (default) is PDLP's signed |primal_obj − dual_obj|.
+            ``"abs"`` sums the |bound|, |inequality| and |equality|
             complementarity terms of the gap, so they cannot cancel; it is
-            never smaller than ``"pdlp"``, PDLP's signed
-            |primal_obj − dual_obj|. Both divide by 1+|primal_obj|+|dual_obj|.
+            never smaller than ``"pdlp"``. Both divide by
+            1+|primal_obj|+|dual_obj|.
             Near a feasible point the difference is about 2|yᵀ(b − Ax)|, so
             ``"abs"`` also bounds the objective error from primal
             infeasibility weighted by large duals.
@@ -2521,7 +2528,7 @@ def make_solver(
     primal_feasibility_tolerance=1e-3,
     dual_feasibility_tolerance=1e-3,
     dual_gap_tolerance=1e-3,
-    gap_test="abs",
+    gap_test="pdlp",
     dual_residual="pdlp",
     termination_norm="l2",
     restart_norm="l2",
@@ -3475,7 +3482,7 @@ def solve_with_presolve(
         and certificate["relative_dual_feasibility_residual"]
         <= solve_kwargs.get("dual_feasibility_tolerance", 1e-3)
         and np.isfinite(certificate["duality_gap"])
-        and certificate[_GAP_TEST_KEYS[solve_kwargs.get("gap_test", "abs")]]
+        and certificate[_GAP_TEST_KEYS[solve_kwargs.get("gap_test", "pdlp")]]
         <= solve_kwargs.get("dual_gap_tolerance", 1e-3)
     )
     if maximise:
@@ -5044,7 +5051,7 @@ def solve_with_polishing(
     p_tol = tolerances["primal_feasibility_tolerance"]
     d_tol = tolerances["dual_feasibility_tolerance"]
     g_tol = tolerances["dual_gap_tolerance"]
-    gap_key = _GAP_TEST_KEYS[kwargs.get("gap_test", "abs")]
+    gap_key = _GAP_TEST_KEYS[kwargs.get("gap_test", "pdlp")]
     # Judge points with solve()'s own stopping test.
     cert_options = {
         "norm": kwargs.get("termination_norm", "l2"),

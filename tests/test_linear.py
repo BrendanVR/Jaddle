@@ -153,16 +153,16 @@ def test_invalid_gap_test():
         jl.solve(toy_lp(), gap_test="signed")
 
 
-def test_pdlp_gap_test():
-    # The signed PDLP gap is never larger than the no-cancellation one, so the
-    # point still matches the reference and passes the gap it was tested on.
+def test_abs_gap_test():
+    # The no-cancellation gap is never smaller than the signed PDLP one, so
+    # the point passes both gaps and still matches the reference.
     lp = random_lp()
-    result = solve(lp, gap_test="pdlp")
+    result = solve(lp, gap_test="abs")
     assert result["converged"] and result["stop_reason"] == "certificate"
     cert = solve_certificate(lp, result["solution"])
     assert cert["relative_primal_feasibility_residual"] <= TOL
     assert cert["relative_dual_feasibility_residual"] <= TOL
-    assert cert["relative_gap"] <= TOL
+    assert cert["relative_gap_abs"] <= TOL
     assert cert["relative_gap"] <= cert["relative_gap_abs"]
     ref = reference_objective(lp)
     assert abs(float(lp.objective(result["solution"].primal)) - ref) <= 1e-4 * (
@@ -227,7 +227,7 @@ def test_certificate_matches_solve():
     cert = solve_certificate(lp, solve(lp)["solution"])
     assert cert["relative_primal_feasibility_residual"] <= TOL
     assert cert["relative_dual_feasibility_residual"] <= TOL
-    assert cert["relative_gap_abs"] <= TOL
+    assert cert["relative_gap"] <= TOL
 
 
 def test_warm_start_from_optimum_stays_put():
@@ -320,7 +320,7 @@ def test_solve_with_polishing(make_lp, polish_trigger, polish_objective_slack):
     cert = solve_certificate(lp, result["solution"])
     assert cert["relative_primal_feasibility_residual"] <= 1e-9
     assert cert["relative_dual_feasibility_residual"] <= 1e-9
-    assert cert["relative_gap_abs"] <= 1e-4
+    assert cert["relative_gap"] <= 1e-4
     ref = reference_objective(lp)
     assert abs(cert["objective"] - ref) / (1 + abs(ref)) < 1e-3
 
@@ -440,7 +440,7 @@ def test_solve_polish_trigger_stops_once_gap_closes():
     assert not result["converged"]
     assert 3 <= result["epochs"] < 500
     cert = solve_certificate(lp, result["solution"])
-    assert cert["relative_gap_abs"] <= 1e-2
+    assert cert["relative_gap"] <= 1e-2
     # A residual gate it cannot meet never fires.
     gated = jl.solve(lp, _polish_trigger=(0, 1.0), **{**kwargs, "max_epochs": 20})
     assert gated["stop_reason"] == "max_epochs"
@@ -779,7 +779,7 @@ def test_solve_with_presolve_polish():
     cert = solve_certificate(lp, result["solution"])
     assert cert["relative_primal_feasibility_residual"] <= 1e-8
     assert cert["relative_dual_feasibility_residual"] <= 1e-8
-    assert cert["relative_gap_abs"] <= 1e-4
+    assert cert["relative_gap"] <= 1e-4
     with pytest.raises(ValueError, match="alternatives"):
         jl.solve_with_presolve(lp, polish=True, reduced_solver=jl.solve)
 
