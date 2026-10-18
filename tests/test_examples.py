@@ -24,6 +24,7 @@ def has(module):
     "script, requires",
     [
         ("lp/intro_example.py", []),
+        ("lp/cvxpy_transport.py", ["cvxpy"]),
         ("cp/isotonic_regression.py", ["matplotlib"]),
         ("cp/linear_regression.py", ["matplotlib", "sklearn"]),
         ("cp/cvxpy_lasso.py", ["cvxpy"]),

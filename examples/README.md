@@ -20,6 +20,7 @@ python examples/lp/intro_example.py
 | Example | What it shows | Extra dependencies |
 |---|---|---|
 | [`intro_example.py`](lp/intro_example.py) | The smallest end-to-end LP: build an `LP` from NumPy/SciPy arrays, call `jl.solve`, and read off the primal solution and objective. | — |
+| [`cvxpy_transport.py`](lp/cvxpy_transport.py) | The same kind of LP written in CVXPY: a production and shipping plan with three variables (output per plant with capacity bounds, a plant × market shipment matrix, unmet demand per market), flow-balance, demand and emissions-cap constraints. Solved with `jcv.JaddleSolver` (HiGHS presolve, Jaddle, postsolve); prints the plan and reads each market's marginal cost and the implicit carbon price off the constraints' duals, checked against HiGHS. | `cvxpy` |
 | [`miplib.py`](lp/miplib.py) | Load a MIPLIB instance with HiGHS, relax integrality, and solve it with `jl.solve_with_presolve`: HiGHS presolve, a Jaddle solve with feasibility polishing, crossover to a basic solution, and postsolve back to the original model. | a MIPLIB `.mps` file |
 | [`battery_sizing.py`](lp/battery_sizing.py) | Batched, differentiable solves: size a battery by gradient descent, where each step solves 32 daily operating LPs at once with `jax.vmap` and differentiates their optimal costs with `jl.make_optimal_value`. The battery's price has economies of scale, so the sizing problem is not one large LP. Checks the result with a second run from a different start and plots the design's convergence and a day's schedule. | `matplotlib` |
 

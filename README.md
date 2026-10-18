@@ -590,6 +590,8 @@ included. An LP then goes through `jl.solve_with_presolve` (HiGHS presolve,
 Jaddle, HiGHS postsolve; `presolve=False` skips it), and a QP through
 `jc.quadratic_program`. A presolved LP whose postsolved point misses the
 tolerance on the original problem is reported as `"optimal_inaccurate"`.
+[`examples/lp/cvxpy_transport.py`](https://github.com/BrendanVR/Jaddle/blob/main/examples/lp/cvxpy_transport.py)
+is a small worked LP.
 
 **`jcv.solve`** handles the rest. For a general convex problem CVXPY's own
 reductions produce cones (exponential, second-order, PSD), and Jaddle has no

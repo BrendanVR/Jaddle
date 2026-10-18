@@ -12,7 +12,8 @@
   Smooth atoms (logistic, log-sum-exp, Huber, ...) stay smooth there, and
   piecewise-linear ones become epigraph rows, avoiding CVXPY's
   exponential-cone reformulation. Results are written back as CVXPY's
-  (status, values, duals). See `examples/cp/cvxpy_lasso.py`.
+  (status, values, duals). See `examples/lp/cvxpy_transport.py` and
+  `examples/cp/cvxpy_lasso.py`.
 
 - LP and convex `solve`/`make_solver`: `diag_adapt` (with `diag_theta` and
   `diag_clamp`), a per-coordinate diagonal step metric on top of the scaling,
