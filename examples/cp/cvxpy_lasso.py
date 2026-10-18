@@ -101,3 +101,5 @@ print(
     f"CVXPY's conic form for Clarabel: {data['A'].shape[1]} variables, "
     f"{data['A'].shape[0]} rows ({data['dims'].exp} exponential cones)"
 )
+
+# %%
