@@ -72,7 +72,7 @@ reference = cp.Problem(cp.Maximize(mu @ w), constraints)
 # %%
 print(
     f"{'σ':>6s}{'return':>10s}{'CLARABEL':>10s}{'slope':>8s}{'assets':>8s}{'epochs':>8s}"
-    f"{'JADDLE s':>10s}{'CLARABEL s':>10s}"
+    f"{'JADDLE s':>10s}{' CLARABEL s':>10s}"
 )
 for limit in [0.06, 0.08, 0.10, 0.14, 0.20]:
     sigma.value = limit

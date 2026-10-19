@@ -332,11 +332,14 @@ class JaddleConicSolver(_EqualByType, ConicSolver):
     ``min cᵀx  s.t.  Ax + s = b,  s ∈ {0} x R+ x SOC x ... x PSD x ... x EXP x ...``
     and
     solves them with ``jaddle_linear.solve`` on cone-constrained variables
-    (``jaddle.cones``). Zero rows become equality rows, nonnegative rows
-    inequality rows ``Ax <= b``, and each second-order, PSD or exponential
-    block gets slack variables ``s`` in that cone with equality rows
-    ``Ax + s = b``. PSD blocks use SCS's ``svec`` (lower triangle by columns,
-    off-diagonals times ``√2``). Power cones are not supported.
+    (``jaddle.cones``). Zero rows become equality rows and nonnegative rows
+    inequality rows ``Ax <= b``. A second-order, PSD or exponential block
+    whose rows each pick out one distinct, unbounded variable (``X >> 0`` for
+    a variable ``X``) puts the cone on those variables directly; any other
+    block gets slack variables ``s`` in the cone with equality rows
+    ``Ax + s = b``. ``cone_substitution=False`` uses slacks for every block.
+    PSD blocks use SCS's ``svec`` (lower triangle by columns, off-diagonals
+    times ``√2``). Power cones are not supported.
 
     The keyword arguments of ``prob.solve`` go to ``jaddle_linear.solve``
     (``verbose`` included). ``tol`` sets its three relative tolerances unless
@@ -375,39 +378,22 @@ class JaddleConicSolver(_EqualByType, ConicSolver):
         n = c.shape[0]
         n_zero, n_nonneg = dims.zero, dims.nonneg
         cones = Cones(soc=dims.soc, psd=dims.psd, exp=dims.exp)
-        k = cones.size
 
         lower, upper = data[s.LOWER_BOUNDS], data[s.UPPER_BOUNDS]
         lower = np.full(n, -np.inf) if lower is None else np.asarray(lower, float)
         upper = np.full(n, np.inf) if upper is None else np.asarray(upper, float)
 
-        # Variables [x; s]: the cone slacks form the cone tail.
-        zero_rows = A[:n_zero]
-        nonneg_rows = A[n_zero : n_zero + n_nonneg]
-        cone_rows = A[n_zero + n_nonneg :]
-        A_eq = sp.vstack(
-            [
-                sp.hstack([zero_rows, sp.csr_matrix((n_zero, k))]),
-                sp.hstack([cone_rows, sp.identity(k, format="csr")]),
-            ],
-            format="csc",
+        substitute = options.pop("cone_substitution", True)
+        red = _conic_reduction(
+            A, b, c, lower, upper, n_zero, n_nonneg, cones, substitute
         )
-        A_ineq = sp.hstack([nonneg_rows, sp.csr_matrix((n_nonneg, k))], format="csc")
-        lp = LP(
-            np.concatenate([c, np.zeros(k)]),
-            A_eq,
-            np.concatenate([b[:n_zero], b[n_zero + n_nonneg :]]),
-            A_ineq,
-            b[n_zero : n_zero + n_nonneg],
-            np.concatenate([lower, np.full(k, -np.inf)]),
-            np.concatenate([upper, np.full(k, np.inf)]),
-            cones=cones,
-        )
+        lp = red["lp"]
+        A_eq, A_ineq = lp.A_eq, lp.A_ineq
 
         cached = None if solver_cache is None else solver_cache.get(self.name())
         if warm_start and cached is not None:
             if (
-                cached.primal.shape[0] == n + k
+                cached.primal.shape[0] == lp.c.shape[0]
                 and cached.dual_eq.shape[0] == A_eq.shape[0]
                 and cached.dual_ineq.shape[0] == A_ineq.shape[0]
             ):
@@ -422,13 +408,18 @@ class JaddleConicSolver(_EqualByType, ConicSolver):
             # solve() may pad an empty block with one zero row.
             solution = SaddleState(
                 primal=np.asarray(solution.primal, dtype=np.float64),
-                dual_ineq=np.asarray(solution.dual_ineq, dtype=np.float64)[:n_nonneg],
+                dual_ineq=np.asarray(solution.dual_ineq, dtype=np.float64)[
+                    : A_ineq.shape[0]
+                ],
                 dual_eq=np.asarray(solution.dual_eq, dtype=np.float64)[
-                    : n_zero + k
+                    : A_eq.shape[0]
                 ],
             )
             result["solution"] = solution
-            result["objective"] = float(c @ solution.primal[:n])
+            x, y = _conic_recover(red, solution)
+            result["cvxpy_primal"], result["cvxpy_dual"] = x, y
+            result["objective"] = float(c @ x)
+            result["cone_substitution"] = red["substituted"]
             if solver_cache is not None:
                 solver_cache[self.name()] = solution
         return result
@@ -442,21 +433,11 @@ class JaddleConicSolver(_EqualByType, ConicSolver):
         }
         if status not in s.SOLUTION_PRESENT:
             return failure_solution(status, attr)
-        solution = results["solution"]
         n_zero = inverse_data[self.DIMS].zero
-        dims = inverse_data[self.DIMS]
-        n = solution.primal.shape[0] - Cones(soc=dims.soc, psd=dims.psd, exp=dims.exp).size
-        # Jaddle's Lagrangian cᵀx + yᵀ(Ax + s - b) with y_nonneg >= 0 and, by
-        # stationarity in the cone slacks, y_cone in the dual cone: the
-        # sign convention of CVXPY's conic duals (as SCS's). Rows are ordered
-        # zero, nonneg, cones, as CVXPY's.
-        y = np.concatenate(
-            [
-                solution.dual_eq[:n_zero],
-                solution.dual_ineq,
-                solution.dual_eq[n_zero:],
-            ]
-        )
+        # x and y are already in CVXPY's variable and row order (see
+        # _conic_recover); y follows the sign convention of CVXPY's conic
+        # duals (as SCS's), with cone duals in the dual cone.
+        y = results["cvxpy_dual"]
         dual_vars = utilities.get_dual_values(
             y[:n_zero], utilities.extract_dual_value, inverse_data[self.EQ_CONSTR]
         ) | utilities.get_dual_values(
@@ -465,13 +446,138 @@ class JaddleConicSolver(_EqualByType, ConicSolver):
         return Solution(
             status,
             results["objective"] + inverse_data[s.OFFSET],
-            {inverse_data[self.VAR_ID]: solution.primal[:n]},
+            {inverse_data[self.VAR_ID]: results["cvxpy_primal"]},
             dual_vars,
             attr,
         )
 
     def cite(self, data):
         return ""
+
+
+def _conic_reduction(A, b, c, lower, upper, n_zero, n_nonneg, cones, substitute):
+    """Jaddle's LP for CVXPY's cone form ``A x + s = b``, ``s`` in the cones.
+
+    Zero rows become equality rows and nonnegative rows inequality rows. A
+    cone block whose rows each select one distinct, unbounded variable
+    (``s_r = b_r - a_r x_j``, as CVXPY writes ``X >> 0`` for a variable ``X``)
+    is put on those variables directly: ``x_j = (b_r - z_r) / a_r`` with
+    ``z`` in the cone, and the block's rows are dropped. Any other cone
+    block keeps slack variables ``s`` in the cone and equality rows
+    ``A x + s = b``. Keeping both a variable and a slack copy tied by
+    equality rows made PDHG reach the cone only through those rows' duals:
+    on a 200-node Max-Cut SDP it took 3x the iterations.
+
+    The LP's variables are ``z = [kept columns of x; cone tail]`` with
+    ``x = P z + q``. Returns the LP and what ``_conic_recover`` needs.
+    """
+    A = sp.csr_matrix(A)
+    A.eliminate_zeros()
+    A.sum_duplicates()
+    n, m = c.shape[0], A.shape[0]
+    free = ~np.isfinite(lower) & ~np.isfinite(upper)
+    used = np.zeros(n, bool)
+
+    # Which cone blocks select variables, in tail order.
+    blocks = []
+    row = n_zero + n_nonneg
+    for size in cones.block_sizes():
+        rows = np.arange(row, row + size)
+        block = A[rows]
+        cols = None
+        if substitute and np.all(np.diff(block.indptr) == 1):
+            candidate = block.indices.copy()
+            if (
+                np.unique(candidate).size == size
+                and free[candidate].all()
+                and not used[candidate].any()
+            ):
+                cols = candidate
+                used[cols] = True
+        blocks.append((rows, cols, None if cols is None else block.data.copy()))
+        row += size
+
+    kept = np.flatnonzero(~used)
+    n_kept = kept.size
+    N = n_kept + cones.size
+    # x = P z + q.
+    P_rows, P_cols, P_vals = [kept], [np.arange(n_kept)], [np.ones(n_kept)]
+    q = np.zeros(n)
+    slack_rows, slack_pos, sub_pos = [], [], []
+    pos = n_kept
+    for rows, cols, a in blocks:
+        tail = np.arange(pos, pos + rows.size)
+        if cols is None:
+            slack_rows.append(rows)
+            slack_pos.append(tail)
+        else:
+            P_rows.append(cols)
+            P_cols.append(tail)
+            P_vals.append(-1.0 / a)
+            q[cols] = b[rows] / a
+            sub_pos.append((rows, tail))
+        pos += rows.size
+    P = sp.csr_matrix(
+        (np.concatenate(P_vals), (np.concatenate(P_rows), np.concatenate(P_cols))),
+        shape=(n, N),
+    )
+    slack_rows = np.concatenate(slack_rows) if slack_rows else np.zeros(0, int)
+    slack_pos = np.concatenate(slack_pos) if slack_pos else np.zeros(0, int)
+
+    zero_rows = np.arange(n_zero)
+    nonneg_rows = np.arange(n_zero, n_zero + n_nonneg)
+    eq_rows = np.concatenate([zero_rows, slack_rows])
+    A_q = A @ q
+    slack_cols = sp.csr_matrix(
+        (np.ones(slack_rows.size), (np.arange(n_zero, n_zero + slack_rows.size), slack_pos)),
+        shape=(eq_rows.size, N),
+    )
+    A_eq = (A[eq_rows] @ P + slack_cols).tocsc()
+    A_ineq = (A[nonneg_rows] @ P).tocsc()
+    lp = LP(
+        P.T @ c,
+        A_eq,
+        b[eq_rows] - A_q[eq_rows],
+        A_ineq,
+        b[nonneg_rows] - A_q[nonneg_rows],
+        np.concatenate([lower[kept], np.full(cones.size, -np.inf)]),
+        np.concatenate([upper[kept], np.full(cones.size, np.inf)]),
+        cones=cones,
+    )
+    return dict(
+        lp=lp,
+        P=P,
+        q=q,
+        m=m,
+        eq_rows=eq_rows,
+        nonneg_rows=nonneg_rows,
+        sub_pos=sub_pos,
+        substituted=int(sum(r.size for r, _ in sub_pos)),
+    )
+
+
+def _conic_recover(red, solution):
+    """CVXPY's ``x`` and ``y`` (rows in CVXPY's order) from the solution of
+    ``_conic_reduction``'s LP.
+
+    A dropped cone block's dual is the reduced cost of its cone variables
+    ``z``: the slack form's stationarity in ``s`` gives ``y = c_s + Aᵀy`` on
+    the slack columns, and ``z`` stands in for ``s``. It lies in the dual
+    cone."""
+    lp = red["lp"]
+    x = red["P"] @ solution.primal + red["q"]
+    y = np.zeros(red["m"])
+    y[red["eq_rows"]] = solution.dual_eq
+    y[red["nonneg_rows"]] = solution.dual_ineq
+    if red["sub_pos"]:
+        reduced_cost = (
+            np.asarray(lp.c)
+            + lp.A_eq.T @ solution.dual_eq
+            + lp.A_ineq.T @ solution.dual_ineq
+        )
+        for rows, tail in red["sub_pos"]:
+            y[rows] = reduced_cost[tail]
+    return x, y
 
 
 # %%

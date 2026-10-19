@@ -673,7 +673,11 @@ is a small worked LP.
 the form `min cᵀx  s.t.  Ax + s = b`, with `s` in a product of zero,
 nonnegative, second-order, PSD and exponential cones. It solves them with
 `jl.solve` on cone-constrained variables (see [Conic programs](#conic-programs));
-there is no presolve. Power cones are not supported. Exponential cones bring
+there is no presolve. When a cone constraint is on a variable itself, such
+as `X >> 0` for a variable `X`, the cone goes on that variable directly
+rather than on a copy tied to it by equality rows: on a 200-node Max-Cut SDP
+that cut the iterations threefold (`cone_substitution=False` turns it off).
+Power cones are not supported. Exponential cones bring
 in `log`, `log_det`, `log1p`, `rel_entr` and `kl_div`, which the compiled
 route below cannot take, alongside `exp`, `log_sum_exp`, `logistic` and
 `entr`.

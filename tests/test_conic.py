@@ -457,6 +457,68 @@ def test_cvxpy_conic_matches_clarabel(name):
         np.testing.assert_allclose(c.dual_value, y, atol=1e-4)
 
 
+def _substitution_cases():
+    """(name, problem, constraints, variables, variables put on the cone)."""
+    cp = pytest.importorskip("cvxpy")
+    rng = np.random.default_rng(3)
+    d = 4
+    B = rng.standard_normal((d, d))
+    C = B + B.T
+    L = d * (d + 1) // 2
+
+    # PSD rows with b != 0: X - I in PSD.
+    X = cp.Variable((d, d), symmetric=True)
+    cons = [X - np.eye(d) >> 0, cp.trace(X) == d + 1]
+    yield "shifted_psd", cp.Problem(cp.Minimize(cp.trace(C @ X)), cons), cons, [X], L
+
+    # A PSD block on a variable next to a second-order cone on an expression.
+    X = cp.Variable((d, d), symmetric=True)
+    v = rng.standard_normal(d)
+    cons = [X >> 0, cp.trace(X) == 1, cp.norm(X @ v) <= 0.5]
+    yield "psd_and_soc", cp.Problem(cp.Minimize(cp.trace(C @ X)), cons), cons, [X], L
+
+    # The same variable in two PSD blocks: only the first is substituted.
+    X = cp.Variable((d, d), symmetric=True)
+    cons = [X >> 0, X - 0.1 * np.eye(d) >> 0, cp.trace(X) == 1]
+    yield "two_psd", cp.Problem(cp.Minimize(cp.trace(C @ X)), cons), cons, [X], L
+
+    # A cone on bounded variables keeps its slack form.
+    t = cp.Variable(nonneg=True)
+    x = cp.Variable(3)
+    cons = [cp.SOC(t, x), cp.sum(x) == 1]
+    yield "bounded_soc", cp.Problem(cp.Minimize(t), cons), cons, [t, x], 0
+
+
+def _flat(dual):
+    # An SOC constraint's dual is a list (t part, x part).
+    if isinstance(dual, (list, tuple)):
+        return np.concatenate([np.ravel(d) for d in dual])
+    return np.ravel(np.copy(dual))
+
+
+@pytest.mark.parametrize("name", ["shifted_psd", "psd_and_soc", "two_psd", "bounded_soc"])
+def test_cvxpy_cone_substitution(name):
+    cp = pytest.importorskip("cvxpy")
+    import jaddle.jaddle_cvxpy as jcv
+
+    problem, constraints, variables, substituted = next(
+        p[1:] for p in _substitution_cases() if p[0] == name
+    )
+    problem.solve(solver="CLARABEL")
+    value = problem.value
+    primals = [np.copy(v.value) for v in variables]
+    duals = [_flat(c.dual_value) for c in constraints]
+
+    problem.solve(solver=jcv.JaddleConicSolver(), tol=1e-8, max_epochs=500)
+    assert problem.status == cp.OPTIMAL
+    assert problem.solver_stats.extra_stats["cone_substitution"] == substituted
+    assert problem.value == pytest.approx(value, abs=1e-6 * (1 + abs(value)))
+    for v, x in zip(variables, primals):
+        np.testing.assert_allclose(v.value, x, atol=1e-4)
+    for c, y in zip(constraints, duals):
+        np.testing.assert_allclose(_flat(c.dual_value), y, atol=1e-4)
+
+
 def test_cvxpy_conic_warm_start():
     # A fresh solver instance per solve must still warm-start: CVXPY clears
     # its cache whenever the solver it is given changes.

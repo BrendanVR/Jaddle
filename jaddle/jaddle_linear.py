@@ -299,25 +299,19 @@ def _make_epoch_fn(
             roots = roots[0] if exp_on else None
             ip1 = jnp.asarray(i + 1, eta.dtype)
 
-            # Retry: while the trial step exceeds its admissible bound,
-            # shrink eta to just under eta_bar and re-trial. The
-            # (1-(i+1)^-0.3) factor < 1 guarantees strict decrease, so the
-            # loop terminates. Carry (eta, cand, eta_bar, Ax_new, roots);
-            # every retry starts its root search from the previous
-            # iteration's roots.
-            def cond(c):
-                eta_c, _, eta_bar_c, _, _ = c
-                return eta_c > eta_bar_c
-
-            def body(c):
-                eta_c, _, eta_bar_c, _, _ = c
-                eta_s = jnp.minimum((1.0 - ip1 ** (-0.3)) * eta_bar_c, eta_c)
-                return (eta_s, *trial(eta_s, state, k, Ax_old, gp, roots))
-
+            # One trial per scan step. If it exceeds its admissible bound
+            # (eta > eta_bar) it is rejected: the step does not move, eta
+            # shrinks to just under eta_bar, and the next scan step retries
+            # from the same state at the same index `i` (which counts only
+            # accepted steps). That is the same sequence of accepted iterates
+            # and steps as a retry loop inside the step, without one: a
+            # data-dependent while_loop cost ~30 us per iteration on GPU
+            # (deciding whether to run it), 10-20% of an iteration. A
+            # rejection uses up one of the epoch's scan steps.
             gp = grad_primal_only(state)
-            eta0, cand, eta_bar, Ax_new, roots = jax.lax.while_loop(
-                cond, body, (eta, *trial(eta, state, k, Ax_old, gp, roots))
-            )
+            cand, eta_bar, Ax_new, roots = trial(eta, state, k, Ax_old, gp, roots)
+            accepted = eta <= eta_bar
+            eta0 = eta
 
             if diag_on:
                 # Per-coordinate squared movement of the operator step (cand,
@@ -332,7 +326,7 @@ def _make_epoch_fn(
                     )
                     * inv_eta
                 )
-                acc = (H_x + dx * dx, H_y + dy * dy)
+                acc = _select_state(accepted, (H_x + dx * dx, H_y + dy * dy), acc)
 
             if halpern:
                 # Halpern anchor: blend T(z_k)=cand back toward z_0.
@@ -354,14 +348,19 @@ def _make_epoch_fn(
             else:
                 new_state = cand
                 Ax_next = Ax_new
+            # A rejected step does not move.
+            new_state = _select_state(accepted, new_state, state)
+            Ax_next = jnp.where(accepted, Ax_next, Ax_old)
 
             # Advance eta for the next iterate (growth allowed once the
             # step is accepted). When eta_bar is +inf the step did not move
             # (e.g. pinned on the box): hold eta rather than letting the
-            # growth branch run away to NaN.
+            # growth branch run away to NaN. A rejected step shrinks eta to
+            # just under eta_bar; the (1-(i+1)^-0.3) factor < 1 guarantees
+            # strict decrease, so a run of rejections ends.
             eta_next = jnp.minimum(
                 (1.0 - ip1 ** (-0.3)) * eta_bar,
-                (1.0 + ip1 ** (-0.6)) * eta0,
+                jnp.where(accepted, (1.0 + ip1 ** (-0.6)) * eta0, eta0),
             )
             eta_next = jnp.where(jnp.isfinite(eta_bar), eta_next, eta0)
             eta_next = jnp.where(jnp.isfinite(eta_next), eta_next, eta0)
@@ -377,17 +376,23 @@ def _make_epoch_fn(
                 # PDLP-style step-size-weighted average (Applegate et al.,
                 # "Practical LP using PDHG", the restart-average
                 # z̄ⁿ = Σ ηₖ zᵏ / Σ ηₖ): weight each iterate by the eta
-                # ACTUALLY used to produce it (eta0, the accepted
-                # post-retry-shrink step).
-                w = eta0
-                total_weight = total_weight + w
-                average_state = optax.incremental_update(
-                    new_state, average_state, w / total_weight
+                # ACTUALLY used to produce it (eta0, the accepted step). A
+                # rejected step adds nothing.
+                w = jnp.where(accepted, eta0, 0.0)
+                new_weight = total_weight + w
+                average_state = _select_state(
+                    accepted,
+                    optax.incremental_update(
+                        new_state, average_state, w / jnp.where(accepted, new_weight, 1.0)
+                    ),
+                    average_state,
                 )
+                total_weight = new_weight
 
+            i_next = i + jnp.where(accepted, 1, 0)
             if diag_on:
-                return (i + 1, new_state, average_state, opt_state, total_weight, acc)
-            return (i + 1, new_state, average_state, opt_state, total_weight)
+                return (i_next, new_state, average_state, opt_state, total_weight, acc)
+            return (i_next, new_state, average_state, opt_state, total_weight)
 
         # Fixed iteration count per epoch: lax.scan (static `max_iter`) lets
         # XLA pipeline the loop body better than a while_loop whose only exit

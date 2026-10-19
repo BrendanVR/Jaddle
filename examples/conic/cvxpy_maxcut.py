@@ -72,10 +72,9 @@ print(f"SCS solve time: {scs_time:.2f}s")
 t0 = time.perf_counter()
 problem.solve(
     solver=jcv.JaddleConicSolver(),
-    tol=1e-3,
+    tol=1e-4,
     verbose=True,
     diag_clamp=1e10,
-    update_mode="halpern",
 )
 jaddle_time = time.perf_counter() - t0
 print(f"Jaddle solve time: {jaddle_time:.2f}s")

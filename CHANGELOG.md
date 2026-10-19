@@ -33,6 +33,11 @@
 
 - `jcv.JaddleConicSolver`: a CVXPY conic solver for problems with zero,
   nonnegative, second-order and PSD cones. See `examples/conic/`.
+  A cone constraint on a variable itself (`X >> 0` for a variable `X`) puts
+  the cone on that variable directly, instead of on slack copies tied to it
+  by equality rows. On the 200-node Max-Cut SDP that took about 6,100
+  iterations and 9.2 s down to about 2,000 and 4.0 s
+  (`cone_substitution=False` restores the slack form).
 
 - `jcv.solve` compiles CVXPY's `entr` atom. Below `jcv.ENTR_FLOOR` (1e-8)
   it is continued by its tangent line, so iterates outside `entr`'s domain
@@ -45,6 +50,16 @@
   smoother on the compiled route.
 
 ### Changed
+
+- The adaptive step size's retry is no longer a loop inside each PDHG
+  iteration. A trial step that overshoots is rejected and the iteration does
+  not move; the next one retries from the same point with the shrunk step,
+  and the iteration count advances only on accepted steps. The accepted
+  steps are the same as before, but a rejection (0-2% of steps on the LPs
+  checked) now uses up one of the epoch's iterations, so results can differ
+  slightly. The data-dependent loop cost about 30 us per iteration on GPU:
+  map18 went from 307 to 248 us per iteration and a small LP from 137 to
+  104 us. CPU is unchanged or slightly faster.
 
 - `jl.solve` no longer recompiles for every call. Its device programs are
   cached per settings and problem shape, and the problem's numbers go in as
