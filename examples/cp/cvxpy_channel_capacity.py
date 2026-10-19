@@ -109,7 +109,7 @@ print("optimal input distribution x =", x.value)
 
 # %%
 rng = np.random.default_rng(0)
-input, output = 6, 10
+input, output = 8, 6
 P = rng.dirichlet(np.full(output, 0.5), size=input).T
 problem, x, total = channel_capacity(P)
 

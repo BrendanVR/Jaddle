@@ -49,13 +49,13 @@ solve_options = dict(
     dual_gap_tolerance=1e-4,
     polish_objective_slack=0.1,
     polish_trigger="auto",
-    scaled_augmented=False,
 )
 
 start_time = time()
 solution = jl.solve_with_presolve(
     highs,
     verbose=True,
+    log_every=10,
     run_crossover=True,
     polish=True,
     highs_options=dict(output_flag="true"),
