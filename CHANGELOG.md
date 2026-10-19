@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `jcv.solve` compiles CVXPY's `entr` atom. Below `jcv.ENTR_FLOOR` (1e-8)
+  it is continued by its tangent line, so iterates outside `entr`'s domain
+  get a finite value and gradient. The result is exact when the solution
+  keeps the argument above the floor. See
+  `examples/cp/cvxpy_channel_capacity.py`.
+
 ## 0.2.2
 
 ### Added

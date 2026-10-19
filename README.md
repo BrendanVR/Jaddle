@@ -605,6 +605,11 @@ variables and 100 linear rows for that problem:
 - smooth atoms stay smooth: `logistic`, `log_sum_exp`, `exp`, `huber`,
   `sum_squares`, `quad_form`, `quad_over_lin` with a constant denominator,
   even powers, and p-norms with p ≥ 1;
+- `entr` is continued below `jcv.ENTR_FLOOR` (1e-8) by its tangent line, so
+  iterates outside its domain see a finite value and gradient. This is exact
+  when the solution keeps the argument above the floor.
+  [`examples/cp/cvxpy_channel_capacity.py`](https://github.com/BrendanVR/Jaddle/blob/main/examples/cp/cvxpy_channel_capacity.py)
+  uses it to compute a channel's capacity;
 - piecewise-linear atoms (`abs`, `maximum`, `max`, `norm1`, `norm_inf`, and
   their concave mirrors `minimum` and `min`; `pos` and `neg` are written with
   these) become epigraph variables with one linear row per piece. This is
@@ -614,7 +619,7 @@ variables and 100 linear rows for that problem:
   costs no dual. The bound constraints' duals are recovered from the reduced
   gradient.
 
-Atoms with a restricted domain (`log`, `sqrt`, `entr`, ...) and second-order
+Other atoms with a restricted domain (`log`, `sqrt`, ...) and second-order
 or PSD constraints raise `NotImplementedError`: Jaddle keeps its iterates
 inside the box only, so they would leave the domain. A problem that CVXPY can
 put in QP form goes to `JaddleSolver` unless `qp_route=False`, so it gets
@@ -648,14 +653,14 @@ recompilation.
 Jaddle's LP solver is evaluated on the LP relaxations of the 383 MIPLIB 2017
 instances used in the PDLP papers (100k–10M nonzeros). The run below used
 default solver settings in float64, HiGHS presolve, a relative tolerance of
-`1e-4` and a 600-second limit per instance, on one NVIDIA GeForce RTX 5070 Ti
+`1e-4` and a 3600-second limit per instance, on one NVIDIA GeForce RTX 5070 Ti
 Laptop GPU.
 
 | Outcome | Instances |
 |---|---|
-| Certified optimal on the HiGHS-presolved LP | **380 / 383** (one settled by presolve itself) |
-| Certified optimal on the original LP, after HiGHS postsolve | **291 / 383** |
-| Time limit reached | 3 |
+| Certified optimal on the HiGHS-presolved LP | **382 / 383** (one settled by presolve itself) |
+| Certified optimal on the original LP, after HiGHS postsolve | **297 / 383** |
+| Time limit reached | 1 (hgms62) |
 
 The two certificates differ because postsolve can enlarge a first-order
 solution's small dual errors, and because presolve can rescale a problem
@@ -664,14 +669,16 @@ drastically, which changes what a relative tolerance means (see
 `jl.crossover` can tighten a postsolved point when the original certificate
 matters.
 
+Convergence on hgms62 can be recovered by altering the solvers default settings, in particular greatly increasing `diag_clamp` which alters the maximum amount of adaptive diagonal scaling used by the solver.
+
 Shifted geometric means of the solve time (shift 10 s, unsolved instances
-counted at the 600-second limit, as in the PDLP papers):
+counted at the 3600-second limit, as in the PDLP papers):
 
 | Time measured | SGM10 |
 |---|---|
-| Iteration loop, including the first-epoch compile (`solve_seconds`) | 7.04 s |
-| Iteration loop with the compile amortised out (`corrected_seconds`) | 4.62 s |
-| Wall clock, including presolve, scaling and setup | 9.81 s |
+| Iteration loop, including the first-epoch compile (`solve_seconds`) | 6.86 s |
+| Iteration loop with the compile amortised out (`corrected_seconds`) | 4.72 s |
+| Wall clock, including presolve, scaling and setup | 9.56 s |
 
 The benchmark harnesses, instance diagnostics and instructions for reproducing
 these results are described in [`benchmarks/README.md`](https://github.com/BrendanVR/Jaddle/blob/main/benchmarks/README.md).

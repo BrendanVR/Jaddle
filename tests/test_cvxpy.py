@@ -219,6 +219,45 @@ def test_compiled_values_match_cvxpy():
         assert got == pytest.approx(float(problem.objective.value), rel=1e-10)
 
 
+def test_entr_values_and_extension():
+    # Above ENTR_FLOOR the compiled entr is CVXPY's; below it, the tangent
+    # line keeps value and gradient finite where entr is undefined.
+    import jax
+
+    rng = np.random.default_rng(0)
+    A = rng.uniform(0.1, 1.0, (5, 3))
+    v = cp.Variable(3)
+    problem = cp.Problem(cp.Maximize(cp.sum(cp.entr(A @ v))))
+    compiled = jcv.compile_problem(problem)
+    for _ in range(3):
+        v.value = rng.uniform(0.01, 2.0, 3)
+        got = -float(compiled.cp.objective(jnp.asarray(v.value)))
+        assert got == pytest.approx(float(problem.objective.value), rel=1e-10)
+    for point in (0.0, -1.0):
+        x = jnp.full(3, point)
+        assert np.isfinite(float(compiled.cp.objective(x)))
+        assert np.all(np.isfinite(jax.grad(compiled.cp.objective)(x)))
+
+
+def test_channel_capacity():
+    # Binary symmetric channel: capacity C = 1 - H2(0.25) at the uniform
+    # input, and the simplex row's dual is C - log2(e) (closed forms; Clarabel
+    # is only ~1e-5 accurate on this dual).
+    P = np.array([[0.75, 0.25], [0.25, 0.75]])
+    x = cp.Variable(2)
+    c = np.sum(P * np.log(P), axis=0)
+    total = cp.sum(x) == 1
+    problem = cp.Problem(
+        cp.Maximize((c @ x + cp.sum(cp.entr(P @ x))) / np.log(2)), [total, x >= 0]
+    )
+    jcv.solve(problem, **TOL)
+    capacity = 1 + 0.25 * np.log2(0.25) + 0.75 * np.log2(0.75)
+    assert problem.status == cp.OPTIMAL
+    assert problem.value == pytest.approx(capacity, abs=1e-8)
+    np.testing.assert_allclose(x.value, [0.5, 0.5], atol=1e-6)
+    assert total.dual_value == pytest.approx(capacity - np.log2(np.e), abs=1e-6)
+
+
 @pytest.mark.parametrize(
     "build",
     [

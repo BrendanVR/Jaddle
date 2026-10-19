@@ -59,6 +59,7 @@ from cvxpy.atoms.affine.transpose import transpose
 from cvxpy.atoms.affine.unary_operators import NegExpression
 from cvxpy.atoms.affine.vstack import Vstack
 from cvxpy.atoms.elementwise.abs import abs as cvx_abs
+from cvxpy.atoms.elementwise.entr import entr
 from cvxpy.atoms.elementwise.exp import exp as cvx_exp
 from cvxpy.atoms.elementwise.huber import huber
 from cvxpy.atoms.elementwise.logistic import logistic
@@ -103,6 +104,10 @@ QP_DEFAULTS = dict(
 # The compiled route adds gradient scaling ("eg_ad_rs_gs"), since a compiled
 # problem is not equilibrated.
 COMPILED_DEFAULTS = dict(QP_DEFAULTS, gradient_scaling=True)
+
+# Below this argument entr(u) = -u log u is compiled as its tangent line, so
+# the iterates, which respect only the box, see a finite value and gradient.
+ENTR_FLOOR = 1e-8
 
 _LIMIT_STOPS = ("max_epochs", "time_limit", "interrupted", "primal_stall")
 
@@ -311,6 +316,15 @@ def _safe_pnorm(v, p, axis=None, keepdims=False):
 def _huber(v, M):
     a = jnp.abs(v)
     return jnp.where(a <= M, v * v, 2 * M * a - M * M)
+
+
+def _entr(u):
+    """``-u log u`` for ``u >= ENTR_FLOOR`` and its tangent line there below:
+    concave and C¹, with slope at most ``-log(ENTR_FLOOR) - 1``."""
+    d = ENTR_FLOOR
+    safe = jnp.maximum(u, d)
+    tangent = -d * np.log(d) - (np.log(d) + 1.0) * (u - d)
+    return jnp.where(u >= d, -safe * jnp.log(safe), tangent)
 
 
 def _expand(t, axis, keepdims, ndim):
@@ -549,6 +563,9 @@ class _Compiler:
         if isinstance(e, cvx_exp):
             (f,) = self._args(e)
             return lambda x: jnp.exp(f(x))
+        if isinstance(e, entr):
+            (f,) = self._args(e)
+            return lambda x: _entr(f(x))
         if isinstance(e, logistic):
             (f,) = self._args(e)
             return lambda x: jnp.logaddexp(0.0, f(x))
@@ -682,10 +699,12 @@ def compile_problem(problem, epigraph=True, detect_bounds=True):
     it they are evaluated as they are and the solver sees their subgradients.
 
     Parameters are read at compile time. Atoms with a restricted domain
-    (``log``, ``sqrt``, ``entr``, ...) and second-order or PSD constraints are
-    not supported: Jaddle's iterates respect only the box, so they would
-    leave the domain. They, and anything else not covered, raise
-    ``NotImplementedError``.
+    (``log``, ``sqrt``, ...) and second-order or PSD constraints are not
+    supported: Jaddle's iterates respect only the box, so they would leave
+    the domain. They, and anything else not covered, raise
+    ``NotImplementedError``. The exception is ``entr``, continued below
+    ``ENTR_FLOOR`` by its tangent line; this is exact when the solution keeps
+    its argument at or above ``ENTR_FLOOR``.
     """
     if not problem.is_dcp():
         raise cp.error.DCPError("problem is not DCP")

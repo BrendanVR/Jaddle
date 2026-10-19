@@ -28,6 +28,7 @@ def has(module):
         ("cp/isotonic_regression.py", ["matplotlib"]),
         ("cp/linear_regression.py", ["matplotlib", "sklearn"]),
         ("cp/cvxpy_lasso.py", ["cvxpy"]),
+        ("cp/cvxpy_channel_capacity.py", ["cvxpy"]),
     ],
 )
 def test_example_runs(script, requires):
