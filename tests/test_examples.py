@@ -30,6 +30,8 @@ def has(module):
         ("cp/cvxpy_lasso.py", ["cvxpy"]),
         ("cp/cvxpy_channel_capacity.py", ["cvxpy"]),
         ("cp/cvxpy_robust_kalman.py", ["cvxpy", "matplotlib"]),
+        ("conic/cvxpy_portfolio.py", ["cvxpy"]),
+        ("conic/cvxpy_maxcut.py", ["cvxpy"]),
     ],
 )
 def test_example_runs(script, requires):

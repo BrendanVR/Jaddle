@@ -16,6 +16,7 @@ from jaddle.jaddle_basic_types import LP, JaddleLP, LPValues, SaddleState, scipy
 from scipy.sparse.linalg import gmres
 from jax.scipy.sparse.linalg import gmres
 import jaddle.jaddle_optimisers as jo
+from jaddle.cones import Cones, project_primal
 
 np.set_printoptions(precision=2, suppress=True)
 
@@ -185,7 +186,8 @@ def _make_epoch_fn(
     diag_on = bool(diag)
 
     def projection_primal(primal_state):
-        return projection_box(primal_state, lp.lower_bounds, lp.upper_bounds)
+        # Box on the linear variables, cones on the tail (plain box for an LP).
+        return project_primal(lp.cones, primal_state, lp.lower_bounds, lp.upper_bounds)
 
     def grad_primal_only(state):
         # Primal partial: c + Aᵀd (+ damping). One sparse matvec (Aᵀ @ d).
@@ -671,7 +673,8 @@ def _device_solver(
         lower_bounds_true = lp.lower_bounds * col_scale
         upper_bounds_true = lp.upper_bounds * col_scale
 
-        projected_primal = projection_box(
+        projected_primal = project_primal(
+            lp.cones,
             primal_true - reduced_cost_true,
             lower_bounds_true,
             upper_bounds_true,
@@ -713,6 +716,19 @@ def _device_solver(
         reduced_cost = grad_primal
         lower_bounds = lp.lower_bounds
         upper_bounds = lp.upper_bounds
+
+        def with_cone_violation(violation):
+            # A cone block's reduced cost must lie in the (self-dual) cone; its
+            # violation is the distance to it, |Π_{-K}(r)|. Cone variables
+            # are unbounded, so their bound term in the gap is already 0. The
+            # column scale is uniform on a block, so true units keep the cone.
+            if not lp.cones:
+                return violation
+            n_lin = violation.shape[0] - lp.cones.size
+            return violation.at[n_lin:].set(
+                jnp.abs(lp.cones.polar(reduced_cost_true[n_lin:]))
+            )
+
         finite_lower = jnp.isfinite(lower_bounds)
         finite_upper = jnp.isfinite(upper_bounds)
 
@@ -744,8 +760,8 @@ def _device_solver(
             box_infimum = jnp.where(
                 absorb_lower, lower_term, jnp.where(absorb_upper, upper_term, 0.0)
             )
-            dual_feasibility_violation = jnp.where(
-                absorb_lower | absorb_upper, 0.0, jnp.abs(reduced_cost_true)
+            dual_feasibility_violation = with_cone_violation(
+                jnp.where(absorb_lower | absorb_upper, 0.0, jnp.abs(reduced_cost_true))
             )
             dual_feasibility_residual = _vector_norm(
                 dual_feasibility_violation, restart_norm
@@ -811,6 +827,7 @@ def _device_solver(
                 ),
             ),
         )
+        dual_feasibility_violation = with_cone_violation(dual_feasibility_violation)
         dual_feasibility_residual = _vector_norm(
             dual_feasibility_violation, restart_norm
         )
@@ -1489,6 +1506,9 @@ def _device_solver(
                     diag_new = jo.rebalance_diag(
                         restart_point, at_restart, diag, accum, diag_theta, diag_clamp
                     )
+                    if lp.cones:
+                        # One step per cone block keeps the projection exact.
+                        diag_new = (lp.cones.tie(diag_new[0]), diag_new[1])
                 if halpern:
                     # Restarted Halpern: reset eta and re-anchor z_0 to the
                     # cycle-start iterate.
@@ -2639,6 +2659,7 @@ def make_solver(
                     augmented=scaled_augmented,
                     scaled_objective=scaled_objective,
                     scaled_rhs=scaled_rhs,
+                    **_cone_groups(pattern.cones, pattern.c.shape[0]),
                 )
             )
             scaled = pattern.with_values(
@@ -3037,6 +3058,7 @@ def make_solution(build_lp, active_tol=1e-6, **settings):
     def backward(residuals, g):
         params, x = residuals
         lp, values = _build_padded(build_lp, params)
+        _require_no_cones(lp, "make_solution")
         n_eq = lp.n_eq
         m, _ = lp.A.shape
         a_rows = np.asarray(lp.A.indices[:, 0])
@@ -3287,6 +3309,7 @@ def solve_with_presolve(
       (then ``"converged"`` is False), and ``"presolve_solved"`` when it reduces
       the problem to nothing.
     """
+    _require_no_cones(model, "solve_with_presolve")
     import highspy
     from jaddle import highs_helpers as hh
 
@@ -3572,6 +3595,7 @@ def crossover(lp, solution, highs_options=None):
     from jaddle import highs_helpers as hh
 
     start = time.time()
+    _require_no_cones(lp, "crossover")
     model = hh.jaddle_lp_to_highs(lp)
     m_eq = lp.A_eq.shape[0]
     m_ineq = model.num_row_ - m_eq
@@ -3758,6 +3782,7 @@ def to_jaddle_sparse(lp: LP):
         jnp.asarray(lp.b_ineq, dtype=float_dtype),
         jnp.asarray(lp.lower_bounds, dtype=float_dtype),
         jnp.asarray(lp.upper_bounds, dtype=float_dtype),
+        cones=getattr(lp, "cones", None),
     )
     return lp_jax
 
@@ -3926,7 +3951,9 @@ def __pad_empty_blocks(lp):
         A_eq, b_eq = zero_row(A_eq), zero_rhs(b_eq)
     if A_ineq.shape[0] == 0:
         A_ineq, b_ineq = zero_row(A_ineq), zero_rhs(b_ineq)
-    return type(lp)(lp.c, A_eq, b_eq, A_ineq, b_ineq, lp.lower_bounds, lp.upper_bounds)
+    return type(lp)(
+        lp.c, A_eq, b_eq, A_ineq, b_ineq, lp.lower_bounds, lp.upper_bounds, lp.cones
+    )
 
 
 def __scipy_to_bcoo(A, dtype):
@@ -3945,6 +3972,8 @@ def __equilibrate(
     use_max,
     clip_bounds,
     threshold,
+    col_group=None,
+    num_groups=None,
 ):
     """Run ``max_iter`` Sinkhorn-Ruiz equilibration sweeps from the given scales.
 
@@ -3958,6 +3987,11 @@ def __equilibrate(
     empty-row/col guard is implicit: absent segments yield the reduction
     identity (0 for ``segment_sum``, -inf for ``segment_max``), which the
     ``<= threshold -> 1.0`` clamp maps to a unit (no-op) scale either way.
+
+    ``col_group`` (one id per column, ``num_groups`` ids) ties columns: each
+    group's columns get its largest norm, so a group that starts with one
+    scale keeps one scale. Cone blocks are groups, since only a uniform
+    scaling maps a cone to itself.
     """
     lo, hi = clip_bounds
     n_rows, n_cols = row_scale.shape[0], col_scale.shape[0]
@@ -3981,12 +4015,24 @@ def __equilibrate(
         col_norms = reduce_segments(absdata * row_scale[row_idx], col_idx, n_cols)
         col_norms = col_norms * col_scale
         col_norms = jnp.where(col_norms <= threshold, 1.0, col_norms)
+        if col_group is not None:
+            col_norms = jax.ops.segment_max(
+                col_norms, col_group, num_segments=num_groups
+            )[col_group]
 
         row_scale = row_scale * jnp.clip(1.0 / jnp.sqrt(row_norms), lo, hi)
         col_scale = col_scale * jnp.clip(1.0 / jnp.sqrt(col_norms), lo, hi)
         return row_scale, col_scale
 
     return jax.lax.fori_loop(0, max_iter, body, (row_scale, col_scale))
+
+
+def _cone_groups(cones, n):
+    """``__scale_problem_jax``'s column-tying arguments for ``cones``."""
+    if not cones:
+        return {}
+    groups = cones.column_groups(n)
+    return dict(col_group=jnp.asarray(groups), num_groups=int(groups[-1]) + 1)
 
 
 def __nonzero_or_one(x):
@@ -4002,6 +4048,7 @@ def __nonzero_or_one(x):
         "augmented",
         "scaled_objective",
         "scaled_rhs",
+        "num_groups",
     ),
 )
 def __scale_problem_jax(
@@ -4024,6 +4071,8 @@ def __scale_problem_jax(
     augmented,
     scaled_objective,
     scaled_rhs,
+    col_group=None,
+    num_groups=None,
 ):
     """Device-side body of ``scale_problem``: equilibrate, then apply the scales.
 
@@ -4031,6 +4080,9 @@ def __scale_problem_jax(
     returns ``(row_scale, col_scale, eq_data, ineq_data, c, b_eq, b_ineq,``
     ``lower_bounds, upper_bounds, c_max)``, all scaled. The sparsity pattern is
     unchanged by diagonal scaling, so the callers reuse the input indices.
+
+    ``col_group``/``num_groups`` (from ``Cones.column_groups``) keep the
+    column scale uniform on each cone block; ``None`` for a plain LP.
     """
     n_eq = b_eq.shape[0]
     m, n = n_eq + b_ineq.shape[0], c.shape[0]
@@ -4064,6 +4116,12 @@ def __scale_problem_jax(
             [a_col, jnp.full(m, n, a_col.dtype), jnp.arange(n, dtype=a_col.dtype)]
         )
         n_rows, n_cols = m + 1, n + 1
+        if col_group is not None:
+            # The b column is a group of its own.
+            col_group = jnp.concatenate(
+                [col_group, jnp.full(1, num_groups, col_group.dtype)]
+            )
+            num_groups = num_groups + 1
     else:
         absdata, row_idx, col_idx = jnp.abs(a_data), a_row, a_col
         n_rows, n_cols = m, n
@@ -4080,6 +4138,8 @@ def __scale_problem_jax(
         True,
         clip_bounds,
         threshold,
+        col_group,
+        num_groups,
     )
 
     if augmented:
@@ -4104,6 +4164,8 @@ def __scale_problem_jax(
         False,
         clip_bounds,
         threshold,
+        col_group,
+        num_groups,
     )
     dr, dc = row_scale[:m], col_scale[:n]
 
@@ -4155,6 +4217,12 @@ def __scale_problem_jax(
         .max(jnp.abs(jnp.concatenate([eq_data, ineq_data])))
     )
     pinned = (c != 0.0) & (col_max > threshold) & (col_max < cost_col_floor)
+    if col_group is not None:
+        # Cone columns (groups of more than one column) keep their tied scale.
+        group_size = jax.ops.segment_sum(
+            jnp.ones(n, jnp.int32), col_group[:n], num_segments=num_groups
+        )
+        pinned = pinned & (group_size[col_group[:n]] == 1)
     col_boost = jnp.where(
         pinned,
         jnp.minimum(1.0 / jnp.where(pinned, col_max, 1.0), clip_bounds[1]),
@@ -4263,6 +4331,7 @@ def scale_problem(
         augmented=augmented,
         scaled_objective=scaled_objective,
         scaled_rhs=scaled_rhs,
+        **_cone_groups(lp.cones, lp.c.shape[0]),
     )
 
     def rebuild(data, like):
@@ -4281,6 +4350,7 @@ def scale_problem(
         b_ineq.astype(float_dtype),
         lb.astype(float_dtype),
         ub.astype(float_dtype),
+        cones=lp.cones,
     )
     return lp_scaled, dr, dc, float(c_max)
 
@@ -4315,6 +4385,11 @@ def project_onto_eq(lp: JaddleLP, primal: jnp.ndarray, tol=1e-6) -> jnp.ndarray:
         print(f"GMRES did not converge (info={info})")
 
     return primal + delta
+
+
+def _require_no_cones(lp, what):
+    if getattr(lp, "cones", None):
+        raise NotImplementedError(f"{what} does not support conic problems yet")
 
 
 def lp_to_dual(lp: JaddleLP) -> JaddleLP:
@@ -4375,6 +4450,7 @@ def lp_to_dual(lp: JaddleLP) -> JaddleLP:
     is exactly this codebase's dual-feasibility constraint; there are no
     inequality rows since all sign structure now lives in the bounds on z.
     """
+    _require_no_cones(lp, "lp_to_dual")
     m = lp.A_eq.shape[0] + lp.A_ineq.shape[0]
     n = lp.c.shape[0]
 
@@ -4637,6 +4713,12 @@ def evaluate_lp_certificate(
                 ),
             ),
         )
+    if lp.cones:
+        # Cone blocks: distance of the reduced cost to the (self-dual) cone.
+        n_lin = primal.shape[0] - lp.cones.size
+        dual_feasibility_violation = dual_feasibility_violation.at[n_lin:].set(
+            jnp.abs(lp.cones.polar(reduced_cost[n_lin:]))
+        )
     dual_feasibility_residual = _vector_norm(dual_feasibility_violation, norm)
 
     ineq_violations = jnp.maximum(grad_dual_ineq, 0.0)
@@ -4834,6 +4916,7 @@ def primal_feasibility_lp(lp: JaddleLP, objective_bound=None) -> JaddleLP:
         b_ineq,
         lp.lower_bounds,
         lp.upper_bounds,
+        cones=lp.cones,
     )
 
 
@@ -5074,6 +5157,7 @@ def solve_with_polishing(
     # solve() pads an empty constraint class with a zero row and returns duals
     # of that padded size; pad here so the certificate below sees the same LP.
     lp = __pad_empty_blocks(lp)
+    _require_no_cones(lp, "solve_with_polishing")
     if first_polish_epoch < 1:
         raise ValueError("first_polish_epoch must be >= 1")
     if not 0.0 < polish_fraction:
@@ -5503,6 +5587,7 @@ def detect_infeasibility(
     if not isinstance(lp, JaddleLP):
         lp = to_jaddle_sparse(lp)
     lp = __pad_empty_blocks(lp)
+    _require_no_cones(lp, "detect_infeasibility")
     if first_check_epoch < 1:
         raise ValueError("first_check_epoch must be >= 1")
     for key, value in (

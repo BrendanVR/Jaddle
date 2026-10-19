@@ -405,6 +405,57 @@ tests.
   coefficient ranges, which is the first thing to check when an instance
   misbehaves.
 
+### Conic programs
+
+The same solver handles second-order and positive semidefinite cones. Pass
+`cones=jl.Cones(soc=..., psd=...)` to `jl.LP` and the last variables of `x`
+are constrained to cones, in the style of SCS's cone dimensions:
+
+```
+minimise    cᵀx
+subject to  A_eq x = b_eq,  A_ineq x <= b_ineq,  l <= x <= u   (linear variables)
+            x[K₁] ∈ K₁, x[K₂] ∈ K₂, ...                         (the tail of x)
+```
+
+With `n` variables and `jl.Cones(soc=(3, 5), psd=(4,))`, the first `n − 18`
+are ordinary linear variables, the next 3 lie in a second-order cone
+`{(t, z) : ‖z‖ ≤ t}`, the next 5 in another, and the last 10 hold a 4 × 4
+PSD matrix in `svec` form (its upper triangle row by row, off-diagonals
+times √2; `jaddle.cones.svec` and `smat` convert). Cone variables must be
+unbounded. A conic constraint `b − Ax ∈ K` becomes `Ax + s = b` with slack
+variables `s` in the cone.
+
+```python
+import numpy as np
+import scipy.sparse as sp
+import jaddle.jaddle_linear as jl
+
+# minimise cᵀz subject to ‖z‖ <= 1, as (t, z) in a second-order cone, t = 1
+c = np.array([1.0, -2.0, 2.0])
+n = 1 + c.size
+lp = jl.LP(
+    c=np.r_[0.0, c],
+    A_eq=sp.csc_matrix(np.eye(1, n)), b_eq=np.ones(1),
+    A_ineq=sp.csc_matrix((0, n)), b_ineq=np.zeros(0),
+    lower_bounds=np.full(n, -np.inf), upper_bounds=np.full(n, np.inf),
+    cones=jl.Cones(soc=(n,)),
+)
+z = jl.solve(lp)["solution"].primal[1:]   # -c / ‖c‖
+```
+
+Each step projects the cone variables onto their cones (a closed form for
+second-order cones, one batched eigendecomposition per PSD size) instead of
+onto a box. Both cones are self-dual, so the dual condition on a cone block is
+that its reduced cost lies in the cone, and the certificate measures dual
+infeasibility as the reduced cost's distance to the cone. Scaling, the
+diagonal metric and restarts work as for an LP, with column scales tied to one
+value per cone block. `jl.solve`, `make_solver`, `solve_batch` and
+`make_optimal_value` (differentiable optimal values) all take conic problems;
+presolve, crossover, polishing, infeasibility detection and `make_solution`
+do not yet, and raise `NotImplementedError`. CVXPY problems with
+second-order and PSD constraints go through `jcv.JaddleConicSolver` (see
+[Modelling with CVXPY](#modelling-with-cvxpy)).
+
 ## The convex programming solver
 
 ### Problem form
@@ -576,8 +627,8 @@ argument, a function of the solver state that returns the three quantities
 ## Modelling with CVXPY
 
 [CVXPY](https://www.cvxpy.org/) can serve as the modelling language
-(`pip install "jaddle[cvxpy]"`). `jaddle.jaddle_cvxpy` offers two routes, and
-both return results the CVXPY way: `problem.status`, `problem.value`,
+(`pip install "jaddle[cvxpy]"`). `jaddle.jaddle_cvxpy` offers three routes, and
+all return results the CVXPY way: `problem.status`, `problem.value`,
 `var.value`, each constraint's `dual_value`, and Jaddle's full result in
 `problem.solver_stats.extra_stats`.
 
@@ -590,6 +641,10 @@ w = cp.Variable(p)
 # An LP or QP: Jaddle as a CVXPY solver.
 lasso = cp.Problem(cp.Minimize(cp.sum_squares(X @ w - y) + cp.norm1(w)))
 lasso.solve(solver=jcv.JaddleSolver(), tol=1e-6)
+
+# Second-order and PSD cones: Jaddle as a CVXPY conic solver.
+risk_limited = cp.Problem(cp.Maximize(mu @ w), [cp.sum(w) == 1, cp.norm(F.T @ w) <= 0.2])
+risk_limited.solve(solver=jcv.JaddleConicSolver(), tol=1e-6)
 
 # Any other DCP problem: compiled to a JaddleCP.
 logistic = cp.Problem(cp.Minimize(cp.sum(cp.logistic(-cp.multiply(labels, X @ w)))))
@@ -605,9 +660,19 @@ tolerance on the original problem is reported as `"optimal_inaccurate"`.
 [`examples/lp/cvxpy_transport.py`](https://github.com/BrendanVR/Jaddle/blob/main/examples/lp/cvxpy_transport.py)
 is a small worked LP.
 
+**`JaddleConicSolver`** is a CVXPY conic solver for problems CVXPY can put in
+the form `min cᵀx  s.t.  Ax + s = b`, with `s` in a product of zero,
+nonnegative, second-order and PSD cones. It solves them with `jl.solve` on
+cone-constrained variables (see [Conic programs](#conic-programs)); there is
+no presolve. Exponential and power cones are not supported.
+[`examples/conic/cvxpy_portfolio.py`](https://github.com/BrendanVR/Jaddle/blob/main/examples/conic/cvxpy_portfolio.py)
+traces a risk-limited portfolio's efficient frontier, and
+[`examples/conic/cvxpy_maxcut.py`](https://github.com/BrendanVR/Jaddle/blob/main/examples/conic/cvxpy_maxcut.py)
+solves the Goemans–Williamson Max-Cut SDP and rounds it to a cut.
+
 **`jcv.solve`** handles the rest. For a general convex problem CVXPY's own
-reductions produce cones (exponential, second-order, PSD), and Jaddle has no
-cone projections. The cone form is also a poor fit for a first-order method:
+reductions produce cones, exponential ones included, which Jaddle cannot
+project onto. The cone form is also a poor fit for a first-order method:
 on the L1-logistic regression in
 [`examples/cp/cvxpy_lasso.py`](https://github.com/BrendanVR/Jaddle/blob/main/examples/cp/cvxpy_lasso.py) it has 701
 variables, 1500 rows and 400 exponential cones. `jcv.compile_problem` instead
@@ -636,8 +701,9 @@ handles these atoms as follows:
   gradient.
 
 Other atoms with a restricted domain (`log`, `sqrt`, ...) and second-order
-or PSD constraints raise `NotImplementedError`: Jaddle keeps its iterates
-inside the box only, so they would leave the domain. A problem that CVXPY can
+or PSD constraints raise `NotImplementedError` on this route: the convex
+solver keeps its iterates inside the box only, so they would leave the domain.
+Second-order and PSD constraints go to `JaddleConicSolver` instead. A problem that CVXPY can
 put in QP form goes to `JaddleSolver` unless `qp_route=False`, so it gets
 presolve or KKT scaling. The compiled problem is solved by `jc.solve` with
 adaptive extragradient, restarts and gradient scaling (`jcv.COMPILED_DEFAULTS`).
@@ -705,12 +771,13 @@ these results are described in [`benchmarks/README.md`](https://github.com/Brend
 |---|---|
 | [`jaddle/jaddle_linear.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_linear.py) | LP solver, scaling, certification and polishing |
 | [`jaddle/jaddle_convex.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_convex.py) | Convex solver |
+| [`jaddle/cones.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/cones.py) | Second-order and PSD cones for the LP solver |
 | [`jaddle/jaddle_cvxpy.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_cvxpy.py) | CVXPY front end |
 | [`jaddle/jaddle_basic_types.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_basic_types.py) | `SaddleState`, `JaddleCP`, `LP` and `JaddleLP` |
 | [`jaddle/jaddle_optimisers.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/jaddle_optimisers.py) | Precision profiles and Optax saddle-point optimisers |
 | [`jaddle/presolve.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/presolve.py) | Defined-variable elimination and postsolve |
 | [`jaddle/highs_helpers.py`](https://github.com/BrendanVR/Jaddle/blob/main/jaddle/highs_helpers.py) | HiGHS converters and presolve interface |
-| [`examples/`](https://github.com/BrendanVR/Jaddle/blob/main/examples/README.md) | Worked LP and convex examples |
+| [`examples/`](https://github.com/BrendanVR/Jaddle/blob/main/examples/README.md) | Worked LP, conic and convex examples |
 | [`benchmarks/`](https://github.com/BrendanVR/Jaddle/blob/main/benchmarks/README.md) | MIPLIB and convex benchmark harnesses |
 | [`tests/`](https://github.com/BrendanVR/Jaddle/tree/main/tests) | Test suite (`pytest`) |
 | [`CHANGELOG.md`](https://github.com/BrendanVR/Jaddle/blob/main/CHANGELOG.md) | Changes in each release |

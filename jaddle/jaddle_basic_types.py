@@ -85,6 +85,22 @@ class JaddleCP:
         )
 
 
+def _check_cones(cones, lower_bounds, upper_bounds):
+    """Normalise an empty ``Cones`` to ``None`` and check that cone variables
+    (the tail of x) are unbounded, when the bounds are concrete."""
+    if cones is None or not cones:
+        return None
+    n = np.shape(lower_bounds)[0]
+    if cones.size > n:
+        raise ValueError(f"{n} variables cannot hold cones of total size {cones.size}")
+    for bound in (lower_bounds, upper_bounds):
+        if isinstance(bound, jax.core.Tracer):
+            continue
+        if np.any(np.isfinite(np.asarray(bound)[n - cones.size :])):
+            raise ValueError("variables in cone blocks must have infinite bounds")
+    return cones
+
+
 class LP:
     def __init__(
         self,
@@ -95,6 +111,7 @@ class LP:
         b_ineq,
         lower_bounds,
         upper_bounds,
+        cones=None,
     ):
         self.c = c
         self.A_eq = A_eq
@@ -103,6 +120,7 @@ class LP:
         self.b_ineq = b_ineq
         self.lower_bounds = lower_bounds
         self.upper_bounds = upper_bounds
+        self.cones = _check_cones(cones, lower_bounds, upper_bounds)
 
     def objective(self, x):
         return self.c @ x
@@ -192,6 +210,7 @@ class JaddleLP:
         b_ineq,
         lower_bounds,
         upper_bounds,
+        cones=None,
     ):
         self.c = c
         self.A_eq = A_eq
@@ -200,6 +219,7 @@ class JaddleLP:
         self.b_ineq = b_ineq
         self.lower_bounds = lower_bounds
         self.upper_bounds = upper_bounds
+        self.cones = _check_cones(cones, lower_bounds, upper_bounds)
         # Fused [A_eq; A_ineq] for 2-matvec gradient computation.
         #
         # Both A and Aᵀ are kept as BCOO. BCSR was benchmarked here (Aᵀ
@@ -260,7 +280,9 @@ class JaddleLP:
         self.b = put(xp.concatenate([xp.asarray(b_eq), xp.asarray(b_ineq)]))
 
     @classmethod
-    def from_scipy(cls, c, A_eq, b_eq, A_ineq, b_ineq, lower_bounds, upper_bounds):
+    def from_scipy(
+        cls, c, A_eq, b_eq, A_ineq, b_ineq, lower_bounds, upper_bounds, cones=None
+    ):
         """Build a ``JaddleLP`` directly from scipy sparse blocks + numpy vectors.
 
         Mirrors ``jaddle_linear.to_jaddle_sparse``: resolves the active precision
@@ -284,6 +306,7 @@ class JaddleLP:
             jnp.asarray(b_ineq, dtype=float_dtype),
             jnp.asarray(lower_bounds, dtype=float_dtype),
             jnp.asarray(upper_bounds, dtype=float_dtype),
+            cones=cones,
         )
 
     def values(self):
@@ -323,6 +346,7 @@ class JaddleLP:
         out.A_eq = bcoo(values.A_eq_data, self.A_eq)
         out.A_ineq = bcoo(values.A_ineq_data, self.A_ineq)
         out.n_eq = self.n_eq
+        out.cones = self.cones
         out._order, out._order_T = self._order, self._order_T
         data = jnp.concatenate([values.A_eq_data, values.A_ineq_data])
         if self._order is not None:
@@ -399,6 +423,7 @@ class JaddleLP:
             np.asarray(self.b_ineq, dtype=np.float64),
             np.asarray(self.lower_bounds, dtype=np.float64),
             np.asarray(self.upper_bounds, dtype=np.float64),
+            cones=self.cones,
         )
 
 

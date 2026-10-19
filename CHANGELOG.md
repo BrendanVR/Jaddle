@@ -4,6 +4,19 @@
 
 ### Added
 
+- Second-order and PSD cones in the LP solver. `jl.LP(..., cones=jl.Cones(
+  soc=..., psd=...))` constrains the tail of `x` to a product of cones (PSD
+  blocks in `svec` form); each step projects onto them, scaling and the
+  diagonal metric keep one scale per cone block, and the certificate measures
+  dual infeasibility as the reduced cost's distance to the cone. `jl.solve`,
+  `make_solver`, `solve_batch` and `make_optimal_value` take conic problems;
+  presolve, crossover, polishing, infeasibility detection and `make_solution`
+  raise `NotImplementedError` for them. Pure LPs are unaffected (bit-identical
+  results). New module `jaddle.cones`.
+
+- `jcv.JaddleConicSolver`: a CVXPY conic solver for problems with zero,
+  nonnegative, second-order and PSD cones. See `examples/conic/`.
+
 - `jcv.solve` compiles CVXPY's `entr` atom. Below `jcv.ENTR_FLOOR` (1e-8)
   it is continued by its tangent line, so iterates outside `entr`'s domain
   get a finite value and gradient. The result is exact when the solution

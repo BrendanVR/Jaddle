@@ -1,7 +1,7 @@
 """
 CVXPY as a modelling front end for Jaddle.
 
-Two routes, both returning results the CVXPY way (``prob.status``,
+Three routes, all returning results the CVXPY way (``prob.status``,
 ``prob.value``, ``var.value``, ``constraint.dual_value``):
 
 * ``JaddleSolver`` is a CVXPY QP solver: ``prob.solve(solver=JaddleSolver())``
@@ -10,9 +10,13 @@ Two routes, both returning results the CVXPY way (``prob.status``,
   (``P = 0``) goes through ``jaddle_linear.solve_with_presolve`` (HiGHS
   presolve, then Jaddle, then HiGHS postsolve), a QP through
   ``jaddle_convex.quadratic_program``.
+* ``JaddleConicSolver`` is a CVXPY conic solver for problems with
+  second-order and PSD cones: ``prob.solve(solver=JaddleConicSolver())``.
+  They are solved by ``jaddle_linear.solve`` on cone-constrained variables
+  (``jaddle.cones``).
 * ``solve(prob)`` handles general convex problems. CVXPY's own route would
-  rewrite them into cones (exponential, second-order), which Jaddle cannot
-  project onto and which turn a smooth loss such as the logistic into many
+  rewrite them into cones (exponential, second-order), which the convex
+  solver cannot project onto and which turn a smooth loss such as the logistic into many
   extra variables and rows. Instead ``compile_problem`` walks the expression
   tree and builds a ``JaddleCP`` of JAX functions for
   ``jaddle_convex.solve``: smooth atoms stay smooth, and only piecewise-linear
@@ -74,18 +78,22 @@ from cvxpy.atoms.norm_inf import norm_inf
 from cvxpy.atoms.pnorm import Pnorm
 from cvxpy.atoms.quad_form import QuadForm
 from cvxpy.atoms.quad_over_lin import quad_over_lin
-from cvxpy.constraints import Equality, Inequality, NonNeg, NonPos, Zero
+from cvxpy.constraints import SOC, Equality, Inequality, NonNeg, NonPos, Zero
+from cvxpy.constraints.psd import SvecPSD
 from cvxpy.expressions.constants.constant import Constant
 from cvxpy.expressions.constants.parameter import Parameter
 from cvxpy.expressions.variable import Variable
 from cvxpy.problems.problem import SolverStats
 from cvxpy.reductions.solution import Solution, failure_solution
 from cvxpy.reductions.solvers import utilities
+from cvxpy.reductions.solvers.conic_solvers.conic_solver import ConicSolver
 from cvxpy.reductions.solvers.qp_solvers.qp_solver import QpSolver
+from cvxpy.utilities.psd_utils import TriangleKind
 
 import jaddle.jaddle_convex as jc
 import jaddle.jaddle_linear as jl
 import jaddle.jaddle_optimisers as jo
+from jaddle.cones import Cones
 from jaddle.jaddle_basic_types import LP, JaddleCP, SaddleState, scipy_to_bcoo
 
 DEFAULT_TOLERANCE = 1e-6
@@ -288,6 +296,158 @@ class JaddleSolver(QpSolver):
             status,
             results["objective"] + inverse_data[s.OFFSET],
             {self.VAR_ID: solution.primal},
+            dual_vars,
+            attr,
+        )
+
+    def cite(self, data):
+        return ""
+
+
+# %%
+# Route 1b: a CVXPY conic solver (second-order and PSD cones)
+
+
+class JaddleConicSolver(ConicSolver):
+    """
+    Jaddle as a CVXPY conic solver:
+    ``prob.solve(solver=JaddleConicSolver(), **opts)``.
+
+    Takes problems CVXPY can put in the cone form
+    ``min cᵀx  s.t.  Ax + s = b,  s ∈ {0} x R+ x SOC x ... x PSD x ...`` and
+    solves them with ``jaddle_linear.solve`` on cone-constrained variables
+    (``jaddle.cones``). Zero rows become equality rows, nonnegative rows
+    inequality rows ``Ax <= b``, and each second-order or PSD block gets slack
+    variables ``s`` in that cone with equality rows ``Ax + s = b``. PSD blocks
+    use SCS's ``svec`` (lower triangle by columns, off-diagonals times ``√2``).
+    Exponential and power cones are not supported.
+
+    The keyword arguments of ``prob.solve`` go to ``jaddle_linear.solve``
+    (``verbose`` included). ``tol`` sets its three relative tolerances unless
+    they are given by name; it defaults to ``DEFAULT_TOLERANCE``.
+    ``warm_start=True`` starts from the previous solve's point when the
+    problem's sizes are unchanged.
+
+    ``prob.solver_stats.extra_stats`` is Jaddle's result dict.
+    """
+
+    MIP_CAPABLE = False
+    BOUNDED_VARIABLES = True
+    SUPPORTED_CONSTRAINTS = ConicSolver.SUPPORTED_CONSTRAINTS + [SOC, SvecPSD]
+    PSD_TRIANGLE_KIND = TriangleKind.LOWER
+    PSD_SQRT2_SCALING = True
+
+    def name(self):
+        return "JADDLE_CONIC"
+
+    def import_solver(self) -> None:
+        import jaddle  # noqa: F401
+
+    def solve_via_data(
+        self, data, warm_start: bool, verbose: bool, solver_opts, solver_cache=None
+    ):
+        options = _with_tolerances(solver_opts, _QP_TOLERANCES)
+        options["verbose"] = verbose
+
+        dims = data[ConicSolver.DIMS]
+        A = sp.csr_matrix(data[s.A])
+        b = np.asarray(data[s.B], dtype=np.float64)
+        c = np.asarray(data[s.C], dtype=np.float64)
+        n = c.shape[0]
+        n_zero, n_nonneg = dims.zero, dims.nonneg
+        cones = Cones(soc=dims.soc, psd=dims.psd)
+        k = cones.size
+
+        lower, upper = data[s.LOWER_BOUNDS], data[s.UPPER_BOUNDS]
+        lower = np.full(n, -np.inf) if lower is None else np.asarray(lower, float)
+        upper = np.full(n, np.inf) if upper is None else np.asarray(upper, float)
+
+        # Variables [x; s]: the cone slacks form the cone tail.
+        zero_rows = A[:n_zero]
+        nonneg_rows = A[n_zero : n_zero + n_nonneg]
+        cone_rows = A[n_zero + n_nonneg :]
+        A_eq = sp.vstack(
+            [
+                sp.hstack([zero_rows, sp.csr_matrix((n_zero, k))]),
+                sp.hstack([cone_rows, sp.identity(k, format="csr")]),
+            ],
+            format="csc",
+        )
+        A_ineq = sp.hstack([nonneg_rows, sp.csr_matrix((n_nonneg, k))], format="csc")
+        lp = LP(
+            np.concatenate([c, np.zeros(k)]),
+            A_eq,
+            np.concatenate([b[:n_zero], b[n_zero + n_nonneg :]]),
+            A_ineq,
+            b[n_zero : n_zero + n_nonneg],
+            np.concatenate([lower, np.full(k, -np.inf)]),
+            np.concatenate([upper, np.full(k, np.inf)]),
+            cones=cones,
+        )
+
+        cached = None if solver_cache is None else solver_cache.get(self.name())
+        if warm_start and cached is not None:
+            if (
+                cached.primal.shape[0] == n + k
+                and cached.dual_eq.shape[0] == A_eq.shape[0]
+                and cached.dual_ineq.shape[0] == A_ineq.shape[0]
+            ):
+                options.setdefault("initial_solution", cached)
+
+        start = time.time()
+        result = jl.solve(lp, **options)
+        result["wall_seconds"] = time.time() - start
+
+        solution = result["solution"]
+        if solution is not None:
+            # solve() may pad an empty block with one zero row.
+            solution = SaddleState(
+                primal=np.asarray(solution.primal, dtype=np.float64),
+                dual_ineq=np.asarray(solution.dual_ineq, dtype=np.float64)[:n_nonneg],
+                dual_eq=np.asarray(solution.dual_eq, dtype=np.float64)[
+                    : n_zero + k
+                ],
+            )
+            result["solution"] = solution
+            result["objective"] = float(c @ solution.primal[:n])
+            if solver_cache is not None:
+                solver_cache[self.name()] = solution
+        return result
+
+    def invert(self, results, inverse_data):
+        status = _status(results)
+        attr = {
+            s.SOLVE_TIME: results.get("solve_seconds", results["wall_seconds"]),
+            s.NUM_ITERS: results.get("epochs"),
+            s.EXTRA_STATS: results,
+        }
+        if status not in s.SOLUTION_PRESENT:
+            return failure_solution(status, attr)
+        solution = results["solution"]
+        n_zero = inverse_data[self.DIMS].zero
+        n = solution.primal.shape[0] - Cones(
+            soc=inverse_data[self.DIMS].soc, psd=inverse_data[self.DIMS].psd
+        ).size
+        # Jaddle's Lagrangian cᵀx + yᵀ(Ax + s - b) with y_nonneg >= 0 and, by
+        # stationarity in the cone slacks, y_cone in the (self-dual) cone: the
+        # sign convention of CVXPY's conic duals (as SCS's). Rows are ordered
+        # zero, nonneg, cones, as CVXPY's.
+        y = np.concatenate(
+            [
+                solution.dual_eq[:n_zero],
+                solution.dual_ineq,
+                solution.dual_eq[n_zero:],
+            ]
+        )
+        dual_vars = utilities.get_dual_values(
+            y[:n_zero], utilities.extract_dual_value, inverse_data[self.EQ_CONSTR]
+        ) | utilities.get_dual_values(
+            y[n_zero:], utilities.extract_dual_value, inverse_data[self.NEQ_CONSTR]
+        )
+        return Solution(
+            status,
+            results["objective"] + inverse_data[s.OFFSET],
+            {inverse_data[self.VAR_ID]: solution.primal[:n]},
             dual_vars,
             attr,
         )

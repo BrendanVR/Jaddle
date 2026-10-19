@@ -4,6 +4,8 @@ Short, self-contained scripts that show how to set up and solve problems with
 Jaddle. They are grouped by solver:
 
 - [`lp/`](lp/): linear programs, solved with `jaddle.jaddle_linear`
+- [`conic/`](conic/): second-order cone and semidefinite programs, solved with
+  `jaddle.jaddle_linear` on cone-constrained variables
 - [`cp/`](cp/): general convex programs, solved with `jaddle.jaddle_convex`
 
 Every example is written in the "percent" cell format (`# %%` / `# %% [markdown]`).
@@ -76,6 +78,13 @@ bring the daily cost from $6.02 with no battery to $3.83. The problem is not
 convex, so the example repeats the run from an oversized battery: the two
 runs agree within 0.03% in cost (14.3 kWh against 14.6 kWh; the cost is flat
 near the optimum). It takes about 50 seconds on a CPU.
+
+## Conic programs (`conic/`)
+
+| Example | What it shows | Extra dependencies |
+|---|---|---|
+| [`cvxpy_portfolio.py`](conic/cvxpy_portfolio.py) | A second-order cone program in CVXPY: long-only portfolio weights for 50 assets that maximise expected return under a volatility limit, with risk from a factor model. Solved with `jcv.JaddleConicSolver`; sweeps the limit to trace the efficient frontier, warm-starting each solve, and reads the frontier's slope off the risk limit's dual. Checked against Clarabel. | `cvxpy` |
+| [`cvxpy_maxcut.py`](conic/cvxpy_maxcut.py) | A semidefinite program in CVXPY: the Goemans–Williamson relaxation of Max-Cut on a random 30-node graph, solved with `jcv.JaddleConicSolver` (a PSD projection each step) and rounded to a cut with random hyperplanes. Checks the bound against Clarabel and against the dual certificate. | `cvxpy` |
 
 ## Convex programs (`cp/`)
 
