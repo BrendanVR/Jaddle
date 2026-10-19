@@ -301,36 +301,48 @@ the dual objective as in PDLP, so far-away finite bounds do not swamp the gap.
 
 ### Batched and differentiable solves
 
-`jl.make_solver(lp, **options)` turns `solve()` into a pure JAX function of
-the LP's numbers. It takes the same options and reproduces `solve()` exactly,
-but it has no logging, time limit or `vertex_bias`. The numbers travel as a
-`jl.LPValues` pytree: the cost, the stored nonzeros of `A_eq` and `A_ineq` on
-`lp`'s sparsity pattern, the right-hand sides and the bounds
-(`jaddle_lp.values()` extracts them, `jaddle_lp.with_values(v)` puts them
-back). The function can be jitted, batched with `jax.vmap` and differentiated:
+As in the convex front end, write a function `build_lp(params)` that returns
+an ordinary `jl.LP` (or `JaddleLP`) whose numbers depend on `params`, any
+pytree. `jl.make_solver(build_lp, **options)` turns `solve()` into a pure JAX
+function of `params`. It takes the same options and reproduces `solve()`
+exactly, but it has no logging, time limit or `vertex_bias`. The function
+can be jitted, batched with `jax.vmap` and differentiated:
 
 ```python
-values = jl.to_jaddle_sparse(lp).values()
-solve_fn = jl.make_solver(lp, max_epochs=1000)
-result = jax.jit(solve_fn)(values)       # SolveCoreResult: solution, converged, ...
+def build_lp(price):
+    return jl.LP(c=price, A_eq=A_eq, b_eq=b_eq, A_ineq=A_ineq, b_ineq=b_ineq,
+                 lower_bounds=lb, upper_bounds=ub)
 
-costs = values.c * (1 + 0.1 * jax.random.normal(key, (32,) + values.c.shape))
-batch = jl.solve_batch(lp, values._replace(c=costs))   # 32 solves at once
+solve_fn = jax.jit(jl.make_solver(build_lp, max_epochs=1000))
+result = solve_fn(price)                 # SolveCoreResult: solution, converged, ...
+batch = jax.vmap(solve_fn)(prices)       # many LPs at once
 ```
 
-In a batch the cost, right-hand sides, bounds and matrix values can all vary;
-any field without a batch axis is shared. Each member is scaled as `solve()`
-would scale it, and finished members wait for the slowest. Members are not
-bit-identical to separate solves, because XLA rounds batched reductions
-slightly differently, but each certifies to the requested tolerance.
+The LPs of one function share a sparsity pattern, which is read from whatever
+does not depend on `params` (`build_lp` runs under
+`jax.ensure_compile_time_eval`, so this holds under `jit` too). SciPy matrices
+and dense matrices that don't depend on `params` keep their nonzeros. A dense
+matrix that does depend on them stores every entry. To reuse a `JaddleLP`'s
+pattern with new numbers, `jl.make_solver(jaddle_lp.with_values)` takes a
+`jl.LPValues` pytree as `params`: the cost, the stored nonzeros of `A_eq` and
+`A_ineq`, the right-hand sides and the bounds (`jaddle_lp.values()` extracts
+them).
 
-Three functions differentiate through a solve:
+In a batch the cost, right-hand sides, bounds and matrix values can all vary.
+`jl.solve_batch(build_lp, params, in_axes=0)` is the jitted `vmap`. Each
+member is scaled as `solve()` would scale it, and finished members wait for
+the slowest. Members are not bit-identical to separate solves, because XLA
+rounds batched reductions slightly differently, but each certifies to the
+requested tolerance.
+
+Three functions differentiate through a solve. Each takes `build_lp` and
+carries its gradient back through it to `params`:
 
 | Function | Differentiates | How |
 |---|---|---|
 | `jl.make_optimal_value` | the optimal value `z*` w.r.t. every number | envelope theorem: `∂z*/∂c = x*`, `∂z*/∂b = −y*`, `∂z*/∂A_ij = y*_i x*_j`, and the reduced costs for the bounds |
 | `jl.make_solution` | `x*` w.r.t. `b`, `A` and the bounds | implicit differentiation of the active constraints at a nondegenerate vertex (raises an error elsewhere) |
-| `jl.make_perturbed_solution` | a smoothed `x*` w.r.t. `c` | perturbed optimizer: averages solves at `c + σZ`, batched |
+| `jl.make_perturbed_solution` | a smoothed `x*` w.r.t. `c` | perturbed optimizer: averages solves at `c + σZ`, batched; `x_fn(params, key)` |
 
 An LP's solution is piecewise constant in its cost, so `dx*/dc` is zero
 almost everywhere. That's why the smoothed, perturbed version exists for

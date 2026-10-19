@@ -14,6 +14,25 @@
   example, the least-squares smoother on the QP route and the Huber-of-norm
   smoother on the compiled route.
 
+### Changed
+
+- LP `make_solver`, `solve_batch`, `make_optimal_value`, `make_solution` and
+  `make_perturbed_solution` now take a builder, as the convex ones do:
+  `build_lp(params)` returns an `LP` or `JaddleLP`, and the returned function
+  takes `params` (any pytree). Gradients are carried back through
+  `build_lp`, so costs, right-hand sides, bounds and matrix entries can all
+  depend on `params`. The sparsity pattern is read from whatever does not
+  depend on `params`. The old `LPValues` interface is
+  `make_solver(jaddle_lp.with_values)`, called with an `LPValues`. Breaking:
+  the functions no longer take a prototype LP, `solve_fn()` no longer
+  defaults to the LP's own values, the `.pattern` attribute is gone,
+  `solve_batch(build_lp, params, in_axes=0)` replaces
+  `solve_batch(lp, values)`, and the perturbed solution is
+  `x_fn(params, key)`.
+- `to_jaddle_sparse` (and `JaddleLP`) accept traced numbers. A dense matrix
+  that is itself traced stores every entry, and a `BCOO` keeps its stored
+  entries.
+
 ## 0.2.2
 
 ### Added

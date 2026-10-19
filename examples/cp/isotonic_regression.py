@@ -11,13 +11,18 @@ os.environ["XLA_FLAGS"] = "--xla_gpu_autotune_level=5"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 import jax
+import jaddle.jaddle_optimisers as jo
 
+jo.configure_jax("float64")
+
+import jax.experimental.sparse as jsp
 import numpy as np
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import time
 import jaddle.jaddle_convex as jc
-import jaddle.jaddle_optimisers as jo
+import jaddle.jaddle_linear as jl
+
 from sklearn.isotonic import IsotonicRegression
 
 # %% [markdown]
@@ -101,5 +106,63 @@ y_pred = solution.primal
 ineq_violations = constraints_ineq(y_pred)
 print("Max Inequality Constraint Violation (should be <= 0):", cp.ineq_slack(y_pred))
 print("Optimal Objective Value:", objective(y_pred))
+
+
+# %% [markdown]
+# ## Isotonic Quantile Regression using Jaddle
+# Minimize the pinball (quantile) loss subject to a non-decreasing constraint.
+def isotonic_quantile_regression(tau):
+    # LP formulation: z = [y_pred, u, v], with u, v >= 0 the positive/negative
+    # parts of the residual: y - y_pred = u - v
+    # minimize tau * sum(u) + (1 - tau) * sum(v)
+    # Written in standard LP form (assumed API):
+    #   min c^T z  s.t.  A_eq z = b_eq,  A_ineq z <= b_ineq,  lb <= z <= ub
+    eye = jnp.eye(n)
+    diff = eye[:-1] - eye[1:]  # y_pred[i] - y_pred[i+1] <= 0
+    c = jnp.concatenate([jnp.zeros(n), tau * jnp.ones(n), (1 - tau) * jnp.ones(n)])
+    A_eq = jnp.hstack([eye, eye, -eye])
+    b_eq = jnp.asarray(y)
+    A_ineq = jnp.hstack([diff, jnp.zeros((n - 1, 2 * n))])
+    b_ineq = jnp.zeros(n - 1)
+
+    problem = jl.LP(
+        c=c,
+        A_eq=A_eq,
+        b_eq=b_eq,
+        A_ineq=A_ineq,
+        b_ineq=b_ineq,
+        lower_bounds=jnp.concatenate([lower_bounds, jnp.zeros(2 * n)]),
+        upper_bounds=jnp.concatenate([upper_bounds, 10.0 * jnp.ones(2 * n)]),
+    )
+    return jl.to_jaddle_sparse(problem)
+
+
+quantile_fitter = jax.jit(jl.make_solver(isotonic_quantile_regression))
+
+# %%
+quantiles = [0.01, 0.5, 0.99]
+quantile_problems = [isotonic_quantile_regression(tau) for tau in quantiles]
+
+start = time.time()
+quantile_fits = jax.vmap(quantile_fitter)(jnp.array(quantiles))
+end = time.time()
+print("Isotonic Quantile Regression using Jaddle Time:", end - start)
+quantile_predictions = quantile_fits.solution.primal[:, :n]
+
+# %%
+plt.figure(figsize=(10, 6))
+plt.plot(x, y, label="Noisy data", marker="o", linestyle="", alpha=0.2)
+for i, tau in enumerate(quantiles):
+    plt.plot(
+        x,
+        quantile_predictions[i],
+        label=f"Isotonic quantile {tau:.1f}",
+        linewidth=2,
+    )
+plt.xlabel("x")
+plt.ylabel("y")
+plt.title("Isotonic Quantile Regression using Jaddle")
+plt.legend()
+plt.show()
 
 # %%

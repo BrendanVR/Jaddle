@@ -144,6 +144,18 @@ def _row_major_order(rows, cols, shape):
     return perm.data
 
 
+def _concrete_indices(indices):
+    """A sparse matrix's indices as a NumPy array. The sparsity pattern is
+    worked out on the host, so it cannot depend on traced values."""
+    if isinstance(indices, jax.core.Tracer):
+        raise ValueError(
+            "the sparsity pattern of an LP's constraint matrices must not depend "
+            "on traced values: build it from NumPy / SciPy arrays or from values "
+            "that do not depend on the solver's params (the numbers may)"
+        )
+    return np.asarray(indices)
+
+
 def scipy_to_bcoo(A, dtype):
     """Sorted, deduplicated BCOO of the scipy matrix ``A`` with ``dtype`` data.
 
@@ -210,9 +222,18 @@ class JaddleLP:
 
         self.n_eq = A_eq.shape[0]
         m, n = A_eq.shape[0] + A_ineq.shape[0], A_eq.shape[1]
-        eq_idx, ineq_idx = np.asarray(A_eq.indices), np.asarray(A_ineq.indices)
+        eq_idx = _concrete_indices(A_eq.indices)
+        ineq_idx = _concrete_indices(A_ineq.indices)
         idx = np.concatenate([eq_idx, ineq_idx + np.array([self.n_eq, 0], eq_idx.dtype)])
-        data = np.concatenate([np.asarray(A_eq.data), np.asarray(A_ineq.data)])
+        # The numbers may be traced (an LP built inside `jit` / `vmap` / `grad`,
+        # as in `jaddle_linear.make_solver`); then they stay JAX arrays and only
+        # the sparsity pattern is handled on the host.
+        traced = any(
+            isinstance(x, jax.core.Tracer) for x in (A_eq.data, A_ineq.data, b_eq, b_ineq)
+        )
+        xp = jnp if traced else np
+        put = (lambda x: x) if traced else jax.device_put
+        data = xp.concatenate([xp.asarray(A_eq.data), xp.asarray(A_ineq.data)])
 
         # Stacking two row-sorted blocks (ineq rows offset below eq) is sorted.
         order = None
@@ -226,7 +247,7 @@ class JaddleLP:
 
         def bcoo(d, i, shape):
             return _jsp.BCOO(
-                (jax.device_put(d), jax.device_put(i)),
+                (put(d), jax.device_put(i)),
                 shape=shape,
                 indices_sorted=True,
                 unique_indices=True,
@@ -236,7 +257,7 @@ class JaddleLP:
         self.A_T = bcoo(
             data[order_T], np.ascontiguousarray(idx[order_T][:, ::-1]), (n, m)
         )
-        self.b = jax.device_put(np.concatenate([np.asarray(b_eq), np.asarray(b_ineq)]))
+        self.b = put(xp.concatenate([xp.asarray(b_eq), xp.asarray(b_ineq)]))
 
     @classmethod
     def from_scipy(cls, c, A_eq, b_eq, A_ineq, b_ineq, lower_bounds, upper_bounds):

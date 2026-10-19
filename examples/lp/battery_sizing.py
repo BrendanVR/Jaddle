@@ -84,15 +84,15 @@ def upper_bounds(energy, power, xp=np):
     )
 
 
-def operating_lp(price, net_load, energy, power):
+def operating_lp(price, net_load, energy, power, xp=np):
     return jl.LP(
-        c=np.concatenate([np.zeros(2 * T), price, np.zeros(T)]),
+        c=xp.concatenate([xp.zeros(2 * T), price, xp.zeros(T)]),
         A_eq=A_eq.tocsc(),
         b_eq=np.zeros(T),
         A_ineq=A_ineq.tocsc(),
         b_ineq=-net_load,
         lower_bounds=np.zeros(4 * T),
-        upper_bounds=upper_bounds(energy, power),
+        upper_bounds=upper_bounds(energy, power, xp),
     )
 
 
@@ -102,8 +102,9 @@ def operating_lp(price, net_load, energy, power):
 # rating, so doubling either costs about 1.74 times as much. The total daily cost
 # of a design is that plus the average optimal operating cost over the scenarios.
 #
-# `jl.make_optimal_value` returns an LP's optimal value as a differentiable
-# function of its numbers. Every day's LP has the same sparsity pattern, so one
+# `jl.make_optimal_value(build_lp)` returns the optimal value of the LP
+# `build_lp(params)` as a differentiable function of `params`, here the design
+# and one day's data. Every day's LP has the same sparsity pattern, so one
 # function serves them all: `jax.vmap` solves the whole batch together, and
 # `jax.grad` returns the gradient with respect to the design. No derivative is
 # taken through the solver's iterations. The gradient of an LP's optimal value
@@ -116,20 +117,18 @@ tolerance = dict(
     dual_feasibility_tolerance=1e-4,
     dual_gap_tolerance=1e-4,
 )
-template = operating_lp(prices[0], net_load[0], 1.0, 1.0)
-values = jl.to_jaddle_sparse(template).values()
-operating_cost = jl.make_optimal_value(template, max_epochs=200, **tolerance)
+
+
+def build_lp(params):
+    (energy, power), price, net_load = params
+    return operating_lp(price, net_load, energy, power, xp=jnp)
+
+
+operating_cost = jl.make_optimal_value(build_lp, max_epochs=200, **tolerance)
 
 
 def day_cost(design, price, net_load):
-    energy, power = design
-    return operating_cost(
-        values._replace(
-            c=jnp.concatenate([jnp.zeros(2 * T), price, jnp.zeros(T)]),
-            b_ineq=-net_load,
-            upper_bounds=upper_bounds(energy, power, xp=jnp),
-        )
-    )
+    return operating_cost((design, price, net_load))
 
 
 def total_cost(design):

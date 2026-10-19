@@ -469,7 +469,9 @@ def test_make_solver_matches_solve(options):
         dual_gap_tolerance=TOL,
     )
     reference = jl.solve(lp, **tolerances, **options)
-    result = jax.jit(jl.make_solver(lp, **tolerances, **options))()
+    result = jax.jit(jl.make_solver(lambda _: lp, **tolerances, **options))(
+        jnp.zeros(())
+    )
     assert reference["stop_reason"] == "certificate"
     assert bool(result.converged) and int(result.stop_code) == 1
     assert abs(int(result.epochs) - reference["epochs"]) <= 1
@@ -477,10 +479,10 @@ def test_make_solver_matches_solve(options):
 
 
 def test_make_solver_vmap_batch():
-    # Batch over the cost, matrix values and right-hand sides: every member
-    # certifies and matches HiGHS. (Members are not bit-identical to separate
-    # solves: XLA rounds batched reductions differently, and the adaptive
-    # steps amplify it.)
+    # Batch over the cost, matrix values and right-hand sides through
+    # `with_values`: every member certifies and matches HiGHS. (Members are
+    # not bit-identical to separate solves: XLA rounds batched reductions
+    # differently, and the adaptive steps amplify it.)
     lp = jl.to_jaddle_sparse(random_lp())
     base = lp.values()
     rng = np.random.default_rng(0)
@@ -499,7 +501,7 @@ def test_make_solver_vmap_batch():
         upper_bounds=np.broadcast_to(base.upper_bounds, (size,) + base.upper_bounds.shape),
     )
     solve_fn = jl.make_solver(
-        lp,
+        lp.with_values,
         primal_feasibility_tolerance=TOL,
         dual_feasibility_tolerance=TOL,
         dual_gap_tolerance=TOL,
@@ -522,41 +524,136 @@ def test_make_solver_vmap_batch():
         assert abs(obj - ref) / (1 + abs(ref)) < 10 * TOL
 
 
+def test_make_solver_builds_lp_from_params():
+    # build_lp written with jnp, as in jc: the equality block is a jnp
+    # constant (made concrete by ensure_compile_time_eval, so its sparsity is
+    # kept), the inequality block a dense matrix that depends on params (so
+    # every entry is stored). Batched under jit, each member matches HiGHS.
+    base = random_lp()
+    A_eq = np.asarray(base.A_eq.todense())
+    A_eq[np.abs(A_eq) < 0.5] = 0.0
+    A_ineq = np.asarray(base.A_ineq.todense())
+    x0 = np.random.default_rng(3).uniform(0.1, 0.9, base.c.shape[0])
+
+    def build_lp(params):
+        cost_scale, ineq_scale = params
+        A = jnp.asarray(A_ineq) * ineq_scale
+        return jl.LP(
+            c=cost_scale * jnp.asarray(base.c),
+            A_eq=jnp.asarray(A_eq),
+            b_eq=jnp.asarray(A_eq @ x0),
+            A_ineq=A,
+            b_ineq=A @ x0 + 0.5,
+            lower_bounds=jnp.asarray(base.lower_bounds),
+            upper_bounds=jnp.asarray(base.upper_bounds),
+        )
+
+    params = (jnp.array([1.0, 1.5, 0.7]), jnp.array([1.0, 0.8, 1.2]))
+    result = jax.jit(
+        jax.vmap(
+            jl.make_solver(
+                build_lp,
+                primal_feasibility_tolerance=TOL,
+                dual_feasibility_tolerance=TOL,
+                dual_gap_tolerance=TOL,
+            )
+        )
+    )(params)
+    assert np.asarray(result.converged).all()
+    for i in range(3):
+        member = build_lp(jax.tree.map(lambda a: a[i], params))
+        member_lp = jl.LP(
+            c=np.asarray(member.c),
+            A_eq=sp.csc_matrix(np.asarray(member.A_eq)),
+            b_eq=np.asarray(member.b_eq),
+            A_ineq=sp.csc_matrix(np.asarray(member.A_ineq)),
+            b_ineq=np.asarray(member.b_ineq),
+            lower_bounds=np.asarray(member.lower_bounds),
+            upper_bounds=np.asarray(member.upper_bounds),
+        )
+        assert_certifies(
+            member_lp,
+            jax.tree.map(lambda a: a[i], result.solution),
+            reference_objective(member_lp),
+        )
+
+
+def test_make_solver_keeps_constant_sparsity_under_jit():
+    # The pattern comes from what does not depend on params: a jnp constant
+    # keeps its nonzeros under jit, and a traced dense matrix stores them all.
+    lp = random_lp()
+    dense_eq = np.asarray(lp.A_eq.todense())
+    dense_eq[:, ::2] = 0.0
+
+    def build_lp(t):
+        return jl.LP(
+            c=t * jnp.asarray(lp.c),
+            A_eq=jnp.asarray(dense_eq),
+            b_eq=jnp.asarray(lp.b_eq),
+            A_ineq=t * jnp.asarray(lp.A_ineq.todense()),
+            b_ineq=jnp.asarray(lp.b_ineq),
+            lower_bounds=jnp.asarray(lp.lower_bounds),
+            upper_bounds=jnp.asarray(lp.upper_bounds),
+        )
+
+    pad = getattr(jl, "_build_padded")
+    shapes = {}
+
+    def nnz(t):
+        pattern, _ = pad(build_lp, t)
+        shapes["eq"] = pattern.A_eq.nse
+        shapes["ineq"] = pattern.A_ineq.nse
+        return t
+
+    jax.jit(nnz)(1.0)
+    assert shapes["eq"] == np.count_nonzero(dense_eq)
+    assert shapes["ineq"] == lp.A_ineq.shape[0] * lp.A_ineq.shape[1]
+
+
 def test_solve_batch_broadcasts_shared_fields():
     # Only c and b_ineq batched; matrices, b_eq and bounds shared.
     lp = random_lp()
-    base = jl.to_jaddle_sparse(lp).values()
-    costs = np.stack([np.asarray(base.c) * s for s in (1.0, 1.1, 0.9)])
-    rhs = np.stack([np.asarray(base.b_ineq) + d for d in (0.0, 0.05, 0.1)])
+    costs = np.stack([np.asarray(lp.c) * s for s in (1.0, 1.1, 0.9)])
+    rhs = np.stack([np.asarray(lp.b_ineq) + d for d in (0.0, 0.05, 0.1)])
+
+    def build_lp(params):
+        c, b_ineq = params
+        return jl.LP(
+            c=c,
+            A_eq=lp.A_eq,
+            b_eq=lp.b_eq,
+            A_ineq=lp.A_ineq,
+            b_ineq=b_ineq,
+            lower_bounds=lp.lower_bounds,
+            upper_bounds=lp.upper_bounds,
+        )
+
     result = jl.solve_batch(
-        lp,
-        base._replace(c=costs, b_ineq=rhs),
+        build_lp,
+        (costs, rhs),
         primal_feasibility_tolerance=TOL,
         dual_feasibility_tolerance=TOL,
         dual_gap_tolerance=TOL,
     )
-    assert result.solution.primal.shape == (3, base.c.shape[0])
+    assert result.solution.primal.shape == (3, lp.c.shape[0])
     assert np.asarray(result.converged).all()
     for i in range(3):
-        member = jl.LP(
-            c=costs[i],
-            A_eq=lp.A_eq,
-            b_eq=lp.b_eq,
-            A_ineq=lp.A_ineq,
-            b_ineq=rhs[i],
-            lower_bounds=lp.lower_bounds,
-            upper_bounds=lp.upper_bounds,
-        )
+        member = build_lp((costs[i], rhs[i]))
         ref = reference_objective(member)
         obj = float(costs[i] @ result.solution.primal[i])
         assert abs(obj - ref) / (1 + abs(ref)) < 10 * TOL
 
 
-def test_solve_batch_accepts_unpadded_values():
-    # toy_lp has no equality rows; its own values() must fit the padded pattern.
+def test_solve_batch_pads_empty_blocks():
+    # toy_lp has no equality rows; the builder's LP is padded like solve()'s.
     lp = toy_lp()
-    base = jl.to_jaddle_sparse(lp).values()
-    result = jl.solve_batch(lp, base._replace(c=np.stack([base.c, 2 * base.c])))
+
+    def build_lp(c):
+        return jl.LP(
+            c, lp.A_eq, lp.b_eq, lp.A_ineq, lp.b_ineq, lp.lower_bounds, lp.upper_bounds
+        )
+
+    result = jl.solve_batch(build_lp, np.stack([lp.c, 2 * lp.c]))
     assert np.asarray(result.converged).all()
 
 
@@ -569,7 +666,7 @@ def test_optimal_value_gradient_matches_finite_differences():
     lp = random_lp()
     jlp = jl.to_jaddle_sparse(lp)
     values = jlp.values()
-    value_fn = jl.make_optimal_value(jlp, **tight)
+    value_fn = jl.make_optimal_value(jlp.with_values, **tight)
     assert abs(float(value_fn(values)) - reference_objective(lp)) < 1e-8
     grad = jax.grad(value_fn)(values)
     to_scipy = getattr(jl, "__convert_to_scipy")
@@ -607,25 +704,63 @@ def test_optimal_value_gradient_matches_finite_differences():
         assert abs(fd - g[k]) <= 1e-6 * (1 + abs(fd)), field
 
 
+def test_optimal_value_gradient_through_build_lp():
+    # The envelope gradient is carried back through build_lp: with
+    # c = t c0 and b_ineq = b0 + s, dz*/dt and dz*/ds match finite
+    # differences of HiGHS solves.
+    tight = dict(
+        primal_feasibility_tolerance=1e-10,
+        dual_feasibility_tolerance=1e-10,
+        dual_gap_tolerance=1e-10,
+    )
+    lp = random_lp()
+
+    def build_lp(params):
+        t, s = params
+        return jl.LP(
+            c=t * lp.c,
+            A_eq=lp.A_eq,
+            b_eq=lp.b_eq,
+            A_ineq=lp.A_ineq,
+            b_ineq=lp.b_ineq + s,
+            lower_bounds=lp.lower_bounds,
+            upper_bounds=lp.upper_bounds,
+        )
+
+    value_fn = jl.make_optimal_value(build_lp, **tight)
+    params = (jnp.asarray(1.2), jnp.asarray(0.1))
+    grad_t, grad_s = jax.jit(jax.grad(value_fn))(params)
+    h = 1e-5
+    fd_t = (
+        reference_objective(build_lp((1.2 + h, 0.1)))
+        - reference_objective(build_lp((1.2 - h, 0.1)))
+    ) / (2 * h)
+    fd_s = (
+        reference_objective(build_lp((1.2, 0.1 + h)))
+        - reference_objective(build_lp((1.2, 0.1 - h)))
+    ) / (2 * h)
+    assert abs(fd_t - float(grad_t)) <= 1e-6 * (1 + abs(fd_t))
+    assert abs(fd_s - float(grad_s)) <= 1e-6 * (1 + abs(fd_s))
+
+
 def test_optimal_value_gradient_vmaps():
     lp = jl.to_jaddle_sparse(random_lp())
     base = lp.values()
-    value_fn = jl.make_optimal_value(
-        lp,
+    tolerances = dict(
         primal_feasibility_tolerance=TOL,
         dual_feasibility_tolerance=TOL,
         dual_gap_tolerance=TOL,
     )
+
+    def build_lp(c):
+        return lp.with_values(base._replace(c=c))
+
+    value_fn = jl.make_optimal_value(build_lp, **tolerances)
     costs = np.stack([np.asarray(base.c), 1.2 * np.asarray(base.c)])
-    grads = jax.vmap(jax.grad(lambda c: value_fn(base._replace(c=c))))(costs)
+    grads = jax.vmap(jax.grad(value_fn))(costs)
     # dz*/dc = x*: each row is that member's optimal primal.
     for i in range(2):
-        x = jl.make_solver(
-            lp,
-            primal_feasibility_tolerance=TOL,
-            dual_feasibility_tolerance=TOL,
-            dual_gap_tolerance=TOL,
-        )(base._replace(c=costs[i])).solution.primal
+        x = jl.make_solver(build_lp, **tolerances)(costs[i]).solution.primal
         np.testing.assert_allclose(grads[i], x, atol=1e-4)
 
 
@@ -636,8 +771,14 @@ def test_perturbed_solution_matches_closed_form():
 
     lp = small_lp([3, 2], A_eq=[[1, 1]], b_eq=[4])
     sigma = 1.0
+
+    def build_lp(c):
+        return jl.LP(
+            c, lp.A_eq, lp.b_eq, lp.A_ineq, lp.b_ineq, lp.lower_bounds, lp.upper_bounds
+        )
+
     x_fn = jl.make_perturbed_solution(
-        lp,
+        build_lp,
         sigma=sigma,
         num_samples=2048,
         primal_feasibility_tolerance=1e-6,
@@ -682,7 +823,7 @@ def test_solution_vjp_matches_finite_differences():
         )
         return res.x
 
-    x_fn = jl.make_solution(lp, **tight)
+    x_fn = jl.make_solution(lp.with_values, **tight)
     g = np.random.default_rng(1).standard_normal(values.c.shape[0])
     vjp = jax.grad(lambda v: jnp.dot(x_fn(v), g))(values)
     assert not np.any(np.asarray(vjp.c))  # x* is piecewise constant in c
@@ -704,16 +845,16 @@ def test_solution_vjp_matches_finite_differences():
 def test_solution_vjp_rejects_optimal_face():
     # Every point of x1 + x2 = 1, x >= 0 is optimal; PDHG returns its middle,
     # where dx*/dθ is undefined.
-    lp = small_lp([1, 1], [[-1, -1]], [-1])
+    lp = jl.to_jaddle_sparse(small_lp([1, 1], [[-1, -1]], [-1]))
     x_fn = jl.make_solution(
-        lp,
+        lp.with_values,
         primal_feasibility_tolerance=1e-10,
         dual_feasibility_tolerance=1e-10,
         dual_gap_tolerance=1e-10,
     )
-    np.testing.assert_allclose(x_fn(), [0.5, 0.5], atol=1e-6)
+    np.testing.assert_allclose(x_fn(lp.values()), [0.5, 0.5], atol=1e-6)
     with pytest.raises(Exception, match="not a nondegenerate vertex"):
-        jax.grad(lambda v: x_fn(v).sum())(jl.to_jaddle_sparse(lp).values())
+        jax.grad(lambda v: x_fn(v).sum())(lp.values())
 
 
 PRESOLVE_TOL = dict(
@@ -1050,7 +1191,7 @@ def test_optimal_value_returns_its_own_solution():
     # With return_solution=True the gradient and the solution come from one
     # solve, so they agree exactly: dz*/dc = x*, dz*/db = -y*.
     lp = jl.to_jaddle_sparse(random_lp())
-    value_fn = jl.make_optimal_value(lp, return_solution=True, **PRESOLVE_TOL)
+    value_fn = jl.make_optimal_value(lp.with_values, return_solution=True, **PRESOLVE_TOL)
     (z, result), grads = jax.value_and_grad(value_fn, has_aux=True)(lp.values())
     s = result.solution
     assert bool(result.converged)

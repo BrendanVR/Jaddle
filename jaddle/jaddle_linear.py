@@ -2519,7 +2519,7 @@ class SolveCoreResult(NamedTuple):
 
 
 def make_solver(
-    lp,
+    build_lp,
     max_epochs=None,
     iterations_per_epoch=256,
     dual_damping_ineq=0.0,
@@ -2565,15 +2565,33 @@ def make_solver(
     diag_clamp=10.0,
 ):
     """
-    Build a pure-JAX solve function for LPs with ``lp``'s sparsity pattern.
+    Build a pure-JAX solve function for a family of LPs.
 
-    Returns ``solve_fn(values=None, initial_solution=None) -> SolveCoreResult``.
-    ``values`` is an ``LPValues`` (``lp.values()`` when omitted): the cost,
-    the constraint matrices' stored nonzeros in ``lp``'s BCOO order, the
-    right-hand sides and the bounds. ``initial_solution`` is an optional warm
-    start in true units. The whole solve (scaling, the epoch loop to the
-    certificate or ``max_epochs``, unscaling) is traceable, so ``solve_fn``
-    can be ``jax.jit``-ed and ``jax.vmap``-ed over a batch of values.
+    ``build_lp(params)`` returns an ordinary ``LP`` or ``JaddleLP`` whose
+    numbers depend on ``params`` (any pytree: costs, right-hand sides,
+    bounds, matrix entries). ``make_solver`` returns
+    ``solve_fn(params, initial_solution=None) -> SolveCoreResult``. The whole
+    solve (scaling, the epoch loop to the certificate or ``max_epochs``,
+    unscaling) is traceable, so ``solve_fn`` can be ``jax.jit``-ed and
+    ``jax.vmap``-ed over a batch of ``params`` whose LPs share their sparsity
+    pattern::
+
+        def build_lp(price):
+            return LP(c=price, A_eq=A_eq, b_eq=b_eq, A_ineq=A_ineq,
+                      b_ineq=b_ineq, lower_bounds=lb, upper_bounds=ub)
+
+        solve_fn = jax.jit(make_solver(build_lp, max_epochs=1000))
+        result = solve_fn(price)
+        batch = jax.vmap(solve_fn)(price_batch)
+
+    ``build_lp`` runs under ``jax.ensure_compile_time_eval``, so whatever does
+    not depend on ``params`` is concrete even under ``jit``, and the sparsity
+    pattern is read from it on the host: a SciPy or concrete dense matrix
+    keeps its nonzeros, a ``BCOO`` its stored entries, and a dense matrix
+    that depends on ``params`` stores every entry. To reuse a ``JaddleLP``'s
+    pattern with new numbers, ``make_solver(jaddle_lp.with_values)`` takes an
+    ``LPValues`` as ``params``. ``initial_solution`` is an optional warm start
+    in true units.
 
     The algorithm is ``solve()``'s, with the same arguments and defaults, and
     a single solve reproduces ``solve()`` exactly. What needs the host is not
@@ -2582,10 +2600,9 @@ def make_solver(
     ``iterations_per_epoch_decay``; ``iterations_per_epoch_min`` is capped at
     ``iterations_per_epoch``). ``max_epochs=None`` runs to the certificate,
     which never comes on an infeasible LP: set a budget when that can happen.
+    Batched members iterate in lockstep until the last one stops (finished
+    members are frozen).
     """
-    if not isinstance(lp, JaddleLP):
-        lp = to_jaddle_sparse(lp)
-    pattern = __pad_empty_blocks(lp)
     k_lo, k_hi, adaptive_eta_setting, halpern = _check_settings(
         dual_residual,
         termination_norm,
@@ -2596,12 +2613,11 @@ def make_solver(
         gap_test,
     )
     float_dtype, compute_dtype = __profile_dtypes()
-    n_eq = pattern.n_eq
     n_epochs = _UNBOUNDED_EPOCHS if not max_epochs else int(max_epochs)
-    base_values = pattern.values()
 
-    def solve_fn(values=None, initial_solution=None):
-        v = base_values if values is None else _pad_values(values, pattern)
+    def solve_fn(params, initial_solution=None):
+        pattern, v = _build_padded(build_lp, params)
+        n_eq = pattern.n_eq
         if scale:
             dr, dc, eq_data, ineq_data, c, b_eq, b_ineq, lb, ub, c_max = (
                 __scale_problem_jax(
@@ -2744,7 +2760,6 @@ def make_solver(
             epochs=carry["count"],
         )
 
-    solve_fn.pattern = pattern
     return solve_fn
 
 
@@ -2752,34 +2767,32 @@ def _select_state(pred, a, b):
     return jax.tree.map(lambda x, y: jnp.where(pred, x, y), a, b)
 
 
-def _pad_values(values, pattern):
-    """Give an empty equality / inequality block the single zero row that
-    ``__pad_empty_blocks`` adds to the pattern, so values taken from the
-    original (unpadded) LP fit. Works on batched values too (the row is
-    appended along the last axis)."""
-
-    def pad(b, rows):
-        if b.shape[-1] == 0 and rows == 1:
-            return jnp.zeros(b.shape[:-1] + (1,), b.dtype)
-        return b
-
-    return values._replace(
-        b_eq=pad(values.b_eq, pattern.n_eq),
-        b_ineq=pad(values.b_ineq, pattern.A_ineq.shape[0]),
-    )
-
-
-def solve_batch(lp, values, **settings):
+def _build_padded(build_lp, params):
+    """``build_lp(params)`` as a ``JaddleLP`` whose empty constraint blocks
+    carry ``solve()``'s single zero row, and its numbers. The ``JaddleLP``
+    holds the sparsity pattern, which is concrete; the numbers may be traced.
     """
-    Solve a batch of LPs sharing ``lp``'s sparsity pattern: ``jax.vmap`` of
-    ``make_solver(lp, **settings)``, jitted.
+    # Compile-time evaluation keeps everything that does not depend on
+    # `params` concrete under `jit`, so the pattern can be read on the host.
+    with jax.ensure_compile_time_eval():
+        lp = build_lp(params)
+        if not isinstance(lp, JaddleLP):
+            lp = to_jaddle_sparse(lp)
+        lp = __pad_empty_blocks(lp)
+    return lp, lp.values()
 
-    ``values`` is an ``LPValues`` whose fields carry a leading batch axis;
-    a field given without one (e.g. bounds shared by every member) is
-    broadcast. Each member is scaled on its own, exactly as ``solve()`` would.
-    Members iterate in lockstep until the last one stops (a finished member
-    is frozen), so one hard member sets the batch's run time; ``max_epochs``
-    bounds it.
+
+def solve_batch(build_lp, params, in_axes=0, **settings):
+    """
+    Solve a batch of LPs sharing a sparsity pattern: ``jax.vmap`` of
+    ``make_solver(build_lp, **settings)`` over ``params``, jitted.
+
+    ``in_axes`` is ``jax.vmap``'s for ``params``: ``0`` batches every leaf
+    along its leading axis, and a pytree of ``0`` / ``None`` shares the
+    ``None`` leaves among the members. Each member is scaled on its own,
+    exactly as ``solve()`` would. Members iterate in lockstep until the last
+    one stops (a finished member is frozen), so one hard member sets the
+    batch's run time; ``max_epochs`` bounds it.
 
     Batched members are not bit-identical to separate solves: XLA rounds
     batched reductions slightly differently, and the adaptive step size
@@ -2787,37 +2800,35 @@ def solve_batch(lp, values, **settings):
     requested tolerance.
 
     Each call re-traces and compiles. To solve many batches of the same shape,
-    jit ``jax.vmap(make_solver(lp, **settings))`` once and reuse it.
+    jit ``jax.vmap(make_solver(build_lp, **settings))`` once and reuse it.
 
     Returns a ``SolveCoreResult`` with a leading batch axis on every field.
     """
-    solve_fn = make_solver(lp, **settings)
-    values = LPValues(*(jnp.asarray(v) for v in values))
-    # A field is batched when it has one more axis than the LP's own field.
-    axes = LPValues(
-        *(
-            0 if v.ndim == r.ndim + 1 else None
-            for v, r in zip(values, solve_fn.pattern.values())
-        )
-    )
-    if all(a is None for a in axes):
-        raise ValueError("solve_batch: no field of `values` has a batch axis")
-    return jax.jit(jax.vmap(solve_fn, in_axes=(axes,)))(values)
+    solve_fn = make_solver(build_lp, **settings)
+    return jax.jit(jax.vmap(solve_fn, in_axes=(in_axes,)))(params)
 
 
-def make_optimal_value(lp, return_solution=False, **settings):
+def _lp_values(build_lp):
+    """``params -> LPValues`` of ``build_lp(params)`` (padded as ``solve()``
+    pads it), for pulling an ``LPValues`` cotangent back to ``params``."""
+    return lambda params: _build_padded(build_lp, params)[1]
+
+
+def make_optimal_value(build_lp, return_solution=False, **settings):
     """
-    The LP's optimal value as a differentiable function of its numbers.
+    The optimal value ``z*(params) = min cᵀx`` of a family of LPs, as a
+    differentiable function of ``params``.
 
-    Returns ``value_fn(values) -> z*``, the objective ``cᵀx*`` of the solution
-    ``make_solver(lp, **settings)`` finds for ``values`` (an ``LPValues``; ``lp``'s
-    own when omitted). Its gradient comes from the envelope theorem, read off
-    the primal-dual solution ``(x*, y*)`` with no differentiation through the
-    iterations. With Jaddle's Lagrangian ``cᵀx + yᵀ(Ax − b)`` (``y_ineq >= 0``)
-    and reduced cost ``r = c + Aᵀy*``:
+    ``build_lp`` is as in ``make_solver`` (``settings`` are its options).
+    Returns ``value_fn(params) -> z*``. Its gradient comes from the envelope
+    theorem, read off the primal-dual solution ``(x*, y*)`` with no
+    differentiation through the iterations, and is carried back through
+    ``build_lp`` to ``params``, so costs, right-hand sides, bounds and matrix
+    entries can all depend on them. With Jaddle's Lagrangian
+    ``cᵀx + yᵀ(Ax − b)`` (``y_ineq >= 0``) and reduced cost ``r = c + Aᵀy*``:
 
     * ``∂z*/∂c = x*``, ``∂z*/∂b = −y*``;
-    * ``∂z*/∂A_ij = y*_i x*_j`` on the stored nonzeros;
+    * ``∂z*/∂A_ij = y*_i x*_j`` on the stored entries;
     * ``∂z*/∂lower_j = max(r_j, 0)`` and ``∂z*/∂upper_j = min(r_j, 0)`` where
       the bound is finite, else 0.
 
@@ -2836,71 +2847,60 @@ def make_optimal_value(lp, return_solution=False, **settings):
     ``jax.value_and_grad(value_fn, has_aux=True)``. Its duals include the
     zero row ``solve()`` adds to an empty constraint block.
     """
-    solve_fn = make_solver(lp, **settings)
-    pattern = solve_fn.pattern
-    eq_rows, eq_cols = pattern.A_eq.indices[:, 0], pattern.A_eq.indices[:, 1]
-    ineq_rows, ineq_cols = pattern.A_ineq.indices[:, 0], pattern.A_ineq.indices[:, 1]
-    base_values = pattern.values()
+    solve_fn = make_solver(build_lp, **settings)
+    lp_values = _lp_values(build_lp)
 
     # The solve runs once, outside the custom derivative; `value_at` turns
     # its solution into z* and, in the backward pass, into the gradient. So
     # the gradient always belongs to the solution the caller can get back.
-    def value_at_forward(values, solution):
-        padded = _pad_values(values, pattern)
-        return padded.c @ solution.primal, (values, padded, solution)
+    def value_at_forward(params, solution):
+        return lp_values(params).c @ solution.primal, (params, solution)
 
     def value_at_backward(residuals, g):
-        values, padded, solution = residuals
+        params, solution = residuals
+        lp, values = _build_padded(build_lp, params)
         x, y_eq, y_ineq = solution.primal, solution.dual_eq, solution.dual_ineq
-        reduced_cost = padded.c + pattern.with_values(padded).A_T @ jnp.concatenate(
-            [y_eq, y_ineq]
-        )
-        finite_lower = jnp.isfinite(padded.lower_bounds)
-        finite_upper = jnp.isfinite(padded.upper_bounds)
-
-        def unpad(grad_b, original):
-            # The padded zero row is not one of the caller's values.
-            return grad_b[..., : original.shape[-1]]
-
+        eq_rows, eq_cols = lp.A_eq.indices[:, 0], lp.A_eq.indices[:, 1]
+        ineq_rows, ineq_cols = lp.A_ineq.indices[:, 0], lp.A_ineq.indices[:, 1]
+        reduced_cost = values.c + lp.A_T @ jnp.concatenate([y_eq, y_ineq])
+        finite_lower = jnp.isfinite(values.lower_bounds)
+        finite_upper = jnp.isfinite(values.upper_bounds)
         grad = LPValues(
             c=x,
             A_eq_data=y_eq[eq_rows] * x[eq_cols],
-            b_eq=unpad(-y_eq, values.b_eq),
+            b_eq=-y_eq,
             A_ineq_data=y_ineq[ineq_rows] * x[ineq_cols],
-            b_ineq=unpad(-y_ineq, values.b_ineq),
+            b_ineq=-y_ineq,
             lower_bounds=jnp.where(finite_lower, jnp.maximum(reduced_cost, 0.0), 0.0),
             upper_bounds=jnp.where(finite_upper, jnp.minimum(reduced_cost, 0.0), 0.0),
         )
-        grad_values = jax.tree.map(
-            lambda t, v: (g * t).astype(jnp.asarray(v).dtype), grad, values
-        )
+        grad = jax.tree.map(lambda t, v: (g * t).astype(v.dtype), grad, values)
+        (grad_params,) = jax.vjp(lp_values, params)[1](grad)
         # The solution is treated as fixed: no gradient flows into the solve.
-        return grad_values, jax.tree.map(jnp.zeros_like, solution)
+        return grad_params, jax.tree.map(jnp.zeros_like, solution)
 
     @jax.custom_vjp
-    def value_at(values, solution):
-        return value_at_forward(values, solution)[0]
+    def value_at(params, solution):
+        return value_at_forward(params, solution)[0]
 
     value_at.defvjp(value_at_forward, value_at_backward)
 
-    def value_fn(values=None):
-        values = base_values if values is None else values
-        result = solve_fn(
-            jax.tree.map(jax.lax.stop_gradient, _pad_values(values, pattern))
-        )
+    def value_fn(params):
+        result = solve_fn(jax.tree.map(jax.lax.stop_gradient, params))
         solution = jax.tree.map(jax.lax.stop_gradient, result.solution)
-        z = value_at(values, solution)
+        z = value_at(params, solution)
         return (z, result) if return_solution else z
 
-    value_fn.pattern = pattern
     return value_fn
 
 
-def make_perturbed_solution(lp, sigma=0.1, num_samples=16, antithetic=True, **settings):
+def make_perturbed_solution(
+    build_lp, sigma=0.1, num_samples=16, antithetic=True, **settings
+):
     """
-    A smoothed, differentiable solution map ``c -> x*_σ(c)`` (the perturbed
-    optimizer of Berthet et al., "Learning with Differentiable Perturbed
-    Optimizers", 2020).
+    A smoothed, differentiable solution map ``params -> x*_σ(c(params))``
+    (the perturbed optimizer of Berthet et al., "Learning with Differentiable
+    Perturbed Optimizers", 2020).
 
     An LP's solution is piecewise constant in its cost, so ``dx*/dc`` is zero
     almost everywhere. The perturbed solution ``x*_σ(c) = E[x*(c + σZ)]``
@@ -2908,12 +2908,14 @@ def make_perturbed_solution(lp, sigma=0.1, num_samples=16, antithetic=True, **se
     estimate ``E[x*(c + σZ) Zᵀ] / σ``. Both are estimated from
     ``num_samples`` solves, run as one batch with ``vmap``.
 
-    Returns ``x_fn(c, key, values=None)``: ``c`` is the cost to perturb (its
-    gradient is the only one computed), ``key`` a ``jax.random`` key, and
-    ``values`` the LP's other numbers (``lp``'s own when omitted). With
-    ``antithetic=True`` the samples come in ``±Z`` pairs, which cancels the
-    estimate's odd-order noise (``num_samples`` must then be even). ``sigma``
-    is in the units of ``c``: larger is smoother and more biased.
+    ``build_lp`` is as in ``make_solver`` (``settings`` are its options).
+    Returns ``x_fn(params, key)``, with ``key`` a ``jax.random`` key. Only the
+    cost is perturbed, and the gradient reaches ``params`` only through the
+    cost ``c(params)``: the other numbers' dependence on ``params`` is not
+    differentiated. With ``antithetic=True`` the samples come in ``±Z`` pairs,
+    which cancels the estimate's odd-order noise (``num_samples`` must then be
+    even). ``sigma`` is in the units of ``c``: larger is smoother and more
+    biased.
 
     The samples are solved to ``settings``' tolerances; a sample that does not
     converge within ``max_epochs`` still contributes its last point. The
@@ -2925,10 +2927,15 @@ def make_perturbed_solution(lp, sigma=0.1, num_samples=16, antithetic=True, **se
         raise ValueError("num_samples must be >= 1, and even when antithetic=True")
     if sigma <= 0:
         raise ValueError("sigma must be > 0")
-    solve_fn = make_solver(lp, **settings)
-    pattern = solve_fn.pattern
+
+    def build_perturbed(args):
+        params, c = args
+        lp, values = _build_padded(build_lp, params)
+        return lp.with_values(values._replace(c=c))
+
+    solve_fn = make_solver(build_perturbed, **settings)
     batched = jax.vmap(
-        lambda c, v: solve_fn(v._replace(c=c)).solution.primal, in_axes=(0, None)
+        lambda c, params: solve_fn((params, c)).solution.primal, in_axes=(0, None)
     )
 
     def noise(key, c):
@@ -2937,9 +2944,9 @@ def make_perturbed_solution(lp, sigma=0.1, num_samples=16, antithetic=True, **se
             return jnp.concatenate([half, -half])
         return jax.random.normal(key, (num_samples,) + c.shape, c.dtype)
 
-    def forward(c, key, values):
+    def forward(c, key, params):
         z = noise(key, c)
-        xs = batched(c + sigma * z, values)
+        xs = batched(c + sigma * z, params)
         return xs.mean(axis=0), (xs, z)
 
     def backward(residuals, g):
@@ -2950,30 +2957,30 @@ def make_perturbed_solution(lp, sigma=0.1, num_samples=16, antithetic=True, **se
         return grad_c, None, None
 
     @jax.custom_vjp
-    def perturbed(c, key, values):
-        return forward(c, key, values)[0]
+    def perturbed(c, key, params):
+        return forward(c, key, params)[0]
 
     perturbed.defvjp(forward, backward)
 
-    def x_fn(c, key, values=None):
-        v = pattern.values() if values is None else _pad_values(values, pattern)
-        return perturbed(jnp.asarray(c, v.c.dtype), key, v)
+    def x_fn(params, key):
+        c = _lp_values(build_lp)(params).c
+        return perturbed(c, key, jax.tree.map(jax.lax.stop_gradient, params))
 
-    x_fn.pattern = pattern
     return x_fn
 
 
-def make_solution(lp, active_tol=1e-6, **settings):
+def make_solution(build_lp, active_tol=1e-6, **settings):
     """
-    The LP's solution ``x*`` as a function of its numbers, differentiable by
-    implicit differentiation of the active constraints.
+    The solution ``x*(params)`` of a family of LPs, differentiable by implicit
+    differentiation of the active constraints.
 
-    Returns ``x_fn(values=None) -> x*`` (``values`` an ``LPValues``, ``lp``'s
-    own when omitted). At a nondegenerate vertex the active constraints
-    determine ``x*``: the equality rows and the inequality rows within
-    ``active_tol`` of tight, restricted to the variables not within
+    ``build_lp`` is as in ``make_solver`` (``settings`` are its options).
+    Returns ``x_fn(params) -> x*``. At a nondegenerate vertex the active
+    constraints determine ``x*``: the equality rows and the inequality rows
+    within ``active_tol`` of tight, restricted to the variables not within
     ``active_tol`` of a bound, form a square matrix ``M``. A VJP solves
-    ``Mᵀλ = g`` once and gives
+    ``Mᵀλ = g`` once and gives, before it is carried back through
+    ``build_lp`` to ``params``,
 
     * ``b``: ``λ`` on the active rows, 0 elsewhere;
     * ``A_ij``: ``−λ_i x*_j``;
@@ -2995,19 +3002,10 @@ def make_solution(lp, active_tol=1e-6, **settings):
     """
     import scipy.sparse.linalg as spla
 
-    solve_fn = make_solver(lp, **settings)
-    pattern = solve_fn.pattern
-    n_eq = pattern.n_eq
-    m, n = pattern.A.shape
-    a_rows = np.asarray(pattern.A.indices[:, 0])
-    a_cols = np.asarray(pattern.A.indices[:, 1])
-    # A row with no stored entries (e.g. the 0 = 0 row padding an empty
-    # block) never constrains x, so it is never active.
-    row_has_entries = jnp.asarray(np.bincount(a_rows, minlength=m) > 0)
-    eq_rows, eq_cols = pattern.A_eq.indices[:, 0], pattern.A_eq.indices[:, 1]
-    ineq_rows, ineq_cols = pattern.A_ineq.indices[:, 0], pattern.A_ineq.indices[:, 1]
+    solve_fn = make_solver(build_lp, **settings)
+    lp_values = _lp_values(build_lp)
 
-    def host_lambda(a_data, basic, active_rows, g):
+    def host_lambda(a_rows, a_cols, a_data, basic, active_rows, g):
         basic = np.asarray(basic, bool)
         active_rows = np.asarray(active_rows, bool)
         n_basic, n_active = int(basic.sum()), int(active_rows.sum())
@@ -3018,6 +3016,7 @@ def make_solution(lp, active_tol=1e-6, **settings):
                 "so dx*/dθ is undefined there. Solve to tighter tolerances, "
                 "adjust active_tol, or use make_perturbed_solution."
             )
+        m, n = active_rows.shape[0], basic.shape[0]
         lam = np.zeros(m, np.asarray(g).dtype)
         if n_basic:
             A = sp.csr_matrix((np.asarray(a_data), (a_rows, a_cols)), shape=(m, n))
@@ -3031,15 +3030,23 @@ def make_solution(lp, active_tol=1e-6, **settings):
             lam[active_rows] = lam_active
         return lam
 
-    def forward(values):
-        padded = _pad_values(values, pattern)
-        x = solve_fn(padded).solution.primal
-        return x, (values, padded, x)
+    def forward(params):
+        solution = solve_fn(jax.tree.map(jax.lax.stop_gradient, params)).solution
+        return solution.primal, (params, solution.primal)
 
     def backward(residuals, g):
-        values, padded, x = residuals
-        lp_v = pattern.with_values(padded)
-        lower, upper = padded.lower_bounds, padded.upper_bounds
+        params, x = residuals
+        lp, values = _build_padded(build_lp, params)
+        n_eq = lp.n_eq
+        m, _ = lp.A.shape
+        a_rows = np.asarray(lp.A.indices[:, 0])
+        a_cols = np.asarray(lp.A.indices[:, 1])
+        # A row with no stored entries (e.g. the 0 = 0 row padding an empty
+        # block) never constrains x, so it is never active.
+        row_has_entries = jnp.asarray(np.bincount(a_rows, minlength=m) > 0)
+        eq_rows, eq_cols = lp.A_eq.indices[:, 0], lp.A_eq.indices[:, 1]
+        ineq_rows, ineq_cols = lp.A_ineq.indices[:, 0], lp.A_ineq.indices[:, 1]
+        lower, upper = values.lower_bounds, values.upper_bounds
         at_lower = jnp.isfinite(lower) & (
             jnp.abs(x - lower) <= active_tol * (1 + jnp.abs(lower))
         )
@@ -3049,45 +3056,39 @@ def make_solution(lp, active_tol=1e-6, **settings):
             & ~at_lower
         )
         basic = ~(at_lower | at_upper)
-        slack = lp_v.A @ x - lp_v.b
+        slack = lp.A @ x - lp.b
         active_rows = row_has_entries & (
             (jnp.arange(m) < n_eq)
-            | (jnp.abs(slack) <= active_tol * (1 + jnp.abs(lp_v.b)))
+            | (jnp.abs(slack) <= active_tol * (1 + jnp.abs(lp.b)))
         )
         lam = jax.pure_callback(
-            host_lambda,
+            functools.partial(host_lambda, a_rows, a_cols),
             jax.ShapeDtypeStruct((m,), x.dtype),
-            lp_v.A.data,
+            lp.A.data,
             basic,
             active_rows,
             g,
             vmap_method="sequential",
         )
-        w = g - lp_v.A_T @ lam
+        w = g - lp.A_T @ lam
         lam_eq, lam_ineq = lam[:n_eq], lam[n_eq:]
         grad = LPValues(
             c=jnp.zeros_like(x),
             A_eq_data=-lam_eq[eq_rows] * x[eq_cols],
-            b_eq=lam_eq[..., : values.b_eq.shape[-1]],
+            b_eq=lam_eq,
             A_ineq_data=-lam_ineq[ineq_rows] * x[ineq_cols],
-            b_ineq=lam_ineq[..., : values.b_ineq.shape[-1]],
+            b_ineq=lam_ineq,
             lower_bounds=jnp.where(at_lower, w, 0.0),
             upper_bounds=jnp.where(at_upper, w, 0.0),
         )
-        return (
-            jax.tree.map(lambda t, v: t.astype(jnp.asarray(v).dtype), grad, values),
-        )
+        grad = jax.tree.map(lambda t, v: t.astype(v.dtype), grad, values)
+        return jax.vjp(lp_values, params)[1](grad)
 
     @jax.custom_vjp
-    def solution(values):
-        return forward(values)[0]
+    def x_fn(params):
+        return forward(params)[0]
 
-    solution.defvjp(forward, backward)
-
-    def x_fn(values=None):
-        return solution(pattern.values() if values is None else values)
-
-    x_fn.pattern = pattern
+    x_fn.defvjp(forward, backward)
     return x_fn
 
 
@@ -3735,6 +3736,12 @@ def to_jaddle_sparse(lp: LP):
     ``jaddle_optimisers.configure_jax``). ``solve`` converts an ``LP`` itself;
     call this to get at the ``JaddleLP``, e.g. for its ``values()``.
 
+    It also runs on traced numbers (inside ``make_solver``'s ``build_lp``).
+    A matrix's sparsity pattern is then read from whatever does not depend on
+    the traced values: a SciPy or concrete matrix keeps its nonzeros, a JAX
+    ``BCOO`` its stored entries, and a dense matrix that is itself traced
+    stores every entry.
+
     Args:
         lp: The LP to convert.
 
@@ -3744,15 +3751,52 @@ def to_jaddle_sparse(lp: LP):
     float_dtype, _ = __profile_dtypes()
 
     lp_jax = JaddleLP(
-        jnp.array(lp.c, dtype=float_dtype),
-        __scipy_to_bcoo(lp.A_eq, float_dtype),
-        jnp.array(lp.b_eq, dtype=float_dtype),
-        __scipy_to_bcoo(lp.A_ineq, float_dtype),
-        jnp.array(lp.b_ineq, dtype=float_dtype),
-        jnp.array(lp.lower_bounds, dtype=float_dtype),
-        jnp.array(lp.upper_bounds, dtype=float_dtype),
+        jnp.asarray(lp.c, dtype=float_dtype),
+        __to_bcoo(lp.A_eq, float_dtype),
+        jnp.asarray(lp.b_eq, dtype=float_dtype),
+        __to_bcoo(lp.A_ineq, float_dtype),
+        jnp.asarray(lp.b_ineq, dtype=float_dtype),
+        jnp.asarray(lp.lower_bounds, dtype=float_dtype),
+        jnp.asarray(lp.upper_bounds, dtype=float_dtype),
     )
     return lp_jax
+
+
+def __to_bcoo(A, dtype):
+    """``A`` (SciPy sparse, dense, or ``BCOO``; the numbers possibly traced)
+    as a sorted, deduplicated ``BCOO`` with ``dtype`` data."""
+    if isinstance(A, jsp.BCOO):
+        indices = np.asarray(A.indices)
+        if isinstance(A.indices, jax.core.Tracer):
+            raise ValueError(
+                "to_jaddle_sparse: a BCOO's indices must not depend on traced values"
+            )
+        data = jnp.asarray(A.data, dtype)
+        # Sort and merge duplicates: the grouping is found on the host, the
+        # sums on the device (so traced data works).
+        _, n = A.shape
+        keys, inverse = np.unique(
+            indices[:, 0].astype(np.int64) * n + indices[:, 1], return_inverse=True
+        )
+        data = jax.ops.segment_sum(data, inverse.ravel(), num_segments=keys.size)
+        indices = np.column_stack([keys // n, keys % n]).astype(np.int32)
+    elif isinstance(A, jax.core.Tracer):
+        # A dense matrix that depends on the traced values: no structural
+        # zeros are known, so every entry is stored.
+        m, n = A.shape
+        rows, cols = np.divmod(np.arange(m * n), n)
+        indices = np.column_stack([rows, cols]).astype(np.int32)
+        data = A.reshape(-1).astype(dtype)
+    else:
+        if not sp.issparse(A):
+            A = np.asarray(A)
+        return __scipy_to_bcoo(A, dtype)
+    return jsp.BCOO(
+        (data, jax.device_put(indices)),
+        shape=A.shape,
+        indices_sorted=True,
+        unique_indices=True,
+    )
 
 
 def lp_summary_statistics(lp: LP):
