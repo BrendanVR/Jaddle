@@ -11,7 +11,8 @@ Three routes, all returning results the CVXPY way (``prob.status``,
   presolve, then Jaddle, then HiGHS postsolve), a QP through
   ``jaddle_convex.quadratic_program``.
 * ``JaddleConicSolver`` is a CVXPY conic solver for problems with
-  second-order and PSD cones: ``prob.solve(solver=JaddleConicSolver())``.
+  second-order, PSD and exponential cones (so ``log``, ``log_det``,
+  ``log_sum_exp``, ...): ``prob.solve(solver=JaddleConicSolver())``.
   They are solved by ``jaddle_linear.solve`` on cone-constrained variables
   (``jaddle.cones``).
 * ``solve(prob)`` handles general convex problems. CVXPY's own route would
@@ -78,7 +79,7 @@ from cvxpy.atoms.norm_inf import norm_inf
 from cvxpy.atoms.pnorm import Pnorm
 from cvxpy.atoms.quad_form import QuadForm
 from cvxpy.atoms.quad_over_lin import quad_over_lin
-from cvxpy.constraints import SOC, Equality, Inequality, NonNeg, NonPos, Zero
+from cvxpy.constraints import SOC, Equality, ExpCone, Inequality, NonNeg, NonPos, Zero
 from cvxpy.constraints.psd import SvecPSD
 from cvxpy.expressions.constants.constant import Constant
 from cvxpy.expressions.constants.parameter import Parameter
@@ -328,13 +329,14 @@ class JaddleConicSolver(_EqualByType, ConicSolver):
     ``prob.solve(solver=JaddleConicSolver(), **opts)``.
 
     Takes problems CVXPY can put in the cone form
-    ``min cᵀx  s.t.  Ax + s = b,  s ∈ {0} x R+ x SOC x ... x PSD x ...`` and
+    ``min cᵀx  s.t.  Ax + s = b,  s ∈ {0} x R+ x SOC x ... x PSD x ... x EXP x ...``
+    and
     solves them with ``jaddle_linear.solve`` on cone-constrained variables
     (``jaddle.cones``). Zero rows become equality rows, nonnegative rows
-    inequality rows ``Ax <= b``, and each second-order or PSD block gets slack
-    variables ``s`` in that cone with equality rows ``Ax + s = b``. PSD blocks
-    use SCS's ``svec`` (lower triangle by columns, off-diagonals times ``√2``).
-    Exponential and power cones are not supported.
+    inequality rows ``Ax <= b``, and each second-order, PSD or exponential
+    block gets slack variables ``s`` in that cone with equality rows
+    ``Ax + s = b``. PSD blocks use SCS's ``svec`` (lower triangle by columns,
+    off-diagonals times ``√2``). Power cones are not supported.
 
     The keyword arguments of ``prob.solve`` go to ``jaddle_linear.solve``
     (``verbose`` included). ``tol`` sets its three relative tolerances unless
@@ -348,9 +350,11 @@ class JaddleConicSolver(_EqualByType, ConicSolver):
 
     MIP_CAPABLE = False
     BOUNDED_VARIABLES = True
-    SUPPORTED_CONSTRAINTS = ConicSolver.SUPPORTED_CONSTRAINTS + [SOC, SvecPSD]
+    SUPPORTED_CONSTRAINTS = ConicSolver.SUPPORTED_CONSTRAINTS + [SOC, SvecPSD, ExpCone]
     PSD_TRIANGLE_KIND = TriangleKind.LOWER
     PSD_SQRT2_SCALING = True
+    # CVXPY's exponential cone, y exp(x / y) <= z, is jaddle.cones's.
+    EXP_CONE_ORDER = [0, 1, 2]
 
     def name(self):
         return "JADDLE_CONIC"
@@ -370,7 +374,7 @@ class JaddleConicSolver(_EqualByType, ConicSolver):
         c = np.asarray(data[s.C], dtype=np.float64)
         n = c.shape[0]
         n_zero, n_nonneg = dims.zero, dims.nonneg
-        cones = Cones(soc=dims.soc, psd=dims.psd)
+        cones = Cones(soc=dims.soc, psd=dims.psd, exp=dims.exp)
         k = cones.size
 
         lower, upper = data[s.LOWER_BOUNDS], data[s.UPPER_BOUNDS]
@@ -440,11 +444,10 @@ class JaddleConicSolver(_EqualByType, ConicSolver):
             return failure_solution(status, attr)
         solution = results["solution"]
         n_zero = inverse_data[self.DIMS].zero
-        n = solution.primal.shape[0] - Cones(
-            soc=inverse_data[self.DIMS].soc, psd=inverse_data[self.DIMS].psd
-        ).size
+        dims = inverse_data[self.DIMS]
+        n = solution.primal.shape[0] - Cones(soc=dims.soc, psd=dims.psd, exp=dims.exp).size
         # Jaddle's Lagrangian cᵀx + yᵀ(Ax + s - b) with y_nonneg >= 0 and, by
-        # stationarity in the cone slacks, y_cone in the (self-dual) cone: the
+        # stationarity in the cone slacks, y_cone in the dual cone: the
         # sign convention of CVXPY's conic duals (as SCS's). Rows are ordered
         # zero, nonneg, cones, as CVXPY's.
         y = np.concatenate(

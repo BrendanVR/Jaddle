@@ -4,7 +4,7 @@ Short, self-contained scripts that show how to set up and solve problems with
 Jaddle. They are grouped by solver:
 
 - [`lp/`](lp/): linear programs, solved with `jaddle.jaddle_linear`
-- [`conic/`](conic/): second-order cone and semidefinite programs, solved with
+- [`conic/`](conic/): second-order cone, semidefinite and exponential cone programs, solved with
   `jaddle.jaddle_linear` on cone-constrained variables
 - [`cp/`](cp/): general convex programs, solved with `jaddle.jaddle_convex`
 
@@ -84,6 +84,7 @@ near the optimum). It takes about 50 seconds on a CPU.
 | Example | What it shows | Extra dependencies |
 |---|---|---|
 | [`cvxpy_portfolio.py`](conic/cvxpy_portfolio.py) | A second-order cone program in CVXPY: long-only portfolio weights for 50 assets that maximise expected return under a volatility limit, with risk from a factor model. Solved with `jcv.JaddleConicSolver`; sweeps the limit to trace the efficient frontier, warm-starting each solve, and reads the frontier's slope off the risk limit's dual. Checked against Clarabel. | `cvxpy` |
+| [`cvxpy_kelly.py`](conic/cvxpy_kelly.py) | An exponential cone program in CVXPY: a log-optimal (Kelly) portfolio of 20 assets over 1000 return scenarios, one exponential cone per `log`. Solved with `jcv.JaddleConicSolver` for a sweep of per-asset weight caps (later solves reuse the compiled program), printing the growth rate, concentration and the cap's shadow price. Checked against Clarabel. | `cvxpy` |
 | [`cvxpy_maxcut.py`](conic/cvxpy_maxcut.py) | A semidefinite program in CVXPY: the Goemans–Williamson relaxation of Max-Cut on a random 30-node graph, solved with `jcv.JaddleConicSolver` (a PSD projection each step) and rounded to a cut with random hyperplanes. Checks the bound against Clarabel and against the dual certificate. | `cvxpy` |
 
 ## Convex programs (`cp/`)

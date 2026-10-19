@@ -32,6 +32,7 @@ def has(module):
         ("cp/cvxpy_robust_kalman.py", ["cvxpy", "matplotlib"]),
         ("conic/cvxpy_portfolio.py", ["cvxpy"]),
         ("conic/cvxpy_maxcut.py", ["cvxpy"]),
+        ("conic/cvxpy_kelly.py", ["cvxpy"]),
     ],
 )
 def test_example_runs(script, requires):

@@ -407,9 +407,10 @@ tests.
 
 ### Conic programs
 
-The same solver handles second-order and positive semidefinite cones. Pass
-`cones=jl.Cones(soc=..., psd=...)` to `jl.LP` and the last variables of `x`
-are constrained to cones, in the style of SCS's cone dimensions:
+The same solver handles second-order, positive semidefinite and exponential
+cones. Pass `cones=jl.Cones(soc=..., psd=..., exp=...)` to `jl.LP` and the
+last variables of `x` are constrained to cones, in the style of SCS's cone
+dimensions:
 
 ```
 minimise    cᵀx
@@ -417,11 +418,12 @@ subject to  A_eq x = b_eq,  A_ineq x <= b_ineq,  l <= x <= u   (linear variables
             x[K₁] ∈ K₁, x[K₂] ∈ K₂, ...                         (the tail of x)
 ```
 
-With `n` variables and `jl.Cones(soc=(3, 5), psd=(4,))`, the first `n − 18`
-are ordinary linear variables, the next 3 lie in a second-order cone
-`{(t, z) : ‖z‖ ≤ t}`, the next 5 in another, and the last 10 hold a 4 × 4
-PSD matrix in `svec` form (its upper triangle row by row, off-diagonals
-times √2; `jaddle.cones.svec` and `smat` convert). Cone variables must be
+With `n` variables and `jl.Cones(soc=(3, 5), psd=(4,), exp=2)`, the first
+`n − 24` are ordinary linear variables, the next 3 lie in a second-order cone
+`{(t, z) : ‖z‖ ≤ t}`, the next 5 in another, the next 10 hold a 4 × 4 PSD
+matrix in `svec` form (its upper triangle row by row, off-diagonals times √2;
+`jaddle.cones.svec` and `smat` convert), and the last 6 are two exponential
+cones `closure{(x, y, z) : y·exp(x/y) ≤ z, y > 0}`. Cone variables must be
 unbounded. A conic constraint `b − Ax ∈ K` becomes `Ax + s = b` with slack
 variables `s` in the cone.
 
@@ -443,17 +445,24 @@ lp = jl.LP(
 z = jl.solve(lp)["solution"].primal[1:]   # -c / ‖c‖
 ```
 
-Each step projects the cone variables onto their cones (a closed form for
-second-order cones, one batched eigendecomposition per PSD size) instead of
-onto a box. Both cones are self-dual, so the dual condition on a cone block is
-that its reduced cost lies in the cone, and the certificate measures dual
-infeasibility as the reduced cost's distance to the cone. Scaling, the
+Each step projects the cone variables onto their cones instead of onto a box:
+a closed form for second-order cones, one batched eigendecomposition per PSD
+size, and for exponential cones Friberg's univariate root search (as in SCS
+and Clarabel). The dual condition on a cone block is that its reduced cost
+lies in the dual cone `K*`, and the certificate measures dual infeasibility as
+the reduced cost's distance to `K*`, computed from the projection onto `K` as
+`−Π_K(−r)`. (The second-order and PSD cones are self-dual; the exponential
+cone is not.) The exponential cone's projection is built for float64. It is
+also the expensive part of an exponential-cone solve: on GPU it runs as a
+sequence of small kernels each iteration, so such problems are slower per
+iteration than SOC or PSD ones. Scaling, the
 diagonal metric and restarts work as for an LP, with column scales tied to one
 value per cone block. `jl.solve`, `make_solver`, `solve_batch` and
 `make_optimal_value` (differentiable optimal values) all take conic problems;
 presolve, crossover, polishing, infeasibility detection and `make_solution`
 do not yet, and raise `NotImplementedError`. CVXPY problems with
-second-order and PSD constraints go through `jcv.JaddleConicSolver` (see
+second-order, PSD and exponential constraints go through
+`jcv.JaddleConicSolver` (see
 [Modelling with CVXPY](#modelling-with-cvxpy)).
 
 ## The convex programming solver
@@ -662,17 +671,22 @@ is a small worked LP.
 
 **`JaddleConicSolver`** is a CVXPY conic solver for problems CVXPY can put in
 the form `min cᵀx  s.t.  Ax + s = b`, with `s` in a product of zero,
-nonnegative, second-order and PSD cones. It solves them with `jl.solve` on
-cone-constrained variables (see [Conic programs](#conic-programs)); there is
-no presolve. Exponential and power cones are not supported.
+nonnegative, second-order, PSD and exponential cones. It solves them with
+`jl.solve` on cone-constrained variables (see [Conic programs](#conic-programs));
+there is no presolve. Power cones are not supported. Exponential cones bring
+in `log`, `log_det`, `log1p`, `rel_entr` and `kl_div`, which the compiled
+route below cannot take, alongside `exp`, `log_sum_exp`, `logistic` and
+`entr`.
 [`examples/conic/cvxpy_portfolio.py`](https://github.com/BrendanVR/Jaddle/blob/main/examples/conic/cvxpy_portfolio.py)
 traces a risk-limited portfolio's efficient frontier, and
 [`examples/conic/cvxpy_maxcut.py`](https://github.com/BrendanVR/Jaddle/blob/main/examples/conic/cvxpy_maxcut.py)
-solves the Goemans–Williamson Max-Cut SDP and rounds it to a cut.
+solves the Goemans–Williamson Max-Cut SDP and rounds it to a cut, and
+[`examples/conic/cvxpy_kelly.py`](https://github.com/BrendanVR/Jaddle/blob/main/examples/conic/cvxpy_kelly.py)
+finds log-optimal (Kelly) portfolios, one exponential cone per scenario.
 
 **`jcv.solve`** handles the rest. For a general convex problem CVXPY's own
-reductions produce cones, exponential ones included, which Jaddle cannot
-project onto. The cone form is also a poor fit for a first-order method:
+reductions produce cones, and the cone form is often a poor fit for a
+first-order method:
 on the L1-logistic regression in
 [`examples/cp/cvxpy_lasso.py`](https://github.com/BrendanVR/Jaddle/blob/main/examples/cp/cvxpy_lasso.py) it has 701
 variables, 1500 rows and 400 exponential cones. `jcv.compile_problem` instead

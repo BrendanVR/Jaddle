@@ -4,6 +4,15 @@
 
 ### Added
 
+- Exponential cones: `jl.Cones(exp=k)` adds `k` three-variable exponential
+  cones to the tail of `x`, projected with Friberg's root search (ported from
+  SCS, with each point projected at unit norm: SCS's absolute tolerances took
+  a heuristic point 40% off at a norm of 1e-3). The dual test on cone blocks
+  is now `−Π_K(−r)`, correct for cones that are not self-dual.
+  `jcv.JaddleConicSolver` accepts CVXPY's `ExpCone`, so `log`, `log_det`,
+  `log_sum_exp`, `logistic`, `entr`, `rel_entr` and friends go through it.
+  See `examples/conic/cvxpy_kelly.py`.
+
 - Second-order and PSD cones in the LP solver. `jl.LP(..., cones=jl.Cones(
   soc=..., psd=...))` constrains the tail of `x` to a product of cones (PSD
   blocks in `svec` form); each step projects onto them, scaling and the

@@ -263,6 +263,8 @@ def run_pipeline(path, args):
         eliminate_defined_vars=args.eliminate_defined_vars,
         polish=args.polish,
         run_crossover=args.crossover,
+        diag_clamp=1e10,
+        iterations_per_epoch=64,
         **kwargs,
     )
     wall_seconds = time.perf_counter() - t0

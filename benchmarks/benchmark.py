@@ -376,7 +376,6 @@ def jaddle_solve_kwargs(
         dual_gap_tolerance=tol if gap_tol is None else gap_tol,
         gap_test=gap_test,
         update_mode=update_mode,
-        iterations_per_epoch=64 * 10,
         cost_col_floor=cost_col_floor,
         termination_norm=norm,
         restart_norm=norm,

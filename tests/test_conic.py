@@ -1,5 +1,5 @@
-"""Second-order and PSD cones: the projections, the LP solver on cone-
-constrained variables, and the CVXPY conic solver against Clarabel."""
+"""Second-order, PSD and exponential cones: the projections, the LP solver on
+cone-constrained variables, and the CVXPY conic solver against Clarabel."""
 
 import jax
 import jax.numpy as jnp
@@ -8,7 +8,7 @@ import pytest
 import scipy.sparse as sp
 
 import jaddle.jaddle_linear as jl
-from jaddle.cones import Cones, smat, svec
+from jaddle.cones import Cones, project_exp, smat, svec
 
 TIGHT = dict(
     primal_feasibility_tolerance=1e-8,
@@ -71,6 +71,79 @@ def test_tie_is_uniform_per_block():
         block = tied[offset : offset + size]
         assert np.ptp(block) < 1e-12
         offset += size
+
+
+def _exp_reference(v):
+    """Brute-force projection onto the exponential cone: the best of the
+    closure's two pieces and the boundary point (ρy, y, y e^ρ), with ρ found
+    by a grid search refined by a bounded scalar minimisation."""
+    from scipy.optimize import minimize_scalar
+
+    def boundary(rho):
+        a = np.array([rho, 1.0, np.exp(rho)])
+        y = max(a @ v, 0.0) / (a @ a)
+        return y * a
+
+    def dist(rho):
+        return np.sum((boundary(rho) - v) ** 2)
+
+    grid = np.linspace(-40.0, 40.0, 8001)
+    k = int(np.argmin([dist(r) for r in grid]))
+    rho = minimize_scalar(
+        dist,
+        bounds=(grid[max(k - 1, 0)], grid[min(k + 1, grid.size - 1)]),
+        method="bounded",
+        options={"xatol": 1e-14},
+    ).x
+    candidates = [np.array([min(v[0], 0.0), 0.0, max(v[2], 0.0)]), boundary(rho)]
+    if v[1] > 0:
+        z = max(v[2], v[1] * np.exp(min(v[0] / v[1], 700.0)))
+        candidates.append(np.array([v[0], v[1], z]))
+    return min(candidates, key=lambda c: np.sum((c - v) ** 2))
+
+
+@pytest.mark.parametrize("scale", [1e-3, 1.0, 1e2])
+def test_exp_projection_matches_brute_force(scale):
+    V = np.random.default_rng(7).standard_normal((40, 3)) * scale
+    P = np.asarray(project_exp(jnp.asarray(V)))
+    for v, p in zip(V, P):
+        ref = _exp_reference(v)
+        # Never measurably farther from v than the reference, and close to it.
+        excess = np.sum((p - v) ** 2) - np.sum((ref - v) ** 2)
+        assert excess <= 1e-9 * np.sum(v**2)
+        assert np.linalg.norm(p - ref) <= 1e-5 * np.linalg.norm(v)
+
+
+def test_exp_projection_cases():
+    inside = [0.0, 1.0, 2.0]  # 1·e^0 <= 2
+    polar = [-1.0, -1.0, -1.0]  # x, y <= 0: projects to (x, 0, max(z, 0))
+    corner = [-2.0, -1.0, 3.0]
+    dual_side = [1.0, 0.0, -3.0]  # -v is in K* = {(u, v, w): -u e^(v/u) <= e w}
+    V = jnp.asarray([inside, polar, corner, dual_side, [0.0, 0.0, 0.0]])
+    P = np.asarray(project_exp(V))
+    np.testing.assert_allclose(P[0], inside)
+    np.testing.assert_allclose(P[1], [-1.0, 0.0, 0.0])
+    np.testing.assert_allclose(P[2], [-2.0, 0.0, 3.0])
+    np.testing.assert_allclose(P[3], 0.0, atol=1e-12)
+    np.testing.assert_allclose(P[4], 0.0)
+    # Idempotent, and finite on extreme inputs.
+    np.testing.assert_allclose(project_exp(jnp.asarray(P)), P, atol=1e-12)
+    extreme = jnp.asarray([[1e8, 1.0, 1.0], [-1e8, 1e-8, 1.0], [1e-300, 1e-300, 0.0]])
+    assert np.all(np.isfinite(np.asarray(project_exp(extreme))))
+
+
+def test_dual_residual():
+    # Self-dual cones: r - Π_{K*}(r) is r - Π_K(r).
+    v = jnp.asarray(np.random.default_rng(8).standard_normal(CONES.size))
+    np.testing.assert_allclose(
+        CONES.dual_residual(v), v - CONES.project(v), atol=1e-12
+    )
+    # Exponential cone: zero on K* and nonzero off it.
+    K = Cones(exp=2)
+    in_dual = jnp.asarray([-1.0, 0.0, 1.0, -1.0, 1.0, 1.0])  # e·w >= -u e^(v/u)
+    np.testing.assert_allclose(K.dual_residual(in_dual), 0.0, atol=1e-12)
+    out = jnp.asarray([1.0, 0.0, 0.0, -1.0, 0.0, -1.0])
+    assert np.all(np.abs(np.asarray(K.dual_residual(out))).reshape(2, 3).sum(1) > 0.1)
 
 
 def test_cone_variables_must_be_unbounded():
@@ -137,6 +210,72 @@ def test_min_eigenvalue_sdp_with_linear_variable():
     x = np.asarray(result["solution"].primal)
     assert x[0] == pytest.approx(0.0, abs=1e-8)
     assert svec(C) @ x[1:] == pytest.approx(np.linalg.eigvalsh(C)[0], abs=1e-6)
+
+
+def test_exp_cone_closed_forms():
+    # min z s.t. (1, 1, z) ∈ K_exp  ->  e.
+    lp = jl.LP(
+        np.array([0.0, 0.0, 1.0]),
+        sp.csc_matrix(np.eye(2, 3)),
+        np.ones(2),
+        sp.csc_matrix((0, 3)),
+        np.zeros(0),
+        np.full(3, -np.inf),
+        np.full(3, np.inf),
+        cones=Cones(exp=1),
+    )
+    result = jl.solve(lp, **TIGHT)
+    assert result["converged"]
+    assert float(result["solution"].primal[2]) == pytest.approx(np.e, rel=1e-6)
+
+    # max Σ -pᵢ log pᵢ s.t. Σ pᵢ = 1  ->  log n, with p = 1/n. With
+    # (tᵢ, pᵢ, 1) ∈ K_exp, i.e. tᵢ <= -pᵢ log pᵢ, maximise Σ tᵢ.
+    n = 6
+    # Variables: p (n, boxed >= 0), then n exp blocks (tᵢ, pᵢ', 1ᵢ).
+    blocks = 3 * n
+    A_eq = np.zeros((1 + 2 * n, n + blocks))
+    b_eq = np.zeros(1 + 2 * n)
+    A_eq[0, :n], b_eq[0] = 1.0, 1.0
+    for i in range(n):
+        A_eq[1 + i, n + 3 * i + 1], A_eq[1 + i, i] = 1.0, -1.0  # pᵢ' = pᵢ
+        A_eq[1 + n + i, n + 3 * i + 2], b_eq[1 + n + i] = 1.0, 1.0
+    c = np.zeros(n + blocks)
+    c[n::3] = -1.0
+    lp = jl.LP(
+        c,
+        sp.csc_matrix(A_eq),
+        b_eq,
+        sp.csc_matrix((0, n + blocks)),
+        np.zeros(0),
+        np.r_[np.zeros(n), np.full(blocks, -np.inf)],
+        np.full(n + blocks, np.inf),
+        cones=Cones(exp=n),
+    )
+    result = jl.solve(lp, **TIGHT)
+    assert result["converged"]
+    x = np.asarray(result["solution"].primal)
+    assert -c @ x == pytest.approx(np.log(n), rel=1e-6)
+    np.testing.assert_allclose(x[:n], 1.0 / n, atol=1e-6)
+
+
+def test_exp_cone_optimal_value_gradient():
+    # z*(a) = min z s.t. (a, 1, z) ∈ K_exp = e^a, so dz*/da = e^a.
+    def build(a):
+        return jl.LP(
+            jnp.array([0.0, 0.0, 1.0]),
+            sp.csc_matrix(np.eye(2, 3)),
+            jnp.stack([a, 1.0]),
+            sp.csc_matrix((0, 3)),
+            jnp.zeros(0),
+            jnp.full(3, -jnp.inf),
+            jnp.full(3, jnp.inf),
+            cones=Cones(exp=1),
+        )
+
+    a = 0.7
+    z, grad = jax.value_and_grad(jl.make_optimal_value(build, **TIGHT))(a)
+    assert z == pytest.approx(np.exp(a), rel=1e-6)
+    assert grad == pytest.approx(np.exp(a), rel=1e-5)
 
 
 def test_scaling_keeps_cone_blocks_uniform():
@@ -237,8 +376,52 @@ def _cvxpy_problems():
         [],
     )
 
+    # Exponential cones.
+    R = 1 + rng.normal(0.01, 0.1, (200, 8))
+    w = cp.Variable(8, nonneg=True)
+    budget = [cp.sum(w) == 1]
+    yield "kelly", cp.Problem(cp.Maximize(cp.sum(cp.log(R @ w)) / 200), budget), budget, [w]
 
-@pytest.mark.parametrize("name", ["portfolio", "robust_ls", "min_eigenvalue", "maxcut"])
+    X = rng.standard_normal((100, 5))
+    y = np.sign(X @ rng.standard_normal(5) + 0.5 * rng.standard_normal(100))
+    beta = cp.Variable(5)
+    loss = cp.sum(cp.logistic(-cp.multiply(y, X @ beta))) / 100
+    yield (
+        "logistic",
+        cp.Problem(cp.Minimize(loss + 0.1 * cp.sum_squares(beta))),
+        [],
+        [beta],
+    )
+
+    A = rng.standard_normal((30, 6))
+    x = cp.Variable(6)
+    ball = [cp.norm(x, 2) <= 1]  # second-order and exponential cones together
+    yield "log_sum_exp", cp.Problem(cp.Minimize(cp.log_sum_exp(A @ x)), ball), ball, [x]
+
+    V = rng.standard_normal((4, 12))
+    lam = cp.Variable(12, nonneg=True)
+    simplex = [cp.sum(lam) == 1]  # PSD and exponential cones together
+    yield (
+        "d_optimal",
+        cp.Problem(cp.Maximize(cp.log_det(V @ cp.diag(lam) @ V.T)), simplex),
+        simplex,
+        [lam],
+    )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "portfolio",
+        "robust_ls",
+        "min_eigenvalue",
+        "maxcut",
+        "kelly",
+        "logistic",
+        "log_sum_exp",
+        "d_optimal",
+    ],
+)
 def test_cvxpy_conic_matches_clarabel(name):
     cp = pytest.importorskip("cvxpy")
     import jaddle.jaddle_cvxpy as jcv

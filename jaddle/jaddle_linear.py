@@ -830,15 +830,15 @@ def _device_solver(
         upper_bounds = lp.upper_bounds
 
         def with_cone_violation(violation):
-            # A cone block's reduced cost must lie in the (self-dual) cone; its
-            # violation is the distance to it, |Π_{-K}(r)|. Cone variables
+            # A cone block's reduced cost must lie in the dual cone K*; its
+            # violation is the distance to it, |r - Π_{K*}(r)|. Cone variables
             # are unbounded, so their bound term in the gap is already 0. The
             # column scale is uniform on a block, so true units keep the cone.
             if not lp.cones:
                 return violation
             n_lin = violation.shape[0] - lp.cones.size
             return violation.at[n_lin:].set(
-                jnp.abs(lp.cones.polar(reduced_cost_true[n_lin:]))
+                jnp.abs(lp.cones.dual_residual(reduced_cost_true[n_lin:]))
             )
 
         finite_lower = jnp.isfinite(lower_bounds)
@@ -4832,10 +4832,10 @@ def evaluate_lp_certificate(
             ),
         )
     if lp.cones:
-        # Cone blocks: distance of the reduced cost to the (self-dual) cone.
+        # Cone blocks: distance of the reduced cost to the dual cone.
         n_lin = primal.shape[0] - lp.cones.size
         dual_feasibility_violation = dual_feasibility_violation.at[n_lin:].set(
-            jnp.abs(lp.cones.polar(reduced_cost[n_lin:]))
+            jnp.abs(lp.cones.dual_residual(reduced_cost[n_lin:]))
         )
     dual_feasibility_residual = _vector_norm(dual_feasibility_violation, norm)
 
