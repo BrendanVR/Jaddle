@@ -4,6 +4,35 @@
 
 ### Added
 
+- `jl.solve_with_refinement`: `jl.solve` with iterative refinement
+  (Gleixner, Steffy & Wolter, INFORMS JOC 2016). A first solve stops at a
+  loose `inner_tol` (1e-4). Each round then solves a correction LP at the
+  current point and adds its scaled-down solution to the point. The
+  correction LP is the same problem shifted to the point, with the primal
+  residual as its right-hand side and the reduced cost as its objective,
+  both scaled up to O(1) by powers of 2. Each round restarts the solver on a
+  fresh, well-scaled problem, so the feasibility and gap tails of a long
+  solve become the first epochs of a short one. The correction LP is in
+  slack form, so its matrix is built once and every round reuses the same
+  compiled programs. The best point is returned. Refinement stops when the
+  point certifies, after `max_rounds` (8) rounds, or when a round fails to
+  halve the worst residual-to-tolerance ratio. The result has a
+  `"refinement"` dict with the rounds, epochs per round, scales and residual
+  history. On stp3d (float64, presolved, `tol=1e-8`, gap `1e-4`) it
+  certified in one round, about 94 s, with the gap at 9.7e-9. A plain solve
+  is still uncertified after 150 s. Polishing is faster there (24 s), but
+  only refinement also brings the gap down to the tolerance. On small
+  random LPs in float64 it is no better than a plain solve. The
+  experimental `fix_threshold` fixes near-bound columns in the correction
+  LP and is off by default: it broke stp3d's dual. Use it on presolved
+  models with `jl.solve_with_presolve(model,
+  reduced_solver=jl.solve_with_refinement)`. LPs only: conic problems raise
+  `NotImplementedError`.
+
+- `benchmarks/benchmark.py --refine` solves with `jl.solve_with_refinement`
+  (it cannot be combined with `--polish`). The new CSV column
+  `jaddle_refine_rounds` records the number of rounds.
+
 - Exponential cones: `jl.Cones(exp=k)` adds `k` three-variable exponential
   cones to the tail of `x`, projected with Friberg's root search (ported from
   SCS, with each point projected at unit norm: SCS's absolute tolerances took

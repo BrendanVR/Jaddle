@@ -396,6 +396,16 @@ tests.
   dual_gap_tolerance=1e-4`: on stp3d (float64) that certifies in 24 s, where a
   plain solve is still at PFR 5e-6 after 150 s.
   `jl.solve_with_presolve(model, polish=True)` uses it for the reduced LP.
+- **Iterative refinement.** `jl.solve_with_refinement` is `jl.solve` with
+  iterative refinement (Gleixner, Steffy & Wolter, 2016). A loose first solve
+  is followed by rounds of correction LPs: the same problem shifted to the
+  current point, with the residuals scaled up to O(1). Each correction
+  restarts the solver on a well-scaled problem in place of a long tail. Unlike
+  polishing, it tightens the gap along with feasibility: on stp3d (float64,
+  `tol=1e-8, dual_gap_tolerance=1e-4`) one round certified in about 94 s,
+  with the gap at 9.7e-9. `result["refinement"]` records the rounds. For
+  presolved models use
+  `jl.solve_with_presolve(model, reduced_solver=jl.solve_with_refinement)`.
 - **Infeasibility detection.** `jl.detect_infeasibility` classifies an LP as
   `"primal_infeasible"`, `"dual_infeasible"` (unbounded if feasible),
   `"optimal"` or `"undetermined"` the PDLP way: diverging iterates give a
@@ -459,8 +469,9 @@ iteration than SOC or PSD ones. Scaling, the
 diagonal metric and restarts work as for an LP, with column scales tied to one
 value per cone block. `jl.solve`, `make_solver`, `solve_batch` and
 `make_optimal_value` (differentiable optimal values) all take conic problems;
-presolve, crossover, polishing, infeasibility detection and `make_solution`
-do not yet, and raise `NotImplementedError`. CVXPY problems with
+presolve, crossover, polishing, iterative refinement, infeasibility
+detection and `make_solution` do not yet, and raise `NotImplementedError`.
+CVXPY problems with
 second-order, PSD and exponential constraints go through
 `jcv.JaddleConicSolver` (see
 [Modelling with CVXPY](#modelling-with-cvxpy)).
@@ -765,8 +776,8 @@ Laptop GPU.
 The two certificates differ because postsolve can enlarge a first-order
 solution's small dual errors, and because presolve can rescale a problem
 drastically, which changes what a relative tolerance means (see
-*Presolve and postsolve* above). `jl.solve_with_polishing` and
-`jl.crossover` can tighten a postsolved point when the original certificate
+*Presolve and postsolve* above). `jl.solve_with_polishing`,
+`jl.solve_with_refinement` and `jl.crossover` can tighten a postsolved point when the original certificate
 matters.
 
 Convergence on hgms62 can be recovered by altering the solvers default settings, in particular greatly increasing `diag_clamp` which alters the maximum amount of adaptive diagonal scaling used by the solver.
