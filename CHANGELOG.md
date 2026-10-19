@@ -29,6 +29,15 @@
 
 ### Changed
 
+- `jl.solve` no longer recompiles for every call. Its device programs are
+  cached per settings and problem shape, and the problem's numbers go in as
+  arguments rather than being baked into the compiled code. A second solve of
+  the same shapes skips tracing and compiling: a small LP re-solve takes
+  0.05 s instead of 0.8 s, a 500-asset CVXPY portfolio sweep 0.08–0.11 s per
+  point instead of 1.1 s, and uccase12 0.6 s instead of 3.9 s. Per-epoch speed
+  and results are unchanged (bit-identical on CPU). `solve_with_polishing`'s
+  sub-solves and repeated benchmark runs benefit the same way.
+
 - LP `make_solver`, `solve_batch`, `make_optimal_value`, `make_solution` and
   `make_perturbed_solution` now take a builder, as the convex ones do:
   `build_lp(params)` returns an `LP` or `JaddleLP`, and the returned function

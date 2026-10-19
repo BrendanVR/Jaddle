@@ -195,6 +195,26 @@ def test_time_budget():
     assert result["stop_reason"] == "time_limit"
 
 
+def test_same_shape_solve_reuses_compiled_programs(monkeypatch):
+    # _device_solver only runs while solve() traces its device programs. A
+    # second LP of the same shapes, with different numbers, must reuse them.
+    traces = []
+    device_solver = jl._device_solver
+
+    def counting(*args, **kwargs):
+        traces.append(1)
+        return device_solver(*args, **kwargs)
+
+    monkeypatch.setattr(jl, "_device_solver", counting)
+    jl._solve_programs.cache_clear()
+    first, second = random_lp(seed=0), random_lp(seed=1)
+    assert_certified(first, solve(first), reference_objective(first))
+    n_traces = len(traces)
+    assert n_traces > 0
+    assert_certified(second, solve(second), reference_objective(second))
+    assert len(traces) == n_traces
+
+
 def test_warm_start():
     lp = random_lp()
     loose = solve(lp, tol=1e-3)

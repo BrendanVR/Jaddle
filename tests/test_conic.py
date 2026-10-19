@@ -259,3 +259,17 @@ def test_cvxpy_conic_matches_clarabel(name):
         np.testing.assert_allclose(v.value, x, atol=1e-4)
     for c, y in zip(constraints, duals):
         np.testing.assert_allclose(c.dual_value, y, atol=1e-4)
+
+
+def test_cvxpy_conic_warm_start():
+    # A fresh solver instance per solve must still warm-start: CVXPY clears
+    # its cache whenever the solver it is given changes.
+    cp = pytest.importorskip("cvxpy")
+    import jaddle.jaddle_cvxpy as jcv
+
+    problem = next(p[1] for p in _cvxpy_problems() if p[0] == "portfolio")
+    problem.solve(solver=jcv.JaddleConicSolver(), tol=1e-8, max_epochs=500)
+    cold = problem.solver_stats.num_iters
+    problem.solve(solver=jcv.JaddleConicSolver(), tol=1e-8, max_epochs=500)
+    assert problem.status == cp.OPTIMAL
+    assert problem.solver_stats.num_iters < cold

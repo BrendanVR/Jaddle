@@ -99,13 +99,14 @@ def test_qp():
 
 
 def test_qp_warm_start():
+    # A fresh solver instance per solve must still warm-start: CVXPY clears
+    # its cache whenever the solver it is given changes.
     problem, _, _ = simplex_qp(n=30)
-    solver = jcv.JaddleSolver()
-    problem.solve(solver=solver, **TOL)
+    problem.solve(solver=jcv.JaddleSolver(), **TOL)
     cold = problem.solver_stats.num_iters
-    problem.solve(solver=solver, warm_start=True, **TOL)
+    problem.solve(solver=jcv.JaddleSolver(), warm_start=True, **TOL)
     assert problem.status == cp.OPTIMAL
-    assert problem.solver_stats.num_iters <= cold
+    assert problem.solver_stats.num_iters < cold
 
 
 def test_presolve_infeasible():

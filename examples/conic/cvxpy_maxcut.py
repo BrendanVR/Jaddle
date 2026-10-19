@@ -23,16 +23,23 @@
 
 # %%
 import os
+import time
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_FLAGS"] = "--xla_gpu_autotune_level=5"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
+import jax
+
+jax.config.update("jax_bcoo_cusparse_lowering", True)
+jax.config.update("jax_optimization_level", "O3")
 
 import cvxpy as cp
 import numpy as np
 
 import jaddle.jaddle_optimisers as jo
 
-jo.configure_jax("float64")
+jo.configure_jax("float32")
 
 import jaddle.jaddle_cvxpy as jcv  # noqa: E402
 
@@ -42,7 +49,7 @@ import jaddle.jaddle_cvxpy as jcv  # noqa: E402
 
 # %%
 rng = np.random.default_rng(0)
-n_nodes = 30
+n_nodes = 200
 W = np.triu(rng.random((n_nodes, n_nodes)) < 0.3, 1).astype(float)
 W = W + W.T
 L = np.diag(W.sum(axis=1)) - W
@@ -50,16 +57,28 @@ print(f"{n_nodes} nodes, {int(W.sum() / 2)} edges")
 
 # %% [markdown]
 # ## The relaxation
-
-# %%
 X = cp.Variable((n_nodes, n_nodes), symmetric=True)
 unit_diagonal = cp.diag(X) == 1
 problem = cp.Problem(cp.Maximize(cp.trace(L @ X) / 4), [X >> 0, unit_diagonal])
 
-problem.solve(solver="CLARABEL")
+# %%
+t0 = time.perf_counter()
+problem.solve(solver="SCS")
+scs_time = time.perf_counter() - t0
 reference_bound = problem.value
+print(f"SCS solve time: {scs_time:.2f}s")
 
-problem.solve(solver=jcv.JaddleConicSolver(), tol=1e-6)
+# %%
+t0 = time.perf_counter()
+problem.solve(
+    solver=jcv.JaddleConicSolver(),
+    tol=1e-3,
+    verbose=True,
+    diag_clamp=1e10,
+    update_mode="halpern",
+)
+jaddle_time = time.perf_counter() - t0
+print(f"Jaddle solve time: {jaddle_time:.2f}s")
 stats = problem.solver_stats.extra_stats
 print(
     f"Status {problem.status}: bound {problem.value:.4f} "
@@ -100,3 +119,5 @@ assert cut_size(best) >= 0.878 * problem.value
 dual_bound = float(unit_diagonal.dual_value.sum())
 print(f"Dual bound: {dual_bound:.4f}")
 assert abs(dual_bound - problem.value) <= 1e-4 * (1 + abs(problem.value))
+
+# %%

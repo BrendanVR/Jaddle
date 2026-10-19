@@ -161,11 +161,24 @@ _COMPILED_TOLERANCES = (
 )
 
 
+class _EqualByType:
+    """Solver instances of one class compare equal. CVXPY keeps a problem's
+    compiled form and its solver cache (which holds the warm start) only while
+    the solver it is given equals the last one, so without this each
+    ``solver=JaddleSolver()`` would recompile and start cold."""
+
+    def __eq__(self, other):
+        return type(other) is type(self)
+
+    def __hash__(self):
+        return hash(type(self))
+
+
 # %%
 # Route 1: a CVXPY QP solver
 
 
-class JaddleSolver(QpSolver):
+class JaddleSolver(_EqualByType, QpSolver):
     """
     Jaddle as a CVXPY QP solver: ``prob.solve(solver=JaddleSolver(), **opts)``.
 
@@ -178,10 +191,11 @@ class JaddleSolver(QpSolver):
     ``dual_feasibility_tolerance``, ``dual_gap_tolerance``) that are not given
     by name; it defaults to ``DEFAULT_TOLERANCE``.
 
-    ``warm_start=True`` starts a QP, or an LP with ``presolve=False``, from the
-    previous solve's point when the problem's sizes are unchanged. (The
-    presolved LP's variables are not the problem's, so the presolve route
-    always starts cold.)
+    ``warm_start=True`` (CVXPY's default) starts a QP, or an LP with
+    ``presolve=False``, from the previous solve's point when the problem's
+    sizes are unchanged. (The presolved LP's variables are not the problem's,
+    so the presolve route always starts cold.) Solving the same problem with
+    another solver in between clears CVXPY's cache, and with it the point.
 
     ``prob.solver_stats.extra_stats`` is Jaddle's result dict (certificate,
     epochs, stop reason, presolve sizes).
@@ -308,7 +322,7 @@ class JaddleSolver(QpSolver):
 # Route 1b: a CVXPY conic solver (second-order and PSD cones)
 
 
-class JaddleConicSolver(ConicSolver):
+class JaddleConicSolver(_EqualByType, ConicSolver):
     """
     Jaddle as a CVXPY conic solver:
     ``prob.solve(solver=JaddleConicSolver(), **opts)``.
@@ -325,8 +339,9 @@ class JaddleConicSolver(ConicSolver):
     The keyword arguments of ``prob.solve`` go to ``jaddle_linear.solve``
     (``verbose`` included). ``tol`` sets its three relative tolerances unless
     they are given by name; it defaults to ``DEFAULT_TOLERANCE``.
-    ``warm_start=True`` starts from the previous solve's point when the
-    problem's sizes are unchanged.
+    ``warm_start=True`` (CVXPY's default) starts from the previous solve's
+    point when the problem's sizes are unchanged. Solving the same problem with
+    another solver in between clears CVXPY's cache, and with it the point.
 
     ``prob.solver_stats.extra_stats`` is Jaddle's result dict.
     """

@@ -554,6 +554,118 @@ def _check_settings(
     return k_lo, k_hi, adaptive_eta, update_mode == "halpern"
 
 
+def _relative_gap(duality_gap, objective_value):
+    # PDLP/cuPDLP relative duality gap: |primal_obj − dual_obj| normalised by
+    # (1 + |primal_obj| + |dual_obj|). The numerator IS `duality_gap` (built
+    # as the unit-consistent complementarity decomposition in
+    # compute_epoch_metrics — equal to primal_obj − dual_obj at a dual-feasible
+    # point), and the dual objective is recovered exactly and unit-consistently
+    # as `dual_obj = primal_obj − duality_gap` rather than recomputing bᵀy +
+    # Σbox_infimum (which would risk the scaled/true unit mismatch the
+    # decomposition exists to avoid). Adding |dual_obj| to the denominator
+    # matches PDLP's convention so RDG magnitudes are directly comparable to
+    # PDLP/HiGHS-PDLP certificates; it only enlarges the denominator, so it
+    # slightly loosens the effective `dual_gap_tolerance` versus the old
+    # (1+|obj|)-only normalisation.
+    # If duality_gap is ever non-finite (nan/inf inputs), report +inf rather
+    # than the raw inf/inf = nan ratio, so the log and any |gap|-based
+    # comparison read sensibly. Convergence still gates on the separate
+    # `dual_gap_is_finite` flag regardless.
+    dual_bound = objective_value - duality_gap
+    return jnp.where(
+        jnp.isfinite(duality_gap),
+        jnp.abs(duality_gap)
+        / (1.0 + jnp.abs(objective_value) + jnp.abs(dual_bound)),
+        jnp.inf,
+    )
+
+def _relative_gap_abs(
+    objective_value, duality_gap, gap_bound_comp, gap_ineq_comp, gap_eq_comp
+):
+    # No-cancellation companion to `relative_gap`: sum of |component|s instead
+    # of the signed sum, so a gap that reads small only through cancellation
+    # between e.g. gap_bound_comp and gap_eq_comp (qap10) doesn't pass. Shared
+    # by `converged()` (the actual gate) and `print_epoch_metrics` (so the
+    # printed diagnostics can't show a converged-looking RDG while this hidden
+    # condition is still what's blocking termination).
+    dual_bound = objective_value - duality_gap
+    gap_denom = 1.0 + jnp.abs(objective_value) + jnp.abs(dual_bound)
+    return (
+        jnp.abs(gap_bound_comp) + jnp.abs(gap_ineq_comp) + jnp.abs(gap_eq_comp)
+    ) / gap_denom
+
+
+def _print_epoch_metrics(
+    termination_b_norm,
+    termination_c_norm,
+    gap_test,
+    reference_objective,
+    epoch,
+    objective_value,
+    termination_pfr,
+    termination_dfr,
+    duality_gap,
+    gap_bound_comp,
+    gap_ineq_comp,
+    gap_eq_comp,
+    epoch_time=None,
+    k_val=None,
+    eta_val=None,
+):
+    time_str = f"|Time {epoch_time:.2f}s|" if epoch_time is not None else ""
+    ke_str = ""
+    if k_val is not None:
+        ke_str += f"|k {k_val:.2e}|"
+    if eta_val is not None:
+        ke_str += f"|eta {eta_val:.2e}|"
+    # PFR/DFR are printed RELATIVE — normalised by (1+‖b‖)/(1+‖c‖), the same
+    # way `converged()` tests them — so the logged values match the stopping
+    # criterion (an absolute DFR of 2e-2 can be a relative 5e-4 that passes).
+    # RDG is already relative (÷(1+|obj|)).
+    relative_pfr = termination_pfr / (1.0 + float(termination_b_norm))
+    relative_dfr = termination_dfr / (1.0 + float(termination_c_norm))
+    # RDGABS: the no-cancellation companion to RDG (see relative_gap_abs),
+    # printed only with gap_test="abs", where `converged()` requires
+    # RDGABS <= dual_gap_tolerance; without it a run can show PFR/DFR/RDG
+    # all comfortably inside tolerance yet never certify because the gap
+    # components are cancelling rather than genuinely small.
+    rdg = float(_relative_gap(duality_gap, objective_value))
+    rdg_abs_str = ""
+    if gap_test == "abs":
+        rdg_abs = float(
+            _relative_gap_abs(
+                objective_value,
+                duality_gap,
+                gap_bound_comp,
+                gap_ineq_comp,
+                gap_eq_comp,
+            )
+        )
+        rdg_abs_str = f"|RDGABS {rdg_abs:.2e}|"
+    # OBJERR: true relative objective error vs a supplied reference optimum.
+    # The duality gap (RDG) is a complementarity sum gated by the dual, so it
+    # lags the primal; OBJERR isolates genuine primal suboptimality, and the
+    # OBJERR≪RDG gap is the dual-lag artifact. Diagnostic only.
+    objerr_str = ""
+    if reference_objective is not None:
+        obj_err = abs(objective_value - reference_objective) / (
+            1.0 + abs(reference_objective)
+        )
+        objerr_str = f"|OBJERR {obj_err:.2e}|"
+    print(
+        f"|Epoch {epoch}|"
+        f"|Obj{objective_value:.2e}|"
+        f"|PFR {relative_pfr:.2e}|"
+        f"|DFR {relative_dfr:.2e}|"
+        f"|RDG {rdg:.2e}|"
+        f"{rdg_abs_str}"
+        f"{objerr_str}"
+        f"{ke_str}"
+        f"{time_str}"
+    )
+    print("----------------------------------------------")
+
+
 def _device_solver(
     lp,
     *,
@@ -866,45 +978,8 @@ def _device_solver(
             _vector_norm(dual_feasibility_violation, termination_norm),
         )
 
-    def relative_gap(duality_gap, objective_value):
-        # PDLP/cuPDLP relative duality gap: |primal_obj − dual_obj| normalised by
-        # (1 + |primal_obj| + |dual_obj|). The numerator IS `duality_gap` (built
-        # as the unit-consistent complementarity decomposition in
-        # compute_epoch_metrics — equal to primal_obj − dual_obj at a dual-feasible
-        # point), and the dual objective is recovered exactly and unit-consistently
-        # as `dual_obj = primal_obj − duality_gap` rather than recomputing bᵀy +
-        # Σbox_infimum (which would risk the scaled/true unit mismatch the
-        # decomposition exists to avoid). Adding |dual_obj| to the denominator
-        # matches PDLP's convention so RDG magnitudes are directly comparable to
-        # PDLP/HiGHS-PDLP certificates; it only enlarges the denominator, so it
-        # slightly loosens the effective `dual_gap_tolerance` versus the old
-        # (1+|obj|)-only normalisation.
-        # If duality_gap is ever non-finite (nan/inf inputs), report +inf rather
-        # than the raw inf/inf = nan ratio, so the log and any |gap|-based
-        # comparison read sensibly. Convergence still gates on the separate
-        # `dual_gap_is_finite` flag regardless.
-        dual_bound = objective_value - duality_gap
-        return jnp.where(
-            jnp.isfinite(duality_gap),
-            jnp.abs(duality_gap)
-            / (1.0 + jnp.abs(objective_value) + jnp.abs(dual_bound)),
-            jnp.inf,
-        )
-
-    def relative_gap_abs(
-        objective_value, duality_gap, gap_bound_comp, gap_ineq_comp, gap_eq_comp
-    ):
-        # No-cancellation companion to `relative_gap`: sum of |component|s instead
-        # of the signed sum, so a gap that reads small only through cancellation
-        # between e.g. gap_bound_comp and gap_eq_comp (qap10) doesn't pass. Shared
-        # by `converged()` (the actual gate) and `print_epoch_metrics` (so the
-        # printed diagnostics can't show a converged-looking RDG while this hidden
-        # condition is still what's blocking termination).
-        dual_bound = objective_value - duality_gap
-        gap_denom = 1.0 + jnp.abs(objective_value) + jnp.abs(dual_bound)
-        return (
-            jnp.abs(gap_bound_comp) + jnp.abs(gap_ineq_comp) + jnp.abs(gap_eq_comp)
-        ) / gap_denom
+    relative_gap = _relative_gap
+    relative_gap_abs = _relative_gap_abs
 
     def gap_measure(
         objective_value, duality_gap, gap_bound_comp, gap_ineq_comp, gap_eq_comp
@@ -1113,71 +1188,13 @@ def _device_solver(
         dual_term = dual_feasibility_residual / (1.0 + c_norm)
         return jnp.maximum(jnp.maximum(primal_term, dual_term), gap_term)
 
-    def print_epoch_metrics(
-        epoch,
-        objective_value,
-        termination_pfr,
-        termination_dfr,
-        duality_gap,
-        gap_bound_comp,
-        gap_ineq_comp,
-        gap_eq_comp,
-        epoch_time=None,
-        k_val=None,
-        eta_val=None,
-    ):
-        time_str = f"|Time {epoch_time:.2f}s|" if epoch_time is not None else ""
-        ke_str = ""
-        if k_val is not None:
-            ke_str += f"|k {k_val:.2e}|"
-        if eta_val is not None:
-            ke_str += f"|eta {eta_val:.2e}|"
-        # PFR/DFR are printed RELATIVE — normalised by (1+‖b‖)/(1+‖c‖), the same
-        # way `converged()` tests them — so the logged values match the stopping
-        # criterion (an absolute DFR of 2e-2 can be a relative 5e-4 that passes).
-        # RDG is already relative (÷(1+|obj|)).
-        relative_pfr = termination_pfr / (1.0 + float(termination_b_norm))
-        relative_dfr = termination_dfr / (1.0 + float(termination_c_norm))
-        # RDGABS: the no-cancellation companion to RDG (see relative_gap_abs),
-        # printed only with gap_test="abs", where `converged()` requires
-        # RDGABS <= dual_gap_tolerance; without it a run can show PFR/DFR/RDG
-        # all comfortably inside tolerance yet never certify because the gap
-        # components are cancelling rather than genuinely small.
-        rdg = float(relative_gap(duality_gap, objective_value))
-        rdg_abs_str = ""
-        if gap_test == "abs":
-            rdg_abs = float(
-                relative_gap_abs(
-                    objective_value,
-                    duality_gap,
-                    gap_bound_comp,
-                    gap_ineq_comp,
-                    gap_eq_comp,
-                )
-            )
-            rdg_abs_str = f"|RDGABS {rdg_abs:.2e}|"
-        # OBJERR: true relative objective error vs a supplied reference optimum.
-        # The duality gap (RDG) is a complementarity sum gated by the dual, so it
-        # lags the primal; OBJERR isolates genuine primal suboptimality, and the
-        # OBJERR≪RDG gap is the dual-lag artifact. Diagnostic only.
-        objerr_str = ""
-        if reference_objective is not None:
-            obj_err = abs(objective_value - reference_objective) / (
-                1.0 + abs(reference_objective)
-            )
-            objerr_str = f"|OBJERR {obj_err:.2e}|"
-        print(
-            f"|Epoch {epoch}|"
-            f"|Obj{objective_value:.2e}|"
-            f"|PFR {relative_pfr:.2e}|"
-            f"|DFR {relative_dfr:.2e}|"
-            f"|RDG {rdg:.2e}|"
-            f"{rdg_abs_str}"
-            f"{objerr_str}"
-            f"{ke_str}"
-            f"{time_str}"
-        )
-        print("----------------------------------------------")
+    print_epoch_metrics = functools.partial(
+        _print_epoch_metrics,
+        termination_b_norm,
+        termination_c_norm,
+        gap_test,
+        reference_objective,
+    )
 
     def _inloop_merit(s):
         # Same restart merit `solve` computes at the epoch boundary, traced into
@@ -1760,7 +1777,91 @@ def _device_solver(
         print_epoch_metrics,
         adaptive_theta,
         _CHUNK_TARGET_SECONDS,
+        (termination_b_norm, termination_c_norm),
     )
+
+
+# The values of `_device_solver` that change from solve to solve; every other
+# argument is a setting.
+_DEVICE_DATA = (
+    "c_true",
+    "c_max",
+    "col_scale",
+    "jnp_row_scale_ineq",
+    "jnp_row_scale_eq",
+    "initial_solution",
+    "initial_opt_state",
+    "k_init",
+    "adaptive_eta",
+)
+
+
+def _lp_arrays(lp):
+    """A ``JaddleLP``'s arrays as a pytree, to pass into a jitted function."""
+    return dict(
+        c=lp.c,
+        b_eq=lp.b_eq,
+        b_ineq=lp.b_ineq,
+        b=lp.b,
+        lower_bounds=lp.lower_bounds,
+        upper_bounds=lp.upper_bounds,
+        A_eq=lp.A_eq,
+        A_ineq=lp.A_ineq,
+        A=lp.A,
+        A_T=lp.A_T,
+    )
+
+
+def _lp_from_arrays(arrays, n_eq, cones):
+    """The ``JaddleLP`` ``_lp_arrays`` came from, rebuilt (possibly from
+    tracers) without host work. It has no sort permutations, so it cannot
+    ``with_values``."""
+    lp = object.__new__(JaddleLP)
+    for key, value in arrays.items():
+        setattr(lp, key, value)
+    lp.n_eq, lp.cones = n_eq, cones
+    lp._order = lp._order_T = None
+    return lp
+
+
+class _SolvePrograms:
+    """``solve()``'s compiled device programs for one set of settings.
+
+    ``init(problem)`` builds the loop carry and ``chunk(ipe)(problem, carry,
+    n_epochs)`` runs epochs; ``problem`` holds the scaled LP's arrays and the
+    other ``_DEVICE_DATA``, all traced. Nothing about the data is baked into
+    the programs, so a later solve of the same shapes (a CVXPY parameter
+    sweep, ``solve_with_polishing``'s sub-solves) reuses them without tracing
+    or compiling. Cached by ``_solve_programs``."""
+
+    def __init__(self, n_eq, cones, settings):
+        self.n_eq, self.cones, self.settings = n_eq, cones, dict(settings)
+        self.init = jax.jit(self._init)
+        self._chunks = {}
+
+    def _device(self, problem):
+        lp = _lp_from_arrays(problem["lp"], self.n_eq, self.cones)
+        data = {key: problem[key] for key in _DEVICE_DATA}
+        return _device_solver(lp, **data, **self.settings)
+
+    def _init(self, problem):
+        _, carry, _, _, _, norms = self._device(problem)
+        return carry, norms
+
+    def chunk(self, ipe):
+        if ipe not in self._chunks:
+
+            def run(problem, carry, n_epochs):
+                build_chunk = self._device(problem)[0]
+                return build_chunk(ipe)(carry, n_epochs)
+
+            self._chunks[ipe] = jax.jit(run)
+        return self._chunks[ipe]
+
+
+@functools.lru_cache(maxsize=16)
+def _solve_programs(n_eq, cones, settings):
+    return _SolvePrograms(n_eq, cones, settings)
 
 
 def solve(
@@ -2251,25 +2352,13 @@ def solve(
             dual_eq=initial_solution.dual_eq / (jnp_row_scale_eq * c_max),
         )
 
-    (
-        _build_chunk,
-        carry,
-        print_epoch_metrics,
-        adaptive_theta,
-        _CHUNK_TARGET_SECONDS,
-    ) = _device_solver(
-        lp,
-        c_true=c_true,
-        c_max=c_max,
-        col_scale=col_scale,
-        jnp_row_scale_ineq=jnp_row_scale_ineq,
-        jnp_row_scale_eq=jnp_row_scale_eq,
-        initial_solution=initial_solution,
-        initial_opt_state=initial_opt_state,
-        k_init=k_init,
+    # The device programs depend only on the settings and the problem's shape:
+    # the data go in as arguments, so a later solve of the same shapes reuses
+    # them without tracing or compiling. The polish trigger's epoch is carried
+    # (`polish_after`), so it is not part of the settings either.
+    settings = dict(
         k_lo=k_lo,
         k_hi=k_hi,
-        adaptive_eta=adaptive_eta,
         halpern=halpern,
         vertex_bias=vertex_bias,
         primal_damping=primal_damping,
@@ -2304,13 +2393,44 @@ def solve(
         iterations_per_epoch_min=iterations_per_epoch_min,
         restart_check_every=restart_check_every,
         reference_objective=reference_objective,
-        polish_trigger=_polish_trigger,
         diag_adapt=diag_adapt,
         diag_theta=diag_theta,
         diag_clamp=diag_clamp,
+        polish_trigger=(
+            None if _polish_trigger is None else (0, _polish_trigger[1])
+        ),
     )
+    programs = _solve_programs(lp.n_eq, lp.cones, tuple(settings.items()))
+    _state_dtype = lp.c.dtype
+    problem = dict(
+        lp=_lp_arrays(lp),
+        c_true=c_true,
+        c_max=jnp.asarray(c_max, _state_dtype),
+        col_scale=col_scale,
+        jnp_row_scale_ineq=jnp_row_scale_ineq,
+        jnp_row_scale_eq=jnp_row_scale_eq,
+        initial_solution=initial_solution,
+        initial_opt_state=initial_opt_state,
+        k_init=None if k_init is None else jnp.asarray(k_init, _state_dtype),
+        adaptive_eta=jnp.asarray(adaptive_eta, _state_dtype),
+    )
+    carry, termination_norms = programs.init(problem)
+    if _polish_trigger is not None:
+        carry = {
+            **carry,
+            "polish_after": jnp.asarray(
+                int(_polish_trigger[0]), carry["polish_after"].dtype
+            ),
+        }
+    print_epoch_metrics = functools.partial(
+        _print_epoch_metrics,
+        *(float(v) for v in termination_norms),
+        gap_test,
+        reference_objective,
+    )
+    adaptive_theta = isinstance(k_theta, str)
+    _CHUNK_TARGET_SECONDS = 1.0
 
-    chunk_fns = {}
     count = 0
     done = False
     stop_code = 0
@@ -2395,12 +2515,10 @@ def solve(
                 remaining = max_seconds - (time.time() - solve_entry_time)
                 n_epochs = min(n_epochs, max(1, int(remaining / seconds_per_epoch)))
 
-            run_chunk = chunk_fns.get(current_ipe)
-            if run_chunk is None:
-                run_chunk = chunk_fns[current_ipe] = _build_chunk(current_ipe)
+            run_chunk = programs.chunk(current_ipe)
 
             chunk_start = time.time()
-            new_carry = run_chunk(carry, n_epochs)
+            new_carry = run_chunk(problem, carry, n_epochs)
             keys = ["count", "done", "stop_code", "ipe"]
             if verbose:
                 keys += ["log", "n_log", "evt", "n_evt"]
