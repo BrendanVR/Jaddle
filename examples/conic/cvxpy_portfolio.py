@@ -71,20 +71,22 @@ reference = cp.Problem(cp.Maximize(mu @ w), constraints)
 
 # %%
 print(
-    f"{'σ':>6s}{'return':>10s}{'SCS':>10s}{'slope':>8s}{'assets':>8s}{'epochs':>8s}"
-    f"{'JADDLE s':>10s}{'SCS s':>10s}"
+    f"{'σ':>6s}{'return':>10s}{'CLARABEL':>10s}{'slope':>8s}{'assets':>8s}{'epochs':>8s}"
+    f"{'JADDLE s':>10s}{'CLARABEL s':>10s}"
 )
 for limit in [0.06, 0.08, 0.10, 0.14, 0.20]:
     sigma.value = limit
     start = time.perf_counter()
-    reference.solve(solver="SCS")
-    scs_time = time.perf_counter() - start
+    reference.solve(solver="CLARABEL")
+    clarabel_time = time.perf_counter() - start
     reference_return, reference_w = reference.value, w.value.copy()
 
     start = time.perf_counter()
     problem.solve(
         solver=jcv.JaddleConicSolver(),
         tol=1e-6,
+        warm_start=True,
+        diag_clamp=1e8,
     )
     jaddle_time = time.perf_counter() - start
     held = int(np.sum(w.value > 1e-4))
@@ -92,7 +94,7 @@ for limit in [0.06, 0.08, 0.10, 0.14, 0.20]:
     print(
         f"{limit:6.2f}{problem.value:10.5f}{reference_return:10.5f}"
         f"{float(risk_limit.dual_value):8.3f}{held:8d}{epochs:8d}"
-        f"{jaddle_time:10.3f}{scs_time:10.3f}"
+        f"{jaddle_time:10.3f}{clarabel_time:10.3f}"
     )
 
     assert problem.status == cp.OPTIMAL

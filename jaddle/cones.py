@@ -126,9 +126,13 @@ class Cones:
 
     # -- projections (traceable)
 
-    def project(self, v):
+    def project(self, v, guess=None):
         """Euclidean projection of a tail vector ``v`` (length ``size``) onto
-        the product of the cones."""
+        the product of the cones.
+
+        With ``guess`` (one root per exponential cone, see ``project_exp``)
+        the result is ``(projection, roots)``, the roots to pass as the next
+        guess."""
         psd_end = self.soc_size + self.psd_size
         parts = []
         if self.soc:
@@ -136,8 +140,12 @@ class Cones:
         if self.psd:
             parts.append(self._project_psd(v[self.soc_size : psd_end]))
         if self.exp:
-            parts.append(project_exp(v[psd_end:].reshape(-1, 3)).reshape(-1))
-        return jnp.concatenate(parts) if len(parts) > 1 else parts[0]
+            exp_part = project_exp(v[psd_end:].reshape(-1, 3), guess)
+            if guess is not None:
+                exp_part, guess = exp_part
+            parts.append(exp_part.reshape(-1))
+        out = jnp.concatenate(parts) if len(parts) > 1 else parts[0]
+        return out if guess is None else (out, guess)
 
     def dual_residual(self, r):
         """``r - Π_{K*}(r) = -Π_K(-r)``, the projection of ``r`` onto the
@@ -207,6 +215,16 @@ def _project_svec(blocks, d, rows, cols):
 _EXP_INF = 1e15
 _EXP_TOL = 1e-8
 _NEWTON_ITERS = 20
+# Newton steps run unconditionally before checking for convergence. From the
+# previous iteration's root (the solver's warm start) the search almost always
+# finishes within these steps. On GPU a rolled loop step is its own kernel
+# launch (~23 us) and a step that tests whether to continue costs ~90 us (the
+# test goes back to the host), so off CPU the prefix is unrolled: it fuses
+# into one kernel, and the `cond` after it is the only host round trip. On
+# the 100-asset Kelly problem that took a GPU epoch from 69 to 44 ms. On CPU
+# unrolling made an epoch slower (143 -> 169 ms), so there the loop stays
+# rolled.
+_NEWTON_FIXED = 4
 _BISECTION_ITERS = 40
 
 
@@ -320,10 +338,17 @@ def _exp_bracket(r0, s0, t0, pdist, ddist):
     return low, upr
 
 
-def _exp_root(r0, s0, t0, xl, xu):
+def _exp_root(r0, s0, t0, xl, xu, x0=None):
     """SCS's damped Newton root search on ``_hfun``, with its bisection
-    fallback, at fixed iteration counts."""
+    fallback, at fixed iteration counts. ``x0`` is a starting guess (clipped
+    to the bracket; NaN or ``None`` starts at the bracket's midpoint, as SCS
+    does)."""
     eps, dftol, lodamp, hidamp = 1e-15, 1e-13, 0.05, 0.95
+    # SCS stops when a step falls below 1e-15 and discards that step. Newton
+    # converges quadratically, so a step below 1e-9 leaves an error of about
+    # 1e-18: take it and stop. That saves the ~3 steps SCS spends confirming,
+    # which is most of the work from a warm start.
+    step_tol = 1e-9
 
     def newton(_, c):
         x, xl, xu, done = c
@@ -338,7 +363,7 @@ def _exp_root(r0, s0, t0, xl, xu):
         xu_n = jnp.where(collapsed, mid, xu_n)
         flat = (jnp.abs(f) >= _EXP_INF) | ~jnp.isfinite(f) | (df < dftol)
         x_plus = x - f / jnp.where(df == 0.0, 1.0, df)
-        small = jnp.abs(x_plus - x) <= eps * jnp.maximum(1.0, jnp.abs(x_plus))
+        small = jnp.abs(x_plus - x) <= step_tol * jnp.maximum(1.0, jnp.abs(x_plus))
         x_new = jnp.where(
             x_plus >= xu_n,
             jnp.minimum(lodamp * x + hidamp * xu_n, xu_n),
@@ -346,21 +371,36 @@ def _exp_root(r0, s0, t0, xl, xu):
                 x_plus <= xl_n, jnp.maximum(lodamp * x + hidamp * xl_n, xl_n), x_plus
             ),
         )
-        moves = ~(stop | collapsed | flat | small)
+        moves = ~(stop | collapsed | flat)
         return (
-            jnp.where(moves, x_new, x),
+            jnp.where(moves, jnp.where(small, jnp.clip(x_plus, xl_n, xu_n), x_new), x),
             jnp.where(stop, xl, xl_n),
             jnp.where(stop, xu, xu_n),
-            stop | ~moves,
+            stop | ~moves | small,
         )
 
-    # Stop as soon as every search has finished: Newton usually needs a few
-    # steps, and the projection runs every iteration of the solve.
-    x0 = 0.5 * (xl + xu)
-    _, x, xl, xu, converged = jax.lax.while_loop(
-        lambda c: (c[0] < _NEWTON_ITERS) & ~jnp.all(c[4]),
-        lambda c: (c[0] + 1, *newton(c[0], c[1:])),
-        (0, x0, xl, xu, jnp.zeros_like(x0, bool)),
+    # A few unconditional steps, then continue only while some search is
+    # unfinished (see _NEWTON_FIXED).
+    mid = 0.5 * (xl + xu)
+    x0 = mid if x0 is None else jnp.where(jnp.isfinite(x0), jnp.clip(x0, xl, xu), mid)
+    state = jax.lax.fori_loop(
+        0,
+        _NEWTON_FIXED,
+        newton,
+        (x0, xl, xu, jnp.zeros_like(x0, bool)),
+        # Decided when traced, so a platform chosen after import counts.
+        unroll=jax.default_backend() != "cpu",
+    )
+
+    def finish(state):
+        return jax.lax.while_loop(
+            lambda c: (c[0] < _NEWTON_ITERS) & ~jnp.all(c[4]),
+            lambda c: (c[0] + 1, *newton(c[0], c[1:])),
+            (_NEWTON_FIXED, *state),
+        )[1:]
+
+    x, xl, xu, converged = jax.lax.cond(
+        jnp.all(state[3]), lambda state: state, finish, state
     )
     newton_root = jnp.clip(x, xl, xu)
 
@@ -398,18 +438,26 @@ def _exp_root(r0, s0, t0, xl, xu):
     return jnp.where(converged, newton_root, fallback)
 
 
-def project_exp(v):
+def project_exp(v, guess=None):
     """Euclidean projection of each row of ``v`` (``k x 3``) onto the
-    exponential cone ``closure{(x, y, z) : y exp(x / y) <= z, y > 0}``."""
+    exponential cone ``closure{(x, y, z) : y exp(x / y) <= z, y > 0}``.
+
+    With ``guess`` (one root ``ρ`` per row, NaN for none) the root search
+    starts there, and the result is ``(projection, roots)``: pass the roots
+    back as the next guess when projecting a nearby point, as the solver does
+    from one iteration to the next. ``ρ = x / y`` does not depend on scale."""
     # The projection commutes with positive scaling, so each point is
     # projected at unit norm: SCS's tolerances are absolute, and at a norm of
     # 1e-3 they accepted heuristic points 40% off the true projection.
     norm = jnp.linalg.norm(v, axis=1, keepdims=True)
     norm = jnp.where(norm > 0.0, norm, 1.0)
-    return _project_exp_unit(v / norm) * norm
+    p, rho = _project_exp_unit(v / norm, guess)
+    if guess is None:
+        return p * norm
+    return p * norm, rho
 
 
-def _project_exp_unit(v):
+def _project_exp_unit(v, guess=None):
     r0, s0, t0 = v[:, 0], v[:, 1], v[:, 2]
     vp, pdist, vd, ddist = _exp_heuristics(r0, s0, t0)
 
@@ -430,7 +478,7 @@ def _project_exp_unit(v):
     xl, xu = _exp_bracket(r0, s0, t0, pdist, ddist)
     xl = jnp.where(trivial, 0.0, xl)
     xu = jnp.where(trivial, 0.0, xu)
-    rho = _exp_root(r0, s0, t0, xl, xu)
+    rho = _exp_root(r0, s0, t0, xl, xu, guess)
 
     linrho = (rho - 1.0) * r0 + s0
     exprho = jnp.exp(rho)
@@ -441,7 +489,10 @@ def _project_exp_unit(v):
     hat_dist = jnp.where(valid, _sq_dist(v_hat, (r0, s0, t0)), _EXP_INF)
     use_hat = ~trivial & (hat_dist <= pdist)
     out = [jnp.where(use_hat, a, b) for a, b in zip(v_hat, vp)]
-    return jnp.stack(out, axis=1)
+    # A trivial cone's dummy root is no guess: keep the one it came with.
+    if guess is not None:
+        rho = jnp.where(trivial, guess, rho)
+    return jnp.stack(out, axis=1), rho
 
 
 def svec(M):
@@ -464,17 +515,20 @@ def smat(v):
     return M
 
 
-def project_primal(cones, x, lower, upper):
+def project_primal(cones, x, lower, upper, guess=None):
     """Project a primal vector: box on the linear head, cones on the tail.
-    ``cones=None`` (or empty) is the plain box projection."""
+    ``cones=None`` (or empty) is the plain box projection. With ``guess``
+    (exponential-cone roots, see ``Cones.project``) the result is
+    ``(projection, roots)``."""
     from optax.projections import projection_box
 
     if not cones:
         return projection_box(x, lower, upper)
     n_lin = x.shape[0] - cones.size
-    return jnp.concatenate(
-        [
-            projection_box(x[:n_lin], lower[:n_lin], upper[:n_lin]),
-            cones.project(x[n_lin:]),
-        ]
+    tail = cones.project(x[n_lin:], guess)
+    if guess is not None:
+        tail, guess = tail
+    out = jnp.concatenate(
+        [projection_box(x[:n_lin], lower[:n_lin], upper[:n_lin]), tail]
     )
+    return out if guess is None else (out, guess)

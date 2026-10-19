@@ -132,6 +132,19 @@ def test_exp_projection_cases():
     assert np.all(np.isfinite(np.asarray(project_exp(extreme))))
 
 
+def test_exp_projection_warm_start():
+    # A guessed root only changes where the search starts, never the answer:
+    # good guesses (the roots of a nearby point), none (NaN) and bad ones.
+    rng = np.random.default_rng(9)
+    V = jnp.asarray(rng.standard_normal((500, 3)))
+    cold = np.asarray(project_exp(V))
+    _, roots = project_exp(V - 1e-4, jnp.full(500, jnp.nan))
+    for guess in (roots, jnp.full(500, jnp.nan), jnp.asarray(rng.uniform(-50, 50, 500))):
+        warm, new_roots = project_exp(V, guess)
+        np.testing.assert_allclose(warm, cold, atol=1e-10)
+        assert new_roots.shape == (500,)
+
+
 def test_dual_residual():
     # Self-dual cones: r - Π_{K*}(r) is r - Π_K(r).
     v = jnp.asarray(np.random.default_rng(8).standard_normal(CONES.size))

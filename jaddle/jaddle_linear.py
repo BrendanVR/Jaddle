@@ -184,10 +184,18 @@ def _make_epoch_fn(
     halpern = update_mode == "halpern"
     theta = 0.0 if update_mode == "alternating" else 1.0
     diag_on = bool(diag)
+    # Exponential cones: each projection's root search starts from the root
+    # found for the same cone at the previous iteration (a nearby point), which
+    # roughly halves its cost. The roots ride in the epoch's step-size state,
+    # like the A @ x carry, and are re-seeded (NaN: no guess) each epoch.
+    exp_on = bool(lp.cones) and lp.cones.exp > 0
 
-    def projection_primal(primal_state):
-        # Box on the linear variables, cones on the tail (plain box for an LP).
-        return project_primal(lp.cones, primal_state, lp.lower_bounds, lp.upper_bounds)
+    def projection_primal(primal_state, guess=None):
+        # Box on the linear variables, cones on the tail (plain box for an
+        # LP). With a guess, returns (projection, roots).
+        return project_primal(
+            lp.cones, primal_state, lp.lower_bounds, lp.upper_bounds, guess
+        )
 
     def grad_primal_only(state):
         # Primal partial: c + Aᵀd (+ damping). One sparse matvec (Aᵀ @ d).
@@ -250,7 +258,7 @@ def _make_epoch_fn(
             # the retry loop accepts and the eta-growth branch is suppressed.
             return jnp.where(interaction > 0.0, move / (2.0 * interaction), jnp.inf)
 
-        def trial(eta, state, k, Ax_old, gp):
+        def trial(eta, state, k, Ax_old, gp, roots=None):
             # One raw PDHG step at base step eta. `gp` = c + Aᵀy at state
             # (eta-independent, computed once per iteration so line-search
             # retries don't redo its matvec). Ax_old = A @ state.primal is
@@ -264,7 +272,10 @@ def _make_epoch_fn(
                 sigma_eq, sigma_ineq = sigma * s_eq, sigma * s_ineq
             else:
                 sigma_eq = sigma_ineq = sigma
-            x_new = projection_primal(state.primal - tau * gp)
+            if exp_on:
+                x_new, roots = projection_primal(state.primal - tau * gp, roots)
+            else:
+                x_new = projection_primal(state.primal - tau * gp)
             Ax_new = lp.A @ x_new
             A_dx = Ax_new - Ax_old
             Ax_bar = Ax_old + (1.0 + theta) * A_dx
@@ -274,7 +285,7 @@ def _make_epoch_fn(
             cand = SaddleState(primal=x_new, dual_ineq=dual_ineq, dual_eq=dual_eq)
             dy = jnp.concatenate([dual_eq - state.dual_eq, dual_ineq - state.dual_ineq])
             interaction = jnp.abs(jnp.vdot(dy, A_dx))
-            return cand, _descent_bound(state, cand, k, interaction), Ax_new
+            return cand, _descent_bound(state, cand, k, interaction), Ax_new, roots
 
         def step(carry, _):
             if diag_on:
@@ -282,29 +293,30 @@ def _make_epoch_fn(
             else:
                 i, state, average_state, opt_state, total_weight = carry
             if halpern:
-                k, eta, anchor, Ax_anchor, Ax_old = opt_state
+                k, eta, anchor, Ax_anchor, Ax_old, *roots = opt_state
             else:
-                k, eta, Ax_old = opt_state
+                k, eta, Ax_old, *roots = opt_state
+            roots = roots[0] if exp_on else None
             ip1 = jnp.asarray(i + 1, eta.dtype)
 
             # Retry: while the trial step exceeds its admissible bound,
             # shrink eta to just under eta_bar and re-trial. The
             # (1-(i+1)^-0.3) factor < 1 guarantees strict decrease, so the
-            # loop terminates. Carry (eta, cand, eta_bar, Ax_new).
+            # loop terminates. Carry (eta, cand, eta_bar, Ax_new, roots);
+            # every retry starts its root search from the previous
+            # iteration's roots.
             def cond(c):
-                eta_c, _, eta_bar_c, _ = c
+                eta_c, _, eta_bar_c, _, _ = c
                 return eta_c > eta_bar_c
 
             def body(c):
-                eta_c, _, eta_bar_c, _ = c
+                eta_c, _, eta_bar_c, _, _ = c
                 eta_s = jnp.minimum((1.0 - ip1 ** (-0.3)) * eta_bar_c, eta_c)
-                cand_s, eta_bar_s, Ax_new_s = trial(eta_s, state, k, Ax_old, gp)
-                return (eta_s, cand_s, eta_bar_s, Ax_new_s)
+                return (eta_s, *trial(eta_s, state, k, Ax_old, gp, roots))
 
             gp = grad_primal_only(state)
-            cand0, eta_bar0, Ax_new0 = trial(eta, state, k, Ax_old, gp)
-            eta0, cand, eta_bar, Ax_new = jax.lax.while_loop(
-                cond, body, (eta, cand0, eta_bar0, Ax_new0)
+            eta0, cand, eta_bar, Ax_new, roots = jax.lax.while_loop(
+                cond, body, (eta, *trial(eta, state, k, Ax_old, gp, roots))
             )
 
             if diag_on:
@@ -358,6 +370,8 @@ def _make_epoch_fn(
                 opt_state = (k, eta_next, anchor, Ax_anchor, Ax_next)
             else:
                 opt_state = (k, eta_next, Ax_next)
+            if exp_on:
+                opt_state = opt_state + (roots,)
 
             if average:
                 # PDLP-style step-size-weighted average (Applegate et al.,
@@ -396,6 +410,8 @@ def _make_epoch_fn(
         else:
             k0, eta0 = opt_state
             opt_state = (k0, eta0, lp.A @ state.primal)
+        if exp_on:
+            opt_state = opt_state + (jnp.full(lp.cones.exp, jnp.nan, state.primal.dtype),)
 
         step_carry = (start_iter, state, average_state, opt_state, total_weight)
         if diag_on:

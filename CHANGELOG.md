@@ -11,7 +11,15 @@
   is now `−Π_K(−r)`, correct for cones that are not self-dual.
   `jcv.JaddleConicSolver` accepts CVXPY's `ExpCone`, so `log`, `log_det`,
   `log_sum_exp`, `logistic`, `entr`, `rel_entr` and friends go through it.
-  See `examples/conic/cvxpy_kelly.py`.
+  See `examples/conic/cvxpy_kelly.py`. Inside the solver each exponential
+  cone's root search starts from the root found at the previous iteration,
+  and Newton accepts its step once it falls below 1e-9 (quadratic
+  convergence leaves an error near 1e-18) rather than SCS's 1e-15: the
+  projection is 1.3-2.2x faster and an exponential-cone epoch about 20%
+  faster on CPU, 10-20% on GPU. Off CPU the projection's first four Newton
+  steps are unrolled so they fuse into one kernel (a rolled loop pays a
+  kernel launch per step): a 100-asset, 1000-scenario Kelly epoch went from
+  69 to 50 ms on GPU, while CPU, where unrolling was slower, is unchanged.
 
 - Second-order and PSD cones in the LP solver. `jl.LP(..., cones=jl.Cones(
   soc=..., psd=...))` constrains the tail of `x` to a product of cones (PSD

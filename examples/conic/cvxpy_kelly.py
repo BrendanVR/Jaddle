@@ -38,12 +38,12 @@ import jaddle.jaddle_cvxpy as jcv  # noqa: E402
 
 # %% [markdown]
 # ## Scenarios
-# 20 assets with different means and volatilities over 1000 one-period
+# 100 assets with different means and volatilities over 1000 one-period
 # scenarios, driven by a common market factor.
 
 # %%
 rng = np.random.default_rng(0)
-n_assets, n_scenarios = 20, 1000
+n_assets, n_scenarios = 100, 1000
 mean = rng.uniform(0.00, 0.08, n_assets)
 vol = rng.uniform(0.05, 0.40, n_assets)
 beta = rng.uniform(0.3, 1.2, n_assets)
@@ -83,7 +83,14 @@ for limit in [1.0, 0.5, 0.3, 0.2, 0.1]:
     reference_growth, reference_w = reference.value, w.value.copy()
 
     start = time.perf_counter()
-    problem.solve(solver=jcv.JaddleConicSolver(), tol=1e-7)
+    problem.solve(
+        solver=jcv.JaddleConicSolver(),
+        tol=1e-7,
+        adaptive_eta="auto",
+        diag_clamp=1e12,
+        warm_start=True,
+        iterations_per_epoch=64,
+    )
     jaddle_time = time.perf_counter() - start
     held = int(np.sum(w.value > 1e-4))
     print(
