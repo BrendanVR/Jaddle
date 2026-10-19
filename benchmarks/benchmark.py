@@ -114,6 +114,12 @@ def add_polish_flags(p):
         "instead of jl.solve. Polishing fires only once the gap is within "
         "--gap-tol, so with --gap-tol equal to --tol it rarely changes anything.",
     )
+    p.add_argument(
+        "--refine",
+        action="store_true",
+        help="Solve with jl.solve_with_refinement (iterative refinement: a loose "
+        "solve, then scaled correction LPs) instead of jl.solve. Excludes --polish.",
+    )
 
 
 def parse_args():
@@ -350,6 +356,16 @@ def original_lp(path):
     return lp, sign, float(highs_lp.offset_), highs_lp.num_col_, highs_lp.num_row_
 
 
+def lp_solver(polish=False, refine=False):
+    """The wrapper replacing ``jl.solve`` for the --polish / --refine arms, or
+    ``None`` for plain ``jl.solve``."""
+    if polish and refine:
+        raise ValueError("--polish and --refine are alternatives")
+    if polish:
+        return jl.solve_with_polishing
+    return jl.solve_with_refinement if refine else None
+
+
 def jaddle_solve_kwargs(
     tol,
     max_epochs,
@@ -379,8 +395,7 @@ def jaddle_solve_kwargs(
         cost_col_floor=cost_col_floor,
         termination_norm=norm,
         restart_norm=norm,
-        average=False if update_mode == "halpern" else True,
-        report_best=False if update_mode == "halpern" else True,
+        diag_clamp=1e10,
     )
 
 
@@ -396,13 +411,15 @@ def run_jaddle(
     polish=False,
     norm="l2",
     gap_test="pdlp",
+    refine=False,
 ):
     """Solve with Jaddle's saddle-point solver. Returns a dict of metrics.
 
     ``polish=True`` solves with ``jl.solve_with_polishing`` instead of
     ``jl.solve``; its solve time is then the whole call's wall time (no
     compile amortisation) and ``jaddle_polished`` records whether the returned
-    point came from polishing.
+    point came from polishing. ``refine=True`` does the same with
+    ``jl.solve_with_refinement``; ``jaddle_refine_rounds`` counts its rounds.
 
     Three times are reported:
       * ``jaddle_solve_seconds`` -- the solver's internal iterate-loop time
@@ -420,7 +437,7 @@ def run_jaddle(
     jl.lp_summary_statistics(lp)
 
     t0 = time.perf_counter()
-    solve = jl.solve_with_polishing if polish else jl.solve
+    solve = lp_solver(polish, refine) or jl.solve
     result = solve(
         lp,
         **jaddle_solve_kwargs(
@@ -467,6 +484,7 @@ def run_jaddle(
         # Blank unless polish=True.
         "jaddle_polished": result["polish"]["polished"] if polish else "",
         "jaddle_polish_attempts": result["polish"]["attempts"] if polish else "",
+        "jaddle_refine_rounds": result["refinement"]["rounds"] if refine else "",
     }
 
 
@@ -483,6 +501,7 @@ def run_jaddle_presolved(
     eliminate_defined_vars=True,
     norm="l2",
     gap_test="pdlp",
+    refine=False,
 ):
     """Solve an instance file with ``jl.solve_with_presolve`` (HiGHS presolve,
     optional defined-variable elimination, Jaddle, postsolve). Returns a dict
@@ -504,7 +523,7 @@ def run_jaddle_presolved(
     result = jl.solve_with_presolve(
         path,
         eliminate_defined_vars=eliminate_defined_vars,
-        reduced_solver=jl.solve_with_polishing if polish else None,
+        reduced_solver=lp_solver(polish, refine),
         **jaddle_solve_kwargs(
             tol,
             max_epochs,
@@ -548,6 +567,9 @@ def run_jaddle_presolved(
         "jaddle_polish_attempts": (
             result["polish"]["attempts"] if polish and "polish" in result else ""
         ),
+        "jaddle_refine_rounds": (
+            result["refinement"]["rounds"] if refine and "refinement" in result else ""
+        ),
     }
 
 
@@ -563,6 +585,7 @@ def run_jaddle_unpresolved(
     polish=False,
     norm="l2",
     gap_test="pdlp",
+    refine=False,
 ):
     """Solve an instance file's LP relaxation as given (no presolve) with
     ``run_jaddle``. The certificate is then on the original LP, so
@@ -581,6 +604,7 @@ def run_jaddle_unpresolved(
         polish=polish,
         norm=norm,
         gap_test=gap_test,
+        refine=refine,
     )
     res["jaddle_obj"] = sign * res["jaddle_obj"] + offset
     res["jaddle_original_certified"] = res["jaddle_converged"]
@@ -637,6 +661,10 @@ def main():
     if args.gap_test != "pdlp":
         gap_text += f", gap_test={args.gap_test}"
     polish_text = ", feasibility polishing" if args.polish else ""
+    if args.refine:
+        if args.polish:
+            raise SystemExit("--polish and --refine are alternatives")
+        polish_text = ", iterative refinement"
     presolve_text = "" if args.presolve else ", no presolve"
     print(
         f"Running {len(instances)} instance(s) at tol={args.tol:g}"
@@ -670,6 +698,7 @@ def main():
                 polish=args.polish,
                 norm=args.norm,
                 gap_test=args.gap_test,
+                refine=args.refine,
             )
             if args.presolve:
                 jres = run_jaddle_presolved(
@@ -751,6 +780,7 @@ CSV_FIELDS = [
     "jaddle_orig_gap",
     "jaddle_polished",
     "jaddle_polish_attempts",
+    "jaddle_refine_rounds",
     "rel_obj_gap",
     "error",
 ]

@@ -345,6 +345,88 @@ def test_solve_with_polishing(make_lp, polish_trigger, polish_objective_slack):
     assert abs(cert["objective"] - ref) / (1 + abs(ref)) < 1e-3
 
 
+@pytest.mark.parametrize("fix_threshold", [None, 100.0])
+@pytest.mark.parametrize("make_lp", [toy_lp, random_lp])
+def test_solve_with_refinement(make_lp, fix_threshold):
+    # A loose first solve, then correction rounds to a tight certificate.
+    lp = make_lp()
+    result = jl.solve_with_refinement(
+        lp,
+        tol=1e-10,
+        inner_tol=1e-3,
+        fix_threshold=fix_threshold,
+        iterations_per_epoch=16,
+        max_epochs=4000,
+    )
+    assert result["stop_reason"] == "certificate"
+    assert result["converged"]
+    refinement = result["refinement"]
+    assert refinement["rounds"] >= 1
+    assert len(refinement["history"]) == refinement["rounds"] + 1
+    assert result["epochs"] >= sum(refinement["epochs_per_round"])
+    cert = solve_certificate(lp, result["solution"])
+    assert cert["relative_primal_feasibility_residual"] <= 1e-10
+    assert cert["relative_dual_feasibility_residual"] <= 1e-10
+    assert cert["relative_gap"] <= 1e-10
+    ref = reference_objective(lp)
+    assert abs(cert["objective"] - ref) / (1 + abs(ref)) < 1e-8
+
+
+def test_refinement_correction_round_trip():
+    # A correction of scale * (target - current) maps back onto the target.
+    lp, sol, noise = perturbed_optimum()
+    jlp = getattr(jl, "__pad_empty_blocks")(jl.to_jaddle_sparse(lp))
+    x = jnp.clip(noise(sol.primal), jlp.lower_bounds, jlp.upper_bounds)
+    y_eq, y_ineq = noise(sol.dual_eq), jnp.abs(noise(sol.dual_ineq))
+    scale_p, scale_d = 2.0**10, 2.0**20
+    n_ineq = y_ineq.shape[0]
+    correction = jl.SaddleState(
+        primal=jnp.concatenate([scale_p * (sol.primal - x), jnp.zeros(n_ineq)]),
+        dual_ineq=jnp.zeros(1),
+        dual_eq=scale_d
+        * jnp.concatenate([sol.dual_eq - y_eq, sol.dual_ineq - y_ineq]),
+    )
+    back = jl._apply_correction(jlp, x, y_eq, y_ineq, correction, scale_p, scale_d)
+    np.testing.assert_allclose(back.primal, sol.primal, atol=1e-12)
+    np.testing.assert_allclose(back.dual_eq, sol.dual_eq, atol=1e-12)
+    np.testing.assert_allclose(back.dual_ineq, sol.dual_ineq, atol=1e-12)
+
+
+def test_refinement_correction_lp_recovers_optimum():
+    # Solving one correction LP tightly from a perturbed point lands on the
+    # optimum: the shifted, scaled problem is exact.
+    lp, sol, noise = perturbed_optimum()
+    jlp = getattr(jl, "__pad_empty_blocks")(jl.to_jaddle_sparse(lp))
+    x = jnp.clip(noise(sol.primal), jlp.lower_bounds, jlp.upper_bounds)
+    y_eq, y_ineq = noise(sol.dual_eq), jnp.maximum(noise(sol.dual_ineq), 0.0)
+    bad = jl.SaddleState(primal=x, dual_ineq=y_ineq, dual_eq=y_eq)
+    before = solve_certificate(lp, bad)
+    scale_p = scale_d = 2.0**8
+    correction_lp, x = jl._correction_lp(
+        jl._slack_form_base(jlp), jlp, x, y_eq, y_ineq, scale_p, scale_d
+    )
+    correction = solve(correction_lp, tol=1e-9, max_epochs=2000)
+    assert correction["stop_reason"] == "certificate"
+    fixed = jl._apply_correction(
+        jlp, x, y_eq, y_ineq, correction["solution"], scale_p, scale_d
+    )
+    after = solve_certificate(lp, fixed)
+    for key in (
+        "relative_primal_feasibility_residual",
+        "relative_dual_feasibility_residual",
+    ):
+        assert after[key] < 1e-2 * before[key]
+    ref = reference_objective(lp)
+    assert abs(after["objective"] - ref) / (1 + abs(ref)) < 1e-6
+
+
+def test_solve_with_refinement_epoch_budget():
+    result = jl.solve_with_refinement(random_lp(), tol=1e-12, max_epochs=3)
+    assert result["stop_reason"] == "max_epochs"
+    assert result["epochs"] == 3
+    assert not result["converged"]
+
+
 def small_lp(c, A_ineq=None, b_ineq=None, A_eq=None, b_eq=None, ub=None):
     n = len(c)
 
