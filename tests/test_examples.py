@@ -29,6 +29,7 @@ def has(module):
         ("cp/linear_regression.py", ["matplotlib", "sklearn"]),
         ("cp/cvxpy_lasso.py", ["cvxpy"]),
         ("cp/cvxpy_channel_capacity.py", ["cvxpy"]),
+        ("cp/cvxpy_robust_kalman.py", ["cvxpy", "matplotlib"]),
     ],
 )
 def test_example_runs(script, requires):

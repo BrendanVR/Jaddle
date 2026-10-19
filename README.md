@@ -600,7 +600,11 @@ on the L1-logistic regression in
 [`examples/cp/cvxpy_lasso.py`](https://github.com/BrendanVR/Jaddle/blob/main/examples/cp/cvxpy_lasso.py) it has 701
 variables, 1500 rows and 400 exponential cones. `jcv.compile_problem` instead
 walks the expression tree and builds a `JaddleCP` of JAX functions, with 101
-variables and 100 linear rows for that problem:
+variables and 100 linear rows for that problem.
+[`examples/cp/cvxpy_robust_kalman.py`](https://github.com/BrendanVR/Jaddle/blob/main/examples/cp/cvxpy_robust_kalman.py)
+compiles another such problem: a Kalman smoother with `huber(norm(v[t]))` on the measurement
+noise, which CVXPY would turn into second-order cones. The compiled route
+handles these atoms as follows:
 
 - smooth atoms stay smooth: `logistic`, `log_sum_exp`, `exp`, `huber`,
   `sum_squares`, `quad_form`, `quad_over_lin` with a constant denominator,

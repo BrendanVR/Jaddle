@@ -10,6 +10,10 @@
   keeps the argument above the floor. See
   `examples/cp/cvxpy_channel_capacity.py`.
 
+- `examples/cp/cvxpy_robust_kalman.py`: CVXPY's robust Kalman filtering
+  example, the least-squares smoother on the QP route and the Huber-of-norm
+  smoother on the compiled route.
+
 ## 0.2.2
 
 ### Added

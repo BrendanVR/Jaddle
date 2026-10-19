@@ -23,6 +23,7 @@
 
 # %%
 import os
+import time
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
@@ -108,17 +109,24 @@ print("optimal input distribution x =", x.value)
 
 # %%
 rng = np.random.default_rng(0)
-P = rng.dirichlet(np.full(6, 0.5), size=8).T
+input, output = 6, 10
+P = rng.dirichlet(np.full(output, 0.5), size=input).T
 problem, x, total = channel_capacity(P)
 
 reference, reference_x = blahut_arimoto(P)
 print(f"Blahut-Arimoto: capacity {reference:.10f} bits")
 
+start = time.perf_counter()
 problem.solve(solver="CLARABEL")
+clarabel_time = time.perf_counter() - start
 report("Clarabel", problem, x, reference, reference_x)
+print(f"Clarabel solve time: {clarabel_time:.4f} s")
 
+start = time.perf_counter()
 jcv.solve(problem, tol=1e-8)
+jaddle_time = time.perf_counter() - start
 report("Jaddle", problem, x, reference, reference_x)
+print(f"Jaddle solve time (including JAX compilation): {jaddle_time:.4f} s")
 
 y = P @ x.value
 divergence = np.sum(xlogy(P, P) - xlogy(P, y[:, None]), axis=0) / np.log(2)
