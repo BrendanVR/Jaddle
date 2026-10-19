@@ -5,7 +5,7 @@ Runs every (problem, config) pair and prints convergence, epochs, solve time
 
 Usage:
     python benchmarks/benchmark_convex.py                 # all configs
-    python benchmarks/benchmark_convex.py eg_ad frb_ad    # only these configs
+    python benchmarks/benchmark_convex.py eg_ad pdhg_ad   # only these configs
     python benchmarks/benchmark_convex.py eg_ad --jaddle-verbose  # show solver logs
     python benchmarks/benchmark_convex.py --misscaled     # mis-scaled copies too
 """
@@ -115,9 +115,9 @@ CONFIGS = {
                         epochs_per_restart=5, diag_adapt=True),
     "eg_ad_rs_gs": dict(update_mode="extragradient", adaptive_eta=0.5, restarts=True,
                         epochs_per_restart=5, gradient_scaling=True),
-    "frb_ad": dict(update_mode="forward_reflected", adaptive_eta=0.5),
-    "frb_ad_rs": dict(update_mode="forward_reflected", adaptive_eta=0.5,
-                      restarts=True, epochs_per_restart=5),
+    "pdhg_ad": dict(update_mode="pdhg", adaptive_eta=0.5),
+    "pdhg_ad_rs": dict(update_mode="pdhg", adaptive_eta=0.5, restarts=True,
+                       epochs_per_restart=5),
 }
 
 

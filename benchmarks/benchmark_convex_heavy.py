@@ -7,7 +7,7 @@ per-epoch cost against epochs-to-converge across update modes.
 
 Usage:
     python benchmarks/benchmark_convex_heavy.py                      # both modes
-    python benchmarks/benchmark_convex_heavy.py forward_reflected    # one mode
+    python benchmarks/benchmark_convex_heavy.py pdhg                 # one mode
     python benchmarks/benchmark_convex_heavy.py --jaddle-verbose     # show solver logs
 """
 
@@ -58,11 +58,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "modes",
         nargs="*",
-        help="Update modes to run (default: extragradient and " "forward_reflected).",
+        help="Update modes to run (default: extragradient and pdhg).",
     )
     add_jaddle_verbose_flag(parser, default=False)
     args = parser.parse_args()
-    for mode in args.modes or ["extragradient", "forward_reflected"]:
+    for mode in args.modes or ["extragradient", "pdhg"]:
         # Show Jaddle's own output only when verbose; otherwise keep the
         # table clean.
         quiet = (

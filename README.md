@@ -505,15 +505,16 @@ automatic differentiation. No derivatives are required from the user.
 |---|---|---|
 | `"alternating"` (default) | 1 | Primal step, then a dual step at the new primal point. The update rule is a user-supplied Optax optimiser. |
 | `"extragradient"` | 2 | Korpelevich extragradient: a look-ahead step followed by a corrector step. Contractive for monotone problems. |
-| `"forward_reflected"` | 1 | Malitsky–Tam forward-reflected-backward: one gradient per iteration plus a reflection term built from the previous gradient. Requires the adaptive step. |
+| `"pdhg"` | 1 | PDHG as in the LP solver: a primal step, then a dual step that reads the extrapolated constraint values `2g(x⁺) − g(x)`. One gradient plus one constraint evaluation per iteration. Requires the adaptive step. |
 
 **Adaptive step size.** With `adaptive_eta="auto"` (the default), the
-extragradient and forward-reflected schemes use a Malitsky–Tam line search
+extragradient and PDHG schemes use a Malitsky–Tam line search
 based on a local Lipschitz estimate. The two gradient evaluations that
 extragradient already performs give an estimate of the local Lipschitz
-constant at no extra cost. The step is accepted while it remains within the
-admissible bound, and is rejected and shrunk otherwise. The learned step is
-carried across restarts.
+constant at no extra cost. PDHG gets its estimate from consecutive iterations,
+so it checks each step one iteration late and undoes it if it overshot. The
+step is accepted while it remains within the admissible bound, and is rejected
+and shrunk otherwise. The learned step is carried across restarts.
 
 **Primal weight.** As in the LP solver, a primal weight `k` balances the primal
 and dual step sizes. It is initialised from the gradient of the objective and

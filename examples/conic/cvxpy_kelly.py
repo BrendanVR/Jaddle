@@ -87,9 +87,6 @@ for limit in [1.0, 0.5, 0.3, 0.2, 0.1]:
         solver=jcv.JaddleConicSolver(),
         tol=1e-7,
         adaptive_eta="auto",
-        diag_clamp=1e12,
-        warm_start=True,
-        iterations_per_epoch=64,
     )
     jaddle_time = time.perf_counter() - start
     held = int(np.sum(w.value > 1e-4))

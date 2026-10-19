@@ -4,6 +4,21 @@
 
 ### Added
 
+- `jc.solve(update_mode="pdhg")`: adaptive PDHG for the convex solver,
+  cuPDLP-style like `jl.solve`. The primal step uses `∇ₓL(x, y)`, and the
+  dual step reads the extrapolated constraint values `2 c(x⁺) − c(x)`,
+  which is the LP solver's `A x̄` when the constraints are affine. Each
+  iteration costs one VJP and one constraint-only evaluation, where
+  extragradient costs two VJPs. The line search tests the local Lipschitz
+  constant of the whole saddle operator. That constant needs the next
+  iteration's gradient, so each step is checked one iteration late and
+  rolled back if it overshot. The mode requires `adaptive_eta`, and
+  `diag_adapt` is not supported. Against adaptive extragradient on
+  `benchmarks/benchmark_convex.py`, it took fewer or equal epochs and
+  25–45% less wall time on every problem (simplex_qp 15→9 epochs, small_lp
+  92→73). On the dense-logistic run in `benchmark_convex_heavy.py` it was
+  2.0× faster (0.58× the per-epoch cost, 6 epochs vs 7). The default is
+  unchanged.
 - `jl.solve_with_refinement`: `jl.solve` with iterative refinement
   (Gleixner, Steffy & Wolter, INFORMS JOC 2016). A first solve stops at a
   loose `inner_tol` (1e-4). Each round then solves a correction LP at the
@@ -115,6 +130,13 @@
 - `to_jaddle_sparse` (and `JaddleLP`) accept traced numbers. A dense matrix
   that is itself traced stores every entry, and a `BCOO` keeps its stored
   entries.
+
+### Removed
+
+- `jc.solve(update_mode="forward_reflected")`. It needed one gradient per
+  iteration but was a net loss against adaptive extragradient: its admissible
+  step is 0.45/L, so it took 2.3–2.9× more epochs. `"pdhg"` also needs one
+  gradient per iteration, and is faster than extragradient.
 
 ## 0.2.2
 

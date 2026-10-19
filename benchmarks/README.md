@@ -215,12 +215,12 @@ Each run has a budget of 300 epochs × 200 iterations and uses tolerance `1e-6`.
 | `alt_gd` | `alternating` with plain gradient descent (`jo.gd(0.05)`) |
 | `eg_ad` | `extragradient` with adaptive step |
 | `eg_ad_rs` | `eg_ad` with restarts every 5 epochs |
-| `frb_ad` | `forward_reflected` with adaptive step |
-| `frb_ad_rs` | `frb_ad` with restarts every 5 epochs |
+| `pdhg_ad` | `pdhg` with adaptive step |
+| `pdhg_ad_rs` | `pdhg_ad` with restarts every 5 epochs |
 
 ```bash
 python benchmarks/benchmark_convex.py              # all configs
-python benchmarks/benchmark_convex.py eg_ad frb_ad # only these configs
+python benchmarks/benchmark_convex.py eg_ad pdhg_ad # only these configs
 python benchmarks/benchmark_convex.py eg_ad --jaddle-verbose  # with Jaddle's log
 ```
 
@@ -236,8 +236,8 @@ overhead instead. Use this script to weigh cost per epoch against epochs to
 converge across update modes.
 
 ```bash
-python benchmarks/benchmark_convex_heavy.py                    # extragradient and forward_reflected
-python benchmarks/benchmark_convex_heavy.py forward_reflected  # one mode
+python benchmarks/benchmark_convex_heavy.py       # extragradient and pdhg
+python benchmarks/benchmark_convex_heavy.py pdhg  # one mode
 ```
 
 Each line of output gives convergence, epochs, total time, time per epoch and

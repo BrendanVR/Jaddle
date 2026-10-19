@@ -58,7 +58,7 @@ def solve(cp, **kwargs):
 
 
 @pytest.mark.parametrize(
-    "update_mode", ["extragradient", "forward_reflected", "alternating"]
+    "update_mode", ["extragradient", "pdhg", "alternating"]
 )
 def test_simplex_projection(update_mode):
     cp, expected = simplex_problem()
@@ -122,7 +122,7 @@ def test_diag_adapt_isotonic_regression():
     "options",
     [
         dict(update_mode="alternating", restarts=True),
-        dict(update_mode="forward_reflected", restarts=True),
+        dict(update_mode="pdhg", restarts=True),
         dict(update_mode="extragradient", restarts=False),
     ],
 )
@@ -229,13 +229,13 @@ def test_epoch_budget():
 def test_invalid_update_mode():
     cp, _ = simplex_problem()
     with pytest.raises(ValueError):
-        jc.solve(cp, update_mode="pdhg")
+        jc.solve(cp, update_mode="bogus")
 
 
-def test_forward_reflected_requires_adaptive_eta():
+def test_pdhg_requires_adaptive_eta():
     cp, _ = simplex_problem()
     with pytest.raises(ValueError):
-        jc.solve(cp, update_mode="forward_reflected", adaptive_eta=None)
+        jc.solve(cp, update_mode="pdhg", adaptive_eta=None)
 
 
 # --- Traceable solves, batching and derivatives ------------------------------
@@ -273,7 +273,8 @@ def exact_scaled_projection(a, s):
     "options",
     [
         {},
-        {"update_mode": "forward_reflected"},
+        {"update_mode": "pdhg"},
+        {"update_mode": "pdhg", "restarts": True},
         {"restarts": True, "average": True},
         {"update_mode": "extragradient", "restarts": True, "diag_adapt": True},
         {"gradient_scaling": True},
@@ -438,6 +439,15 @@ def test_quadratic_program(scaled):
     assert s.dual_ineq.shape == (0,)
     objective = float(expected @ expected + qp["c"] @ expected)
     assert abs(result["objective"] - objective) <= 1e-5 * (1 + abs(objective))
+
+
+def test_quadratic_program_pdhg():
+    # The objective's curvature (Q) is only caught by the full-operator
+    # Lipschitz test, not by the constraint coupling alone.
+    qp, expected = simplex_qp()
+    result = solve_qp(qp, update_mode="pdhg")
+    assert_qp_certified(result)
+    np.testing.assert_allclose(result["solution"].primal, expected, atol=1e-5)
 
 
 def test_quadratic_program_diag_adapt():

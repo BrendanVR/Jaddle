@@ -49,7 +49,7 @@ import jaddle.jaddle_cvxpy as jcv  # noqa: E402
 
 # %%
 rng = np.random.default_rng(0)
-n_nodes = 200
+n_nodes = 30
 W = np.triu(rng.random((n_nodes, n_nodes)) < 0.3, 1).astype(float)
 W = W + W.T
 L = np.diag(W.sum(axis=1)) - W
@@ -63,7 +63,7 @@ problem = cp.Problem(cp.Maximize(cp.trace(L @ X) / 4), [X >> 0, unit_diagonal])
 
 # %%
 t0 = time.perf_counter()
-problem.solve(solver="SCS")
+problem.solve(solver="SCS", verbose=True)
 scs_time = time.perf_counter() - t0
 reference_bound = problem.value
 print(f"SCS solve time: {scs_time:.2f}s")
@@ -72,11 +72,12 @@ print(f"SCS solve time: {scs_time:.2f}s")
 t0 = time.perf_counter()
 problem.solve(
     solver=jcv.JaddleConicSolver(),
-    tol=1e-4,
+    tol=1e-5,
     verbose=True,
-    diag_clamp=1e10,
 )
 jaddle_time = time.perf_counter() - t0
+
+# %%
 print(f"Jaddle solve time: {jaddle_time:.2f}s")
 stats = problem.solver_stats.extra_stats
 print(
