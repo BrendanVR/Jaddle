@@ -97,11 +97,7 @@ problem = jc.JaddleCP(
 )
 
 # %%
-result = jc.solve(
-    problem,
-    verbose=True,
-    update_mode="extragradient",
-)
+result = jc.solve(problem, verbose=True)
 
 alpha = np.asarray(result["solution"].primal)
 # The intercept is the multiplier of the constraint yᵀα = 0.

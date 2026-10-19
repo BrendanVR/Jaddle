@@ -24,8 +24,10 @@
 # form, solved by `jc.quadratic_program`). The robust one is not: CVXPY
 # would turn `huber(norm(v))` into second-order cones, which Jaddle does not
 # support. `jcv.solve` therefore compiles it into JAX functions for `jc.solve`
-# instead, where the Huber of the norm stays a smooth function. Both are
-# checked against Clarabel, the interior-point solver CVXPY ships with.
+# instead, where the Huber of the norm stays a smooth function. The compiler
+# also substitutes out `v`, which `y == C x + v` defines, so the solver works
+# on the states and forces alone. Both are checked against Clarabel, the
+# interior-point solver CVXPY ships with.
 
 # %%
 import os
@@ -34,16 +36,19 @@ import time
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
+import jax
+
+jax.config.update("jax_platform_name", "cpu")
+
 import cvxpy as cp
 import matplotlib.pyplot as plt
 import numpy as np
-import optax
-
 import jaddle.jaddle_optimisers as jo
+import jaddle.jaddle_cvxpy as jcv  # noqa: E402
+import optax
 
 jo.configure_jax("float64")
 
-import jaddle.jaddle_cvxpy as jcv  # noqa: E402
 
 # %% [markdown]
 # ## The system
@@ -116,7 +121,10 @@ for name, robust, tau, rho in [
     reference, reference_x = problem.value, x.value.copy()
 
     start = time.perf_counter()
-    jcv.solve(problem, tol=1e-6)
+    jcv.solve(
+        problem,
+        tol=1e-6,
+    )
     jaddle_time = time.perf_counter() - start
     estimates[name] = x.value
     print(
@@ -128,7 +136,7 @@ for name, robust, tau, rho in [
     )
     print(
         f"  runtime: Clarabel {clarabel_time:.3f}s, "
-        f"Jaddle {jaddle_time:.3f}s (includes JAX compilation)"
+        f"Jaddle {jaddle_time:.3f}s (includes CVXPY and compile setup)"
     )
 
 # %% [markdown]

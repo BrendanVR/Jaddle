@@ -148,7 +148,7 @@ def report(name, params):
 # ## Unconstrained and fully fair models
 # First plain logistic regression (`c = ∞`), then the fully fair model
 # (`c = 0`).
-unconstrained = jc.solve(build_cp(jnp.inf), **settings)
+unconstrained = jc.solve(build_cp(1e8), **settings)
 fair = jc.solve(build_cp(0.0), **settings)
 print("Converged:", unconstrained["converged"], fair["converged"])
 

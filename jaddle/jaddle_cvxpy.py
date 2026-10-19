@@ -22,7 +22,8 @@ Three routes, all returning results the CVXPY way (``prob.status``,
   tree and builds a ``JaddleCP`` of JAX functions for
   ``jaddle_convex.solve``: smooth atoms stay smooth, and only piecewise-linear
   ones (``abs``, ``maximum``, ``norm1``, ...) become epigraph variables and
-  linear rows. CVXPY still checks that the problem is DCP. A problem CVXPY
+  linear rows, and a variable defined by an equality (``y == C @ x + v``)
+  is substituted out. CVXPY still checks that the problem is DCP. A problem CVXPY
   can put in QP form goes to ``JaddleSolver`` instead, unless
   ``qp_route=False``.
 
@@ -649,15 +650,48 @@ class CompiledProblem:
       for a lower one; ``mask`` marks the entries whose bound is that
       constraint's (the box keeps the tightest of several).
     * ``sign``: -1 for a maximisation, solved as the minimisation of ``-f``.
+    * ``eliminated``: the equalities that define a variable, substituted out
+      (``num_eliminated`` entries), as ``(constraint.id, var.id, sign,
+      offset, shape, row)`` with ``row(z) = sign * var + rest``.
+
+    Offsets in ``variables`` and ``eliminated`` index the full vector ``z``,
+    which holds every variable; ``cp`` works on the vector of the kept
+    entries ``z[keep]``, and ``expand`` maps it back to ``z``, filling in
+    the eliminated variables. ``objective`` and ``eq_rows`` /
+    ``ineq_rows`` are the minimised objective and ``cp``'s rows as
+    functions of ``z``.
     """
 
-    def __init__(self, cp, variables, rows, bounds, sign, num_epigraph):
+    def __init__(
+        self,
+        cp,
+        variables,
+        rows,
+        bounds,
+        sign,
+        num_epigraph,
+        eliminated=(),
+        keep=None,
+        expand=None,
+        objective=None,
+        eq_rows=None,
+        ineq_rows=None,
+    ):
         self.cp = cp
         self.variables = variables
         self.rows = rows
         self.bounds = bounds
         self.sign = sign
         self.num_epigraph = num_epigraph
+        self.eliminated = list(eliminated)
+        self.num_eliminated = sum(
+            int(np.prod(shape, dtype=int)) for *_, shape, _ in self.eliminated
+        )
+        self.keep = keep
+        self.expand = expand if expand is not None else (lambda x: x)
+        self.objective = objective if objective is not None else cp.objective
+        self.eq_rows = eq_rows if eq_rows is not None else cp.constraints_eq
+        self.ineq_rows = ineq_rows if ineq_rows is not None else cp.constraints_ineq
 
 
 class _Compiler:
@@ -707,11 +741,7 @@ class _Compiler:
         return t
 
     def add_variable(self, var):
-        attributes = {
-            k: v
-            for k, v in var.attributes.items()
-            if v is not False and v is not None
-        }
+        attributes = _attributes(var)
         lower, upper = -np.inf, np.inf
         bounds = attributes.pop("bounds", None)
         if bounds is not None:
@@ -943,6 +973,42 @@ class _Compiler:
         return t
 
 
+def _attributes(var):
+    """The attributes set on ``var`` (``nonneg``, ``bounds``, ...)."""
+    return {k: v for k, v in var.attributes.items() if v is not False and v is not None}
+
+
+def _signed_terms(e, sign=1.0):
+    """The additive terms of ``e``, each with its sign."""
+    if isinstance(e, AddExpression):
+        return [t for a in e.args for t in _signed_terms(a, sign)]
+    if isinstance(e, NegExpression):
+        return _signed_terms(e.args[0], -sign)
+    return [(e, sign)]
+
+
+def _definition(constraint, eligible):
+    """``(var, sign)`` when ``constraint`` is an equality reading
+    ``sign * var + rest == 0``, with ``var`` a whole variable of the
+    constraint's shape whose id is in ``eligible``, and ``rest`` free of it;
+    otherwise ``None``."""
+    if not isinstance(constraint, Equality):
+        return None
+    lhs, rhs = constraint.args
+    terms = _signed_terms(lhs) + _signed_terms(rhs, -1.0)
+    for i, (term, sign) in enumerate(terms):
+        if (
+            not isinstance(term, Variable)
+            or term.id not in eligible
+            or term.shape != constraint.shape
+        ):
+            continue
+        rest = (t for j, (t, _) in enumerate(terms) if j != i)
+        if all(term.id not in {v.id for v in t.variables()} for t in rest):
+            return term, sign
+    return None
+
+
 def _bound_of(constraint):
     """``(variable, side, value)`` when ``constraint`` bounds a whole
     variable by a constant, ``side`` +1 for ``var <= value`` and -1 for
@@ -964,7 +1030,7 @@ def _bound_of(constraint):
     return None
 
 
-def compile_problem(problem, epigraph=True, detect_bounds=True):
+def compile_problem(problem, epigraph=True, detect_bounds=True, eliminate=True):
     """
     Compile a DCP ``cvxpy.Problem`` to a ``CompiledProblem`` whose ``cp`` is a
     ``JaddleCP`` for ``jaddle_convex.solve``.
@@ -975,6 +1041,15 @@ def compile_problem(problem, epigraph=True, detect_bounds=True):
     (``x >= 0``, ``x <= u``), which then cost no dual. An equality
     ``lhs == rhs`` becomes the row ``lhs - rhs = 0``, an inequality
     ``lhs <= rhs`` the row ``lhs - rhs <= 0``.
+
+    With ``eliminate`` (default) an equality that defines a variable, such as
+    ``y == C @ x + v`` for ``v``, is substituted out instead: the variable
+    must appear in it once, whole and with coefficient ±1, and have no
+    attributes or bounds. The solver then sees neither the variable nor the
+    row, which can save many iterations (a free variable tied to others only
+    by rows has no curvature of its own); its value and the row's dual are
+    recovered afterwards. Definitions are taken in constraint order and
+    never reference a variable defined later.
 
     With ``epigraph`` (default) the piecewise-linear atoms (``abs``,
     ``maximum``, ``max``, ``norm1``, ``norm_inf``, their concave mirrors, and
@@ -1016,6 +1091,37 @@ def compile_problem(problem, epigraph=True, detect_bounds=True):
             box[block], value
         )
         bound_constraints.append((constraint, var.id, side, value, offset, size, block))
+
+    # Equalities defining a variable. A variable in an earlier definition
+    # cannot be defined later, so definitions reference only kept variables
+    # and earlier definitions.
+    eliminated = []
+    if eliminate:
+        eligible = {var.id for var in problem.variables() if not _attributes(var)}
+        eligible -= {var_id for _, var_id, *_ in bound_constraints}
+        kept = []
+        for constraint in general:
+            found = _definition(constraint, eligible)
+            if found is None:
+                kept.append(constraint)
+                continue
+            var, var_sign = found
+            eligible -= {v.id for v in constraint.variables()}
+            lhs, rhs = (compiler.expr(a) for a in constraint.args)
+            offset, shape = compiler.variables[var.id]
+            eliminated.append(
+                (
+                    constraint.id,
+                    var.id,
+                    var_sign,
+                    offset,
+                    shape,
+                    lambda z, lhs=lhs, rhs=rhs, shape=shape: jnp.ravel(
+                        jnp.broadcast_to(lhs(z) - rhs(z), shape)
+                    ),
+                )
+            )
+        general = kept
 
     rows = {}
     for constraint in general:
@@ -1059,16 +1165,50 @@ def compile_problem(problem, epigraph=True, detect_bounds=True):
             return lambda x: jnp.zeros(0, dtype)
         return lambda x: jnp.concatenate([f(x) for f in fns])
 
+    objective = lambda z: sign * jnp.sum(objective_fn(z))
+    eq_full, ineq_full = stack(eq_rows), stack(ineq_rows)
+    keep, expand = None, None
+    if eliminated:
+        removed = np.zeros(compiler.size, bool)
+        for *_, offset, shape, _ in eliminated:
+            removed[offset : offset + int(np.prod(shape, dtype=int))] = True
+        keep = np.flatnonzero(~removed)
+        lower, upper = lower[keep], upper[keep]
+        full_size, kept_index = compiler.size, jnp.asarray(keep)
+
+        # jit: the solver's setup calls the problem's functions eagerly.
+        @jax.jit
+        def expand(x):
+            # Each eliminated block is still zero when its row is evaluated,
+            # so row = sign * 0 + rest and the variable is -sign * row.
+            z = jnp.zeros(full_size, x.dtype).at[kept_index].set(x)
+            for _, _, var_sign, offset, shape, row in eliminated:
+                size = int(np.prod(shape, dtype=int))
+                z = z.at[offset : offset + size].set(-var_sign * row(z))
+            return z
+
+    reduced = (lambda f: f) if expand is None else (lambda f: lambda x: f(expand(x)))
     jcp = JaddleCP(
-        num_variables=compiler.size,
-        objective=lambda x: sign * jnp.sum(objective_fn(x)),
-        constraints_eq=stack(eq_rows),
-        constraints_ineq=stack(ineq_rows),
+        num_variables=lower.size,
+        objective=reduced(objective),
+        constraints_eq=reduced(eq_full),
+        constraints_ineq=reduced(ineq_full),
         lower_bounds=jnp.asarray(lower, dtype),
         upper_bounds=jnp.asarray(upper, dtype),
     )
     return CompiledProblem(
-        jcp, compiler.variables, rows, bounds, sign, compiler.num_epigraph
+        jcp,
+        compiler.variables,
+        rows,
+        bounds,
+        sign,
+        compiler.num_epigraph,
+        eliminated=eliminated,
+        keep=keep,
+        expand=expand,
+        objective=objective,
+        eq_rows=eq_full,
+        ineq_rows=ineq_full,
     )
 
 
@@ -1084,7 +1224,8 @@ def _unpack(problem, compiled, result):
         solution = failure_solution(status, attr)
     else:
         state = result["solution"]
-        x = np.asarray(state.primal, dtype=np.float64)
+        z = compiled.expand(state.primal)
+        x = np.asarray(z, dtype=np.float64)
         y_eq = np.asarray(state.dual_eq, dtype=np.float64)
         y_ineq = np.asarray(state.dual_ineq, dtype=np.float64)
         primal_vars = {
@@ -1096,19 +1237,37 @@ def _unpack(problem, compiled, result):
             y = y_eq if kind == "eq" else y_ineq
             size = int(np.prod(shape, dtype=int))
             dual_vars[constraint_id] = y[offset : offset + size].reshape(shape)
+
+        # The Lagrangian over the full vector, with the duals of the
+        # eliminated rows found so far.
+        eliminated_duals = []
+
+        def lagrangian(z):
+            value = (
+                compiled.objective(z)
+                + jnp.dot(state.dual_eq, compiled.eq_rows(z))
+                + jnp.dot(state.dual_ineq, compiled.ineq_rows(z))
+            )
+            for row, y in eliminated_duals:
+                value = value + jnp.dot(y, row(z))
+            return value
+
+        # An eliminated variable is free, so ∇_v L = 0, and it enters its
+        # own row as sign * v: the row's dual is -sign * ∇_v of the rest of
+        # L. Later definitions may use earlier variables but not the reverse,
+        # so the rows are solved last to first.
+        for constraint_id, _, var_sign, offset, shape, row in reversed(
+            compiled.eliminated
+        ):
+            size = int(np.prod(shape, dtype=int))
+            y = -var_sign * jax.grad(lagrangian)(z)[offset : offset + size]
+            eliminated_duals.append((row, y))
+            dual_vars[constraint_id] = np.asarray(y, np.float64).reshape(shape)
+
         if compiled.bounds:
             # A bound's dual is the reduced gradient it absorbs: for x >= l,
             # ∇L - y = 0 with y >= 0, so y = max(∇L, 0); for x <= u, max(-∇L, 0).
-            jcp = compiled.cp
-
-            def lagrangian(x):
-                return (
-                    jcp.objective(x)
-                    + jnp.dot(state.dual_eq, jcp.constraints_eq(x))
-                    + jnp.dot(state.dual_ineq, jcp.constraints_ineq(x))
-                )
-
-            gradient = np.asarray(jax.grad(lagrangian)(state.primal), np.float64)
+            gradient = np.asarray(jax.grad(lagrangian)(z), np.float64)
             for constraint_id, (var_id, side, mask) in compiled.bounds.items():
                 offset, shape = compiled.variables[var_id]
                 g = gradient[offset : offset + mask.size]
@@ -1120,7 +1279,9 @@ def _unpack(problem, compiled, result):
     problem._solver_stats = SolverStats.from_dict(attr, "JADDLE")
 
 
-def solve(problem, qp_route=True, epigraph=True, detect_bounds=True, **options):
+def solve(
+    problem, qp_route=True, epigraph=True, detect_bounds=True, eliminate=True, **options
+):
     """
     Solve a CVXPY problem with Jaddle and write the result back into it
     (``problem.status``, ``problem.value``, ``var.value``,
@@ -1132,7 +1293,7 @@ def solve(problem, qp_route=True, epigraph=True, detect_bounds=True, **options):
     ``problem.solve(solver=JaddleSolver(), **options)``, which gets HiGHS's
     presolve or ``quadratic_program``'s KKT scaling. Any other DCP problem, or
     every problem when ``qp_route=False``, is compiled by ``compile_problem``
-    (with ``epigraph`` and ``detect_bounds``) and solved by
+    (with ``epigraph``, ``detect_bounds`` and ``eliminate``) and solved by
     ``jaddle_convex.solve`` with ``COMPILED_DEFAULTS`` updated by ``options``.
     Its tolerances are absolute, in the problem's own units.
 
@@ -1146,7 +1307,9 @@ def solve(problem, qp_route=True, epigraph=True, detect_bounds=True, **options):
     """
     if qp_route and problem.is_qp():
         return problem.solve(solver=JaddleSolver(), **options)
-    compiled = compile_problem(problem, epigraph=epigraph, detect_bounds=detect_bounds)
+    compiled = compile_problem(
+        problem, epigraph=epigraph, detect_bounds=detect_bounds, eliminate=eliminate
+    )
     options = _with_tolerances(options, _COMPILED_TOLERANCES)
     result = jc.solve(compiled.cp, **{**COMPILED_DEFAULTS, **options})
     _unpack(problem, compiled, result)

@@ -68,7 +68,7 @@ differentiated with respect to the LP's data, and solves batch with `vmap`
 
 **Composable optimisation primitives.** The convex solver builds on
 [Optax](https://github.com/google-deepmind/optax). It uses Optax's projection
-operators, and in `alternating` mode it accepts any Optax gradient
+operators, and with `adaptive_eta=None` it accepts any Optax gradient
 transformation as the update rule. A new primal–dual variant is often only a
 few lines of code: for example, giving the primal player plain gradient descent
 and the dual player Nesterov momentum.
@@ -503,16 +503,17 @@ automatic differentiation. No derivatives are required from the user.
 
 | Mode | Gradient evaluations per iteration | Description |
 |---|---|---|
-| `"alternating"` (default) | 1 | Primal step, then a dual step at the new primal point. The update rule is a user-supplied Optax optimiser. |
+| `"alternating"` (default) | 1 | Primal step, then a dual step at the new primal point: PDHG without the extrapolation. With `adaptive_eta=None` the update rule is a user-supplied Optax optimiser. Best used with restarts. |
 | `"extragradient"` | 2 | Korpelevich extragradient: a look-ahead step followed by a corrector step. Contractive for monotone problems. |
 | `"pdhg"` | 1 | PDHG as in the LP solver: a primal step, then a dual step that reads the extrapolated constraint values `2g(x⁺) − g(x)`. One gradient plus one constraint evaluation per iteration. Requires the adaptive step. |
 
-**Adaptive step size.** With `adaptive_eta="auto"` (the default), the
-extragradient and PDHG schemes use a Malitsky–Tam line search
+**Adaptive step size.** With `adaptive_eta=1.0` (the default, as in the LP
+solver), every scheme uses a Malitsky–Tam line search
 based on a local Lipschitz estimate. The two gradient evaluations that
 extragradient already performs give an estimate of the local Lipschitz
-constant at no extra cost. PDHG gets its estimate from consecutive iterations,
-so it checks each step one iteration late and undoes it if it overshot. The
+constant at no extra cost. PDHG and alternating get their estimate from
+consecutive iterations, so they check each step one iteration late and undo
+it if it overshot. The
 step is accepted while it remains within the admissible bound, and is rejected
 and shrunk otherwise. The learned step is carried across restarts.
 
@@ -521,7 +522,7 @@ and dual step sizes. It is initialised from the gradient of the objective and
 the constraint values at the origin, rebalanced at each restart, and clamped
 to `[1/k_scale, k_scale]` (default `k_scale = 10`).
 
-**Custom optimisers.** In `alternating` mode, `optimiser` accepts any Optax
+**Custom optimisers.** With `adaptive_eta=None`, `optimiser` accepts any Optax
 `GradientTransformation`. It is applied separately to the primal and dual
 players through `jaddle_optimisers.create_saddle_optimiser`. Ready-made
 choices include `jo.gd`, `jo.optimistic_gd`, `jo.optimistic_adadelta` and
@@ -548,8 +549,8 @@ their tolerances:
 | Argument | Default | Purpose |
 |---|---|---|
 | `update_mode` | `"alternating"` | Iteration scheme (see above). |
-| `adaptive_eta` | `"auto"` | Adaptive line-searched step. Pass a float to set the seed, or `None` to use the optimiser's fixed learning rate. |
-| `optimiser` | `None` | Optax optimiser for `alternating` mode. When `None`, gradient descent with learning rate 0.5 is used. |
+| `adaptive_eta` | `1.0` | Seed of the adaptive line-searched step. `None` uses the optimiser's fixed learning rate instead. |
+| `optimiser` | `None` | Optax optimiser for the fixed step (`adaptive_eta=None`). When `None`, gradient descent with learning rate 0.5 is used. |
 | `iterations_per_epoch` | `1000` | Iterations per compiled epoch. |
 | `max_epochs`, `max_seconds` | `None` | Iteration and wall-clock budgets. |
 | `k_scale`, `k_theta`, `k_init` | `10.0`, `0.5`, `None` | Primal weight controls. `k_scale=None` disables the primal weight. |

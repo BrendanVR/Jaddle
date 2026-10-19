@@ -232,6 +232,23 @@ def test_invalid_update_mode():
         jc.solve(cp, update_mode="bogus")
 
 
+def test_alternating_fixed_step():
+    # adaptive_eta=None runs alternating on the optimiser's fixed step.
+    cp, expected = simplex_problem()
+    result = solve(cp, update_mode="alternating", adaptive_eta=None)
+    assert result["converged"]
+    np.testing.assert_allclose(result["solution"].primal, expected, atol=1e-5)
+
+
+def test_optimiser_requires_fixed_step():
+    # The adaptive step (the default) would bypass an explicit optimiser.
+    cp, _ = simplex_problem()
+    with pytest.raises(ValueError, match="adaptive_eta=None"):
+        jc.solve(cp, optimiser=jo.gd(0.1))
+    result = solve(cp, optimiser=jo.gd(0.1), adaptive_eta="auto")
+    assert result["converged"]
+
+
 def test_pdhg_requires_adaptive_eta():
     cp, _ = simplex_problem()
     with pytest.raises(ValueError):
@@ -556,8 +573,8 @@ def test_quadratic_program_rejects_asymmetric_Q():
 
 def test_diverged_solve_does_not_certify():
     # Free columns without curvature (the epigraph form of sum((x - a)^2)):
-    # the default fixed-step alternating scheme diverges to NaN, and a NaN
-    # residual must not pass the convergence test.
+    # the fixed-step alternating scheme diverges to NaN, and a NaN residual
+    # must not pass the convergence test.
     a = np.array([0.3, -0.2])
     result = jc.quadratic_program(
         Q=np.diag([0.0, 0.0, 2.0, 2.0]),
@@ -568,6 +585,8 @@ def test_diverged_solve_does_not_certify():
         pc_iterations=0,
         max_epochs=300,
         iterations_per_epoch=5,
+        update_mode="alternating",
+        adaptive_eta=None,
     )
     assert not np.all(np.isfinite(result["solution"].primal))
     assert not result["converged"]

@@ -107,7 +107,10 @@ def misscaled(cp, seed=0):
                        cp.lower_bounds, cp.upper_bounds)
 
 CONFIGS = {
-    "alt_gd": dict(update_mode="alternating", optimiser=jo.gd(0.05)),
+    "alt_gd": dict(update_mode="alternating", optimiser=jo.gd(0.05), adaptive_eta=None),
+    "alt_ad": dict(update_mode="alternating", adaptive_eta=0.5),
+    "alt_ad_rs": dict(update_mode="alternating", adaptive_eta=0.5, restarts=True,
+                      epochs_per_restart=5),
     "eg_ad": dict(update_mode="extragradient", adaptive_eta=0.5),
     "eg_ad_rs": dict(update_mode="extragradient", adaptive_eta=0.5, restarts=True,
                      epochs_per_restart=5),

@@ -13,9 +13,9 @@ import jaddle.jaddle_cvxpy as jcv  # noqa: E402
 TOL = dict(tol=1e-8)
 
 
-def reference(problem, constraints, variables):
+def reference(problem, constraints, variables, **options):
     """Clarabel's value, primal and duals."""
-    problem.solve(solver="CLARABEL")
+    problem.solve(solver="CLARABEL", **options)
     assert problem.status == cp.OPTIMAL
     return (
         problem.value,
@@ -183,6 +183,71 @@ def test_without_epigraph():
     jcv.solve(problem, epigraph=False, tol=1e-6, max_epochs=2000)
     assert jcv.compile_problem(problem, epigraph=False).num_epigraph == 0
     assert problem.value == pytest.approx(ref[0], abs=1e-4)
+
+
+def robust_smoother(n=40, seed=0):
+    # The robust Kalman smoother of examples/cp/cvxpy_robust_kalman.py, small:
+    # y == C x + v defines the noise v.
+    dt = 0.1
+    A = np.eye(4)
+    A[0, 2] = A[1, 3] = dt
+    B = np.zeros((4, 2))
+    B[0, 0] = B[1, 1] = dt**2 / 2
+    B[2, 0] = B[3, 1] = dt
+    C = np.eye(2, 4)
+    y = np.random.default_rng(seed).standard_normal((2, n))
+    x, w, v = cp.Variable((4, n + 1)), cp.Variable((2, n)), cp.Variable((2, n))
+    constraints = [x[:, 1:] == A @ x[:, :-1] + B @ w, y == C @ x[:, :-1] + v]
+    noise = cp.sum(cp.huber(cp.norm(v, 2, axis=0), 1.0))
+    problem = cp.Problem(cp.Minimize(cp.sum_squares(w) + 2 * noise), constraints)
+    return problem, constraints, [x, w, v]
+
+
+def test_eliminated_defined_variable():
+    problem, constraints, variables = robust_smoother()
+    v = variables[2]
+    assert not problem.is_qp()
+    compiled = jcv.compile_problem(problem)
+    full = jcv.compile_problem(problem, eliminate=False)
+    assert compiled.num_eliminated == v.size
+    assert full.num_eliminated == 0
+    assert compiled.cp.num_variables == full.cp.num_variables - v.size
+    ref = reference(problem, constraints, variables)
+    jcv.solve(problem, **TOL)
+    # The duals (of size ~10) are ~1e-4 from Clarabel's with or without
+    # the elimination.
+    assert_matches(problem, constraints, variables, ref, atol=1e-5, dual_atol=2e-4)
+
+
+def test_chained_definitions():
+    # v is defined through u, itself defined; their rows' duals are
+    # recovered last to first.
+    a = np.array([0.5, -1.0, 2.0])
+    x, u, v = cp.Variable(3), cp.Variable(3), cp.Variable(3)
+    constraints = [u == x + 1, v == 2 * u - a, cp.sum(x) <= 1]
+    problem = cp.Problem(
+        cp.Minimize(cp.log_sum_exp(v) + cp.sum_squares(x - a)), constraints
+    )
+    compiled = jcv.compile_problem(problem)
+    assert compiled.num_eliminated == 6
+    assert compiled.cp.num_variables == 3
+    # Clarabel's defaults are only ~3e-5 accurate on this exponential cone.
+    tight = dict(tol_gap_abs=1e-12, tol_gap_rel=1e-12, tol_feas=1e-12)
+    ref = reference(problem, constraints, [x, u, v], **tight)
+    jcv.solve(problem, **TOL)
+    assert_matches(problem, constraints, [x, u, v], ref)
+
+
+def test_elimination_guards():
+    # Not eliminated: a variable with attributes (x), one also in the rest
+    # of its row (u), one held as a box bound (w).
+    M = np.full((3, 3), 0.1)
+    x, u, w = cp.Variable(3, nonneg=True), cp.Variable(3), cp.Variable(3)
+    constraints = [x == 0.2, u == M @ u + x, w >= 0, w == x + 0.5]
+    problem = cp.Problem(
+        cp.Minimize(cp.log_sum_exp(u) + cp.sum_squares(w)), constraints
+    )
+    assert jcv.compile_problem(problem).num_eliminated == 0
 
 
 def test_compiled_values_match_cvxpy():

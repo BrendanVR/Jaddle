@@ -18,7 +18,9 @@ _CHUNK_TARGET_SECONDS = 1.0
 _LOG_CAP = 64
 _EVT_CAP = 64
 
-_ADAPTIVE_MODES = ("extragradient", "pdhg")
+_ADAPTIVE_MODES = ("alternating", "extragradient", "pdhg")
+# Adaptive modes whose line search validates each step one iteration late.
+_LAGGED_MODES = ("alternating", "pdhg")
 
 
 def _dual_stack(state):
@@ -184,16 +186,16 @@ def _init_k_slot(k, eta, state, update_mode):
     # The k-slot rides in opt_state next to the optimiser state:
     #   - k-scaling only (eta None):        k
     #   - adaptive extragradient:           (k, eta)
-    #   - adaptive pdhg:                    (k, eta, z_prev, F_prev, valid)
-    # pdhg validates each step one iteration late: z_prev is the iterate the
-    # current one was stepped from (at step eta), F_prev the saddle operator
-    # there. valid=False (fresh start / restart) skips the check once.
+    #   - adaptive pdhg / alternating:      (k, eta, z_prev, F_prev, valid)
+    # pdhg and alternating validate each step one iteration late: z_prev is
+    # the iterate the current one was stepped from (at step eta), F_prev the
+    # saddle operator there. valid=False (fresh start / restart) skips the check once.
     dtype = state.primal.dtype
     k = jnp.asarray(k, dtype)
     if eta is None:
         return k
     eta = jnp.asarray(eta, dtype)
-    if update_mode != "pdhg":
+    if update_mode not in _LAGGED_MODES:
         return (k, eta)
     zeros = jax.tree.map(jnp.zeros_like, state)
     zeros2 = jax.tree.map(jnp.zeros_like, state)
@@ -232,9 +234,10 @@ def _make_epoch_fn(
     # (w = the k-weighted norm) comes free, and the step is admissible while
     # eta · L_hat <= 1/sqrt(2). The primal/dual steps are tau=eta/k, sigma=eta*k.
     # eta is packed alongside k in the k-slot of opt_state. Requires k_scaling
-    # (it needs k) and a contractive scheme (extragradient or pdhg);
-    # alternating is not contractive on the saddle and a
-    # line search cannot fix that, so it is excluded.
+    # (it needs k). pdhg and alternating share the one-iteration-late line
+    # search below; alternating (theta = 0) is not contractive in the last
+    # iterate, so its guarantees are for the average, and the line search only
+    # keeps its step within the local Lipschitz bound.
     if adaptive_step and not k_scaling:
         raise ValueError("adaptive_eta requires k_scaling (primal weight k)")
     diag_on = bool(diag)
@@ -448,12 +451,14 @@ def _make_epoch_fn(
                     )
                 return average_state, total_weight
 
-            if update_mode == "pdhg":
+            if update_mode in _LAGGED_MODES:
                 # --- Adaptive nonlinear PDHG (cuPDLP-style, as in jl.solve) ---
                 #   x+ = P(x - tau ∇ₓL(x, y))
-                #   y+ = P(y + sigma (c(x+) + (c(x+) - c(x))))
-                # The dual reads the constraint values extrapolated in c-space,
-                # which is the LP solver's A @ x_bar when c is affine. One VJP
+                #   y+ = P(y + sigma (c(x+) + theta (c(x+) - c(x))))
+                # With theta = 1 ("pdhg") the dual reads the constraint values
+                # extrapolated in c-space, which is the LP solver's A @ x_bar
+                # when c is affine. With theta = 0 ("alternating") it reads
+                # c(x+): alternating GDA, as the LP solver's "alternating". One VJP
                 # (whose forward pass yields c(x)) plus one constraint-only
                 # forward per iteration, versus two VJPs for extragradient.
                 #
@@ -534,11 +539,13 @@ def _make_epoch_fn(
                             dual_eq=base.dual_eq,
                         )
                     )
+                    if update_mode == "pdhg":
+                        gd_ineq = 2.0 * gd_ineq - F_base.dual_ineq
+                        gd_eq = 2.0 * gd_eq - F_base.dual_eq
                     dual_ineq = projection_non_negative(
-                        base.dual_ineq
-                        - sigma * (2.0 * gd_ineq - F_base.dual_ineq)
+                        base.dual_ineq - sigma * gd_ineq
                     )
-                    dual_eq = base.dual_eq - sigma * (2.0 * gd_eq - F_base.dual_eq)
+                    dual_eq = base.dual_eq - sigma * gd_eq
                     cand = SaddleState(
                         primal=x_new, dual_ineq=dual_ineq, dual_eq=dual_eq
                     )
@@ -779,13 +786,17 @@ def _check_settings(optimiser, adaptive_eta, update_mode, k_scale):
     """Resolve and validate the settings ``solve()`` and ``make_solver`` share.
     Returns ``(optimiser, adaptive_eta, adaptive_step, k_scaling, k_lo, k_hi)``."""
     if adaptive_eta == "auto":
-        if update_mode == "pdhg" or (
-            update_mode in _ADAPTIVE_MODES and k_scale is not None and optimiser is None
-        ):
+        if update_mode == "pdhg" or (k_scale is not None and optimiser is None):
             adaptive_eta = 1.0
         else:
             adaptive_eta = None
 
+    # The adaptive step replaces the optimiser's update, so an explicit
+    # optimiser would be silently ignored.
+    if optimiser is not None and adaptive_eta is not None:
+        raise ValueError(
+            "optimiser is used only by the fixed-step scheme: pass adaptive_eta=None"
+        )
     if optimiser is None:
         optimiser = jo.gd(1 / 2)
 
@@ -793,10 +804,9 @@ def _check_settings(optimiser, adaptive_eta, update_mode, k_scale):
     if update_mode not in valid_update_modes:
         raise ValueError(f"update_mode must be one of {valid_update_modes}")
 
-    # Per-iteration adaptive step size (Malitsky-Tam line search). Only the
-    # contractive schemes (extragradient, pdhg) support it; it also needs the
-    # primal weight k, hence k_scale. pdhg has no fixed-step (optimiser) form
-    # here, so it requires the line search.
+    # Per-iteration adaptive step size (Malitsky-Tam line search). Every mode
+    # supports it; it needs the primal weight k, hence k_scale. pdhg has no
+    # fixed-step (optimiser) form here, so it requires the line search.
     adaptive_step = adaptive_eta is not None and update_mode in _ADAPTIVE_MODES
     if adaptive_eta is not None:
         if update_mode not in _ADAPTIVE_MODES:
@@ -1327,7 +1337,7 @@ def solve(
     k_scale=10.0,
     k_theta=0.5,
     k_init=None,
-    adaptive_eta="auto",
+    adaptive_eta=1.0,
     restarts=False,
     epochs_per_restart=None,
     restart_multiplier=1.0,
@@ -1373,10 +1383,10 @@ def solve(
             players (build one with
             ``jaddle_optimisers.create_saddle_optimiser``, or use a ready-made
             one such as ``jo.gd`` or ``jo.optimistic_gd``). It drives the steps
-            whenever the adaptive step is off: always in ``"alternating"``
-            mode, and in ``"extragradient"`` mode when ``adaptive_eta=None``.
-            Passing one makes ``adaptive_eta="auto"`` resolve to ``None``.
-            ``None`` (default) uses plain gradient descent, ``jo.gd(0.5)``.
+            of ``"alternating"`` and ``"extragradient"`` when the adaptive step
+            is off, so passing one requires ``adaptive_eta=None`` (or
+            ``"auto"``, which then resolves to ``None``). ``None`` (default)
+            uses plain gradient descent, ``jo.gd(0.5)``, for the fixed step.
         max_epochs: Epoch budget (default ``None`` = no limit). The solve stops
             with ``stop_reason="max_epochs"`` once it is reached.
         max_seconds: Wall-clock budget in seconds (default ``None`` = no limit).
@@ -1420,7 +1430,10 @@ def solve(
             metrics evaluation per epoch. ``False`` always uses the average.
         update_mode: Selects the stepping scheme (single source of truth):
             ``"alternating"`` (default; primal step, then dual step at the new
-            primal, driven by ``optimiser``), ``"extragradient"`` (Korpelevich
+            primal: with ``adaptive_eta`` it is ``"pdhg"`` without the
+            extrapolation, the dual reading ``c(x+)``, and with
+            ``adaptive_eta=None`` the steps come from ``optimiser``),
+            ``"extragradient"`` (Korpelevich
             two-call) or ``"pdhg"`` (cuPDLP-style PDHG with the dual reading extrapolated
             constraint values ``2 c(x+) - c(x)``: one VJP plus one
             constraint-only evaluation per iteration; requires
@@ -1447,24 +1460,24 @@ def solve(
             float to override (``1.0`` = symmetric steps). Only used when
             ``k_scale`` is set.
         adaptive_eta: Enables a per-iteration adaptive step size with a
-            Malitsky-Tam local-Lipschitz line search. ``"auto"`` (default)
-            enables it with seed ``1.0`` when ``update_mode`` supports it,
-            ``k_scale`` is set and no ``optimiser`` was passed (otherwise it
-            behaves like ``None``; ``pdhg`` always enables it — the
-            seed barely matters, the line search corrects it within a few
-            iterations). ``None`` keeps the optimiser's fixed learning rate.
-            A float seeds a single scalar
+            Malitsky-Tam local-Lipschitz line search, seeded with this value
+            (default ``1.0``, as in ``jaddle_linear.solve``; the seed barely
+            matters, the line search corrects it within a few iterations).
+            ``None`` uses the optimiser's fixed learning rate instead.
+            ``"auto"`` resolves to ``1.0`` when ``k_scale`` is set and no
+            ``optimiser`` was passed, and to ``None`` otherwise (``pdhg``
+            always enables it). A float seeds a single scalar
             base step ``eta`` driving the primal step ``tau = eta / k`` and dual
             step ``sigma = eta * k``. The extragradient look-ahead and corrector
             already evaluate the gradient twice, so the local Lipschitz estimate
             ``L_hat = ‖g_half - g‖_w / ‖z_half - z‖_w`` (the k-weighted norm)
             comes free; the step is admissible while ``eta · L_hat <= 1/sqrt2``,
             and ``eta`` is rejected + shrunk if the trial overshot, then advanced
-            with a two-sided guard. Only supported with ``update_mode`` in
-            ``('extragradient', 'pdhg')`` (the contractive schemes
-            here) and requires ``k_scale`` (the primal weight k). The learned
-            ``eta`` is carried across restarts. The optimiser's learning rate is
-            bypassed in the hot loop.
+            with a two-sided guard. ``"pdhg"`` and ``"alternating"`` estimate
+            ``L_hat`` from consecutive iterations instead, so each step is
+            validated one iteration late and rolled back if it overshot.
+            Requires ``k_scale`` (the primal weight k). The learned ``eta`` is
+            carried across restarts.
         restarts: Enable adaptive warm restarts (default ``False``). There is
             no cap on how many fire; the triggers alone decide. Each restart
             resets the optimiser momentum and averaging while keeping the
@@ -1783,7 +1796,7 @@ def make_solver(
     k_scale=10.0,
     k_theta=0.5,
     k_init=None,
-    adaptive_eta="auto",
+    adaptive_eta=1.0,
     restarts=False,
     epochs_per_restart=None,
     restart_multiplier=1.0,

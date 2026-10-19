@@ -93,7 +93,30 @@
   example, the least-squares smoother on the QP route and the Huber-of-norm
   smoother on the compiled route.
 
+- `jcv.compile_problem(eliminate=True)`: an equality that defines a
+  variable, such as `y == C @ x + v` for `v`, is substituted out instead of
+  becoming a row. The variable must appear once, whole, with coefficient
+  ±1, and have no attributes or box bounds. Its value and the row's dual
+  are recovered afterwards, the dual from stationarity in the eliminated
+  variable. On the robust Kalman example this halves the robust solve
+  (29→14 epochs, 1.45→0.77 s). `jcv.solve` takes the flag too.
+
 ### Changed
+
+- `jc.solve` and `jc.make_solver`: `update_mode="alternating"` supports the
+  adaptive step, and `adaptive_eta=1.0` is the default, as in `jl.solve`
+  (was `"auto"`). Adaptive alternating is the convex `"pdhg"` step with the
+  dual reading `c(x⁺)` instead of `2c(x⁺) − c(x)`, as the LP solver's
+  `"alternating"`, with the same one-iteration-late line search. Passing an
+  `optimiser` now requires `adaptive_eta=None` (or `"auto"`), since the
+  adaptive step would bypass it. On `benchmarks/benchmark_convex.py`, adaptive
+  alternating with restarts (`alt_ad_rs`) certifies every problem and is
+  fastest on small_lp (20 epochs, against 73 for pdhg and 92 for
+  extragradient), but takes 8 epochs on logistic_l1 against 3. Without
+  restarts it does not certify small_lp or logistic_l1 in 300 epochs. Against
+  the old default (fixed `gd(0.5)`), the new default certifies ridge_ball
+  where the fixed step diverged to NaN, no longer diverges on logistic_l1, and
+  takes 15 epochs on simplex_qp against 2.
 
 - The adaptive step size's retry is no longer a loop inside each PDHG
   iteration. A trial step that overshoots is rejected and the iteration does

@@ -15,7 +15,6 @@ import jaddle.jaddle_optimisers as jo
 
 jo.configure_jax("float64")
 
-import jax.experimental.sparse as jsp
 import numpy as np
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
@@ -28,6 +27,7 @@ from sklearn.isotonic import IsotonicRegression
 # %% [markdown]
 # ## Generate Synthetic Data
 # We will create synthetic data that follows a cubic relationship with some added noise.
+np.random.seed(0)  # for reproducibility
 n = 500
 x = np.linspace(-1, 1, n)
 y = x**3
@@ -64,10 +64,14 @@ cp = jc.JaddleCP(
 
 # %% [markdown]
 # ## Solve the problem using Jaddle Convex SPS optimizer
+start_time = time.time()
 solution = jc.solve(
     cp,
     primal_feasibility_tolerance=1e-6,
 )["solution"]
+jax.block_until_ready(solution.primal)
+end_time = time.time()
+print("Jaddle Isotonic Regression Time:", end_time - start_time)
 
 # %% [markdown]
 # ## Solve the problem using scikit-learn's Isotonic Regression
@@ -137,14 +141,18 @@ def isotonic_quantile_regression(tau):
     return jl.to_jaddle_sparse(problem)
 
 
-quantile_fitter = jax.jit(jl.make_solver(isotonic_quantile_regression))
+quantile_fitter = jax.jit(
+    jl.make_solver(
+        isotonic_quantile_regression,
+        primal_feasibility_tolerance=1e-6,
+    )
+)
 
 # %%
-quantiles = [0.01, 0.5, 0.99]
-quantile_problems = [isotonic_quantile_regression(tau) for tau in quantiles]
+quantiles = jnp.array([0.1, 0.5, 0.99])
 
 start = time.time()
-quantile_fits = jax.vmap(quantile_fitter)(jnp.array(quantiles))
+quantile_fits = jax.vmap(quantile_fitter)(quantiles)
 end = time.time()
 print("Isotonic Quantile Regression using Jaddle Time:", end - start)
 quantile_predictions = quantile_fits.solution.primal[:, :n]
