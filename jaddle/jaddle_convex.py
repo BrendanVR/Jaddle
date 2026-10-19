@@ -215,7 +215,7 @@ def _make_epoch_fn(
     # Returns `run_epoch(max_iter, start_iter, state, average_state, opt_state,
     # total_weight)`, which runs one epoch of `max_iter` iterations and returns
     # (i, state, average_state, opt_state, total_weight). With `diag`
-    # (diag_adapt, adaptive extragradient only) it also takes `diag=(t, s)` and
+    # (diag_adapt, adaptive step only) it also takes `diag=(t, s)` and
     # `accum=(H_x, H_y)` keywords and returns the updated `accum` last: the
     # steps become tau = eta/k * t, sigma = eta*k * s, the line search measures
     # in that metric, and each accepted step adds its eta-normalised squared
@@ -483,7 +483,7 @@ def _make_epoch_fn(
                         F_prev,
                         valid,
                         total_weight,
-                    ) = carry
+                    ) = carry[:8]
                     ip1 = jnp.asarray(i + 1, eta.dtype)
                     k = k0
                     F = grad(state)
@@ -530,7 +530,10 @@ def _make_epoch_fn(
                     )
 
                     tau = eta_use / k
-                    sigma = eta_use * k
+                    sigma_eq = sigma_ineq = eta_use * k
+                    if diag_on:
+                        tau = tau * t
+                        sigma_eq, sigma_ineq = sigma_eq * s_eq, sigma_ineq * s_ineq
                     x_new = projection_primal(base.primal - tau * F_base.primal)
                     gd_ineq, gd_eq = grad_dual_only(
                         SaddleState(
@@ -543,13 +546,13 @@ def _make_epoch_fn(
                         gd_ineq = 2.0 * gd_ineq - F_base.dual_ineq
                         gd_eq = 2.0 * gd_eq - F_base.dual_eq
                     dual_ineq = projection_non_negative(
-                        base.dual_ineq - sigma * gd_ineq
+                        base.dual_ineq - sigma_ineq * gd_ineq
                     )
-                    dual_eq = base.dual_eq - sigma * gd_eq
+                    dual_eq = base.dual_eq - sigma_eq * gd_eq
                     cand = SaddleState(
                         primal=x_new, dual_ineq=dual_ineq, dual_eq=dual_eq
                     )
-                    return (
+                    out = (
                         i + 1,
                         cand,
                         average_state,
@@ -558,8 +561,39 @@ def _make_epoch_fn(
                         F_base,
                         jnp.asarray(True),
                         total_weight,
-                    ), None
+                    )
+                    if diag_on:
+                        # Squared movement of the step validated here,
+                        # z_prev -> state, normalised by the eta it ran at
+                        # (zero when it was rolled back).
+                        H_x, H_y = carry[8]
+                        w = jnp.where(accept & valid, 1.0 / eta, 0.0)
+                        dx = (state.primal - z_prev.primal) * w
+                        dy = (
+                            jnp.concatenate(
+                                [
+                                    state.dual_eq - z_prev.dual_eq,
+                                    state.dual_ineq - z_prev.dual_ineq,
+                                ]
+                            )
+                            * w
+                        )
+                        out = out + ((H_x + dx * dx, H_y + dy * dy),)
+                    return out, None
 
+                init = (
+                    start_iter,
+                    state,
+                    average_state,
+                    eta0,
+                    z_prev0,
+                    F_prev0,
+                    valid0,
+                    total_weight,
+                )
+                if diag_on:
+                    init = init + (accum,)
+                out, _ = jax.lax.scan(step, init, None, length=max_iter)
                 (
                     i,
                     state,
@@ -569,23 +603,9 @@ def _make_epoch_fn(
                     F_prev,
                     valid,
                     total_weight,
-                ), _ = jax.lax.scan(
-                    step,
-                    (
-                        start_iter,
-                        state,
-                        average_state,
-                        eta0,
-                        z_prev0,
-                        F_prev0,
-                        valid0,
-                        total_weight,
-                    ),
-                    None,
-                    length=max_iter,
-                )
+                ) = out[:8]
                 opt_state = (inner0, (k0, eta, z_prev, F_prev, valid))
-                return i, state, average_state, opt_state, total_weight
+                return (i, state, average_state, opt_state, total_weight) + out[8:]
 
             def _trial(eta, state, k, g):
                 tau = eta / k
@@ -870,16 +890,11 @@ def _device_solver(
     ``run_chunk(carry, n_epochs)`` for an epoch length, and ``carry`` is the
     initial loop state.
     """
-    if diag_adapt and not (
-        adaptive_step and update_mode == "extragradient" and restarts
-    ):
-        # The diagonal is learned over a restart cycle and changed only at a
-        # restart, and only the adaptive extragradient line search measures in
-        # its metric; anywhere else it would silently do nothing.
-        raise ValueError(
-            "diag_adapt requires update_mode='extragradient' with adaptive_eta "
-            "and restarts=True"
-        )
+    # The diagonal is learned over a restart cycle and changed only at a
+    # restart, and only the adaptive line search measures in its metric, so
+    # without restarts or with the fixed-step optimiser it does nothing (as in
+    # jaddle_linear.solve): skip its accumulators.
+    diag_adapt = bool(diag_adapt and adaptive_step and restarts)
 
     def langrangian(state):
         return (
@@ -965,10 +980,16 @@ def _device_solver(
             return c, b
 
         c, b = jax.jit(_k_init_fn)(zero)
-        norm_c2 = jnp.vdot(c, c) + 1e-60
-        norm_b2 = jnp.vdot(b, b) + 1e-60
-        # Kept on the device (no float()) so this runs under jit / vmap.
-        k_init = jnp.clip(jnp.sqrt(norm_c2 / norm_b2), k_lo, k_hi)
+        norm_c2 = jnp.vdot(c, c)
+        norm_b2 = jnp.vdot(b, b)
+        # Kept on the device (no float()) so this runs under jit / vmap. As in
+        # PDLP, a zero norm (e.g. constraints with no constant term, b = 0)
+        # gives k = 1: the ratio would sit at the clamp, which under the wide
+        # default k_scale stalled isotonic regression.
+        ratio = jnp.sqrt(norm_c2 / jnp.where(norm_b2 > 0, norm_b2, 1.0))
+        k_init = jnp.where(
+            (norm_c2 > 0) & (norm_b2 > 0), jnp.clip(ratio, k_lo, k_hi), 1.0
+        )
     elif k_init is None:
         k_init = 1.0
 
@@ -1324,7 +1345,7 @@ def solve(
     max_seconds=None,
     initial_solution=None,
     initial_opt_state=None,
-    iterations_per_epoch=int(1e3),
+    iterations_per_epoch=256,
     primal_grad_norm_tolerance=1e-2,
     primal_feasibility_tolerance=1e-3,
     complementarity_slack_tolerance=1e-3,
@@ -1334,20 +1355,20 @@ def solve(
     average=True,
     report_best=True,
     update_mode="alternating",
-    k_scale=10.0,
+    k_scale=100.0,
     k_theta=0.5,
     k_init=None,
     adaptive_eta=1.0,
-    restarts=False,
+    restarts=True,
     epochs_per_restart=None,
     restart_multiplier=1.0,
     restart_decay=0.2,
     iterations_per_epoch_decay=1.0,
     iterations_per_epoch_min=100,
-    diag_adapt=False,
+    diag_adapt=True,
     diag_theta=0.5,
     diag_clamp=10.0,
-    gradient_scaling=False,
+    gradient_scaling=True,
     gradient_scaling_probes=16,
     precompile=True,
 ):
@@ -1402,7 +1423,8 @@ def solve(
         initial_opt_state: Starting step-size / optimiser state (default
             ``None`` = fresh), e.g. the ``"opt_state"`` of a previous solve.
             Pass it together with ``initial_solution`` to resume a solve.
-        iterations_per_epoch: Iterations per compiled epoch (default 1000).
+        iterations_per_epoch: Iterations per compiled epoch (default 256, as
+            in ``jaddle_linear.solve``).
             Convergence, budgets, logging and restarts are checked between
             epochs, so smaller values react faster at some per-epoch cost.
         primal_grad_norm_tolerance: Stationarity tolerance (default 1e-2); see
@@ -1441,8 +1463,10 @@ def solve(
             iteration late, rolling it back if it overshot).
         k_scale: Primal-weight (k) scaling control. ``None`` disables it;
             otherwise a float sets a symmetric clamp band
-            ``[1/k_scale, k_scale]`` for ``k`` (default ``10`` →
-            ``[0.1, 10]``). When enabled — orthogonal to ``update_mode``, so
+            ``[1/k_scale, k_scale]`` for ``k`` (default ``100`` →
+            ``[0.01, 100]``; ``jaddle_linear.solve`` uses ``1e8``, but here
+            ``k`` swinging to 1e-7 drove the adaptive step to its floor, where
+            it stayed across restarts). When enabled — orthogonal to ``update_mode``, so
             it composes with every scheme — a primal weight ``k`` rescales the
             primal/dual gradients by ``(1/k, k)`` before each ``opt_update``,
             making the dual/primal step ratio ``k**2``. ``k`` is initialised
@@ -1456,7 +1480,8 @@ def solve(
             adaptation. Only used when ``k_scale`` is set.
         k_init: Initial primal weight ``k``. ``None`` (default) initialises it to
             the PDLP heuristic ``||c|| / ||b||`` (objective vs RHS norms), where
-            ``c = grad(objective)(0)`` and ``b = -[c_eq(0); c_ineq(0)]``. Pass a
+            ``c = grad(objective)(0)`` and ``b = -[c_eq(0); c_ineq(0)]``, or
+            ``1.0`` when either is zero (as in PDLP). Pass a
             float to override (``1.0`` = symmetric steps). Only used when
             ``k_scale`` is set.
         adaptive_eta: Enables a per-iteration adaptive step size with a
@@ -1478,7 +1503,8 @@ def solve(
             validated one iteration late and rolled back if it overshot.
             Requires ``k_scale`` (the primal weight k). The learned ``eta`` is
             carried across restarts.
-        restarts: Enable adaptive warm restarts (default ``False``). There is
+        restarts: Enable adaptive warm restarts (default ``True``, as in
+            ``jaddle_linear.solve``). There is
             no cap on how many fire; the triggers alone decide. Each restart
             resets the optimiser momentum and averaging while keeping the
             current iterate as a warm start. A restart fires when the normalised
@@ -1509,8 +1535,9 @@ def solve(
             ``rho = |net displacement| / sqrt(accumulated)`` (large for a
             steadily drifting coordinate, small for an oscillating one). The
             metric only changes at restarts and the line search measures in it,
-            so it requires ``update_mode="extragradient"`` with ``adaptive_eta``
-            and ``restarts=True``. Default ``False``.
+            so it has no effect with ``restarts=False`` or the fixed-step
+            optimiser (``adaptive_eta=None``). Default ``True``, as in
+            ``jaddle_linear.solve``.
         diag_theta: Log-space step of the ``diag_adapt`` update (``0`` freezes
             ``t = s = 1``).
         diag_clamp: ``diag_adapt`` clamp: ``t, s`` stay in
@@ -1522,7 +1549,9 @@ def solve(
             ``[1e-4, 1e4]`` (a zero gradient keeps 1). The variables are not
             touched, so this fixes rows and objectives in mismatched units but
             not variables in mismatched units. The convergence test and the
-            returned duals stay in the problem's own units. Default ``False``.
+            returned duals stay in the problem's own units. Default ``True``
+            (``quadratic_program``, which scales its matrices itself, turns it
+            off unless asked).
         gradient_scaling_probes: Row norms are exact when the constraint
             Jacobian has at most this many rows or columns, and otherwise
             estimated from this many random Jacobian-vector products
@@ -1785,7 +1814,7 @@ def make_solver(
     build_cp,
     max_epochs=None,
     optimiser=None,
-    iterations_per_epoch=int(1e3),
+    iterations_per_epoch=256,
     primal_grad_norm_tolerance=1e-2,
     primal_feasibility_tolerance=1e-3,
     complementarity_slack_tolerance=1e-3,
@@ -1793,19 +1822,19 @@ def make_solver(
     average=True,
     report_best=True,
     update_mode="alternating",
-    k_scale=10.0,
+    k_scale=100.0,
     k_theta=0.5,
     k_init=None,
     adaptive_eta=1.0,
-    restarts=False,
+    restarts=True,
     epochs_per_restart=None,
     restart_multiplier=1.0,
     restart_decay=0.2,
     iterations_per_epoch_min=100,
-    diag_adapt=False,
+    diag_adapt=True,
     diag_theta=0.5,
     diag_clamp=10.0,
-    gradient_scaling=False,
+    gradient_scaling=True,
     gradient_scaling_probes=16,
 ):
     """
@@ -2221,7 +2250,9 @@ def quadratic_program(
       ``jaddle_linear.evaluate_lp_certificate``).
 
     ``initial_solution`` is a ``SaddleState`` in the problem's own units;
-    ``initial_opt_state`` is passed to ``solve()`` unchanged.
+    ``initial_opt_state`` is passed to ``solve()`` unchanged. The KKT scaling
+    already equilibrates the rows, so ``gradient_scaling`` defaults to
+    ``False`` here.
     """
     import scipy.sparse as sp
 
@@ -2335,6 +2366,8 @@ def quadratic_program(
                 np.asarray(initial_solution.dual_eq) / e[:m_eq], dtype=dtype
             ),
         )
+    # The KKT scaling has already equilibrated the rows.
+    solve_options.setdefault("gradient_scaling", False)
     result = solve(
         cp,
         initial_solution=initial_solution,

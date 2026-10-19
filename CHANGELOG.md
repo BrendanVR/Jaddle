@@ -12,8 +12,8 @@
   extragradient costs two VJPs. The line search tests the local Lipschitz
   constant of the whole saddle operator. That constant needs the next
   iteration's gradient, so each step is checked one iteration late and
-  rolled back if it overshot. The mode requires `adaptive_eta`, and
-  `diag_adapt` is not supported. Against adaptive extragradient on
+  rolled back if it overshot. The mode requires `adaptive_eta`. Against
+  adaptive extragradient on
   `benchmarks/benchmark_convex.py`, it took fewer or equal epochs and
   25–45% less wall time on every problem (simplex_qp 15→9 epochs, small_lp
   92→73). On the dense-logistic run in `benchmark_convex_heavy.py` it was
@@ -103,6 +103,26 @@
 
 ### Changed
 
+- `jc.solve` and `jc.make_solver` take `jl.solve`'s defaults where the two
+  share a setting: `iterations_per_epoch=256` (was 1000), `restarts=True`
+  (was `False`) and `diag_adapt=True` (was `False`). `gradient_scaling` is
+  also on by default. `k_scale` is `100` (was 10), not the LP's `1e8`: under
+  `1e8`, `k` fell to 1e-7 on the CVXPY channel-capacity example, which drove
+  the adaptive step to its 1e-12 floor, where it stayed across restarts.
+  `jc.quadratic_program` already equilibrates its matrices, so it keeps
+  gradient scaling off unless asked. On `benchmarks/benchmark_convex.py`
+  (plain and misscaled problems, 300 × 200-iteration budget), the new
+  defaults certify 9 of 10 runs against 5 of 10 for the old ones (isotonic
+  66→17 epochs, simplex_qp 15→8; small_lp and logistic_l1 now certify).
+- `jc.solve`: `diag_adapt` works with the adaptive `"alternating"` and
+  `"pdhg"` modes, not only extragradient. Each step validated by the
+  one-iteration-late line search adds its movement to the metric's
+  accumulators. Where the metric cannot apply (`restarts=False`, or the
+  fixed-step optimiser with `adaptive_eta=None`), `diag_adapt=True` now does
+  nothing instead of raising, as in `jl.solve`.
+- `jc.solve`: when `‖∇f(0)‖` or the constraint values at 0 are zero, the
+  primal weight starts at 1 (PDLP's rule). Before, it started at the edge of
+  the `k_scale` clamp.
 - `jc.solve` and `jc.make_solver`: `update_mode="alternating"` supports the
   adaptive step, and `adaptive_eta=1.0` is the default, as in `jl.solve`
   (was `"auto"`). Adaptive alternating is the convex `"pdhg"` step with the

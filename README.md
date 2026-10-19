@@ -520,7 +520,25 @@ and shrunk otherwise. The learned step is carried across restarts.
 **Primal weight.** As in the LP solver, a primal weight `k` balances the primal
 and dual step sizes. It is initialised from the gradient of the objective and
 the constraint values at the origin, rebalanced at each restart, and clamped
-to `[1/k_scale, k_scale]` (default `k_scale = 10`).
+to `[1/k_scale, k_scale]` (default `k_scale = 100`; the LP solver's `1e8`
+let `k` swing far enough to collapse the adaptive step on some problems). It
+starts at 1 when the objective gradient or the constraint values at the origin
+are zero.
+
+**Diagonal metric.** As in the LP solver, `diag_adapt=True` (the default)
+adapts a per-coordinate step metric at each restart: larger steps for
+steadily drifting coordinates, smaller for oscillating ones. It applies to all
+three schemes with the adaptive step, and has no effect without restarts or
+with a custom optimiser.
+
+**Gradient scaling.** The solver sees a problem only through its functions,
+so it cannot equilibrate a matrix. Instead, `gradient_scaling=True` (the
+default) rescales the objective and each constraint row by the size of its
+gradient at the start point, as IPOPT does. This fixes objectives and rows in
+mismatched units, but not variables in mismatched units. The convergence test
+and the returned duals stay in the problem's own units.
+`jc.quadratic_program` scales its matrices itself, so it turns gradient
+scaling off unless asked.
 
 **Custom optimisers.** With `adaptive_eta=None`, `optimiser` accepts any Optax
 `GradientTransformation`. It is applied separately to the primal and dual
@@ -533,7 +551,7 @@ optional `weight_function`) is on by default. As in the LP solver,
 `report_best=True` (the default) tests convergence on, and returns, whichever
 of the average and the last iterate has the lower KKT merit each epoch, so
 averaging never holds back a last iterate that is already converging. Adaptive
-restarts (`restarts=True`) are available but off by default.
+restarts (`restarts=True`) are on by default, as in the LP solver.
 
 **Termination.** The solver stops when all three of the following fall below
 their tolerances:
@@ -551,10 +569,12 @@ their tolerances:
 | `update_mode` | `"alternating"` | Iteration scheme (see above). |
 | `adaptive_eta` | `1.0` | Seed of the adaptive line-searched step. `None` uses the optimiser's fixed learning rate instead. |
 | `optimiser` | `None` | Optax optimiser for the fixed step (`adaptive_eta=None`). When `None`, gradient descent with learning rate 0.5 is used. |
-| `iterations_per_epoch` | `1000` | Iterations per compiled epoch. |
+| `iterations_per_epoch` | `256` | Iterations per compiled epoch. |
 | `max_epochs`, `max_seconds` | `None` | Iteration and wall-clock budgets. |
-| `k_scale`, `k_theta`, `k_init` | `10.0`, `0.5`, `None` | Primal weight controls. `k_scale=None` disables the primal weight. |
-| `restarts`, `epochs_per_restart` | `False`, `None` | Adaptive restarts (`epochs_per_restart=None` = no cycle cap). |
+| `k_scale`, `k_theta`, `k_init` | `100.0`, `0.5`, `None` | Primal weight controls. `k_scale=None` disables the primal weight. |
+| `restarts`, `epochs_per_restart` | `True`, `None` | Adaptive restarts (`epochs_per_restart=None` = no cycle cap). |
+| `diag_adapt`, `diag_theta`, `diag_clamp` | `True`, `0.5`, `10.0` | Per-coordinate diagonal step metric, adapted at each restart. |
+| `gradient_scaling` | `True` | Rescale the objective and constraint rows by their gradients at the start point. |
 | `initial_solution`, `initial_opt_state` | `None` | Warm start. |
 
 `solve` returns a dictionary containing `solution` (a `SaddleState`),

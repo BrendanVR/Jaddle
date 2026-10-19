@@ -87,19 +87,25 @@ def test_isotonic_regression():
     )
 
 
-DIAG = dict(update_mode="extragradient", restarts=True, diag_adapt=True)
+DIAG_MODES = pytest.mark.parametrize(
+    "update_mode", ["alternating", "extragradient", "pdhg"]
+)
 
 
-def test_diag_adapt_simplex(capsys):
+@DIAG_MODES
+def test_diag_adapt_simplex(capsys, update_mode):
     cp, expected = simplex_problem()
-    result = solve(cp, verbose=True, **DIAG)
+    result = solve(
+        cp, verbose=True, update_mode=update_mode, restarts=True, diag_adapt=True
+    )
     assert result["stop_reason"] == "certificate"
     np.testing.assert_allclose(result["solution"].primal, expected, atol=1e-5)
     out = capsys.readouterr().out
     assert "Restart" not in out or "t-spread" in out
 
 
-def test_diag_adapt_isotonic_regression():
+@DIAG_MODES
+def test_diag_adapt_isotonic_regression(update_mode):
     n = 60
     x = np.linspace(-1, 1, n)
     y = x**3 + 0.15 * np.random.default_rng(0).standard_normal(n)
@@ -111,7 +117,7 @@ def test_diag_adapt_isotonic_regression():
         lower_bounds=-jnp.ones(n),
         upper_bounds=jnp.ones(n),
     )
-    result = solve(cp, **DIAG)
+    result = solve(cp, update_mode=update_mode, restarts=True, diag_adapt=True)
     assert result["converged"]
     np.testing.assert_allclose(
         result["solution"].primal, isotonic_fit(y, -1.0, 1.0), atol=1e-4
@@ -121,15 +127,18 @@ def test_diag_adapt_isotonic_regression():
 @pytest.mark.parametrize(
     "options",
     [
-        dict(update_mode="alternating", restarts=True),
-        dict(update_mode="pdhg", restarts=True),
-        dict(update_mode="extragradient", restarts=False),
+        dict(restarts=False),
+        dict(adaptive_eta=None, optimiser=jo.gd(0.1)),
     ],
 )
-def test_diag_adapt_rejects_unsupported(options):
+def test_diag_adapt_without_its_requirements_has_no_effect(options):
+    # The diagonal changes only at restarts and only the adaptive line search
+    # measures in it, so elsewhere diag_adapt=True runs as diag_adapt=False.
     cp, _ = simplex_problem()
-    with pytest.raises(ValueError):
-        jc.solve(cp, diag_adapt=True, **options)
+    kwargs = dict(max_epochs=5, **options)
+    on = solve(cp, diag_adapt=True, **kwargs)
+    off = solve(cp, diag_adapt=False, **kwargs)
+    np.testing.assert_array_equal(on["solution"].primal, off["solution"].primal)
 
 
 def misscaled_isotonic(objective_scale, row_scale, n=60):
@@ -160,7 +169,8 @@ def test_gradient_scaling_fixes_misscaled_rows_and_objective():
     reference_cp, fit = misscaled_isotonic(1.0, 1.0)
     cp, _ = misscaled_isotonic(1e3, rows)
 
-    unscaled = jc.solve(cp, iterations_per_epoch=200, max_epochs=50, **tols)
+    unscaled = jc.solve(cp, iterations_per_epoch=200, max_epochs=50, **tols,
+                        gradient_scaling=False)
     assert not unscaled["converged"]
 
     result = jc.solve(cp, iterations_per_epoch=200, max_epochs=300, **tols,
@@ -467,9 +477,10 @@ def test_quadratic_program_pdhg():
     np.testing.assert_allclose(result["solution"].primal, expected, atol=1e-5)
 
 
-def test_quadratic_program_diag_adapt():
+@DIAG_MODES
+def test_quadratic_program_diag_adapt(update_mode):
     qp, expected = simplex_qp()
-    result = solve_qp(qp, **DIAG)
+    result = solve_qp(qp, update_mode=update_mode, restarts=True, diag_adapt=True)
     assert_qp_certified(result)
     np.testing.assert_allclose(result["solution"].primal, expected, atol=1e-5)
 
@@ -573,8 +584,8 @@ def test_quadratic_program_rejects_asymmetric_Q():
 
 def test_diverged_solve_does_not_certify():
     # Free columns without curvature (the epigraph form of sum((x - a)^2)):
-    # the fixed-step alternating scheme diverges to NaN, and a NaN residual
-    # must not pass the convergence test.
+    # the fixed-step alternating scheme diverges to NaN from k = 0.1 without
+    # restarts, and a NaN residual must not pass the convergence test.
     a = np.array([0.3, -0.2])
     result = jc.quadratic_program(
         Q=np.diag([0.0, 0.0, 2.0, 2.0]),
@@ -587,6 +598,8 @@ def test_diverged_solve_does_not_certify():
         iterations_per_epoch=5,
         update_mode="alternating",
         adaptive_eta=None,
+        restarts=False,
+        k_init=0.1,
     )
     assert not np.all(np.isfinite(result["solution"].primal))
     assert not result["converged"]

@@ -106,21 +106,33 @@ def misscaled(cp, seed=0):
                        lambda x: e_ineq * cp.constraints_ineq(x),
                        cp.lower_bounds, cp.upper_bounds)
 
+# jc.solve's defaults until 2026-10-20, which the configs below were tuned
+# against; each states its departures from them.
+OLD_DEFAULTS = dict(k_scale=10.0, restarts=False, diag_adapt=False,
+                    gradient_scaling=False)
+
 CONFIGS = {
-    "alt_gd": dict(update_mode="alternating", optimiser=jo.gd(0.05), adaptive_eta=None),
-    "alt_ad": dict(update_mode="alternating", adaptive_eta=0.5),
-    "alt_ad_rs": dict(update_mode="alternating", adaptive_eta=0.5, restarts=True,
-                      epochs_per_restart=5),
-    "eg_ad": dict(update_mode="extragradient", adaptive_eta=0.5),
-    "eg_ad_rs": dict(update_mode="extragradient", adaptive_eta=0.5, restarts=True,
-                     epochs_per_restart=5),
-    "eg_ad_rs_dg": dict(update_mode="extragradient", adaptive_eta=0.5, restarts=True,
-                        epochs_per_restart=5, diag_adapt=True),
-    "eg_ad_rs_gs": dict(update_mode="extragradient", adaptive_eta=0.5, restarts=True,
-                        epochs_per_restart=5, gradient_scaling=True),
-    "pdhg_ad": dict(update_mode="pdhg", adaptive_eta=0.5),
-    "pdhg_ad_rs": dict(update_mode="pdhg", adaptive_eta=0.5, restarts=True,
-                       epochs_per_restart=5),
+    "default": dict(),
+    "old_default": OLD_DEFAULTS,
+    "alt_gd": dict(OLD_DEFAULTS, update_mode="alternating", optimiser=jo.gd(0.05),
+                   adaptive_eta=None),
+    "alt_ad": dict(OLD_DEFAULTS, update_mode="alternating", adaptive_eta=0.5),
+    "alt_ad_rs": dict(OLD_DEFAULTS, update_mode="alternating", adaptive_eta=0.5,
+                      restarts=True, epochs_per_restart=5),
+    "alt_ad_rs_dg": dict(OLD_DEFAULTS, update_mode="alternating", adaptive_eta=0.5,
+                         restarts=True, epochs_per_restart=5, diag_adapt=True),
+    "eg_ad": dict(OLD_DEFAULTS, update_mode="extragradient", adaptive_eta=0.5),
+    "eg_ad_rs": dict(OLD_DEFAULTS, update_mode="extragradient", adaptive_eta=0.5,
+                     restarts=True, epochs_per_restart=5),
+    "eg_ad_rs_dg": dict(OLD_DEFAULTS, update_mode="extragradient", adaptive_eta=0.5,
+                        restarts=True, epochs_per_restart=5, diag_adapt=True),
+    "eg_ad_rs_gs": dict(OLD_DEFAULTS, update_mode="extragradient", adaptive_eta=0.5,
+                        restarts=True, epochs_per_restart=5, gradient_scaling=True),
+    "pdhg_ad": dict(OLD_DEFAULTS, update_mode="pdhg", adaptive_eta=0.5),
+    "pdhg_ad_rs": dict(OLD_DEFAULTS, update_mode="pdhg", adaptive_eta=0.5,
+                       restarts=True, epochs_per_restart=5),
+    "pdhg_ad_rs_dg": dict(OLD_DEFAULTS, update_mode="pdhg", adaptive_eta=0.5,
+                          restarts=True, epochs_per_restart=5, diag_adapt=True),
 }
 
 

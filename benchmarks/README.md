@@ -210,13 +210,26 @@ Each run has a budget of 300 epochs × 200 iterations and uses tolerance `1e-6`.
 | `small_lp` | Random feasible bounded LP, posed as a convex program |
 | `logistic_l1` | Sparse logistic regression with an L1-ball constraint written as many inequalities |
 
+Every config except `default` starts from `OLD_DEFAULTS`, the solver's
+defaults before 2026-10-20 (`k_scale=10`, no restarts, no diagonal metric,
+no gradient scaling), and adds the settings below. `iterations_per_epoch` is
+200 for every config.
+
 | Config | Settings |
 |---|---|
+| `default` | `jc.solve`'s current defaults |
+| `old_default` | `OLD_DEFAULTS` alone |
 | `alt_gd` | `alternating` with plain gradient descent (`jo.gd(0.05)`) |
+| `alt_ad` | `alternating` with adaptive step |
+| `alt_ad_rs` | `alt_ad` with restarts every 5 epochs |
+| `alt_ad_rs_dg` | `alt_ad_rs` with the diagonal metric (`diag_adapt`) |
 | `eg_ad` | `extragradient` with adaptive step |
 | `eg_ad_rs` | `eg_ad` with restarts every 5 epochs |
+| `eg_ad_rs_dg` | `eg_ad_rs` with the diagonal metric |
+| `eg_ad_rs_gs` | `eg_ad_rs` with gradient scaling |
 | `pdhg_ad` | `pdhg` with adaptive step |
 | `pdhg_ad_rs` | `pdhg_ad` with restarts every 5 epochs |
+| `pdhg_ad_rs_dg` | `pdhg_ad_rs` with the diagonal metric |
 
 ```bash
 python benchmarks/benchmark_convex.py              # all configs
