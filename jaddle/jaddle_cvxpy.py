@@ -106,7 +106,7 @@ DEFAULT_TOLERANCE = 1e-6
 # QP form introduces.
 QP_DEFAULTS = dict(
     update_mode="extragradient",
-    adaptive_eta=0.5,
+    step_size=0.5,
     restarts=True,
     epochs_per_restart=5,
 )

@@ -128,7 +128,7 @@ def test_diag_adapt_isotonic_regression(update_mode):
     "options",
     [
         dict(restarts=False),
-        dict(adaptive_eta=None, optimiser=jo.gd(0.1)),
+        dict(adaptive_eta=False, optimiser=jo.gd(0.1)),
     ],
 )
 def test_diag_adapt_without_its_requirements_has_no_effect(options):
@@ -242,20 +242,49 @@ def test_invalid_update_mode():
         jc.solve(cp, update_mode="bogus")
 
 
-def test_alternating_fixed_step():
-    # adaptive_eta=None runs alternating on the optimiser's fixed step.
+@pytest.mark.parametrize("adaptive_eta", [False, None])
+@pytest.mark.parametrize("step_size", [1.0, 0.5])
+def test_alternating_fixed_step(adaptive_eta, step_size):
+    # adaptive_eta off runs alternating on jo.gd(step_size)'s fixed step.
     cp, expected = simplex_problem()
-    result = solve(cp, update_mode="alternating", adaptive_eta=None)
+    result = solve(
+        cp, update_mode="alternating", adaptive_eta=adaptive_eta, step_size=step_size
+    )
     assert result["converged"]
     np.testing.assert_allclose(result["solution"].primal, expected, atol=1e-5)
+
+
+@pytest.mark.parametrize("update_mode", ["alternating", "extragradient", "pdhg"])
+@pytest.mark.parametrize("step_size", [0.1, 3.0])
+def test_step_size_seeds(update_mode, step_size):
+    cp, expected = simplex_problem()
+    result = solve(cp, update_mode=update_mode, step_size=step_size)
+    assert result["converged"]
+    np.testing.assert_allclose(result["solution"].primal, expected, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"adaptive_eta": 0.5},
+        {"adaptive_eta": "auto"},
+        {"step_size": -1.0},
+        {"step_size": 0.0},
+        {"step_size": "auto"},
+    ],
+)
+def test_invalid_step_settings(options):
+    cp, _ = simplex_problem()
+    with pytest.raises(ValueError):
+        jc.solve(cp, **options)
 
 
 def test_optimiser_requires_fixed_step():
     # The adaptive step (the default) would bypass an explicit optimiser.
     cp, _ = simplex_problem()
-    with pytest.raises(ValueError, match="adaptive_eta=None"):
+    with pytest.raises(ValueError, match="adaptive_eta=False"):
         jc.solve(cp, optimiser=jo.gd(0.1))
-    result = solve(cp, optimiser=jo.gd(0.1), adaptive_eta="auto")
+    result = solve(cp, optimiser=jo.gd(0.1), adaptive_eta=False)
     assert result["converged"]
 
 

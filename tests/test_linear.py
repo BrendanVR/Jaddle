@@ -130,17 +130,50 @@ def test_diag_adapt_frozen_matches_off():
     assert_certifies(lp, frozen["solution"], reference_objective(lp))
 
 
-@pytest.mark.parametrize("adaptive_eta", [0.3, 0.0, "auto"])
-def test_adaptive_eta_seeds(adaptive_eta):
+@pytest.mark.parametrize("step_size", [0.3, 1.0, "auto"])
+def test_step_size_seeds(step_size):
     lp = random_lp()
-    result = solve(lp, adaptive_eta=adaptive_eta)
+    result = solve(lp, step_size=step_size)
     assert_certified(lp, result, reference_objective(lp))
 
 
-@pytest.mark.parametrize("adaptive_eta", ["bogus", -1.0, None])
-def test_invalid_adaptive_eta(adaptive_eta):
+@pytest.mark.parametrize("update_mode", ["alternating", "pdhg", "halpern"])
+@pytest.mark.parametrize("step_size", [0.3, "auto"])
+def test_fixed_step(update_mode, step_size):
+    # adaptive_eta=False holds eta at step_size: every step is accepted and
+    # the returned eta is the starting one.
+    lp = random_lp()
+    result = solve(
+        lp,
+        update_mode=update_mode,
+        adaptive_eta=False,
+        step_size=step_size,
+        diag_adapt=False,
+        max_epochs=2000,
+    )
+    assert_certified(lp, result, reference_objective(lp))
+    if step_size != "auto":
+        assert float(result["opt_state"][1]) == step_size
+
+
+def test_fixed_step_none():
+    result = solve(toy_lp(), tol=1e-4, adaptive_eta=None, step_size="auto")
+    assert result["stop_reason"] == "certificate"
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"adaptive_eta": 0.3},
+        {"adaptive_eta": "auto"},
+        {"step_size": -1.0},
+        {"step_size": 0.0},
+        {"step_size": "bogus"},
+    ],
+)
+def test_invalid_step_settings(options):
     with pytest.raises(ValueError):
-        jl.solve(toy_lp(), adaptive_eta=adaptive_eta)
+        jl.solve(toy_lp(), **options)
 
 
 def test_invalid_update_mode():
@@ -556,6 +589,7 @@ def test_solve_polish_trigger_stops_once_gap_closes():
         {"update_mode": "halpern"},
         {"scale": False},
         {"diag_adapt": False},
+        {"adaptive_eta": False, "step_size": "auto", "diag_adapt": False},
     ],
 )
 def test_make_solver_matches_solve(options):

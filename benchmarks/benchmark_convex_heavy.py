@@ -76,7 +76,7 @@ if __name__ == "__main__":
                 max_epochs=300,
                 iterations_per_epoch=200,
                 update_mode=mode,
-                adaptive_eta=0.5,
+                step_size=0.5,
                 primal_grad_norm_tolerance=1e-4,
                 primal_feasibility_tolerance=1e-4,
                 complementarity_slack_tolerance=1e-4,

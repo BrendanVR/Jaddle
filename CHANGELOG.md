@@ -4,6 +4,12 @@
 
 ### Added
 
+- `jl.solve(adaptive_eta=False)` (or `None`) runs plain PDHG on a fixed
+  step: the line search is off and `eta` stays at `step_size` for the whole
+  solve. This restores the fixed-step LP solve removed on 2026-10-04.
+  `diag_adapt` can make a fixed step unstable; pass `diag_adapt=False` with it
+  to keep the step bound.
+
 - `jc.solve(update_mode="pdhg")`: adaptive PDHG for the convex solver,
   cuPDLP-style like `jl.solve`. The primal step uses `∇ₓL(x, y)`, and the
   dual step reads the extrapolated constraint values `2 c(x⁺) − c(x)`,
@@ -102,6 +108,18 @@
   (29→14 epochs, 1.45→0.77 s). `jcv.solve` takes the flag too.
 
 ### Changed
+
+- `jl.solve` and `jl.make_solver`: the starting step moves from
+  `adaptive_eta` to the new `step_size` (default `1.0`; `"auto"` is now
+  `0.99/‖[[A, b], [cᵀ, 0]]‖₂`, was `1/‖·‖₂`). `adaptive_eta` is a switch,
+  `True` by default; a float or `"auto"` passed to it raises and names
+  `step_size`.
+- `jc.solve` and `jc.make_solver` take the same two arguments: `step_size`
+  (default `1.0`) is the starting step, and `adaptive_eta` (default `True`)
+  switches the line search. With it off, the fixed step's default optimiser is
+  `jo.gd(step_size)`, which was `jo.gd(0.5)`, so pass `step_size=0.5` to keep
+  the old fixed step. `adaptive_eta="auto"` is gone. An explicit `optimiser`
+  needs `adaptive_eta=False`. `jcv`'s QP defaults now set `step_size=0.5`.
 
 - `jc.solve` and `jc.make_solver` take `jl.solve`'s defaults where the two
   share a setting: `iterations_per_epoch=256` (was 1000), `restarts=True`

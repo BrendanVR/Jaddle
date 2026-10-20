@@ -226,7 +226,7 @@ def _make_epoch_fn(
     # Python int (it is the scan length).
     #
     # Per-iteration adaptive step size (Malitsky-Tam local-Lipschitz line
-    # search). When `adaptive_eta` is not None the extragradient scheme replaces
+    # search). With `adaptive_step` the extragradient scheme replaces
     # the optimiser's fixed learning rate with a single scalar base step eta,
     # line-searched every iteration: the look-ahead and corrector already
     # evaluate grad twice, so the local Lipschitz estimate
@@ -802,23 +802,28 @@ def _make_epoch_fn(
     return run_epoch
 
 
-def _check_settings(optimiser, adaptive_eta, update_mode, k_scale):
+def _check_settings(optimiser, adaptive_eta, step_size, update_mode, k_scale):
     """Resolve and validate the settings ``solve()`` and ``make_solver`` share.
-    Returns ``(optimiser, adaptive_eta, adaptive_step, k_scaling, k_lo, k_hi)``."""
-    if adaptive_eta == "auto":
-        if update_mode == "pdhg" or (k_scale is not None and optimiser is None):
-            adaptive_eta = 1.0
-        else:
-            adaptive_eta = None
+    Returns ``(optimiser, step_size, adaptive_step, k_scaling, k_lo, k_hi)``."""
+    # adaptive_eta switches the line search; step_size is the starting eta
+    # either way (the fixed step's learning rate when it is off).
+    if adaptive_eta is not None and not isinstance(adaptive_eta, (bool, np.bool_)):
+        raise ValueError(
+            f"adaptive_eta must be True, False or None, got {adaptive_eta!r}; "
+            "pass the starting step as step_size=..."
+        )
+    if isinstance(step_size, str) or not step_size > 0.0:
+        raise ValueError(f"step_size must be a float > 0, got {step_size!r}")
+    adaptive_step = bool(adaptive_eta)
 
     # The adaptive step replaces the optimiser's update, so an explicit
     # optimiser would be silently ignored.
-    if optimiser is not None and adaptive_eta is not None:
+    if optimiser is not None and adaptive_step:
         raise ValueError(
-            "optimiser is used only by the fixed-step scheme: pass adaptive_eta=None"
+            "optimiser is used only by the fixed-step scheme: pass adaptive_eta=False"
         )
     if optimiser is None:
-        optimiser = jo.gd(1 / 2)
+        optimiser = jo.gd(step_size)
 
     valid_update_modes = ["alternating", "extragradient", "pdhg"]
     if update_mode not in valid_update_modes:
@@ -827,8 +832,7 @@ def _check_settings(optimiser, adaptive_eta, update_mode, k_scale):
     # Per-iteration adaptive step size (Malitsky-Tam line search). Every mode
     # supports it; it needs the primal weight k, hence k_scale. pdhg has no
     # fixed-step (optimiser) form here, so it requires the line search.
-    adaptive_step = adaptive_eta is not None and update_mode in _ADAPTIVE_MODES
-    if adaptive_eta is not None:
+    if adaptive_step:
         if update_mode not in _ADAPTIVE_MODES:
             raise ValueError(
                 f"adaptive_eta is only supported with update_mode in {_ADAPTIVE_MODES}"
@@ -836,7 +840,7 @@ def _check_settings(optimiser, adaptive_eta, update_mode, k_scale):
         if k_scale is None:
             raise ValueError("adaptive_eta requires k_scale (primal weight k)")
     elif update_mode == "pdhg":
-        raise ValueError("update_mode='pdhg' requires adaptive_eta")
+        raise ValueError("update_mode='pdhg' requires adaptive_eta=True")
 
     # ``k_scale`` is the public knob for primal-weight scaling: ``None`` disables
     # it, otherwise it sets a symmetric clamp band ``[1/k_scale, k_scale]``.
@@ -845,7 +849,7 @@ def _check_settings(optimiser, adaptive_eta, update_mode, k_scale):
         k_lo, k_hi = 1.0 / k_scale, k_scale
     else:
         k_lo, k_hi = None, None
-    return optimiser, adaptive_eta, adaptive_step, k_scaling, k_lo, k_hi
+    return optimiser, step_size, adaptive_step, k_scaling, k_lo, k_hi
 
 
 def _device_solver(
@@ -869,7 +873,7 @@ def _device_solver(
     k_hi,
     k_theta,
     k_init,
-    adaptive_eta,
+    eta_init,
     adaptive_step,
     restarts,
     epochs_per_restart,
@@ -998,7 +1002,7 @@ def _device_solver(
     elif k_scaling:
         k_slot = _init_k_slot(
             k_init,
-            adaptive_eta if adaptive_step else None,
+            eta_init if adaptive_step else None,
             initial_solution,
             update_mode,
         )
@@ -1188,7 +1192,7 @@ def _device_solver(
                     k_new = _rebalance_k(restart_point, at_restart, _k_of(opt), diag)
                     # Carry the learned step size across the restart (PDLP
                     # convention, as in the linear solver): re-seeding forced
-                    # the adaptive rule to re-climb from adaptive_eta after
+                    # the adaptive rule to re-climb from eta_init after
                     # every restart.
                     k_slot = _init_k_slot(
                         k_new,
@@ -1358,7 +1362,8 @@ def solve(
     k_scale=100.0,
     k_theta=0.5,
     k_init=None,
-    adaptive_eta=1.0,
+    adaptive_eta=True,
+    step_size=1.0,
     restarts=True,
     epochs_per_restart=None,
     restart_multiplier=1.0,
@@ -1405,9 +1410,9 @@ def solve(
             ``jaddle_optimisers.create_saddle_optimiser``, or use a ready-made
             one such as ``jo.gd`` or ``jo.optimistic_gd``). It drives the steps
             of ``"alternating"`` and ``"extragradient"`` when the adaptive step
-            is off, so passing one requires ``adaptive_eta=None`` (or
-            ``"auto"``, which then resolves to ``None``). ``None`` (default)
-            uses plain gradient descent, ``jo.gd(0.5)``, for the fixed step.
+            is off, so passing one requires ``adaptive_eta=False``. ``None``
+            (default) uses plain gradient descent, ``jo.gd(step_size)``, for
+            the fixed step.
         max_epochs: Epoch budget (default ``None`` = no limit). The solve stops
             with ``stop_reason="max_epochs"`` once it is reached.
         max_seconds: Wall-clock budget in seconds (default ``None`` = no limit).
@@ -1454,12 +1459,12 @@ def solve(
             ``"alternating"`` (default; primal step, then dual step at the new
             primal: with ``adaptive_eta`` it is ``"pdhg"`` without the
             extrapolation, the dual reading ``c(x+)``, and with
-            ``adaptive_eta=None`` the steps come from ``optimiser``),
+            ``adaptive_eta=False`` the steps come from ``optimiser``),
             ``"extragradient"`` (Korpelevich
             two-call) or ``"pdhg"`` (cuPDLP-style PDHG with the dual reading extrapolated
             constraint values ``2 c(x+) - c(x)``: one VJP plus one
             constraint-only evaluation per iteration; requires
-            ``adaptive_eta``, and its line search validates each step one
+            ``adaptive_eta=True``, and its line search validates each step one
             iteration late, rolling it back if it overshot).
         k_scale: Primal-weight (k) scaling control. ``None`` disables it;
             otherwise a float sets a symmetric clamp band
@@ -1484,14 +1489,11 @@ def solve(
             ``1.0`` when either is zero (as in PDLP). Pass a
             float to override (``1.0`` = symmetric steps). Only used when
             ``k_scale`` is set.
-        adaptive_eta: Enables a per-iteration adaptive step size with a
-            Malitsky-Tam local-Lipschitz line search, seeded with this value
-            (default ``1.0``, as in ``jaddle_linear.solve``; the seed barely
-            matters, the line search corrects it within a few iterations).
-            ``None`` uses the optimiser's fixed learning rate instead.
-            ``"auto"`` resolves to ``1.0`` when ``k_scale`` is set and no
-            ``optimiser`` was passed, and to ``None`` otherwise (``pdhg``
-            always enables it). A float seeds a single scalar
+        adaptive_eta: Switches on a per-iteration adaptive step size with a
+            Malitsky-Tam local-Lipschitz line search (default ``True``, as in
+            ``jaddle_linear.solve``), started from ``step_size``. ``False`` (or
+            ``None``) uses the fixed step of ``optimiser`` instead (``pdhg``
+            requires the line search). The adaptive step is a single scalar
             base step ``eta`` driving the primal step ``tau = eta / k`` and dual
             step ``sigma = eta * k``. The extragradient look-ahead and corrector
             already evaluate the gradient twice, so the local Lipschitz estimate
@@ -1503,6 +1505,13 @@ def solve(
             validated one iteration late and rolled back if it overshot.
             Requires ``k_scale`` (the primal weight k). The learned ``eta`` is
             carried across restarts.
+        step_size: The starting step ``eta`` (default ``1.0``, as in
+            ``jaddle_linear.solve``). With ``adaptive_eta`` it seeds the line
+            search, which corrects a poor value within a few iterations;
+            without it, it is the learning rate of the default optimiser
+            ``jo.gd(step_size)`` (with ``k_scale`` set, again ``tau = eta / k``
+            and ``sigma = eta * k``). An explicit ``optimiser`` carries its own
+            learning rate and ignores it.
         restarts: Enable adaptive warm restarts (default ``True``, as in
             ``jaddle_linear.solve``). There is
             no cap on how many fire; the triggers alone decide. Each restart
@@ -1536,7 +1545,7 @@ def solve(
             steadily drifting coordinate, small for an oscillating one). The
             metric only changes at restarts and the line search measures in it,
             so it has no effect with ``restarts=False`` or the fixed-step
-            optimiser (``adaptive_eta=None``). Default ``True``, as in
+            optimiser (``adaptive_eta=False``). Default ``True``, as in
             ``jaddle_linear.solve``.
         diag_theta: Log-space step of the ``diag_adapt`` update (``0`` freezes
             ``t = s = 1``).
@@ -1592,8 +1601,8 @@ def solve(
     if verbose:
         print("----------------------------------------------")
 
-    optimiser, adaptive_eta, adaptive_step, k_scaling, k_lo, k_hi = _check_settings(
-        optimiser, adaptive_eta, update_mode, k_scale
+    optimiser, step_size, adaptive_step, k_scaling, k_lo, k_hi = _check_settings(
+        optimiser, adaptive_eta, step_size, update_mode, k_scale
     )
 
     if verbose:
@@ -1630,7 +1639,7 @@ def solve(
         k_hi=k_hi,
         k_theta=k_theta,
         k_init=k_init,
-        adaptive_eta=adaptive_eta,
+        eta_init=step_size,
         adaptive_step=adaptive_step,
         restarts=restarts,
         epochs_per_restart=epochs_per_restart,
@@ -1825,7 +1834,8 @@ def make_solver(
     k_scale=100.0,
     k_theta=0.5,
     k_init=None,
-    adaptive_eta=1.0,
+    adaptive_eta=True,
+    step_size=1.0,
     restarts=True,
     epochs_per_restart=None,
     restart_multiplier=1.0,
@@ -1867,8 +1877,8 @@ def make_solver(
     when that may not happen. Batched members iterate in lockstep until the
     last one stops (finished members are frozen).
     """
-    optimiser, adaptive_eta, adaptive_step, k_scaling, k_lo, k_hi = _check_settings(
-        optimiser, adaptive_eta, update_mode, k_scale
+    optimiser, step_size, adaptive_step, k_scaling, k_lo, k_hi = _check_settings(
+        optimiser, adaptive_eta, step_size, update_mode, k_scale
     )
     n_epochs = _UNBOUNDED_EPOCHS if not max_epochs else int(max_epochs)
 
@@ -1902,7 +1912,7 @@ def make_solver(
             k_hi=k_hi,
             k_theta=k_theta,
             k_init=k_init,
-            adaptive_eta=adaptive_eta,
+            eta_init=step_size,
             adaptive_step=adaptive_step,
             restarts=restarts,
             epochs_per_restart=epochs_per_restart,

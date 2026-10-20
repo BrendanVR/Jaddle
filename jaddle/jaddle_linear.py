@@ -142,6 +142,7 @@ def _make_epoch_fn(
     merit_fn=None,
     check_every=None,
     diag=False,
+    adaptive_step=True,
 ):
     # Returns `run_epoch(start_iter, state, average_state, opt_state,
     # total_weight, merit_threshold, stall_threshold, *, max_iter)`, which runs
@@ -165,13 +166,14 @@ def _make_epoch_fn(
     # returned `stalled` flag tells `solve` to restart on it. The epoch length
     # rounds down to a whole number of chunks.
     #
-    # Every mode is cuPDLP-style adaptive PDHG: a single scalar base step eta is
-    # line-searched every iteration (a trial step is taken, the largest
-    # admissible step eta_bar = move / (2|interaction|) is formed from the trial
-    # movement, and the step is rejected + shrunk if it overshot eta_bar). The
-    # primal/dual steps are tau=eta/k, sigma=eta*k, with k the primal weight
-    # (rebalanced at restarts in `solve`). The modes differ only in the dual's
-    # extrapolation and an optional anchor:
+    # Every mode is PDHG on a single scalar base step eta. With `adaptive_step`
+    # (cuPDLP-style) eta is line-searched every iteration (a trial step is
+    # taken, the largest admissible step eta_bar = move / (2|interaction|) is
+    # formed from the trial movement, and the step is rejected + shrunk if it
+    # overshot eta_bar); without it eta stays at its seed and every step is
+    # accepted. The primal/dual steps are tau=eta/k, sigma=eta*k, with k the
+    # primal weight (rebalanced at restarts in `solve`). The modes differ only
+    # in the dual's extrapolation and an optional anchor:
     #   * "pdhg":        dual reads x_bar = 2 x_new - x_old (theta=1).
     #   * "alternating": dual reads x_new (theta=0, Gauss-Seidel). Not
     #                    contractive in general; relies on averaging/restarts.
@@ -283,6 +285,8 @@ def _make_epoch_fn(
             dual_ineq = projection_non_negative(state.dual_ineq - sigma_ineq * gd_ineq)
             dual_eq = state.dual_eq - sigma_eq * gd_eq
             cand = SaddleState(primal=x_new, dual_ineq=dual_ineq, dual_eq=dual_eq)
+            if not adaptive_step:
+                return cand, None, Ax_new, roots
             dy = jnp.concatenate([dual_eq - state.dual_eq, dual_ineq - state.dual_ineq])
             interaction = jnp.abs(jnp.vdot(dy, A_dx))
             return cand, _descent_bound(state, cand, k, interaction), Ax_new, roots
@@ -310,7 +314,8 @@ def _make_epoch_fn(
             # rejection uses up one of the epoch's scan steps.
             gp = grad_primal_only(state)
             cand, eta_bar, Ax_new, roots = trial(eta, state, k, Ax_old, gp, roots)
-            accepted = eta <= eta_bar
+            # A fixed step (no line search) accepts every trial.
+            accepted = eta <= eta_bar if adaptive_step else jnp.asarray(True)
             eta0 = eta
 
             if diag_on:
@@ -358,13 +363,16 @@ def _make_epoch_fn(
             # growth branch run away to NaN. A rejected step shrinks eta to
             # just under eta_bar; the (1-(i+1)^-0.3) factor < 1 guarantees
             # strict decrease, so a run of rejections ends.
-            eta_next = jnp.minimum(
-                (1.0 - ip1 ** (-0.3)) * eta_bar,
-                jnp.where(accepted, (1.0 + ip1 ** (-0.6)) * eta0, eta0),
-            )
-            eta_next = jnp.where(jnp.isfinite(eta_bar), eta_next, eta0)
-            eta_next = jnp.where(jnp.isfinite(eta_next), eta_next, eta0)
-            eta_next = jnp.maximum(eta_next, 1e-12)
+            if adaptive_step:
+                eta_next = jnp.minimum(
+                    (1.0 - ip1 ** (-0.3)) * eta_bar,
+                    jnp.where(accepted, (1.0 + ip1 ** (-0.6)) * eta0, eta0),
+                )
+                eta_next = jnp.where(jnp.isfinite(eta_bar), eta_next, eta0)
+                eta_next = jnp.where(jnp.isfinite(eta_next), eta_next, eta0)
+                eta_next = jnp.maximum(eta_next, 1e-12)
+            else:
+                eta_next = eta0
             if halpern:
                 opt_state = (k, eta_next, anchor, Ax_anchor, Ax_next)
             else:
@@ -533,11 +541,12 @@ def _check_settings(
     update_mode,
     k_scale,
     adaptive_eta,
+    step_size,
     gap_test="pdlp",
 ):
     """Validate the settings ``solve()`` and ``make_solver`` share. Returns
-    ``(k_lo, k_hi, adaptive_eta, halpern)``, with ``adaptive_eta`` either a
-    float or ``"auto"`` (resolved after scaling)."""
+    ``(k_lo, k_hi, adaptive_step, step_size, halpern)``, with ``step_size``
+    either a float or ``"auto"`` (resolved after scaling)."""
     if dual_residual not in ("pdlp", "projected"):
         raise ValueError(
             f"dual_residual must be 'pdlp' or 'projected', got {dual_residual!r}"
@@ -561,18 +570,22 @@ def _check_settings(
         k_lo, k_hi = 1.0 / k_scale, k_scale
     else:
         k_lo, k_hi = 0.0, np.inf
-    # "auto" (or 0.0) seeds eta from the scaled LP's augmented spectral norm,
-    # resolved after scaling.
-    if isinstance(adaptive_eta, str):
-        if adaptive_eta != "auto":
+    # adaptive_eta switches the line search; step_size is the starting eta
+    # either way ("auto": from the scaled LP's augmented spectral norm,
+    # resolved after scaling).
+    if adaptive_eta is not None and not isinstance(adaptive_eta, (bool, np.bool_)):
+        raise ValueError(
+            f"adaptive_eta must be True, False or None, got {adaptive_eta!r}; "
+            "pass the starting step as step_size=..."
+        )
+    if isinstance(step_size, str):
+        if step_size != "auto":
             raise ValueError(
-                f"adaptive_eta must be a float >= 0 or 'auto', got {adaptive_eta!r}"
+                f"step_size must be a float > 0 or 'auto', got {step_size!r}"
             )
-    elif adaptive_eta is None or adaptive_eta < 0.0:
-        raise ValueError("adaptive_eta must be a float >= 0 or 'auto' (0.0 = auto)")
-    elif adaptive_eta == 0.0:
-        adaptive_eta = "auto"
-    return k_lo, k_hi, adaptive_eta, update_mode == "halpern"
+    elif not step_size > 0.0:
+        raise ValueError(f"step_size must be a float > 0 or 'auto', got {step_size!r}")
+    return k_lo, k_hi, bool(adaptive_eta), step_size, update_mode == "halpern"
 
 
 def _relative_gap(duality_gap, objective_value):
@@ -700,7 +713,7 @@ def _device_solver(
     k_init,
     k_lo,
     k_hi,
-    adaptive_eta,
+    eta_init,
     halpern,
     vertex_bias,
     primal_damping,
@@ -739,6 +752,7 @@ def _device_solver(
     diag_adapt=False,
     diag_theta=0.5,
     diag_clamp=10.0,
+    adaptive_step=True,
 ):
     """The device side of ``solve()``: everything that runs inside its jitted
     epoch loop, built for one scaled problem.
@@ -1150,7 +1164,7 @@ def _device_solver(
         _pik_dtype = initial_solution.primal.dtype
         opt_state = (
             jnp.asarray(k_init, _pik_dtype),
-            jnp.asarray(adaptive_eta, _pik_dtype),
+            jnp.asarray(eta_init, _pik_dtype),
         )
         if halpern:
             opt_state = opt_state + (initial_solution,)
@@ -1314,6 +1328,7 @@ def _device_solver(
             merit_fn=_inloop_merit if check_every else None,
             check_every=check_every,
             diag=diag_adapt,
+            adaptive_step=adaptive_step,
         )
         inloop_restart_check = bool(check_every) and restarts
         ipe_after_restart = max(
@@ -1552,7 +1567,7 @@ def _device_solver(
                     # cycle-start iterate.
                     opt_restart = (
                         k_new,
-                        jnp.asarray(adaptive_eta, opt[1].dtype),
+                        jnp.asarray(eta_init, opt[1].dtype),
                         restart_point,
                     )
                 else:
@@ -1813,7 +1828,7 @@ _DEVICE_DATA = (
     "initial_solution",
     "initial_opt_state",
     "k_init",
-    "adaptive_eta",
+    "eta_init",
 )
 
 
@@ -1911,7 +1926,8 @@ def solve(
     k_theta=0.5,
     k_init=None,
     k_update_per_epoch=False,
-    adaptive_eta=1.0,
+    adaptive_eta=True,
+    step_size=1.0,
     scale=True,
     scaled_objective=True,
     scaled_rhs=True,
@@ -1951,9 +1967,10 @@ def solve(
     gap within ``dual_gap_tolerance`` (normalised by 1+|primal_obj|+|dual_obj|,
     the PDLP/cuPDLP convention, so RDG is directly comparable to PDLP).
 
-    Every update_mode is cuPDLP-style adaptive PDHG: plain projected
-    primal-descent / dual-ascent steps with a per-iteration line-searched step
-    size ``eta`` and a primal weight ``k`` (no optimiser plug-in).
+    Every update_mode is PDHG: plain projected primal-descent / dual-ascent
+    steps with a step size ``eta`` and a primal weight ``k`` (no optimiser
+    plug-in). ``eta`` starts at ``step_size`` and is line-searched every
+    iteration (cuPDLP-style) unless ``adaptive_eta`` is off.
 
     Adaptive restarts (PDLP-style) accelerate ill-conditioned problems. A
     restart resets the averaging (and the halpern anchor) while keeping the current
@@ -2090,17 +2107,25 @@ def solve(
             ``False`` (default, the PDLP convention) keeps k frozen between
             restarts: under a wide ``k_scale`` clamp the per-epoch update let k
             run away on mzzv11 (k→1e8, gap 0.94).
-        adaptive_eta: Seed for the cuPDLP-style per-iteration adaptive step
-            ``eta``, which drives the primal step ``tau = eta / k`` and dual step
-            ``sigma = eta * k``. Each iteration takes a trial step, forms the
-            largest admissible step from the interaction term
+        adaptive_eta: Switches the cuPDLP-style per-iteration line search on
+            the step ``eta`` (default ``True``). Each iteration takes a trial
+            step, forms the largest admissible step from the interaction term
             ``(y^{k+1}-y^k)ᵀ A (x^{k+1}-x^k)``, and rejects + shrinks ``eta`` if
             the trial overshot; ``eta`` is then advanced with a two-sided guard.
-            A float > 0 sets the seed directly (default ``1.0``, a natural scale
-            once Ruiz/PC scaling has brought ``||A||`` to O(1)); ``"auto"`` (or
-            ``0.0``) seeds it at ``1/||[[A,b],[c,0]]||_2`` of the scaled LP,
-            estimated by power iteration. The line search corrects a poor seed
-            within a few iterations. The learned ``eta`` is carried across restarts.
+            The line search corrects a poor ``step_size`` within a few
+            iterations, and the learned ``eta`` is carried across restarts.
+            ``False`` (or ``None``) holds ``eta = step_size`` fixed and accepts
+            every step: plain PDHG, stable while ``eta * ||A||_2 < 1`` in the
+            metric the solve runs in (``step_size="auto"`` ensures it at the
+            start). ``diag_adapt`` changes that metric at each restart, by up
+            to a factor ``diag_clamp`` per coordinate, which can break the bound;
+            pass ``diag_adapt=False`` with a fixed step to keep it.
+        step_size: The starting step ``eta``, which drives the primal step
+            ``tau = eta / k`` and dual step ``sigma = eta * k``. A float > 0
+            sets it directly (default ``1.0``, a natural scale once Ruiz/PC
+            scaling has brought ``||A||`` to O(1)); ``"auto"`` sets it to
+            ``0.99/||[[A,b],[c,0]]||_2`` of the scaled LP, estimated by power
+            iteration. Halpern resets ``eta`` to it at each restart.
         k_theta: Smoothing coefficient for the log-space primal-weight update at
             each restart / epoch. A float fixes it (default ``0.5``, as in PDLP;
             smaller = slower adaptation).
@@ -2230,13 +2255,14 @@ def solve(
     if verbose:
         print("----------------------------------------------")
 
-    k_lo, k_hi, adaptive_eta, halpern = _check_settings(
+    k_lo, k_hi, adaptive_step, step_size, halpern = _check_settings(
         dual_residual,
         termination_norm,
         restart_norm,
         update_mode,
         k_scale,
         adaptive_eta,
+        step_size,
         gap_test,
     )
 
@@ -2280,11 +2306,12 @@ def solve(
         # shallow copy suffices.
         lp = copy.copy(lp) if isinstance(lp, JaddleLP) else to_jaddle_sparse(lp)
 
-    if adaptive_eta == "auto":
-        adaptive_eta = 1 / float(estimate_augmented_spectral_norm(lp))
-        if verbose:
-            print(f"Adaptive step size seed set to 1/||A||_2 = {adaptive_eta:.3e}")
-            print("----------------------------------------------")
+    if step_size == "auto":
+        step_size = 0.99 / float(estimate_augmented_spectral_norm(lp))
+    if verbose:
+        kind = "Adaptive step size seed" if adaptive_step else "Fixed step size"
+        print(f"{kind} set to {step_size:.3e}")
+        print("----------------------------------------------")
 
     # A user-supplied initial_solution is given in the LP's original (unscaled)
     # space, so it must be mapped into the scaled space the solver iterates in.
@@ -2417,6 +2444,7 @@ def solve(
         diag_adapt=diag_adapt,
         diag_theta=diag_theta,
         diag_clamp=diag_clamp,
+        adaptive_step=adaptive_step,
         polish_trigger=(
             None if _polish_trigger is None else (0, _polish_trigger[1])
         ),
@@ -2433,7 +2461,7 @@ def solve(
         initial_solution=initial_solution,
         initial_opt_state=initial_opt_state,
         k_init=None if k_init is None else jnp.asarray(k_init, _state_dtype),
-        adaptive_eta=jnp.asarray(adaptive_eta, _state_dtype),
+        eta_init=jnp.asarray(step_size, _state_dtype),
     )
     carry, termination_norms = programs.init(problem)
     if _polish_trigger is not None:
@@ -2698,7 +2726,8 @@ def make_solver(
     k_theta=0.5,
     k_init=None,
     k_update_per_epoch=False,
-    adaptive_eta=1.0,
+    adaptive_eta=True,
+    step_size=1.0,
     scale=True,
     scaled_objective=True,
     scaled_rhs=True,
@@ -2762,13 +2791,14 @@ def make_solver(
     Batched members iterate in lockstep until the last one stops (finished
     members are frozen).
     """
-    k_lo, k_hi, adaptive_eta_setting, halpern = _check_settings(
+    k_lo, k_hi, adaptive_step, step_size, halpern = _check_settings(
         dual_residual,
         termination_norm,
         restart_norm,
         update_mode,
         k_scale,
         adaptive_eta,
+        step_size,
         gap_test,
     )
     float_dtype, compute_dtype = __profile_dtypes()
@@ -2815,9 +2845,9 @@ def make_solver(
             dc = jnp.ones(scaled.c.shape[0], scaled.c.dtype)
             c_max = jnp.ones((), scaled.c.dtype)
 
-        eta = adaptive_eta_setting
+        eta = step_size
         if eta == "auto":
-            eta = 1 / estimate_augmented_spectral_norm(scaled)
+            eta = 0.99 / estimate_augmented_spectral_norm(scaled)
 
         state_dtype = scaled.c.dtype
         row_scale_eq = dr[:n_eq].astype(state_dtype)
@@ -2854,7 +2884,7 @@ def make_solver(
             k_init=k_init,
             k_lo=k_lo,
             k_hi=k_hi,
-            adaptive_eta=eta,
+            eta_init=eta,
             halpern=halpern,
             vertex_bias=0.0,
             primal_damping=primal_damping,
@@ -2894,6 +2924,7 @@ def make_solver(
             diag_adapt=diag_adapt,
             diag_theta=diag_theta,
             diag_clamp=diag_clamp,
+            adaptive_step=adaptive_step,
         )
         carry = build_chunk(iterations_per_epoch)(carry, n_epochs)
 

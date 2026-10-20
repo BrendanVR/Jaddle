@@ -68,7 +68,7 @@ differentiated with respect to the LP's data, and solves batch with `vmap`
 
 **Composable optimisation primitives.** The convex solver builds on
 [Optax](https://github.com/google-deepmind/optax). It uses Optax's projection
-operators, and with `adaptive_eta=None` it accepts any Optax gradient
+operators, and with `adaptive_eta=False` it accepts any Optax gradient
 transformation as the update rule. A new primal–dual variant is often only a
 few lines of code: for example, giving the primal player plain gradient descent
 and the dual player Nesterov momentum.
@@ -227,7 +227,9 @@ some refinements of our own.
 iteration the step `η` is checked against a local estimate of the interaction
 term `(Δy)ᵀ A (Δx)`. A step that overshoots is rejected and shrunk. An accepted
 step is advanced conservatively. The step size learned during a solve is
-carried across restarts.
+carried across restarts. `adaptive_eta=False` turns the line search off and
+holds `η` at `step_size` (plain PDHG; `step_size="auto"` picks a step that is
+stable for the scaled problem).
 
 **Primal weight.** The primal and dual step sizes are `η / k` and `η · k`. The
 primal weight `k` is initialised from the ratio `‖c‖ / ‖b‖`. At each restart it
@@ -279,6 +281,7 @@ the dual objective as in PDLP, so far-away finite bounds do not swamp the gap.
 | `restarts`, `epochs_per_restart` | `True`, `None` | Adaptive restarts and the length cap of a restart cycle (`None` = no cap). |
 | `restart_decay`, `necessary_decay` | `0.2`, `0.8` | Thresholds for the sufficient-progress and stalling restarts. |
 | `k_scale`, `k_theta`, `k_init` | `1e8`, `0.5`, `None` | Clamp band, smoothing and initial value for the primal weight. |
+| `adaptive_eta`, `step_size` | `True`, `1.0` | Line search on the step `η` (off: `η` stays fixed), and the starting `η` (`"auto"` = `0.99/‖[[A, b], [cᵀ, 0]]‖₂`). |
 | `diag_adapt`, `diag_theta`, `diag_clamp` | `True`, `0.5`, `10.0` | Per-coordinate diagonal step metric on top of the scaling, adapted at each restart (larger steps for steadily drifting coordinates, smaller for oscillating ones). |
 | `ruiz_iterations`, `pc_iterations` | `10`, `1` | Number of preconditioning sweeps. |
 | `initial_solution`, `initial_opt_state` | `None` | Warm start from a previous solve's `solution` and `opt_state`. |
@@ -503,13 +506,13 @@ automatic differentiation. No derivatives are required from the user.
 
 | Mode | Gradient evaluations per iteration | Description |
 |---|---|---|
-| `"alternating"` (default) | 1 | Primal step, then a dual step at the new primal point: PDHG without the extrapolation. With `adaptive_eta=None` the update rule is a user-supplied Optax optimiser. Best used with restarts. |
+| `"alternating"` (default) | 1 | Primal step, then a dual step at the new primal point: PDHG without the extrapolation. With `adaptive_eta=False` the update rule is a user-supplied Optax optimiser. Best used with restarts. |
 | `"extragradient"` | 2 | Korpelevich extragradient: a look-ahead step followed by a corrector step. Contractive for monotone problems. |
 | `"pdhg"` | 1 | PDHG as in the LP solver: a primal step, then a dual step that reads the extrapolated constraint values `2g(x⁺) − g(x)`. One gradient plus one constraint evaluation per iteration. Requires the adaptive step. |
 
-**Adaptive step size.** With `adaptive_eta=1.0` (the default, as in the LP
-solver), every scheme uses a Malitsky–Tam line search
-based on a local Lipschitz estimate. The two gradient evaluations that
+**Adaptive step size.** With `adaptive_eta=True` (the default, as in the LP
+solver), every scheme uses a Malitsky–Tam line search, started from
+`step_size` and based on a local Lipschitz estimate. The two gradient evaluations that
 extragradient already performs give an estimate of the local Lipschitz
 constant at no extra cost. PDHG and alternating get their estimate from
 consecutive iterations, so they check each step one iteration late and undo
@@ -540,7 +543,7 @@ and the returned duals stay in the problem's own units.
 `jc.quadratic_program` scales its matrices itself, so it turns gradient
 scaling off unless asked.
 
-**Custom optimisers.** With `adaptive_eta=None`, `optimiser` accepts any Optax
+**Custom optimisers.** With `adaptive_eta=False`, `optimiser` accepts any Optax
 `GradientTransformation`. It is applied separately to the primal and dual
 players through `jaddle_optimisers.create_saddle_optimiser`. Ready-made
 choices include `jo.gd`, `jo.optimistic_gd`, `jo.optimistic_adadelta` and
@@ -567,8 +570,8 @@ their tolerances:
 | Argument | Default | Purpose |
 |---|---|---|
 | `update_mode` | `"alternating"` | Iteration scheme (see above). |
-| `adaptive_eta` | `1.0` | Seed of the adaptive line-searched step. `None` uses the optimiser's fixed learning rate instead. |
-| `optimiser` | `None` | Optax optimiser for the fixed step (`adaptive_eta=None`). When `None`, gradient descent with learning rate 0.5 is used. |
+| `adaptive_eta`, `step_size` | `True`, `1.0` | Line search on the step `η`, and the starting `η`. With `adaptive_eta=False` the optimiser's fixed step is used instead. |
+| `optimiser` | `None` | Optax optimiser for the fixed step (`adaptive_eta=False`). When `None`, gradient descent with learning rate `step_size` is used. |
 | `iterations_per_epoch` | `256` | Iterations per compiled epoch. |
 | `max_epochs`, `max_seconds` | `None` | Iteration and wall-clock budgets. |
 | `k_scale`, `k_theta`, `k_init` | `100.0`, `0.5`, `None` | Primal weight controls. `k_scale=None` disables the primal weight. |
