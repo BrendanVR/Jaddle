@@ -257,6 +257,14 @@ def parse_args():
         help="JAX precision profile passed to jaddle_optimisers.configure_jax "
         "(default: float64).",
     )
+    p.add_argument(
+        "--diag-clamp",
+        type=float,
+        default=10.0,
+        help="diag_adapt clamp passed to jl.solve: the per-coordinate diagonal "
+        "scalings stay in [1/diag_clamp, diag_clamp] around the Ruiz+PC baseline "
+        "(default: %(default)s).",
+    )
     add_cost_col_floor_flag(p)
     add_norm_flag(p)
     add_polish_flags(p)
@@ -376,12 +384,14 @@ def jaddle_solve_kwargs(
     gap_tol=None,
     norm="l2",
     gap_test="pdlp",
+    diag_clamp=10.0,
 ):
     """The ``jl.solve`` settings every benchmark harness uses, so all of them
     (and benchmark_mpax.py's Jaddle arm) run the same configuration.
     ``gap_tol`` (default: ``tol``) sets the duality-gap tolerance alone.
     ``norm`` (``"l2"`` or ``"inf"``) sets both the termination and the
-    restart norm. ``gap_test`` is ``jl.solve``'s."""
+    restart norm. ``gap_test`` is ``jl.solve``'s. ``diag_clamp`` is the
+    ``diag_adapt`` clamp (``jl.solve``'s)."""
     return dict(
         max_epochs=max_epochs,
         max_seconds=max_seconds,
@@ -395,7 +405,7 @@ def jaddle_solve_kwargs(
         cost_col_floor=cost_col_floor,
         termination_norm=norm,
         restart_norm=norm,
-        diag_clamp=1e10,
+        diag_clamp=diag_clamp,
     )
 
 
@@ -412,6 +422,7 @@ def run_jaddle(
     norm="l2",
     gap_test="pdlp",
     refine=False,
+    diag_clamp=10.0,
 ):
     """Solve with Jaddle's saddle-point solver. Returns a dict of metrics.
 
@@ -450,6 +461,7 @@ def run_jaddle(
             gap_tol,
             norm,
             gap_test,
+            diag_clamp,
         ),
     )
     wall_seconds = time.perf_counter() - t0
@@ -502,6 +514,7 @@ def run_jaddle_presolved(
     norm="l2",
     gap_test="pdlp",
     refine=False,
+    diag_clamp=10.0,
 ):
     """Solve an instance file with ``jl.solve_with_presolve`` (HiGHS presolve,
     optional defined-variable elimination, Jaddle, postsolve). Returns a dict
@@ -534,6 +547,7 @@ def run_jaddle_presolved(
             gap_tol,
             norm,
             gap_test,
+            diag_clamp,
         ),
     )
     wall_seconds = time.perf_counter() - t0
@@ -586,6 +600,7 @@ def run_jaddle_unpresolved(
     norm="l2",
     gap_test="pdlp",
     refine=False,
+    diag_clamp=10.0,
 ):
     """Solve an instance file's LP relaxation as given (no presolve) with
     ``run_jaddle``. The certificate is then on the original LP, so
@@ -605,6 +620,7 @@ def run_jaddle_unpresolved(
         norm=norm,
         gap_test=gap_test,
         refine=refine,
+        diag_clamp=diag_clamp,
     )
     res["jaddle_obj"] = sign * res["jaddle_obj"] + offset
     res["jaddle_original_certified"] = res["jaddle_converged"]
@@ -699,6 +715,7 @@ def main():
                 norm=args.norm,
                 gap_test=args.gap_test,
                 refine=args.refine,
+                diag_clamp=args.diag_clamp,
             )
             if args.presolve:
                 jres = run_jaddle_presolved(

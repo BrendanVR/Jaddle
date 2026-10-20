@@ -2139,17 +2139,21 @@ def _equilibrate_kkt(Q, A, ruiz_iterations, pc_iterations):
 # A product with a BCOO matrix gathers and scatters every entry, where a dense
 # one is a single BLAS call: on a GPU the dense product wins from about a
 # quarter of the entries being nonzero, by 9x (n = 1000) to 40x (n = 4000) on a
-# full matrix.
+# full matrix. A small matrix is dense whatever its density: its dense product
+# is one cheap call, and under vmap a batched one, where a batched BCOO product
+# was 9x slower at 105 x 120 with 20% nonzeros (examples/cp/mpc_fleet.py).
 _DENSE_DENSITY = 0.25
+_DENSE_SIZE = 1 << 16
 
 
 def _device_matrix(A, dtype):
     """The scipy matrix ``A`` on the device with ``dtype`` data: a dense array
-    if at least ``_DENSE_DENSITY`` of its entries are nonzero, else a BCOO."""
+    if it has at most ``_DENSE_SIZE`` entries or at least ``_DENSE_DENSITY``
+    of them are nonzero, else a BCOO."""
     from jaddle.jaddle_basic_types import scipy_to_bcoo
 
     size = A.shape[0] * A.shape[1]
-    if size > 0 and A.nnz >= _DENSE_DENSITY * size:
+    if size > 0 and (size <= _DENSE_SIZE or A.nnz >= _DENSE_DENSITY * size):
         return jax.device_put(A.toarray().astype(jnp.dtype(dtype)))
     return scipy_to_bcoo(A, dtype)
 
@@ -2199,6 +2203,136 @@ def _qp_certificate(Q, c, A_eq, b_eq, A_ineq, b_ineq, lower, upper, solution):
         "relative_primal_feasibility_residual": float(primal_residual / (1 + b_norm)),
         "relative_dual_feasibility_residual": float(dual_residual / (1 + c_norm)),
     }
+
+
+def _matvec(M, v):
+    """``M @ v`` at full precision for a dense ``M``. Under ``vmap`` a product
+    with a shared matrix becomes a matrix-matrix product, which the float32
+    profile would run in TF32 (about 3 significant digits)."""
+    if isinstance(M, jax.Array):
+        return jnp.matmul(M, v, precision="highest")
+    return M @ v
+
+
+def _scaled_qp_cp(matrices, c_s, b_eq_s, b_ineq_s, c_norm, b_norm):
+    """The ``JaddleCP`` of a KKT-scaled QP, with the QP certificate (in the
+    problem's own units) as its ``residuals``. ``matrices`` is
+    ``(Q_s, A_eq_s, A_eq_T, A_ineq_s, A_ineq_T, lower_s, upper_s, d, e_eq,
+    e_ineq)``: the scaled data and the variable and row scales. ``c_norm``
+    and ``b_norm`` are the l2 norms of the unscaled ``c`` and ``b``."""
+    Q_s, A_eq_s, A_eq_T, A_ineq_s, A_ineq_T, lower_s, upper_s, d, e_eq, e_ineq = (
+        matrices
+    )
+
+    def objective(x):
+        # Q is symmetric, so the gradient is Qx + c: one product with Q,
+        # where differentiating xᵀQx would take a second with Qᵀ.
+        Qx = jax.lax.stop_gradient(_matvec(Q_s, x))
+        return x @ Qx - 0.5 * jax.lax.stop_gradient(x) @ Qx + c_s @ x
+
+    def residuals(state):
+        # _qp_certificate on the scaled problem: a residual of the original
+        # is the scaled one over its row's or column's scale, and the
+        # objectives and bound terms are the same numbers in either.
+        x = state.primal
+        Qx = _matvec(Q_s, x)
+        reduced_cost = (
+            Qx
+            + c_s
+            + _matvec(A_eq_T, state.dual_eq)
+            + _matvec(A_ineq_T, state.dual_ineq)
+        )
+        at_lower = (reduced_cost > 0) & jnp.isfinite(lower_s)
+        at_upper = (reduced_cost < 0) & jnp.isfinite(upper_s)
+        bound_term = jnp.sum(
+            reduced_cost
+            * jnp.where(at_lower, lower_s, jnp.where(at_upper, upper_s, 0.0))
+        )
+        dual_residual = jnp.linalg.norm(
+            jnp.where(at_lower | at_upper, 0.0, reduced_cost) / d
+        )
+        primal_residual = jnp.linalg.norm(
+            jnp.concatenate(
+                [
+                    (_matvec(A_eq_s, x) - b_eq_s) / e_eq,
+                    jnp.maximum(_matvec(A_ineq_s, x) - b_ineq_s, 0.0) / e_ineq,
+                ]
+            )
+        )
+        primal_objective = 0.5 * x @ Qx + c_s @ x
+        dual_objective = (
+            -0.5 * x @ Qx
+            - b_eq_s @ state.dual_eq
+            - b_ineq_s @ state.dual_ineq
+            + bound_term
+        )
+        return (
+            dual_residual / (1 + jnp.maximum(c_norm, jnp.linalg.norm(Qx / d))),
+            primal_residual / (1 + b_norm),
+            jnp.abs(primal_objective - dual_objective)
+            / (1 + jnp.abs(primal_objective) + jnp.abs(dual_objective)),
+        )
+
+    return JaddleCP(
+        num_variables=c_s.shape[0],
+        objective=objective,
+        constraints_eq=lambda x: _matvec(A_eq_s, x) - b_eq_s,
+        constraints_ineq=lambda x: _matvec(A_ineq_s, x) - b_ineq_s,
+        lower_bounds=lower_s,
+        upper_bounds=upper_s,
+        residuals=residuals,
+    )
+
+
+def _scale_qp(
+    Q, n, A_eq, A_ineq, lower_bounds, upper_bounds, ruiz_iterations, pc_iterations
+):
+    """Check a QP's matrices and KKT-scale them. Returns the matrices as
+    scipy CSR (``None`` blocks as empty ones), the bounds as float arrays,
+    the variable scales ``d`` and row scales ``e`` (eq rows first), and the
+    scaled device data ``_scaled_qp_cp`` takes as ``matrices``."""
+    import scipy.sparse as sp
+
+    Q = sp.csr_matrix(Q, dtype=np.float64)
+    if Q.shape != (n, n):
+        raise ValueError(f"Q has shape {Q.shape}, expected {(n, n)}")
+    if abs(Q - Q.T).max() > 1e-12 * max(abs(Q).max(), 1.0):
+        raise ValueError("Q must be symmetric")
+
+    def block(A):
+        if A is None:
+            return sp.csr_matrix((0, n))
+        return sp.csr_matrix(A, dtype=np.float64)
+
+    A_eq, A_ineq = block(A_eq), block(A_ineq)
+    m_eq = A_eq.shape[0]
+    lower = (
+        np.full(n, -np.inf) if lower_bounds is None else np.asarray(lower_bounds, float)
+    )
+    upper = (
+        np.full(n, np.inf) if upper_bounds is None else np.asarray(upper_bounds, float)
+    )
+
+    d, e = _equilibrate_kkt(
+        Q, sp.vstack([A_eq, A_ineq]), ruiz_iterations, pc_iterations
+    )
+    D = sp.diags(d)
+    dtype = jo.jaddle_dtype()
+    A_eq_scipy = sp.diags(e[:m_eq]) @ A_eq @ D
+    A_ineq_scipy = sp.diags(e[m_eq:]) @ A_ineq @ D
+    matrices = (
+        _device_matrix(D @ Q @ D, dtype),
+        _device_matrix(A_eq_scipy, dtype),
+        _device_matrix(A_eq_scipy.T, dtype),
+        _device_matrix(A_ineq_scipy, dtype),
+        _device_matrix(A_ineq_scipy.T, dtype),
+        jnp.asarray(lower / d, dtype=dtype),
+        jnp.asarray(upper / d, dtype=dtype),
+        jnp.asarray(d, dtype=dtype),
+        jnp.asarray(e[:m_eq], dtype=dtype),
+        jnp.asarray(e[m_eq:], dtype=dtype),
+    )
+    return Q, A_eq, A_ineq, lower, upper, d, e, matrices
 
 
 def quadratic_program(
@@ -2264,107 +2398,28 @@ def quadratic_program(
     already equilibrates the rows, so ``gradient_scaling`` defaults to
     ``False`` here.
     """
-    import scipy.sparse as sp
-
     c = np.asarray(c, dtype=np.float64)
-    n = c.shape[0]
-    Q = sp.csr_matrix(Q, dtype=np.float64)
-    if Q.shape != (n, n):
-        raise ValueError(f"Q has shape {Q.shape}, expected {(n, n)}")
-    if abs(Q - Q.T).max() > 1e-12 * max(abs(Q).max(), 1.0):
-        raise ValueError("Q must be symmetric")
-
-    def block(A, b):
-        if A is None:
-            return sp.csr_matrix((0, n)), np.zeros(0)
-        return sp.csr_matrix(A, dtype=np.float64), np.asarray(b, dtype=np.float64)
-
-    A_eq, b_eq = block(A_eq, b_eq)
-    A_ineq, b_ineq = block(A_ineq, b_ineq)
+    Q, A_eq, A_ineq, lower, upper, d, e, matrices = _scale_qp(
+        Q,
+        c.shape[0],
+        A_eq,
+        A_ineq,
+        lower_bounds,
+        upper_bounds,
+        ruiz_iterations,
+        pc_iterations,
+    )
     m_eq = A_eq.shape[0]
-    lower = (
-        np.full(n, -np.inf) if lower_bounds is None else np.asarray(lower_bounds, float)
-    )
-    upper = (
-        np.full(n, np.inf) if upper_bounds is None else np.asarray(upper_bounds, float)
-    )
-
-    d, e = _equilibrate_kkt(
-        Q, sp.vstack([A_eq, A_ineq]), ruiz_iterations, pc_iterations
-    )
-    D = sp.diags(d)
+    b_eq = np.asarray(b_eq, dtype=np.float64) if m_eq else np.zeros(0)
+    b_ineq = np.asarray(b_ineq, dtype=np.float64) if A_ineq.shape[0] else np.zeros(0)
     dtype = jo.jaddle_dtype()
-    A_eq_scipy = sp.diags(e[:m_eq]) @ A_eq @ D
-    A_ineq_scipy = sp.diags(e[m_eq:]) @ A_ineq @ D
-    Q_s = _device_matrix(D @ Q @ D, dtype)
-    A_eq_s, A_eq_T = (_device_matrix(m, dtype) for m in (A_eq_scipy, A_eq_scipy.T))
-    A_ineq_s, A_ineq_T = (
-        _device_matrix(m, dtype) for m in (A_ineq_scipy, A_ineq_scipy.T)
-    )
-    c_s = jnp.asarray(d * c, dtype=dtype)
-    b_eq_s = jnp.asarray(e[:m_eq] * b_eq, dtype=dtype)
-    b_ineq_s = jnp.asarray(e[m_eq:] * b_ineq, dtype=dtype)
-    lower_s = jnp.asarray(lower / d, dtype=dtype)
-    upper_s = jnp.asarray(upper / d, dtype=dtype)
-    d_j = jnp.asarray(d, dtype=dtype)
-    e_eq, e_ineq = jnp.asarray(e[:m_eq], dtype=dtype), jnp.asarray(
-        e[m_eq:], dtype=dtype
-    )
-    b_norm = float(np.linalg.norm(np.concatenate([b_eq, b_ineq])))
-    c_norm = float(np.linalg.norm(c))
-
-    def objective(x):
-        # Q is symmetric, so the gradient is Qx + c: one product with Q,
-        # where differentiating xᵀQx would take a second with Qᵀ.
-        Qx = jax.lax.stop_gradient(Q_s @ x)
-        return x @ Qx - 0.5 * jax.lax.stop_gradient(x) @ Qx + c_s @ x
-
-    def residuals(state):
-        # _qp_certificate on the scaled problem: a residual of the original
-        # is the scaled one over its row's or column's scale, and the
-        # objectives and bound terms are the same numbers in either.
-        x = state.primal
-        Qx = Q_s @ x
-        reduced_cost = Qx + c_s + A_eq_T @ state.dual_eq + A_ineq_T @ state.dual_ineq
-        at_lower = (reduced_cost > 0) & jnp.isfinite(lower_s)
-        at_upper = (reduced_cost < 0) & jnp.isfinite(upper_s)
-        bound_term = jnp.sum(
-            reduced_cost
-            * jnp.where(at_lower, lower_s, jnp.where(at_upper, upper_s, 0.0))
-        )
-        dual_residual = jnp.linalg.norm(
-            jnp.where(at_lower | at_upper, 0.0, reduced_cost) / d_j
-        )
-        primal_residual = jnp.linalg.norm(
-            jnp.concatenate(
-                [
-                    (A_eq_s @ x - b_eq_s) / e_eq,
-                    jnp.maximum(A_ineq_s @ x - b_ineq_s, 0.0) / e_ineq,
-                ]
-            )
-        )
-        primal_objective = 0.5 * x @ Qx + c_s @ x
-        dual_objective = (
-            -0.5 * x @ Qx
-            - b_eq_s @ state.dual_eq
-            - b_ineq_s @ state.dual_ineq
-            + bound_term
-        )
-        return (
-            dual_residual / (1 + jnp.maximum(c_norm, jnp.linalg.norm(Qx / d_j))),
-            primal_residual / (1 + b_norm),
-            jnp.abs(primal_objective - dual_objective)
-            / (1 + jnp.abs(primal_objective) + jnp.abs(dual_objective)),
-        )
-
-    cp = JaddleCP(
-        num_variables=n,
-        objective=objective,
-        constraints_eq=lambda x: A_eq_s @ x - b_eq_s,
-        constraints_ineq=lambda x: A_ineq_s @ x - b_ineq_s,
-        lower_bounds=lower_s,
-        upper_bounds=upper_s,
-        residuals=residuals,
+    cp = _scaled_qp_cp(
+        matrices,
+        jnp.asarray(d * c, dtype=dtype),
+        jnp.asarray(e[:m_eq] * b_eq, dtype=dtype),
+        jnp.asarray(e[m_eq:] * b_ineq, dtype=dtype),
+        float(np.linalg.norm(c)),
+        float(np.linalg.norm(np.concatenate([b_eq, b_ineq]))),
     )
     if initial_solution is not None:
         initial_solution = SaddleState(
@@ -2401,3 +2456,117 @@ def quadratic_program(
         solution=solution, objective=certificate["objective"], certificate=certificate
     )
     return result
+
+
+def make_qp_solver(
+    Q,
+    A_eq=None,
+    A_ineq=None,
+    lower_bounds=None,
+    upper_bounds=None,
+    primal_feasibility_tolerance=1e-3,
+    dual_feasibility_tolerance=1e-3,
+    dual_gap_tolerance=1e-3,
+    ruiz_iterations=10,
+    pc_iterations=1,
+    **settings,
+):
+    """
+    Build a pure-JAX solve function for a family of quadratic programs that
+    share their matrices and bounds and differ only in ``c`` and ``b``:
+
+        minimise    ½ xᵀQx + cᵀx
+        subject to  A_eq   x  = b_eq
+                    A_ineq x <= b_ineq
+                    lower_bounds <= x <= upper_bounds
+
+    This is ``quadratic_program`` split in two. The matrices are checked and
+    KKT-scaled once, here, on the host; the scaling depends only on them, so
+    it serves every ``c`` and ``b``. The returned
+
+        solve_fn(c, b_eq=None, b_ineq=None, initial_solution=None)
+            -> SolveCoreResult
+
+    is ``make_solver``'s, so it can be ``jax.jit``-ed and ``jax.vmap``-ed over
+    a batch of vectors, as in model predictive control where the measured
+    state enters only the right-hand side::
+
+        solve_fn = jax.jit(jax.vmap(make_qp_solver(Q, A_ineq=G, max_epochs=50)))
+        batch = solve_fn(c_batch, b_ineq=h_batch)
+
+    ``b_eq`` (``b_ineq``) is required when ``A_eq`` (``A_ineq``) is given.
+    ``initial_solution`` and the returned ``solution`` are ``SaddleState``-s
+    in the problem's own units, with the multiplier signs of
+    ``quadratic_program``. The termination test is ``quadratic_program``'s
+    (relative, in the problem's own units). Other keyword arguments go to
+    ``make_solver``; ``gradient_scaling`` defaults to ``False``, since the
+    KKT scaling already equilibrates the rows.
+    """
+    n = Q.shape[0]
+    _, A_eq, A_ineq, _, _, d, e, matrices = _scale_qp(
+        Q,
+        n,
+        A_eq,
+        A_ineq,
+        lower_bounds,
+        upper_bounds,
+        ruiz_iterations,
+        pc_iterations,
+    )
+    m_eq, m_ineq = A_eq.shape[0], A_ineq.shape[0]
+    dtype = jo.jaddle_dtype()
+    d = jnp.asarray(d, dtype=dtype)
+    e_eq, e_ineq = jnp.asarray(e[:m_eq], dtype=dtype), jnp.asarray(e[m_eq:], dtype=dtype)
+
+    def build_cp(params):
+        return _scaled_qp_cp(matrices, *params)
+
+    settings.setdefault("gradient_scaling", False)
+    scaled_solve = make_solver(
+        build_cp,
+        primal_grad_norm_tolerance=dual_feasibility_tolerance,
+        primal_feasibility_tolerance=primal_feasibility_tolerance,
+        complementarity_slack_tolerance=dual_gap_tolerance,
+        **settings,
+    )
+
+    def rhs(b, m, name):
+        if m == 0:
+            return jnp.zeros(0, dtype)
+        if b is None:
+            raise ValueError(f"{name} is required when its matrix is given")
+        b = jnp.asarray(b, dtype=dtype)
+        if b.shape != (m,):
+            raise ValueError(f"{name} has shape {b.shape}, expected {(m,)}")
+        return b
+
+    def solve_fn(c, b_eq=None, b_ineq=None, initial_solution=None):
+        c = jnp.asarray(c, dtype=dtype)
+        if c.shape != (n,):
+            raise ValueError(f"c has shape {c.shape}, expected {(n,)}")
+        b_eq = rhs(b_eq, m_eq, "b_eq")
+        b_ineq = rhs(b_ineq, m_ineq, "b_ineq")
+        params = (
+            d * c,
+            e_eq * b_eq,
+            e_ineq * b_ineq,
+            jnp.linalg.norm(c),
+            jnp.linalg.norm(jnp.concatenate([b_eq, b_ineq])),
+        )
+        if initial_solution is not None:
+            initial_solution = SaddleState(
+                primal=jnp.asarray(initial_solution.primal, dtype) / d,
+                dual_ineq=jnp.asarray(initial_solution.dual_ineq, dtype) / e_ineq,
+                dual_eq=jnp.asarray(initial_solution.dual_eq, dtype) / e_eq,
+            )
+        result = scaled_solve(params, initial_solution)
+        scaled = result.solution
+        return result._replace(
+            solution=SaddleState(
+                primal=d * scaled.primal,
+                dual_ineq=e_ineq * scaled.dual_ineq,
+                dual_eq=e_eq * scaled.dual_eq,
+            )
+        )
+
+    return solve_fn

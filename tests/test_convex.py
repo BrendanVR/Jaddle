@@ -537,6 +537,82 @@ def test_quadratic_program_inequality_rows():
     )
 
 
+def random_qp(seed=0, n=12, m_eq=2, m_ineq=8):
+    """A feasible dense QP with eq rows, ineq rows and bounds, minus its c and
+    b (returned separately so they can be varied)."""
+    rng = np.random.default_rng(seed)
+    M = rng.standard_normal((n, n))
+    matrices = dict(
+        Q=M @ M.T / n + 0.1 * np.eye(n),
+        A_eq=rng.standard_normal((m_eq, n)),
+        A_ineq=rng.standard_normal((m_ineq, n)),
+        lower_bounds=-np.ones(n),
+        upper_bounds=np.ones(n),
+    )
+    return matrices, rng
+
+
+def random_qp_vectors(matrices, rng):
+    # b is built around a point inside the box, so every draw is feasible.
+    x0 = rng.uniform(-0.5, 0.5, matrices["Q"].shape[0])
+    c = rng.standard_normal(x0.shape[0])
+    b_eq = matrices["A_eq"] @ x0
+    b_ineq = matrices["A_ineq"] @ x0 + rng.uniform(0.0, 0.5, matrices["A_ineq"].shape[0])
+    return c, b_eq, b_ineq
+
+
+QP_SOLVER_SETTINGS = dict(QP_TOLS, iterations_per_epoch=200, max_epochs=300)
+
+
+def test_make_qp_solver_matches_quadratic_program():
+    matrices, rng = random_qp()
+    c, b_eq, b_ineq = random_qp_vectors(matrices, rng)
+    reference = jc.quadratic_program(
+        **matrices, c=c, b_eq=b_eq, b_ineq=b_ineq, **QP_SOLVER_SETTINGS
+    )
+    assert_qp_certified(reference)
+    solve_fn = jc.make_qp_solver(**matrices, **QP_SOLVER_SETTINGS)
+    result = solve_fn(c, b_eq, b_ineq)
+    assert bool(result.converged)
+    for a, b in zip(result.solution, reference["solution"]):
+        np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=1e-5)
+
+
+def test_make_qp_solver_vmap_batch():
+    matrices, rng = random_qp(seed=1)
+    batch = [random_qp_vectors(matrices, rng) for _ in range(5)]
+    c, b_eq, b_ineq = (jnp.asarray(np.stack(v)) for v in zip(*batch))
+    solve_fn = jc.make_qp_solver(**matrices, **QP_SOLVER_SETTINGS)
+    result = jax.jit(jax.vmap(solve_fn))(c, b_eq, b_ineq)
+    assert np.asarray(result.converged).all()
+    for i, (c_i, b_eq_i, b_ineq_i) in enumerate(batch):
+        reference = jc.quadratic_program(
+            **matrices, c=c_i, b_eq=b_eq_i, b_ineq=b_ineq_i, **QP_SOLVER_SETTINGS
+        )
+        np.testing.assert_allclose(
+            result.solution.primal[i], reference["solution"].primal, atol=1e-5
+        )
+
+
+def test_make_qp_solver_warm_start():
+    # Started at the solution of a nearby problem, the solve takes fewer epochs.
+    matrices, rng = random_qp(seed=2)
+    c, b_eq, b_ineq = random_qp_vectors(matrices, rng)
+    solve_fn = jax.jit(jc.make_qp_solver(**matrices, **QP_SOLVER_SETTINGS))
+    nearby = solve_fn(c + 1e-3, b_eq, b_ineq)
+    cold, warm = solve_fn(c, b_eq, b_ineq), solve_fn(c, b_eq, b_ineq, nearby.solution)
+    assert bool(cold.converged) and bool(warm.converged)
+    assert int(warm.epochs) < int(cold.epochs)
+    np.testing.assert_allclose(warm.solution.primal, cold.solution.primal, atol=1e-5)
+
+
+def test_make_qp_solver_requires_rhs():
+    matrices, _ = random_qp()
+    solve_fn = jc.make_qp_solver(**matrices)
+    with pytest.raises(ValueError, match="b_eq"):
+        solve_fn(np.zeros(12), b_ineq=np.zeros(8))
+
+
 def test_quadratic_program_is_scale_invariant():
     # The same problem in variables x = S z, with its row rescaled: unusable
     # as given, and the scaling recovers it, duals included.
@@ -590,11 +666,14 @@ def test_quadratic_program_dense_and_sparse_storage_agree(monkeypatch):
     )
     dtype = jo.jaddle_dtype()
     assert isinstance(jc._device_matrix(sp.csr_matrix(qp["Q"]), dtype), jax.Array)
-    assert isinstance(jc._device_matrix(sp.identity(n, format="csr"), dtype), BCOO)
+    # A small matrix is dense whatever its density; a large sparse one is not.
+    assert isinstance(jc._device_matrix(sp.identity(n, format="csr"), dtype), jax.Array)
+    assert isinstance(jc._device_matrix(sp.identity(300, format="csr"), dtype), BCOO)
     assert isinstance(jc._device_matrix(sp.csr_matrix((0, n)), dtype), BCOO)
 
     dense = solve_qp(qp)
     monkeypatch.setattr(jc, "_DENSE_DENSITY", np.inf)
+    monkeypatch.setattr(jc, "_DENSE_SIZE", 0)
     sparse = solve_qp(qp)
     assert_qp_certified(dense)
     assert_qp_certified(sparse)

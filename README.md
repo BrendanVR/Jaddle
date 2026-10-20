@@ -638,7 +638,7 @@ x = result["solution"].primal
 `Q` is symmetric positive semidefinite, the matrices are NumPy arrays or SciPy
 sparse matrices, and any constraint block or bound can be left out. Each
 matrix is held on the device as a dense array if at least a quarter of its
-entries are nonzero and as a sparse one otherwise, so a full `Q` (a kernel
+entries are nonzero (or it is small) and as a sparse one otherwise, so a full `Q` (a kernel
 matrix, say) costs one dense product per gradient. The
 function equilibrates the KKT matrix `[[Q, Aᵀ], [A, 0]]` symmetrically with
 Ruiz and Pock–Chambolle sweeps (`ruiz_iterations`, `pc_iterations`, as in the
@@ -668,6 +668,28 @@ the primal weight alone does not do.
 The stopping test is supplied through `JaddleCP`'s optional `residuals`
 argument, a function of the solver state that returns the three quantities
 `solve` tests. Any problem with a better certificate of its own can use it.
+
+Many QPs that share their matrices and differ only in `c` and `b` arise in
+model predictive control, parametric studies and scenario sweeps.
+`jc.make_qp_solver` is `quadratic_program` split in two for that case. It
+checks and scales the matrices once, on the host, and returns a pure-JAX
+`solve_fn` to `jit` and `vmap` over the vectors:
+
+```python
+solve_fn = jax.jit(jax.vmap(jc.make_qp_solver(
+    Q, A_ineq=A_ineq, lower_bounds=l, upper_bounds=u, max_epochs=100,
+)))
+result = solve_fn(c_batch, b_ineq=b_batch, initial_solution=warm_batch)
+x = result.solution.primal            # one row per problem
+```
+
+It has the same stopping test as `quadratic_program`, and `make_solver`'s
+result type (`solution`, `converged`, `epochs`). A matrix with at most 65,536
+entries is always held dense, since a batched dense product is far cheaper
+than a sparse one at that size.
+[`examples/cp/mpc_fleet.py`](examples/cp/mpc_fleet.py) controls a fleet of
+1000 systems this way. On a laptop GPU, each MPC solve took about 1/40 of the
+time of a warm-started SCS loop on the CPU.
 
 ## Modelling with CVXPY
 

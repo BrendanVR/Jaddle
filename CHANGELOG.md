@@ -4,6 +4,19 @@
 
 ### Added
 
+- `jc.make_qp_solver`: batched quadratic programs that share their
+  matrices. The matrices are checked and KKT-scaled once, and the returned
+  `solve_fn(c, b_eq, b_ineq, initial_solution)` is pure JAX, so it can be
+  `jit`-ed and `vmap`-ed over the vectors with warm starts. It has the same
+  scaling and stopping test as `jc.quadratic_program`, and both now build
+  their problem through one shared helper.
+- `examples/cp/mpc_fleet.py`: closed-loop MPC of 1000 oscillating-mass
+  systems, with all the fleet's QPs solved in one batched call per step.
+  Benchmarked against warm-started SCS, one solver per system, at a
+  tolerance of 1e-3. On an RTX 5070 Ti laptop GPU this took 10.5 us per QP
+  against SCS's 420 us. Jaddle's plans were also closer to a 1e-9 reference
+  (median relative cost error 5e-6 against SCS's 2e-4). SCS is faster for a
+  single system.
 - `jl.solve(adaptive_eta=False)` (or `None`) runs plain PDHG on a fixed
   step: the line search is off and `eta` stays at `step_size` for the whole
   solve. This restores the fixed-step LP solve removed on 2026-10-04.
@@ -108,6 +121,12 @@
   (29→14 epochs, 1.45→0.77 s). `jcv.solve` takes the flag too.
 
 ### Changed
+
+- Matrices given to `jc.quadratic_program` (and `jc.make_qp_solver`) with at
+  most 65,536 entries are held dense whatever their density. At 105 × 120
+  with 20% nonzeros, a batched BCOO product made the MPC example 9x slower.
+  Dense products of these matrices use full precision, so a `vmap`-ed solve
+  is not limited to TF32 accuracy.
 
 - `jl.solve` and `jl.make_solver`: the starting step moves from
   `adaptive_eta` to the new `step_size` (default `1.0`; `"auto"` is now
