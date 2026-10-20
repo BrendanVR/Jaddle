@@ -62,7 +62,10 @@ penalty = 20.0  # on position-limit violations; see below
 stiffness = 2 * np.eye(masses) - np.eye(masses, k=1) - np.eye(masses, k=-1)
 actuators = np.eye(masses, nu) - np.eye(masses, nu, k=-1)
 A_c = np.block(
-    [[np.zeros((masses, masses)), np.eye(masses)], [-stiffness, np.zeros((masses, masses))]]
+    [
+        [np.zeros((masses, masses)), np.eye(masses)],
+        [-stiffness, np.zeros((masses, masses))],
+    ]
 )
 B_c = np.vstack([np.zeros((masses, nu)), actuators])
 expm = scipy.linalg.expm(np.block([[A_c, B_c], [np.zeros((nu, nx + nu))]]) * dt)
@@ -105,9 +108,7 @@ positions = np.kron(np.eye(horizon), np.eye(masses, nx))  # S
 
 n_u, n_e = nu * horizon, masses * horizon
 Q = scipy.linalg.block_diag(Gamma.T @ Gamma + np.eye(n_u), np.zeros((n_e, n_e)))
-G = np.block(
-    [[positions @ Gamma, -np.eye(n_e)], [-positions @ Gamma, -np.eye(n_e)]]
-)
+G = np.block([[positions @ Gamma, -np.eye(n_e)], [-positions @ Gamma, -np.eye(n_e)]])
 lower = np.r_[np.full(n_u, -u_max), np.zeros(n_e)]
 upper = np.r_[np.full(n_u, u_max), np.full(n_e, np.inf)]
 print(f"QP: {Q.shape[0]} variables, {G.shape[0]} inequality rows, plus bounds")
@@ -164,7 +165,10 @@ rng = np.random.default_rng(0)
 
 def random_fleet(n, steps):
     x0 = rng.uniform(-1, 1, (n, nx)) * np.r_[np.full(masses, 2.0), np.full(masses, 0.5)]
-    w = rng.uniform(-w_max, w_max, (steps, n, nx)) * np.r_[np.zeros(masses), np.ones(masses)]
+    w = (
+        rng.uniform(-w_max, w_max, (steps, n, nx))
+        * np.r_[np.zeros(masses), np.ones(masses)]
+    )
     return x0, w
 
 
@@ -204,7 +208,9 @@ def make_controller(max_epochs=100):
             max_epochs=max_epochs,
         )
     )
-    Phi_j, Gamma_j, S_j, A_j, B_j = (jnp.asarray(m) for m in (Phi, Gamma, positions, A, B))
+    Phi_j, Gamma_j, S_j, A_j, B_j = (
+        jnp.asarray(m) for m in (Phi, Gamma, positions, A, B)
+    )
 
     @jax.jit
     def step(x, warm, w):
@@ -213,7 +219,9 @@ def make_controller(max_epochs=100):
         with jax.default_matmul_precision("highest"):
             predicted = x @ Phi_j.T
             p = predicted @ S_j.T
-            c = jnp.concatenate([predicted @ Gamma_j, jnp.full((x.shape[0], n_e), penalty)], 1)
+            c = jnp.concatenate(
+                [predicted @ Gamma_j, jnp.full((x.shape[0], n_e), penalty)], 1
+            )
             b_ineq = jnp.concatenate([p_max - p, p_max + p], axis=1)
             result = solve(c, b_ineq=b_ineq, initial_solution=warm)
             z = result.solution.primal
@@ -416,6 +424,153 @@ for run, name in [(jaddle_gpu, "Jaddle"), (scs_run, "SCS")]:
         f"{name}: largest planned slack {run['plans'][..., n_u:].max():.1e},"
         f" {np.sum(excess > 1e-3)} / {fleet} systems went past p_max"
     )
+
+# %% [markdown]
+# ## Watching the fleet
+# The animation shows the Jaddle-controlled closed loop. On the left are four
+# systems of the fleet. Each mass is a block between springs, and the bar
+# above each pair of masses is the actuator between them: red when it draws
+# the pair together, blue when it pushes them apart. Each mass may move
+# within its shaded band, `|p| <= 3` from its rest position, and turns red
+# outside it.
+# The systems shown are the one that went furthest out, and three that
+# started far from rest. On the right is the whole fleet, one dot per
+# system, at the positions of its first and last masses: the controller
+# draws the cloud in from its random start, and the disturbances keep shaking
+# it. A dot turns red while any of its masses is past its limit.
+#
+# The controller acts every 0.5 s. The frames in between follow the exact
+# motion over the step, with the input held and the step's disturbance
+# spread evenly across it, so the animation plays in real time.
+from matplotlib.animation import FuncAnimation, PillowWriter
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import Normalize
+from matplotlib.patches import Rectangle
+
+substeps = 6  # frames per control step
+system_matrix = np.block([[A_c, B_c], [np.zeros((nu, nx + nu))]])
+
+
+def in_between_states(run):
+    """States at `substeps` points in each control step: shape
+    (steps * substeps + 1, fleet, nx)."""
+    states, inputs = run["states"], run["plans"][:, :, :nu]
+    frames = [states[0]]
+    for k in range(steps):
+        x, u = states[k], inputs[k]
+        w = states[k + 1] - (x @ A.T + u @ B.T)  # the step's disturbance
+        for j in range(1, substeps + 1):
+            M = scipy.linalg.expm(system_matrix * dt * j / substeps)
+            frames.append(x @ M[:nx, :nx].T + u @ M[:nx, nx:].T + (j / substeps) * w)
+    return np.stack(frames)
+
+
+frames = in_between_states(jaddle_gpu)
+frame_inputs = np.repeat(jaddle_gpu["plans"][:, :, :nu], substeps, axis=0)
+frame_inputs = np.concatenate([frame_inputs[:1], frame_inputs])
+positions_over_time = frames[:, :, :masses]
+furthest = int(np.argmax(np.abs(positions_over_time).max(axis=(0, 2))))
+started_far = np.argsort(-np.abs(x0[:, :masses]).max(axis=1))
+shown = [furthest] + [int(i) for i in started_far if i != furthest][:3]
+
+spacing, wall = 8.0, (masses + 1) * 8.0
+fig, (ax_chain, ax_fleet) = plt.subplots(
+    1, 2, figsize=(13, 5), gridspec_kw=dict(width_ratios=[1.6, 1])
+)
+ax_chain.set_xlim(-1, wall + 1)
+ax_chain.set_ylim(-0.7, len(shown) - 0.3)
+ax_chain.set_yticks(range(len(shown)), [f"system {i}" for i in shown])
+ax_chain.set_xticks([])
+ax_chain.invert_yaxis()
+for side in ["top", "right", "bottom", "left"]:
+    ax_chain.spines[side].set_visible(False)
+colormap, half, width = plt.get_cmap("coolwarm"), 0.18, 1.6  # drawn mass size
+fig.colorbar(
+    ScalarMappable(Normalize(-u_max, u_max), colormap),
+    ax=ax_chain,
+    orientation="horizontal",
+    fraction=0.04,
+    pad=0.02,
+    label="Actuator force (> 0 draws the pair together)",
+)
+
+
+def zigzag(left, right, y, coils=6, amplitude=0.08):
+    xs = np.linspace(left, right, 2 * coils + 2)
+    ys = np.full_like(xs, y)
+    ys[1:-1] += amplitude * np.where(np.arange(2 * coils) % 2 == 0, 1, -1)
+    return xs, ys
+
+
+chains = []
+for row in range(len(shown)):
+    for edge in (0.0, wall):
+        ax_chain.plot([edge, edge], [row - 0.3, row + 0.3], color="0.3", linewidth=3)
+    for i in range(masses):
+        rest = spacing * (i + 1)
+        ax_chain.fill_between(
+            [rest - p_max, rest + p_max], row - 0.3, row + 0.3, color="0.93", zorder=0
+        )
+    springs = [
+        ax_chain.plot([], [], color="0.5", linewidth=1)[0] for _ in range(masses + 1)
+    ]
+    blocks = [
+        ax_chain.add_patch(Rectangle((0, row - half), width, 2 * half, zorder=3))
+        for _ in range(masses)
+    ]
+    actuators = [
+        ax_chain.plot([], [], linewidth=3, solid_capstyle="butt", zorder=2)[0]
+        for _ in range(nu)
+    ]
+    chains.append((row, springs, blocks, actuators))
+
+fleet_dots = ax_fleet.scatter(
+    positions_over_time[0, :, 0], positions_over_time[0, :, -1], s=6
+)
+ax_fleet.add_patch(
+    Rectangle((-p_max, -p_max), 2 * p_max, 2 * p_max, fill=False, linestyle="--")
+)
+ax_fleet.set_xlim(-p_max - 1, p_max + 1)
+ax_fleet.set_ylim(-p_max - 1, p_max + 1)
+ax_fleet.set_aspect("equal")
+ax_fleet.set_xlabel("First mass position")
+ax_fleet.set_ylabel("Last mass position")
+ax_fleet.set_title(f"All {fleet} systems")
+clock = fig.suptitle("")
+
+
+def draw(frame):
+    for row, springs, blocks, actuators in chains:
+        system = shown[row]
+        p = positions_over_time[frame, system]
+        centres = spacing * np.arange(1, masses + 1) + p
+        ends = (
+            [0.0]
+            + [e for c in centres for e in (c - width / 2, c + width / 2)]
+            + [wall]
+        )
+        for j, spring in enumerate(springs):
+            spring.set_data(*zigzag(ends[2 * j], ends[2 * j + 1], row))
+        for block, c, p_i in zip(blocks, centres, p):
+            block.set_x(c - width / 2)
+            block.set_color("C3" if abs(p_i) > p_max + 1e-3 else "0.25")
+        u = frame_inputs[frame, system]
+        for j, actuator in enumerate(actuators):
+            actuator.set_data([centres[j], centres[j + 1]], [row - 0.3, row - 0.3])
+            actuator.set_color(colormap(0.5 + 0.5 * u[j] / u_max))
+    p_all = positions_over_time[frame]
+    fleet_dots.set_offsets(p_all[:, [0, -1]])
+    fleet_dots.set_color(
+        np.where((np.abs(p_all) > p_max + 1e-3).any(axis=1), "C3", "C0")
+    )
+    clock.set_text(f"t = {frame * dt / substeps:4.1f} s")
+    return []
+
+
+animation = FuncAnimation(fig, draw, frames=len(frames), interval=1000 * dt / substeps)
+# Saved next to where the script runs; matplotlib writes GIFs with Pillow.
+animation.save("mpc_fleet.gif", writer=PillowWriter(fps=substeps / dt), dpi=72)
+plt.show()
 
 # %% [markdown]
 # ## How the batch size matters
