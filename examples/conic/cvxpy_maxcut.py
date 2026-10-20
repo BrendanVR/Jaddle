@@ -19,7 +19,7 @@
 #
 # `jcv.JaddleConicSolver` solves the SDP with `jl.solve` on a PSD-constrained
 # block of variables, projecting onto the PSD cone (one eigendecomposition)
-# each step. The result is checked against Clarabel.
+# each step. The result is checked against SCS.
 
 # %%
 import os
@@ -82,7 +82,7 @@ print(f"Jaddle solve time: {jaddle_time:.2f}s")
 stats = problem.solver_stats.extra_stats
 print(
     f"Status {problem.status}: bound {problem.value:.4f} "
-    f"(Clarabel {reference_bound:.4f}), {stats['epochs']} epochs"
+    f"(SCS {reference_bound:.4f}), {stats['epochs']} epochs"
 )
 assert problem.status == cp.OPTIMAL
 assert abs(problem.value - reference_bound) <= 1e-5 * (1 + abs(reference_bound))
