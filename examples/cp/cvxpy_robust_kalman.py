@@ -38,8 +38,6 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 import jax
 
-jax.config.update("jax_platform_name", "cpu")
-
 import cvxpy as cp
 import matplotlib.pyplot as plt
 import numpy as np
