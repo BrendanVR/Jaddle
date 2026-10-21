@@ -1,6 +1,6 @@
 # %% [markdown]
 # # A second-order cone program in CVXPY: a risk-limited portfolio
-# Choose long-only weights `w` for 50 assets to maximise expected return while
+# Choose long-only weights `w` for 500 assets to maximise expected return while
 # keeping the portfolio's volatility under a limit `σ`:
 #
 # ```
@@ -50,7 +50,7 @@ d = rng.uniform(0.05, 0.25, n_assets)  # idiosyncratic volatilities
 # ## Model
 # `σ` is a CVXPY parameter, so the sweep below only changes its value. Declaring
 # `w` nonnegative, rather than adding the constraint `w >= 0`, makes CVXPY pass
-# it to Jaddle as bounds on `w`, not as 5000 inequality rows.
+# it to Jaddle as bounds on `w`, not as 500 inequality rows.
 
 # %%
 w = cp.Variable(n_assets, nonneg=True)
@@ -59,7 +59,7 @@ volatility = cp.norm(cp.hstack([F.T @ w, cp.multiply(d, w)]))
 risk_limit = volatility <= sigma
 constraints = [cp.sum(w) == 1, risk_limit]
 problem = cp.Problem(cp.Maximize(mu @ w), constraints)
-# SCS gets its own copy: solving one problem with two solvers in turn would
+# Clarabel gets its own copy: solving one problem with two solvers in turn would
 # clear CVXPY's cache, and with it Jaddle's warm start.
 reference = cp.Problem(cp.Maximize(mu @ w), constraints)
 

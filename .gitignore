@@ -1,6 +1,7 @@
 *.png
 /data
 /playpen
+/articles
 /jaddle.egg-info
 *.pyc
 /build
