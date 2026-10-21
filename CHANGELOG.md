@@ -120,6 +120,15 @@
   variable. On the robust Kalman example this halves the robust solve
   (29→14 epochs, 1.45→0.77 s). `jcv.solve` takes the flag too.
 
+- `jl.solve_concurrent(model, run_crossover=False, max_seconds=None, highs_options=None, **solve_kwargs)`:
+  races Jaddle's PDLP against HiGHS's interior-point method on the same LP
+  and returns the first leg to converge. The HiGHS leg is stopped through
+  `cancelSolve()` and PDLP through a new `cancel` event on `jl.solve`, which
+  ends the solve with `stop_reason="cancelled"`. The result is the winner's
+  dict, plus `"winner"` (`"jaddle"` or `"highs"`) and `"legs"`, the
+  `"converged"`, `"stop_reason"` and `"seconds"` of each leg. It accepts the
+  same inputs as `jl.solve_with_presolve`.
+
 ### Changed
 
 - Matrices given to `jc.quadratic_program` (and `jc.make_qp_solver`) with at

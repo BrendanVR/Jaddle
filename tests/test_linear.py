@@ -1,5 +1,7 @@
 """Tests for the LP solver, jaddle.jaddle_linear."""
 
+import threading
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -1335,3 +1337,32 @@ def test_optimal_value_returns_its_own_solution():
     np.testing.assert_array_equal(grads.b_eq, -s.dual_eq)
     np.testing.assert_array_equal(grads.b_ineq, -s.dual_ineq)
     assert float(z) == float(lp.c @ s.primal)
+
+
+def test_cancel_event_stops_solve():
+    cancel = threading.Event()
+    cancel.set()
+    result = solve(random_lp(), tol=1e-12, cancel=cancel)
+    assert not result["converged"]
+    assert result["stop_reason"] == "cancelled"
+
+
+def test_solve_concurrent_matches_reference():
+    lp = random_lp()
+    result = jl.solve_concurrent(lp, **PRESOLVE_TOL)
+    assert result["converged"]
+    assert result["winner"] in ("jaddle", "highs")
+    assert set(result["legs"]) == {"jaddle", "highs"}
+    ref = reference_objective(lp)
+    assert abs(result["objective"] - ref) / (1 + abs(ref)) < 1e-6
+
+
+def test_solve_concurrent_ipm_wins_when_pdlp_is_starved():
+    # One PDLP epoch cannot converge, so the IPM leg must be the winner.
+    lp = random_lp()
+    result = jl.solve_concurrent(lp, max_epochs=1, **PRESOLVE_TOL)
+    assert result["winner"] == "highs"
+    assert result["converged"]
+    assert not result["legs"]["jaddle"]["converged"]
+    ref = reference_objective(lp)
+    assert abs(result["objective"] - ref) / (1 + abs(ref)) < 1e-6

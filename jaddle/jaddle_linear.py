@@ -10,6 +10,7 @@ import functools
 import inspect
 import os
 from typing import NamedTuple
+import threading
 import time
 from scipy import sparse as sp
 from jaddle.jaddle_basic_types import LP, JaddleLP, LPValues, SaddleState, scipy_to_bcoo
@@ -1956,6 +1957,7 @@ def solve(
     diag_theta=0.5,
     diag_clamp=10.0,
     _polish_trigger=None,
+    cancel=None,
 ):
     """
     Solve a linear program via saddle-point optimisation.
@@ -2230,8 +2232,9 @@ def solve(
               but not certified optimal, so the objective may be suboptimal even
               though ``"converged"`` is ``True``), ``"max_epochs"`` (epoch budget
               exhausted), ``"time_limit"`` (``max_seconds`` exhausted),
-              ``"interrupted"`` (KeyboardInterrupt), or ``"polish_ready"``
-              (only with ``_polish_trigger``).
+              ``"interrupted"`` (KeyboardInterrupt), ``"cancelled"`` (the
+              ``cancel`` event was set), or ``"polish_ready"`` (only with
+              ``_polish_trigger``).
             * ``"solve_seconds"``: ``float`` wall time of the epoch loop (incl. the
               first-epoch XLA compile but not the scaling / sparse-setup phase).
             * ``"corrected_seconds"``: ``float`` steady-state runtime with the
@@ -2489,7 +2492,9 @@ def solve(
     # epochs, so the whole solve is one call: the loop only returns when the
     # certificate is met (or a restart changes iterations_per_epoch, whose new
     # scan length needs a new compile).
-    single_call = not verbose and not max_epochs and max_seconds is None
+    single_call = (
+        not verbose and not max_epochs and max_seconds is None and cancel is None
+    )
     # Wall time of the very first epoch (which pays the one-off XLA compile).
     # Outside single-call mode the first chunk is exactly one epoch, so this
     # keeps its meaning; callers use it to form a "corrected" runtime.
@@ -2556,6 +2561,10 @@ def solve(
                         print(f"Reached time limit: {max_seconds}s. Stopping.")
                         print("----------------------------------------------")
                     break
+            if cancel is not None and cancel.is_set():
+                is_converged = False
+                stop_reason = "cancelled"
+                break
 
             n_epochs = chunk_epochs
             if max_epochs:
@@ -4555,6 +4564,147 @@ def project_onto_eq(lp: JaddleLP, primal: jnp.ndarray, tol=1e-6) -> jnp.ndarray:
         print(f"GMRES did not converge (info={info})")
 
     return primal + delta
+
+
+def _highs_ipm_leg(highs):
+    """Run an interior-point solve (HiGHS, with its crossover if enabled) on
+    ``highs`` and return the leg's result in ``solve_with_presolve``'s keys."""
+    import highspy
+    from jaddle import highs_helpers as hh
+
+    highs.run()
+    status = highs.getModelStatus()
+    result = {
+        "converged": status == highspy.HighsModelStatus.kOptimal,
+        "stop_reason": status.name,
+    }
+    if not result["converged"]:
+        return result
+    lp = highs.getLp()
+    full = highs.getSolution()
+    dual_eq, dual_ineq = hh.highs_duals_to_jaddle(
+        np.asarray(full.row_dual), np.asarray(lp.row_lower_), np.asarray(lp.row_upper_)
+    )
+    result.update(
+        solution=SaddleState(
+            primal=jnp.asarray(full.col_value),
+            dual_ineq=jnp.asarray(dual_ineq),
+            dual_eq=jnp.asarray(dual_eq),
+        ),
+        objective=highs.getInfo().objective_function_value,
+        highs_solution={
+            "col_value": np.asarray(full.col_value),
+            "col_dual": np.asarray(full.col_dual),
+            "row_value": np.asarray(full.row_value),
+            "row_dual": np.asarray(full.row_dual),
+        },
+    )
+    return result
+
+
+# The names solve_concurrent reports its legs under.
+LEG_NAMES = {"pdlp": "jaddle", "ipm": "highs"}
+
+
+def solve_concurrent(
+    model,
+    highs_options=None,
+    run_crossover=False,
+    max_seconds=None,
+    **solve_kwargs,
+):
+    """
+    Race a HiGHS interior-point solve against ``solve_with_presolve``
+    (PDLP) and return the first leg whose solution is converged. Works on a
+    file, a ``highspy.Highs``, a ``highspy.HighsLp``, or a Jaddle
+    ``LP`` / ``JaddleLP``, with the same input handling as
+    ``solve_with_presolve``. Integer variables are relaxed.
+
+    The IPM leg runs on its own HiGHS instance. When one leg converges the
+    other is cancelled: PDLP stops at its next chunk boundary through its
+    ``cancel`` event, and HiGHS through ``cancelSolve()``. If the first leg to
+    finish has not converged, the race waits for the other one. If neither
+    converges, the first to finish is returned with ``"converged"`` False.
+
+    ``highs_options`` (a dict of HiGHS options) applies to both legs.
+    ``run_crossover=True`` makes the IPM leg return a vertex; the PDLP leg
+    never crosses over. ``max_seconds`` bounds both legs, and other keyword
+    arguments go to ``solve()`` for the PDLP leg.
+
+    Returns the winning leg's dict from ``solve_with_presolve`` (or its IPM
+    counterpart, with the same keys ``solution``, ``objective``,
+    ``highs_solution`` and ``converged``), plus:
+
+    * ``"winner"``: ``"jaddle"`` (PDLP) or ``"highs"`` (IPM).
+    * ``"legs"``: keyed by ``"jaddle"`` and ``"highs"``, for each leg that
+      finished, its ``"converged"``,
+      ``"stop_reason"`` and ``"seconds"``.
+    """
+    _require_no_cones(model, "solve_concurrent")
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+    if max_seconds is not None:
+        solve_kwargs["max_seconds"] = max_seconds
+    ipm_options = {
+        **(highs_options or {}),
+        "solver": "ipm",
+        "run_crossover": "on" if run_crossover else "off",
+    }
+    if max_seconds is not None:
+        ipm_options["time_limit"] = float(max_seconds)
+
+    # Copy the LP before any thread runs: solve_with_presolve works on a
+    # caller's HiGHS instance in place.
+    ipm = _highs_model(_highs_model(model, highs_options).getLp(), ipm_options)
+    # Without this, cancelSolve() is a no-op and the loser runs to completion.
+    ipm.HandleUserInterrupt = True
+    cancel = threading.Event()
+
+    def timed(leg):
+        start = time.time()
+        result = leg()
+        result["seconds"] = time.time() - start
+        return result
+
+    legs = {
+        "pdlp": lambda: solve_with_presolve(
+            model, highs_options, cancel=cancel, **solve_kwargs
+        ),
+        "ipm": lambda: _highs_ipm_leg(ipm),
+    }
+    pool = ThreadPoolExecutor(max_workers=len(legs))
+    futures = {pool.submit(timed, leg): name for name, leg in legs.items()}
+    results, finished, winner = {}, [], None
+    try:
+        pending = set(futures)
+        while pending and winner is None:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                name = futures[future]
+                results[name] = future.result()
+                finished.append(name)
+                if winner is None and results[name]["converged"]:
+                    winner = name
+    finally:
+        cancel.set()
+        ipm.cancelSolve()
+        pool.shutdown(wait=True)
+    for future, name in futures.items():
+        if name not in results:
+            results[name] = future.result()
+
+    winner = winner or finished[0]
+    result = dict(results[winner])
+    result["winner"] = LEG_NAMES[winner]
+    result["legs"] = {
+        LEG_NAMES[name]: {
+            "converged": leg["converged"],
+            "stop_reason": leg["stop_reason"],
+            "seconds": leg["seconds"],
+        }
+        for name, leg in results.items()
+    }
+    return result
 
 
 def _require_no_cones(lp, what):
